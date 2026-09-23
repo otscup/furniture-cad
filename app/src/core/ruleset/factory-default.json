@@ -1,0 +1,67 @@
+{
+  "id": "factory_default_v1",
+  "name": "行业默认规则集（占位，待真实工厂校准）",
+  "note": "Phase 0 占位值。换工厂 = 换本文件，不改代码。",
+  "materials": {
+    "M_BOARD_18_WOOD": { "name": "18mm 双饰面木纹板", "thickness": 18, "kind": "board", "maxSheet": [2440, 1220], "grain": true, "density": 0.72 },
+    "M_BOARD_15_WOOD": { "name": "15mm 抽侧板", "thickness": 15, "kind": "board", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 },
+    "M_BACK_9": { "name": "9mm 背板", "thickness": 9, "kind": "back", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 },
+    "M_BOARD_5": { "name": "5mm 抽底板", "thickness": 5, "kind": "back", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 }
+  },
+  "edgebanding": {
+    "E_1MM": { "name": "1mm PVC 白", "thickness": 1 },
+    "E_04MM": { "name": "0.4mm PVC 白", "thickness": 0.4 }
+  },
+  "hardware": {
+    "HW_HINGE_110": { "name": "110度快装铰链", "unit": "只" },
+    "HW_RUNNER_500": { "name": "三节轨 500mm", "unit": "副" },
+    "HW_ROD_25": { "name": "挂衣杆 25mm 铝合金", "unit": "根" },
+    "HW_SHELF_PIN": { "name": "层板托", "unit": "只" },
+    "HW_HANDLE_128": { "name": "拉手 128mm", "unit": "只" }
+  },
+  "limits": {
+    "maxSheetSize": [2440, 1220],
+    "minPanelSize": 50,
+    "maxPanelWeightKg": 50,
+    "maxDoorWidth": 600,
+    "maxDoorHeight": 2400,
+    "maxShelfSpan": 900,
+    "maxSingleCabinetHeight": 2400,
+    "maxSingleCabinetWidth": 2400,
+    "hingeSpacingMax": 500
+  },
+  "policy": {
+    "remainderPolicy": "bottom",
+    "widthAllocationPolicy": "fit_total",
+    "edgeBandingRule": "visible_1mm_others_04mm"
+  },
+  "stylePresets": [
+    {
+      "id": "STYLE_FULL_FRONT",
+      "nameZh": "通体四门",
+      "note": "门板通高，内部为挂衣区 + 顶层层板。2400mm 宽下单扇约 588mm，未超 600mm 门宽上限。",
+      "units": [
+        { "kind": "hanging", "ratio": 1, "nickname": "通体挂衣", "rodHeight": 1800, "doors": { "count": 4 } }
+      ]
+    },
+    {
+      "id": "STYLE_THREE_PART",
+      "nameZh": "三段分格",
+      "note": "抽屉 : 挂衣 : 层板 = 1 : 2 : 1，层板区带 2 扇门。这是默认的 2:4:2 三分区结构。",
+      "units": [
+        { "kind": "drawerBank", "ratio": 1, "nickname": "抽屉", "count": 3 },
+        { "kind": "hanging", "ratio": 2, "nickname": "挂衣", "rodHeight": 1800 },
+        { "kind": "shelves", "ratio": 1, "nickname": "层板", "count": 4, "doors": { "count": 2 } }
+      ]
+    },
+    {
+      "id": "STYLE_DRAWER_HEAVY",
+      "nameZh": "储物为主",
+      "note": "抽屉 : 挂衣 = 1 : 1，抽屉 6 只（单抽面板高约 374mm，未超 400mm 常用上限）。",
+      "units": [
+        { "kind": "drawerBank", "ratio": 1, "nickname": "抽屉", "count": 6 },
+        { "kind": "hanging", "ratio": 1, "nickname": "挂衣", "rodHeight": 1800, "doors": { "count": 2 } }
+      ]
+    }
+  ]
+}

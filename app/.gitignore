@@ -1,0 +1,20 @@
+# 依赖与产物
+node_modules/
+dist/
+
+# 本地配置 —— 里面有明文 API Key，绝不入库
+.env
+
+# 记忆文件的覆盖前备份
+memory/*.bak
+
+# 账号库（含口令哈希与会话哈希）与审计日志 —— 绝不入库：
+# 口令哈希虽然不可逆，但它是"离线爆破"的原料；审计日志含 IP 与操作史。
+# 这两份都是**每台机器各自生成**的运行时数据，不是项目资产。
+memory/accounts.json
+memory/accounts.json.tmp
+memory/audit.jsonl
+
+# 验收截图是证据，保留；
+# 但 Chrome 临时 profile 若因环境删除保护而残留，不要入库
+verify/out/chrome-profile-*/

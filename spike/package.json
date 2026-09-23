@@ -1,0 +1,16 @@
+{
+  "name": "furniture-cad-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 0 技术验证：Semantic Model → Panel Model → DXF，并验证 DXF 可被真实 CAD 打开",
+  "scripts": {
+    "build": "node --experimental-strip-types --no-warnings src/main.ts",
+    "export": "python py/export_dxf.py",
+    "verify": "python py/verify_dxf.py && node js/verify-with-dxf-parser.mjs",
+    "all": "npm run build && npm run export && npm run verify"
+  },
+  "devDependencies": {
+    "dxf-parser": "^1.1.2"
+  }
+}

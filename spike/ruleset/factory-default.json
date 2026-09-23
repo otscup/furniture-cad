@@ -1,0 +1,38 @@
+{
+  "id": "factory_default_v1",
+  "name": "行业默认规则集（占位，待真实工厂校准）",
+  "note": "Phase 0 占位值。换工厂 = 换本文件，不改代码。",
+  "materials": {
+    "M_BOARD_18_WOOD": { "name": "18mm 双饰面木纹板", "thickness": 18, "kind": "board", "maxSheet": [2440, 1220], "grain": true, "density": 0.72 },
+    "M_BOARD_15_WOOD": { "name": "15mm 抽侧板", "thickness": 15, "kind": "board", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 },
+    "M_BACK_9": { "name": "9mm 背板", "thickness": 9, "kind": "back", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 },
+    "M_BOARD_5": { "name": "5mm 抽底板", "thickness": 5, "kind": "back", "maxSheet": [2440, 1220], "grain": false, "density": 0.72 }
+  },
+  "edgebanding": {
+    "E_1MM": { "name": "1mm PVC 白", "thickness": 1 },
+    "E_04MM": { "name": "0.4mm PVC 白", "thickness": 0.4 }
+  },
+  "hardware": {
+    "HW_HINGE_110": { "name": "110度快装铰链", "unit": "只" },
+    "HW_RUNNER_500": { "name": "三节轨 500mm", "unit": "副" },
+    "HW_ROD_25": { "name": "挂衣杆 25mm 铝合金", "unit": "根" },
+    "HW_SHELF_PIN": { "name": "层板托", "unit": "只" },
+    "HW_HANDLE_128": { "name": "拉手 128mm", "unit": "只" }
+  },
+  "limits": {
+    "maxSheetSize": [2440, 1220],
+    "minPanelSize": 50,
+    "maxPanelWeightKg": 50,
+    "maxDoorWidth": 600,
+    "maxDoorHeight": 2400,
+    "maxShelfSpan": 900,
+    "maxSingleCabinetHeight": 2400,
+    "maxSingleCabinetWidth": 2400,
+    "hingeSpacingMax": 500
+  },
+  "policy": {
+    "remainderPolicy": "bottom",
+    "widthAllocationPolicy": "fit_total",
+    "edgeBandingRule": "visible_1mm_others_04mm"
+  }
+}

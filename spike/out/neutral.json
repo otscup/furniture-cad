@@ -1,0 +1,913 @@
+{
+  "meta": {
+    "cabinetId": "Cabinet_001",
+    "cabinetName": "主卧衣柜",
+    "units": "mm",
+    "insUnits": 4,
+    "outer": {
+      "width": 2400,
+      "height": 2400,
+      "depth": 600
+    },
+    "inner": {
+      "width": 2364,
+      "height": 2284
+    },
+    "generatorVersion": "spike@0.1.0",
+    "ruleSetId": "factory_default_v1",
+    "ruleSetName": "行业默认规则集（占位，待真实工厂校准）",
+    "generatedAt": "2026-09-23T09:03:59.640Z",
+    "traceability": {
+      "modelId": "Cabinet_001",
+      "schemaVersion": "0.1",
+      "generator": "spike@0.1.0",
+      "ruleSet": "factory_default_v1@1"
+    }
+  },
+  "panels": [
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_LS",
+      "role": "LeftSidePanel",
+      "nameZh": "左侧板",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2320,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": "E_04MM",
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；上端 1mm；下端 0.4mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_RS",
+      "role": "RightSidePanel",
+      "nameZh": "右侧板",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2320,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": "E_04MM",
+        "left": null,
+        "right": "E_1MM"
+      },
+      "edgeLabel": "前边 1mm；上端 1mm；下端 0.4mm（镜像）",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_TOP",
+      "role": "TopPanel",
+      "nameZh": "顶板",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2364,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_BOT",
+      "role": "BottomPanel",
+      "nameZh": "底板",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2364,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_KICK",
+      "role": "KickBoard",
+      "nameZh": "踢脚板",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2364,
+      "width": 80,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_DIV1",
+      "role": "DividerPanel",
+      "nameZh": "中立板1",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2284,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_DIV2",
+      "role": "DividerPanel",
+      "nameZh": "中立板2",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2284,
+      "width": 600,
+      "grain": "length",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_BACK1",
+      "role": "BackPanel",
+      "nameZh": "背板-1",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BACK_9",
+      "thickness": 9,
+      "length": 1150,
+      "width": 2379,
+      "grain": "none",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "不封边",
+      "layer": "PANEL_9"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_BACK2",
+      "role": "BackPanel",
+      "nameZh": "背板-2",
+      "belongsTo": "Cabinet_001",
+      "group": "箱体",
+      "material": "M_BACK_9",
+      "thickness": 9,
+      "length": 1149,
+      "width": 2379,
+      "grain": "none",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "不封边",
+      "layer": "PANEL_9"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DF1",
+      "role": "DrawerFront",
+      "nameZh": "抽屉面板-1",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 756,
+      "width": 578,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": "E_1MM",
+        "left": "E_1MM",
+        "right": "E_1MM"
+      },
+      "edgeLabel": "四周 1mm（可见面）",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 2,
+      "id": "P_Cabinet_001_Unit_L_DS1",
+      "role": "DrawerSide",
+      "nameZh": "抽屉侧板-1",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 500,
+      "width": 726,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DB1",
+      "role": "DrawerBack",
+      "nameZh": "抽屉后板-1",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 527,
+      "width": 726,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DBOT1",
+      "role": "DrawerBottom",
+      "nameZh": "抽屉底板-1",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_5",
+      "thickness": 5,
+      "length": 511,
+      "width": 538,
+      "grain": "none",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "嵌槽，不封边",
+      "layer": "PANEL_5"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DF2",
+      "role": "DrawerFront",
+      "nameZh": "抽屉面板-2",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 754,
+      "width": 578,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": "E_1MM",
+        "left": "E_1MM",
+        "right": "E_1MM"
+      },
+      "edgeLabel": "四周 1mm（可见面）",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 2,
+      "id": "P_Cabinet_001_Unit_L_DS2",
+      "role": "DrawerSide",
+      "nameZh": "抽屉侧板-2",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 500,
+      "width": 724,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DB2",
+      "role": "DrawerBack",
+      "nameZh": "抽屉后板-2",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 527,
+      "width": 724,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DBOT2",
+      "role": "DrawerBottom",
+      "nameZh": "抽屉底板-2",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_5",
+      "thickness": 5,
+      "length": 511,
+      "width": 538,
+      "grain": "none",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "嵌槽，不封边",
+      "layer": "PANEL_5"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DF3",
+      "role": "DrawerFront",
+      "nameZh": "抽屉面板-3",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 754,
+      "width": 578,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": "E_1MM",
+        "left": "E_1MM",
+        "right": "E_1MM"
+      },
+      "edgeLabel": "四周 1mm（可见面）",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 2,
+      "id": "P_Cabinet_001_Unit_L_DS3",
+      "role": "DrawerSide",
+      "nameZh": "抽屉侧板-3",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 500,
+      "width": 724,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DB3",
+      "role": "DrawerBack",
+      "nameZh": "抽屉后板-3",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_15_WOOD",
+      "thickness": 15,
+      "length": 527,
+      "width": 724,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "上棱 1mm",
+      "layer": "PANEL_15"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_L_DBOT3",
+      "role": "DrawerBottom",
+      "nameZh": "抽屉底板-3",
+      "belongsTo": "Cabinet_001.Unit_L",
+      "group": "Unit_L",
+      "material": "M_BOARD_5",
+      "thickness": 5,
+      "length": 511,
+      "width": 538,
+      "grain": "none",
+      "edge": {
+        "top": null,
+        "bottom": null,
+        "left": null,
+        "right": null
+      },
+      "edgeLabel": "嵌槽，不封边",
+      "layer": "PANEL_5"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_M_SH1",
+      "role": "ShelfPanel",
+      "nameZh": "层板-1",
+      "belongsTo": "Cabinet_001.Unit_M",
+      "group": "Unit_M",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 1163,
+      "width": 570,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；位置：距柜内底 1142mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_SH1",
+      "role": "ShelfPanel",
+      "nameZh": "层板-1",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 581,
+      "width": 570,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；位置：距柜内底 457mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_SH2",
+      "role": "ShelfPanel",
+      "nameZh": "层板-2",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 581,
+      "width": 570,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；位置：距柜内底 914mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_SH3",
+      "role": "ShelfPanel",
+      "nameZh": "层板-3",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 581,
+      "width": 570,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；位置：距柜内底 1370mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_SH4",
+      "role": "ShelfPanel",
+      "nameZh": "层板-4",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 581,
+      "width": 570,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": null,
+        "left": "E_1MM",
+        "right": null
+      },
+      "edgeLabel": "前边 1mm；位置：距柜内底 1827mm",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_DOOR1",
+      "role": "DoorPanel",
+      "nameZh": "2 扇门之第 1 扇",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2280,
+      "width": 288,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": "E_1MM",
+        "left": "E_1MM",
+        "right": "E_1MM"
+      },
+      "edgeLabel": "四周 1mm（可见面）",
+      "layer": "PANEL_18"
+    },
+    {
+      "qty": 1,
+      "id": "P_Cabinet_001_Unit_R_DOOR2",
+      "role": "DoorPanel",
+      "nameZh": "2 扇门之第 2 扇",
+      "belongsTo": "Cabinet_001.Unit_R",
+      "group": "Unit_R",
+      "material": "M_BOARD_18_WOOD",
+      "thickness": 18,
+      "length": 2280,
+      "width": 287,
+      "grain": "length",
+      "edge": {
+        "top": "E_1MM",
+        "bottom": "E_1MM",
+        "left": "E_1MM",
+        "right": "E_1MM"
+      },
+      "edgeLabel": "四周 1mm（可见面）",
+      "layer": "PANEL_18"
+    }
+  ],
+  "hardware": [
+    {
+      "id": "HW_Cabinet_001_Unit_L_RUNNER",
+      "nameZh": "抽屉滑轨",
+      "kind": "runner",
+      "qty": 3,
+      "spec": "三节轨 500mm，L=500mm",
+      "belongsTo": "Cabinet_001.Unit_L"
+    },
+    {
+      "id": "HW_Cabinet_001_Unit_M_PIN",
+      "nameZh": "层板托",
+      "kind": "shelfPin",
+      "qty": 4,
+      "spec": "每块层板 4 只",
+      "belongsTo": "Cabinet_001.Unit_M"
+    },
+    {
+      "id": "HW_Cabinet_001_Unit_M_ROD",
+      "nameZh": "挂衣杆",
+      "kind": "rod",
+      "qty": 1,
+      "spec": "挂衣杆 25mm 铝合金 L=1162mm，距柜内底 1800mm",
+      "belongsTo": "Cabinet_001.Unit_M"
+    },
+    {
+      "id": "HW_Cabinet_001_Unit_R_PIN",
+      "nameZh": "层板托",
+      "kind": "shelfPin",
+      "qty": 16,
+      "spec": "每块层板 4 只",
+      "belongsTo": "Cabinet_001.Unit_R"
+    },
+    {
+      "id": "HW_Cabinet_001_Unit_R_HINGE",
+      "nameZh": "门铰链",
+      "kind": "hinge",
+      "qty": 10,
+      "spec": "110度快装铰链，每扇 5 只（按门高 2280mm / 间距上限 500mm 计算）",
+      "belongsTo": "Cabinet_001.Unit_R"
+    },
+    {
+      "id": "HW_Cabinet_001_Unit_R_HANDLE",
+      "nameZh": "拉手",
+      "kind": "handle",
+      "qty": 2,
+      "spec": "HW_HANDLE_128 128mm 孔距",
+      "belongsTo": "Cabinet_001.Unit_R"
+    }
+  ],
+  "issues": [
+    {
+      "severity": "INFO",
+      "code": "ALLOC-FIT-TOTAL",
+      "target": "Cabinet_001",
+      "message": "总宽 2400mm 固定，扣除两侧板 18×2 与立板 18×2 后可用净宽 2328mm，按期望比例重新分配：Unit_L 期望净宽 600 → 实际 582（-18mm）；Unit_M 期望净宽 1200 → 实际 1164（-36mm）；Unit_R 期望净宽 600 → 实际 582（-18mm）。这是「总宽优先」策略的必然结果，不是错误。",
+      "fixHint": "如需严格满足净宽，请改用 layout.widthMode = \"fit_units\"（总宽将随之变化）"
+    },
+    {
+      "severity": "WARNING",
+      "code": "RULE-BACKPANEL-SPLIT",
+      "target": "Cabinet_001",
+      "message": "背板 2379×2299mm 超出板材最大幅面 2440×1220，已按高度方向拆为 2 块。",
+      "fixHint": "确认拼接方向与压条方案；或改用 5mm 背板条 + 中密度板"
+    },
+    {
+      "severity": "WARNING",
+      "code": "RULE-DRAWER-TALL-FRONT",
+      "target": "Cabinet_001.Unit_L",
+      "message": "抽屉面板最高 756mm，超出单抽常用高度（≤400mm）。",
+      "fixHint": "增加抽屉数量，或改为「抽屉 + 上翻门」组合"
+    },
+    {
+      "severity": "WARNING",
+      "code": "RULE-SHELF-SPAN",
+      "target": "Cabinet_001.Unit_M",
+      "message": "Unit_M 层板跨度 1164mm 超过建议上限 900mm。",
+      "fixHint": "增加中立板，或加厚层板至 25mm"
+    },
+    {
+      "severity": "INFO",
+      "code": "RULE-DOOR-TALL",
+      "target": "Cabinet_001.Unit_R",
+      "message": "门板高 2280mm，需 5 只铰链；建议复核铰链品牌与承重。"
+    }
+  ],
+  "elevation": {
+    "outer": {
+      "w": 2400,
+      "h": 2400
+    },
+    "rects": [
+      {
+        "x": 18,
+        "y": 0,
+        "w": 2364,
+        "h": 80,
+        "layer": "ELEV_STRUCT",
+        "label": "踢脚板"
+      },
+      {
+        "x": 0,
+        "y": 80,
+        "w": 18,
+        "h": 2320,
+        "layer": "ELEV_STRUCT",
+        "label": "左侧板"
+      },
+      {
+        "x": 2382,
+        "y": 80,
+        "w": 18,
+        "h": 2320,
+        "layer": "ELEV_STRUCT",
+        "label": "右侧板"
+      },
+      {
+        "x": 18,
+        "y": 2382,
+        "w": 2364,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "顶板"
+      },
+      {
+        "x": 18,
+        "y": 80,
+        "w": 2364,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "底板"
+      },
+      {
+        "x": 600,
+        "y": 98,
+        "w": 18,
+        "h": 2284,
+        "layer": "ELEV_STRUCT",
+        "label": "中立板1"
+      },
+      {
+        "x": 1782,
+        "y": 98,
+        "w": 18,
+        "h": 2284,
+        "layer": "ELEV_STRUCT",
+        "label": "中立板2"
+      },
+      {
+        "x": 20,
+        "y": 100,
+        "w": 578,
+        "h": 756,
+        "layer": "ELEV_FRONT",
+        "label": "抽屉面板-1"
+      },
+      {
+        "x": 20,
+        "y": 858,
+        "w": 578,
+        "h": 754,
+        "layer": "ELEV_FRONT",
+        "label": "抽屉面板-2"
+      },
+      {
+        "x": 20,
+        "y": 1614,
+        "w": 578,
+        "h": 754,
+        "layer": "ELEV_FRONT",
+        "label": "抽屉面板-3"
+      },
+      {
+        "x": 618,
+        "y": 1240,
+        "w": 1164,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "层板-1"
+      },
+      {
+        "x": 619,
+        "y": 1898,
+        "w": 1162,
+        "h": 0,
+        "layer": "ELEV_HW",
+        "label": "挂衣杆",
+        "dashed": true
+      },
+      {
+        "x": 1800,
+        "y": 555,
+        "w": 582,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "层板-1"
+      },
+      {
+        "x": 1800,
+        "y": 1012,
+        "w": 582,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "层板-2"
+      },
+      {
+        "x": 1800,
+        "y": 1468,
+        "w": 582,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "层板-3"
+      },
+      {
+        "x": 1800,
+        "y": 1925,
+        "w": 582,
+        "h": 18,
+        "layer": "ELEV_STRUCT",
+        "label": "层板-4"
+      },
+      {
+        "x": 1802,
+        "y": 100,
+        "w": 288,
+        "h": 2280,
+        "layer": "ELEV_FRONT",
+        "label": "2 扇门之第 1 扇"
+      },
+      {
+        "x": 2093,
+        "y": 100,
+        "w": 287,
+        "h": 2280,
+        "layer": "ELEV_FRONT",
+        "label": "2 扇门之第 2 扇"
+      }
+    ],
+    "dims": [
+      {
+        "kind": "vertical",
+        "x": -120,
+        "y": 0,
+        "length": 2400,
+        "text": "2400"
+      },
+      {
+        "kind": "vertical",
+        "x": -60,
+        "y": 80,
+        "length": 2320,
+        "text": "2320"
+      },
+      {
+        "kind": "vertical",
+        "x": -190,
+        "y": 0,
+        "length": 80,
+        "text": "80"
+      },
+      {
+        "kind": "horizontal",
+        "x": 0,
+        "y": -120,
+        "length": 2400,
+        "text": "2400"
+      },
+      {
+        "kind": "horizontal",
+        "x": 18,
+        "y": -60,
+        "length": 582,
+        "text": "582"
+      },
+      {
+        "kind": "horizontal",
+        "x": 618,
+        "y": -60,
+        "length": 1164,
+        "text": "1164"
+      },
+      {
+        "kind": "horizontal",
+        "x": 1800,
+        "y": -60,
+        "length": 582,
+        "text": "582"
+      }
+    ]
+  },
+  "stats": {
+    "panelKinds": 28,
+    "totalPieces": 31,
+    "boardAreaM2": 22.8,
+    "estWeightKg": 244.8
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "useDefineForClassFields": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    /**
+     * allowJs 是为了 `shared/aiContract.mjs` —— AI 动作契约必须被前端（TS）
+     * 与本地服务（.mjs）**同时** import。JSON 做不到（Node 22 的
+     * `import ... with { type: 'json' }` 在本机直接报 ImportAttributes），
+     * 而各写一份必然漂移。所以契约是纯 ESM JS，由 TS 侧引入。
+     * checkJs 保持关闭：契约文件本身不该被 TS 的严格规则反向绑架。
+     */
+    "allowJs": true,
+    "checkJs": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["vite/client"]
+  },
+  "include": ["src", "vite.config.ts"]
+}

@@ -1,0 +1,28 @@
+# ── 依赖与构建产物 ──
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ── 本地配置：里面有明文 API Key，绝不入库 ──
+.env
+*.env.local
+
+# ── 运行时数据 ──
+# 账号库含口令哈希（离线爆破的原料），审计日志含 IP 与操作史。
+# 这两份都是每台机器各自生成的运行时数据，不是项目资产。
+app/memory/accounts.json
+app/memory/accounts.json.tmp
+app/memory/audit.jsonl
+memory/*.bak
+
+# Chrome 临时 profile（验收时建在系统临时目录，偶尔因删除保护残留在这里）
+app/verify/out/chrome-profile-*/
+
+# ── WorkBuddy ──
+# 只把「决策记忆」入库（它是项目决策与踩坑的记录）；
+# 其余是工具自己的运行时数据，不进版本控制。
+.workbuddy/*
+!.workbuddy/memory/

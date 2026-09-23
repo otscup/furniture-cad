@@ -1,0 +1,29 @@
+﻿序号,板件编号,名称,组,材质,厚(mm),长(mm),宽(mm),数量,封边,木纹
+1,P_Cabinet_001_LS,左侧板,箱体,M_BOARD_18_WOOD,18,2320,600,1,前边 1mm；上端 1mm；下端 0.4mm,length
+2,P_Cabinet_001_RS,右侧板,箱体,M_BOARD_18_WOOD,18,2320,600,1,前边 1mm；上端 1mm；下端 0.4mm（镜像）,length
+3,P_Cabinet_001_TOP,顶板,箱体,M_BOARD_18_WOOD,18,2364,600,1,前边 1mm,length
+4,P_Cabinet_001_BOT,底板,箱体,M_BOARD_18_WOOD,18,2364,600,1,前边 1mm,length
+5,P_Cabinet_001_KICK,踢脚板,箱体,M_BOARD_18_WOOD,18,2364,80,1,上棱 1mm,length
+6,P_Cabinet_001_DIV1,中立板1,箱体,M_BOARD_18_WOOD,18,2284,600,1,前边 1mm,length
+7,P_Cabinet_001_DIV2,中立板2,箱体,M_BOARD_18_WOOD,18,2284,600,1,前边 1mm,length
+8,P_Cabinet_001_BACK1,背板-1,箱体,M_BACK_9,9,1150,2379,1,不封边,none
+9,P_Cabinet_001_BACK2,背板-2,箱体,M_BACK_9,9,1149,2379,1,不封边,none
+10,P_Cabinet_001_Unit_L_DF1,抽屉面板-1,Unit_L,M_BOARD_18_WOOD,18,756,578,1,四周 1mm（可见面）,length
+11,P_Cabinet_001_Unit_L_DS1,抽屉侧板-1,Unit_L,M_BOARD_15_WOOD,15,500,726,2,上棱 1mm,length
+12,P_Cabinet_001_Unit_L_DB1,抽屉后板-1,Unit_L,M_BOARD_15_WOOD,15,527,726,1,上棱 1mm,length
+13,P_Cabinet_001_Unit_L_DBOT1,抽屉底板-1,Unit_L,M_BOARD_5,5,511,538,1,嵌槽，不封边,none
+14,P_Cabinet_001_Unit_L_DF2,抽屉面板-2,Unit_L,M_BOARD_18_WOOD,18,754,578,1,四周 1mm（可见面）,length
+15,P_Cabinet_001_Unit_L_DS2,抽屉侧板-2,Unit_L,M_BOARD_15_WOOD,15,500,724,2,上棱 1mm,length
+16,P_Cabinet_001_Unit_L_DB2,抽屉后板-2,Unit_L,M_BOARD_15_WOOD,15,527,724,1,上棱 1mm,length
+17,P_Cabinet_001_Unit_L_DBOT2,抽屉底板-2,Unit_L,M_BOARD_5,5,511,538,1,嵌槽，不封边,none
+18,P_Cabinet_001_Unit_L_DF3,抽屉面板-3,Unit_L,M_BOARD_18_WOOD,18,754,578,1,四周 1mm（可见面）,length
+19,P_Cabinet_001_Unit_L_DS3,抽屉侧板-3,Unit_L,M_BOARD_15_WOOD,15,500,724,2,上棱 1mm,length
+20,P_Cabinet_001_Unit_L_DB3,抽屉后板-3,Unit_L,M_BOARD_15_WOOD,15,527,724,1,上棱 1mm,length
+21,P_Cabinet_001_Unit_L_DBOT3,抽屉底板-3,Unit_L,M_BOARD_5,5,511,538,1,嵌槽，不封边,none
+22,P_Cabinet_001_Unit_M_SH1,层板-1,Unit_M,M_BOARD_18_WOOD,18,1163,570,1,前边 1mm；位置：距柜内底 1142mm,length
+23,P_Cabinet_001_Unit_R_SH1,层板-1,Unit_R,M_BOARD_18_WOOD,18,581,570,1,前边 1mm；位置：距柜内底 457mm,length
+24,P_Cabinet_001_Unit_R_SH2,层板-2,Unit_R,M_BOARD_18_WOOD,18,581,570,1,前边 1mm；位置：距柜内底 914mm,length
+25,P_Cabinet_001_Unit_R_SH3,层板-3,Unit_R,M_BOARD_18_WOOD,18,581,570,1,前边 1mm；位置：距柜内底 1370mm,length
+26,P_Cabinet_001_Unit_R_SH4,层板-4,Unit_R,M_BOARD_18_WOOD,18,581,570,1,前边 1mm；位置：距柜内底 1827mm,length
+27,P_Cabinet_001_Unit_R_DOOR1,2 扇门之第 1 扇,Unit_R,M_BOARD_18_WOOD,18,2280,288,1,四周 1mm（可见面）,length
+28,P_Cabinet_001_Unit_R_DOOR2,2 扇门之第 2 扇,Unit_R,M_BOARD_18_WOOD,18,2280,287,1,四周 1mm（可见面）,length

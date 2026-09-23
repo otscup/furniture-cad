@@ -1,0 +1,560 @@
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  账号 / 会话 / 额度 / 审计 —— 零依赖实现
+ *
+ *  为什么全放在一个文件里：这四件事共用同一份载体（账号记录），
+ *  拆成四个模块必然出现"谁负责写盘"的扯皮，最后落出两份状态。
+ *  一份 store，一处读写，一处判权限。
+ *
+ *  ── 关于"这是不是生产级" ──
+ *    不是。这里实现的是一套**能自证清白**的单机账号体系：
+ *      · 口令用 scrypt + 每账号独立随机盐，比较用 timingSafeEqual
+ *      · 会话 token 只落**哈希**，明文只回给登录者一次
+ *      · 失败登录计数 + 锁定窗口
+ *      · 所有管理操作写审计日志
+ *    缺的是生产必需的那几样，**已在 /api/security/policy 里逐条写明**：
+ *      HTTPS、反向代理后的真实 IP、会话轮换与撤销、邮件/短信二次验证、
+ *      数据库而不是 JSON 文件、备份与灾备。
+ *    把这些说清楚比假装安全重要得多 —— 一个"看起来有登录框"的系统
+ *    比一个明说"我是单机自用"的系统危险。
+ *
+ *  ── 两种运行模式（关键设计）──
+ *    local-open  —— 还没有任何账号。所有接口不要求 token，行为与加账号体系之前完全一致。
+ *                   目的：不破坏任何既有用法，也让"先自用、后商业化"这条路走得通。
+ *    accounts    —— 存在至少一个账号。**所有** /api 接口（除健康检查与登录本身）都要求 token。
+ *                   一旦建了第一个账号，就没有"悄悄绕过"的口子 —— 这个切换是单向的。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+
+/** 角色 → 能做什么。全部判定只读这一张表，不许在别处再写一遍 if (role === ...) */
+export const ROLES = {
+  owner: { label: '所有者', rank: 40, canManage: true, canDesign: true, canView: true },
+  admin: { label: '管理员', rank: 30, canManage: true, canDesign: true, canView: true },
+  designer: { label: '设计师', rank: 20, canManage: false, canDesign: true, canView: true },
+  viewer: { label: '只读', rank: 10, canManage: false, canDesign: false, canView: true },
+};
+
+/** 订阅档位 → AI 调用额度。额度按"自然月 token 总量"计，与商用订阅的常见口径一致 */
+export const PLANS = {
+  free: { label: '免费', monthlyTokens: 200_000, dailyCalls: 60, models: [] },
+  pro: { label: '专业', monthlyTokens: 5_000_000, dailyCalls: 1200, models: [] },
+  team: { label: '团队', monthlyTokens: 30_000_000, dailyCalls: 6000, models: [] },
+  unlimited: { label: '不限', monthlyTokens: Number.MAX_SAFE_INTEGER, dailyCalls: Number.MAX_SAFE_INTEGER, models: [] },
+};
+/** models: [] 表示不限制模型；填了就是白名单（"AI 模型调用管理"的落点） */
+
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 小时
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILS = 5;
+const LOCK_MS = 15 * 60 * 1000;
+const SCRYPT_KEYLEN = 64;
+/** scrypt 代价参数。写在这里、并且**记进哈希串**里 —— 见 hashPassword 的说明 */
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
+
+/** 自描述哈希串：scrypt$N=…,r=…,p=…$salt$hash */
+function encodeHash(salt, hash, params) {
+  return `scrypt$N=${params.N},r=${params.r},p=${params.p}$${salt}$${hash}`;
+}
+
+/**
+ * 解析自描述哈希串；认不出来就按**早期的裸 hex + 独立盐**形态处理。
+ *
+ * 为什么要留这条老路：换哈希格式的那一天，已经存在的账号必须仍能登录。
+ * "升级后所有人登不进来"是这类改动最典型的翻车方式。
+ */
+function parseHash(stored, legacySalt) {
+  const s = String(stored ?? '');
+  const m = /^scrypt\$N=(\d+),r=(\d+),p=(\d+)\$([0-9a-f]+)\$([0-9a-f]+)$/.exec(s);
+  if (m) {
+    const params = { N: Number(m[1]), r: Number(m[2]), p: Number(m[3]) };
+    const hash = m[5];
+    return { salt: m[4], hash, params, keylen: hash.length / 2 };
+  }
+  // 早期形态：hash 是裸 hex，盐在另一个字段里
+  if (/^[0-9a-f]+$/.test(s) && legacySalt) {
+    return { salt: String(legacySalt), hash: s, params: SCRYPT_PARAMS, keylen: s.length / 2 };
+  }
+  return null;
+}
+
+export class AuthStore {  /**
+   * @param opts.accountsPath 账号库落点（JSON）
+   * @param opts.auditPath    审计日志落点（JSONL，**只追加**）
+   */
+  constructor(opts) {
+    this.accountsPath = opts.accountsPath;
+    this.auditPath = opts.auditPath;
+    this.data = this.#load();
+  }
+
+  // ───────────────────────── 持久化 ─────────────────────────
+
+  #load() {
+    if (!existsSync(this.accountsPath)) return { version: 1, accounts: [] };
+    try {
+      const d = JSON.parse(readFileSync(this.accountsPath, 'utf8'));
+      if (!d || !Array.isArray(d.accounts)) return { version: 1, accounts: [] };
+      return d;
+    } catch {
+      /**
+       * 账号库损坏**不能**当成"没有账号"—— 那等于把整个系统降级成不设防，
+       * 任何人打开页面就又是主人了。宁可启动失败，让人来处理。
+       */
+      throw new Error(`账号库 ${this.accountsPath} 解析失败。为安全起见拒绝降级为"无账号"模式，请人工检查该文件。`);
+    }
+  }
+
+  #save() {
+    const dir = dirname(this.accountsPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    // 先写临时文件再 rename：避免写到一半断电留下半个 JSON
+    const tmp = `${this.accountsPath}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
+    renameSync(tmp, this.accountsPath);
+  }
+
+  /** 审计日志只追加，永不覆盖 —— 它是"谁在什么时候改了什么"的唯一凭据 */
+  audit(entry) {
+    const dir = dirname(this.auditPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const line = JSON.stringify({ at: new Date().toISOString(), ...entry });
+    const prev = existsSync(this.auditPath) ? readFileSync(this.auditPath, 'utf8') : '';
+    writeFileSync(this.auditPath, `${prev}${line}\n`, 'utf8');
+  }
+
+  readAudit(limit = 200) {
+    if (!existsSync(this.auditPath)) return [];
+    const lines = readFileSync(this.auditPath, 'utf8').split(/\r?\n/).filter((l) => l.trim());
+    return lines.slice(-limit).reverse().map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return { at: '', action: 'parse_error', raw: l.slice(0, 200) };
+      }
+    });
+  }
+
+  // ───────────────────────── 模式 ─────────────────────────
+
+  get enabled() {
+    return this.data.accounts.length > 0;
+  }
+
+  get mode() {
+    return this.enabled ? 'accounts' : 'local-open';
+  }
+
+  // ───────────────────────── 口令 ─────────────────────────
+
+  /**
+   * 口令哈希 —— 存成**自描述**的串：
+   *
+   *     scrypt$N=16384,r=8,p=1$<salt-hex>$<hash-hex>
+   *
+   * 为什么不存一个裸 hex：
+   *   裸 hex 只记下了"结果"，没记下"用哪套参数算的"。将来把 N 从 16384 提到
+   *   65536（或者整族换成 argon2），**老账号就没法验证了** ——
+   *   而那恰恰是最不该出事的时刻：所有人会在同一个早上突然登不进来。
+   *   自描述之后，参数升级可以逐账号做：验证时按记录里的参数算，
+   *   登录成功后再用新参数重算一遍写回去。用户名/口令是唯一凭据，
+   *   这条升级路必须提前留好。
+   *
+   * 兼容：仍然接受早期的 `{ salt, hash: <裸 hex> }` 形态（那时盐是分开存的），
+   * 所以换格式不会把已经存在的账号锁在门外。
+   */
+  static hashPassword(password, salt = randomBytes(16).toString('hex')) {
+    const hash = scryptSync(String(password), salt, SCRYPT_KEYLEN, SCRYPT_PARAMS).toString('hex');
+    return { salt, hash: encodeHash(salt, hash, SCRYPT_PARAMS) };
+  }
+
+  /** 校验。`stored` 既可以是自描述串，也可以是早期形态（此时需要用 legacySalt 补齐） */
+  static verifyPassword(password, stored, legacySalt) {
+    try {
+      const parsed = parseHash(stored, legacySalt);
+      if (!parsed) return false;
+      const a = scryptSync(String(password), parsed.salt, parsed.keylen, parsed.params);
+      const b = Buffer.from(parsed.hash, 'hex');
+      if (a.length !== b.length) return false;
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  // ───────────────────────── 账号 ─────────────────────────
+
+  /** 对外暴露的账号视图 —— **白名单**，口令哈希与盐永远不出这个函数 */
+  static publicView(a, extra = {}) {
+    return {
+      id: a.id,
+      username: a.username,
+      displayName: a.displayName,
+      role: a.role,
+      roleLabel: ROLES[a.role]?.label ?? a.role,
+      plan: a.plan,
+      planLabel: PLANS[a.plan]?.label ?? a.plan,
+      status: a.status,
+      tenantId: a.tenantId,
+      createdAt: a.createdAt,
+      lastLoginAt: a.lastLoginAt ?? null,
+      quota: {
+        monthlyTokens: PLANS[a.plan]?.monthlyTokens ?? 0,
+        dailyCalls: PLANS[a.plan]?.dailyCalls ?? 0,
+        models: PLANS[a.plan]?.models ?? [],
+        used: a.usage ?? { monthTokens: 0, dayCalls: 0, month: '', day: '', totalTokens: 0, totalCalls: 0 },
+      },
+      ...extra,
+    };
+  }
+
+  list() {
+    return this.data.accounts.map((a) => AuthStore.publicView(a));
+  }
+
+  findById(id) {
+    return this.data.accounts.find((a) => a.id === id) ?? null;
+  }
+
+  findByUsername(username) {
+    const u = String(username ?? '').trim().toLowerCase();
+    return this.data.accounts.find((a) => a.username.toLowerCase() === u) ?? null;
+  }
+
+  /**
+   * 建账号。第一个账号必然是 owner —— 且**只**允许在没有账号时自助创建，
+   * 之后创建账号必须有 owner/admin 身份（由调用方先判定权限）。
+   */
+  create({ username, password, displayName, role, plan, actor = null }) {
+    const u = String(username ?? '').trim();
+    if (!/^[A-Za-z0-9_.@-]{3,32}$/.test(u)) return { ok: false, error: '用户名只能由字母、数字、_ . @ - 组成，3~32 位' };
+    if (this.findByUsername(u)) return { ok: false, error: '用户名已存在' };
+    const pwErr = checkPasswordStrength(password);
+    if (pwErr) return { ok: false, error: pwErr };
+    const first = this.data.accounts.length === 0;
+    const finalRole = first ? 'owner' : role && ROLES[role] ? role : 'designer';
+    const { salt, hash } = AuthStore.hashPassword(password);
+    const acc = {
+      id: `acc_${randomBytes(6).toString('hex')}`,
+      username: u,
+      displayName: String(displayName ?? '').trim() || u,
+      role: finalRole,
+      plan: plan && PLANS[plan] ? plan : 'free',
+      status: 'active',
+      /**
+       * 租户 id —— 商用上线后所有业务数据（项目/规则集/订单）都要按它隔离。
+       * 现在只有一个租户，但字段从第一天就在，将来不必做数据迁移。
+       * owner 的租户 id 固定为 'tenant_default'，其它账号默认加入同一租户，
+       * 由管理操作显式改成别的值 —— 不允许通过注册参数自选（否则就是租户逃逸）。
+       */
+      tenantId: first ? 'tenant_default' : 'tenant_default',
+      password: { salt, hash },
+      createdAt: new Date().toISOString(),
+      sessions: [],
+      failedLogins: [],
+      lockedUntil: null,
+      usage: { month: '', day: '', monthTokens: 0, dayCalls: 0, totalTokens: 0, totalCalls: 0 },
+    };
+    this.data.accounts.push(acc);
+    this.#save();
+    this.audit({ actor: actor ?? acc.id, action: first ? 'account.bootstrap' : 'account.create', target: acc.id, username: acc.username, role: acc.role });
+    return { ok: true, account: AuthStore.publicView(acc) };
+  }
+
+  setRole(id, role, actor) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    if (!ROLES[role]) return { ok: false, error: `未知角色 ${role}` };
+    if (a.role === 'owner' && role !== 'owner' && this.#ownerCount() <= 1) {
+      return { ok: false, error: '这是最后一个所有者账号，不能降级 —— 否则没人能再管理这个系统了' };
+    }
+    const from = a.role;
+    a.role = role;
+    this.#save();
+    this.audit({ actor, action: 'account.setRole', target: id, from, to: role });
+    return { ok: true, account: AuthStore.publicView(a) };
+  }
+
+  setPlan(id, plan, actor) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    if (!PLANS[plan]) return { ok: false, error: `未知档位 ${plan}` };
+    const from = a.plan;
+    a.plan = plan;
+    this.#save();
+    this.audit({ actor, action: 'account.setPlan', target: id, from, to: plan });
+    return { ok: true, account: AuthStore.publicView(a) };
+  }
+
+  setStatus(id, status, actor) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    if (!['active', 'disabled'].includes(status)) return { ok: false, error: '状态只能是 active / disabled' };
+    if (a.role === 'owner' && status === 'disabled' && this.#ownerCount() <= 1) {
+      return { ok: false, error: '不能停用最后一个所有者账号' };
+    }
+    a.status = status;
+    if (status === 'disabled') a.sessions = []; // 停用即踢下线
+    this.#save();
+    this.audit({ actor, action: 'account.setStatus', target: id, to: status });
+    return { ok: true, account: AuthStore.publicView(a) };
+  }
+
+  /** 改自己的口令：必须提供当前口令。改完踢掉所有会话（含当前这条） */
+  changePassword(id, currentPassword, newPassword) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    if (!AuthStore.verifyPassword(currentPassword, a.password.hash, a.password.salt)) {
+      this.audit({ actor: id, action: 'account.changePassword', result: 'bad_current' });
+      return { ok: false, error: '当前口令不正确' };
+    }
+    const pwErr = checkPasswordStrength(newPassword);
+    if (pwErr) return { ok: false, error: pwErr };
+    a.password = AuthStore.hashPassword(newPassword);
+    a.sessions = [];
+    this.#save();
+    this.audit({ actor: id, action: 'account.changePassword', result: 'ok' });
+    return { ok: true };
+  }
+
+  /** 管理员重置口令：不需要旧口令，但会踢下线并记审计（这是有意的越权行为，必须留痕） */
+  resetPassword(id, newPassword, actor) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    const pwErr = checkPasswordStrength(newPassword);
+    if (pwErr) return { ok: false, error: pwErr };
+    a.password = AuthStore.hashPassword(newPassword);
+    a.sessions = [];
+    this.#save();
+    this.audit({ actor, action: 'account.resetPassword', target: id });
+    return { ok: true };
+  }
+
+  #ownerCount() {
+    return this.data.accounts.filter((a) => a.role === 'owner' && a.status === 'active').length;
+  }
+
+  // ───────────────────────── 登录 / 会话 ─────────────────────────
+
+  /**
+   * 登录。
+   *
+   * 失败一律回同一个错误文案（"用户名或口令不正确"），不区分
+   * "用户不存在"和"口令错误" —— 后者会变成账号枚举接口。
+   * 但要**分别**记审计，否则排查真实问题时没有线索。
+   */
+  login(username, password, meta = {}) {
+    const a = this.findByUsername(username);
+    const now = Date.now();
+    if (!a) {
+      this.audit({ actor: null, action: 'auth.login', username: String(username ?? '').slice(0, 64), result: 'no_such_user', ip: meta.ip });
+      return { ok: false, error: '用户名或口令不正确', code: 'BAD_CREDENTIALS' };
+    }
+    if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) {
+      const left = Math.ceil((new Date(a.lockedUntil).getTime() - now) / 1000);
+      this.audit({ actor: a.id, action: 'auth.login', result: 'locked', ip: meta.ip });
+      return { ok: false, error: `账号已锁定，请 ${left} 秒后再试`, code: 'LOCKED' };
+    }
+    if (a.status !== 'active') {
+      this.audit({ actor: a.id, action: 'auth.login', result: 'disabled', ip: meta.ip });
+      return { ok: false, error: '账号已停用，请联系管理员', code: 'DISABLED' };
+    }
+    if (!AuthStore.verifyPassword(password, a.password.hash, a.password.salt)) {
+      a.failedLogins = [...(a.failedLogins ?? []), now].filter((t) => now - t < LOGIN_WINDOW_MS);
+      let locked = false;
+      if (a.failedLogins.length >= LOGIN_MAX_FAILS) {
+        a.lockedUntil = new Date(now + LOCK_MS).toISOString();
+        a.failedLogins = [];
+        locked = true;
+      }
+      this.#save();
+      this.audit({ actor: a.id, action: 'auth.login', result: locked ? 'fail+locked' : 'fail', ip: meta.ip, ua: meta.ua });
+      return {
+        ok: false,
+        error: locked ? `连续 ${LOGIN_MAX_FAILS} 次口令错误，账号已锁定 ${LOCK_MS / 60000} 分钟` : '用户名或口令不正确',
+        code: locked ? 'LOCKED' : 'BAD_CREDENTIALS',
+      };
+    }
+
+    a.failedLogins = [];
+    a.lockedUntil = null;
+    a.lastLoginAt = new Date().toISOString();
+    const token = randomBytes(32).toString('base64url'); // 明文 token 只出现在这一次响应里
+    a.sessions = [
+      ...(a.sessions ?? []).filter((s) => new Date(s.expiresAt).getTime() > now),
+      {
+        hash: sha256(token), // ← 落盘的只有哈希
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
+        ip: meta.ip ?? '',
+        ua: String(meta.ua ?? '').slice(0, 160),
+      },
+    ];
+    this.#save();
+    this.audit({ actor: a.id, action: 'auth.login', result: 'ok', ip: meta.ip, ua: meta.ua });
+    return { ok: true, token, expiresAt: a.sessions[a.sessions.length - 1].expiresAt, account: AuthStore.publicView(a) };
+  }
+
+  /** 校验 token。返回账号（已过停用/锁定/过期检查），或 null */
+  authenticate(token) {
+    if (!token) return null;
+    const h = sha256(String(token));
+    const now = Date.now();
+    for (const a of this.data.accounts) {
+      const s = (a.sessions ?? []).find((x) => x.hash === h);
+      if (!s) continue;
+      if (new Date(s.expiresAt).getTime() <= now) return null;
+      if (a.status !== 'active') return null;
+      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;
+      return a;
+    }
+    return null;
+  }
+
+  logout(token, actor = null) {
+    if (!token) return { ok: true };
+    const h = sha256(String(token));
+    let hit = false;
+    for (const a of this.data.accounts) {
+      const before = (a.sessions ?? []).length;
+      a.sessions = (a.sessions ?? []).filter((x) => x.hash !== h);
+      if (a.sessions.length !== before) hit = true;
+    }
+    if (hit) this.#save();
+    this.audit({ actor, action: 'auth.logout', result: hit ? 'ok' : 'no_session' });
+    return { ok: true };
+  }
+
+  sessionCount(id) {
+    const a = this.findById(id);
+    if (!a) return 0;
+    const now = Date.now();
+    return (a.sessions ?? []).filter((s) => new Date(s.expiresAt).getTime() > now).length;
+  }
+
+  // ───────────────────────── 额度与用量 ─────────────────────────
+
+  /** 额度检查 —— 在**发起 AI 调用之前**执行，不是事后统计 */
+  checkQuota(id) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: '账号不存在' };
+    const plan = PLANS[a.plan] ?? PLANS.free;
+    const u = normalizeUsage(a.usage);
+    if (u.monthTokens >= plan.monthlyTokens) {
+      return { ok: false, error: `本月 AI 额度已用完（${u.monthTokens} / ${plan.monthlyTokens} token），请升级订阅档位`, code: 'QUOTA_MONTHLY' };
+    }
+    if (u.dayCalls >= plan.dailyCalls) {
+      return { ok: false, error: `今日调用次数已用完（${u.dayCalls} / ${plan.dailyCalls} 次），请明天再试或升级档位`, code: 'QUOTA_DAILY' };
+    }
+    return { ok: true, plan, used: u };
+  }
+
+  /** 额度检查之模型白名单 —— 空数组 = 不限制 */
+  checkModel(id, model) {
+    const a = this.findById(id);
+    const plan = PLANS[a?.plan ?? 'free'] ?? PLANS.free;
+    if (!plan.models || plan.models.length === 0) return { ok: true };
+    return plan.models.includes(model)
+      ? { ok: true }
+      : { ok: false, error: `当前档位不允许调用模型 "${model}"（允许：${plan.models.join('、')}）`, code: 'MODEL_NOT_ALLOWED' };
+  }
+
+  /**
+   * 记一次调用。
+   *
+   * provider 返回的 usage 可能缺字段、可能是 0、也可能整段没有 ——
+   * 所以宁可少记也不要编造：缺 token 数时按 0 记，并把 calls 记上，
+   * 界面上如实显示"本次未返回用量"。凭空估一个数字会让账单不可信。
+   */
+  recordUsage(id, { promptTokens = 0, completionTokens = 0, model = '', ok = true, ms = 0, note = '' }) {
+    const a = this.findById(id);
+    if (!a) return;
+    const u = normalizeUsage(a.usage);
+    u.monthTokens += promptTokens + completionTokens;
+    u.totalTokens += promptTokens + completionTokens;
+    u.dayCalls += 1;
+    u.totalCalls += 1;
+    a.usage = { ...u, lastAt: new Date().toISOString(), lastModel: model, lastMs: ms, lastOk: ok };
+    this.#save();
+    this.audit({ actor: id, action: 'ai.call', model, ok, ms, promptTokens, completionTokens, note: String(note).slice(0, 120) });
+  }
+}
+
+function normalizeUsage(u) {
+  const now = new Date();
+  const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  const day = now.toISOString().slice(0, 10);
+  const base = u ?? {};
+  return {
+    month: month,
+    day: day,
+    // 跨月/跨日归零 —— 在读取处判，不在定时器里判：没有定时器就没有"没跑到"的问题
+    monthTokens: base.month === month ? Number(base.monthTokens ?? 0) : 0,
+    dayCalls: base.day === day ? Number(base.dayCalls ?? 0) : 0,
+    totalTokens: Number(base.totalTokens ?? 0),
+    totalCalls: Number(base.totalCalls ?? 0),
+  };
+}
+
+function sha256(s) {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+/**
+ * 口令强度。
+ *
+ * 有意**不**要求"必须含大写+符号"这种规则 —— 它会把人逼成 `Password1!`
+ * 这种又难记又好猜的东西。要求的是**长度**与**不在常见弱口令里**。
+ * 这是 NIST SP 800-63B 的路子，也是实际更安全的做法。
+ */
+const WEAK = new Set([
+  'password', '123456', '12345678', '123456789', 'qwerty', 'abc123', '111111', '000000',
+  'iloveyou', 'admin', 'root', 'letmein', 'welcome', 'monkey', 'dragon', 'master',
+  'password1', 'qwerty123', 'admin123', '1234567890', 'passw0rd', 'p@ssw0rd',
+]);
+export function checkPasswordStrength(pw) {
+  const s = String(pw ?? '');
+  if (s.length < 8) return '口令至少 8 位';
+  if (s.length > 200) return '口令过长';
+  if (/^\d+$/.test(s)) return '口令不能是纯数字';
+  if (WEAK.has(s.toLowerCase())) return '这个口令在常见弱口令表里，换一个';
+  if (/^(.)\1+$/.test(s)) return '口令不能是同一个字符重复';
+  if (/^(0123|1234|2345|3456|4567|5678|6789|abcd|bcde|cdef)/i.test(s)) return '口令不能是连续序列';
+  return null;
+}
+
+/** 安全现状自述 —— 界面上要**照实**显示，包括现在还差什么 */
+export function securityPolicy({ mode, accountsPath, auditPath, host }) {
+  return {
+    mode,
+    host,
+    accountsPath,
+    auditPath,
+    sessionTtlHours: SESSION_TTL_MS / 3600000,
+    login: { windowMinutes: LOGIN_WINDOW_MS / 60000, maxFails: LOGIN_MAX_FAILS, lockMinutes: LOCK_MS / 60000 },
+    passwordHashing: `scrypt（Node 内建；参数写进哈希串里：${encodeHash('<salt>', '<hash>', SCRYPT_PARAMS)}，每账号 16 字节随机盐，比较用 timingSafeEqual）`,
+    sessionStorage: '只落 SHA-256 哈希；明文 token 只在登录响应里出现一次',
+    transport: host === '127.0.0.1' ? '仅本机回环，未出网' : '⚠ 已监听非回环地址但没有 TLS',
+    tenantIsolation: '按 tenantId 隔离业务数据（当前只有一个租户，字段已就位）',
+    implemented: [
+      '口令哈希 + 独立盐 + 定时安全比较',
+      '会话 token 只存哈希，支持过期与停用即踢下线',
+      '失败登录计数与锁定窗口',
+      '角色（owner/admin/designer/viewer）与最小权限判定',
+      'AI 调用额度（月 token / 日次数）与模型白名单',
+      '管理操作与 AI 调用全量审计（actor / action / target / ip / 时间）',
+      '账号库损坏时**拒绝启动**，不降级为无账号模式',
+    ],
+    notImplemented: [
+      '⚠ 没有 HTTPS —— 上线必须由反向代理终止 TLS，本服务本身不做',
+      '⚠ 会话不会轮换（refresh）也不能远程撤销单条，只能整账号踢下线',
+      '⚠ 没有二次验证（邮件/短信/TOTP），口令是唯一凭据',
+      '⚠ 账号库是本地 JSON 文件，没有并发写保护，多进程会互相覆盖',
+      '⚠ 没有密码找回流程，忘记口令只能由管理员重置',
+      '⚠ 审计日志无防篡改（没有链式哈希或外部归档），且与账号库同机',
+      '⚠ 上传/模型文件没有按账号隔离配额',
+    ],
+  };
+}

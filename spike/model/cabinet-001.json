@@ -1,0 +1,66 @@
+{
+  "schemaVersion": "0.1",
+  "id": "Cabinet_001",
+  "type": "Cabinet",
+  "name": "主卧衣柜",
+  "units": "mm",
+  "params": {
+    "width": 2400,
+    "height": 2400,
+    "depth": 600,
+    "boardMaterial": "M_BOARD_18_WOOD",
+    "backPanel": {
+      "material": "M_BACK_9",
+      "method": "groove",
+      "grooveDepth": 8,
+      "grooveSetback": 12,
+      "clearance": 0.5
+    },
+    "bodyLift": 80,
+    "shelfFrontClearance": 10
+  },
+  "layout": {
+    "type": "row",
+    "widthMode": "fit_total",
+    "units": [
+      {
+        "id": "Unit_L",
+        "kind": "drawerBank",
+        "requestedWidth": 600,
+        "drawers": {
+          "count": 3,
+          "runner": "HW_RUNNER_500",
+          "runnerLength": 500,
+          "sideThickness": 15,
+          "bottomThickness": 5,
+          "bottomGrooveDepth": 6,
+          "gap": 2,
+          "boxHeightDeduct": 30
+        }
+      },
+      {
+        "id": "Unit_M",
+        "kind": "hanging",
+        "requestedWidth": 1200,
+        "rod": { "count": 1, "heightFromBottom": 1800, "hardware": "HW_ROD_25" },
+        "shelves": { "count": 1, "mode": "equal", "gapPerSide": 0.5 }
+      },
+      {
+        "id": "Unit_R",
+        "kind": "shelves",
+        "requestedWidth": 600,
+        "shelves": { "count": 4, "mode": "equal", "gapPerSide": 0.5 },
+        "doors": {
+          "type": "hinged",
+          "count": 2,
+          "mode": "equal",
+          "style": "inset",
+          "gapOuter": 2,
+          "gapMid": 3,
+          "hinge": "HW_HINGE_110"
+        }
+      }
+    ]
+  },
+  "camera": { "note": "Phase 0 spike: 单柜、无房间、无墙" }
+}

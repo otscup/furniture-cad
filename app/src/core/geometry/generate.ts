@@ -71,8 +71,14 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   };
 
   // ───────── 1. 箱体结构板 ─────────
-  push({ id: `P_${cabId}_LS`, role: 'LeftSidePanel', nameZh: '左侧板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: bodyH, width: p.depth, grain: 'length', edge: edge(null, E04, E1, null), edgeLabel: '前边 1mm；上端 1mm；下端 0.4mm', layer: layerOf(t) });
-  push({ id: `P_${cabId}_RS`, role: 'RightSidePanel', nameZh: '右侧板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: bodyH, width: p.depth, grain: 'length', edge: edge(null, E04, null, E1), edgeLabel: '前边 1mm；上端 1mm；下端 0.4mm（镜像）', layer: layerOf(t) });
+  // 见光板（Phase E 表达异形）：外露端板做 R36 前缘圆弧工艺。
+  // 不改结构板数量，只改端板命名 + 标注（侧视图前缘圆弧由 views.ts 画）。
+  const fe = p.finishedEnds ?? 'none';
+  const isFinished = (side: 'left' | 'right'): boolean => fe === 'both' || fe === side;
+  const feLabel = (side: 'left' | 'right'): string =>
+    isFinished(side) ? '；前缘 R36 圆弧见光（工艺）' : '';
+  push({ id: `P_${cabId}_LS`, role: 'LeftSidePanel', nameZh: isFinished('left') ? '见光板-左' : '左侧板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: bodyH, width: p.depth, grain: 'length', edge: edge(null, E04, E1, null), edgeLabel: '前边 1mm；上端 1mm；下端 0.4mm' + feLabel('left'), layer: layerOf(t) });
+  push({ id: `P_${cabId}_RS`, role: 'RightSidePanel', nameZh: isFinished('right') ? '见光板-右' : '右侧板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: bodyH, width: p.depth, grain: 'length', edge: edge(null, E04, null, E1), edgeLabel: '前边 1mm；上端 1mm；下端 0.4mm（镜像）' + feLabel('right'), layer: layerOf(t) });
   push({ id: `P_${cabId}_TOP`, role: 'TopPanel', nameZh: '顶板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
   push({ id: `P_${cabId}_BOT`, role: 'BottomPanel', nameZh: '底板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
   push({ id: `P_${cabId}_KICK`, role: 'KickBoard', nameZh: '踢脚板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
@@ -205,8 +211,18 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
 
   function buildShelves(uid: string, s: NonNullable<Cabinet['layout']['units'][number]['shelves']>, netW: number, netH: number, sDepth: number): void {
     const shelfW = netW - 2 * s.gapPerSide;
+    /**
+     * 斜层板（Phase E 图元扩展）：板件真实裁切长 = 水平跨度 / cos(tilt)。
+     * 净宽分配仍按水平投影（tilt 不改变分区占用），只让板件更长、图面倾斜。
+     * tilt=0（默认）时 realLen === shelfW，与旧行为完全一致（不留隐式分支）。
+     */
+    const tilt = s.tilt ?? 0;
+    const tiltRad = (tilt * Math.PI) / 180;
+    const cosT = Math.cos(tiltRad);
+    const realLen = tilt > 0 ? Math.max(1, Math.round(shelfW / cosT)) : shelfW;
+    const tiltNote = tilt > 0 ? `；斜 ${tilt}°（裁切长 ${realLen}mm = 水平 ${shelfW}mm ÷ cos${tilt}°）` : '';
     equalSpacing(netH, s.count).forEach((pos, k) => {
-      push({ id: `P_${cabId}_${uid}_SH${k + 1}`, role: 'ShelfPanel', nameZh: `层板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: shelfW, width: sDepth, grain: 'length', edge: edge(E1, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${pos}mm`, layer: layerOf(t) });
+      push({ id: `P_${cabId}_${uid}_SH${k + 1}`, role: 'ShelfPanel', nameZh: tilt > 0 ? `斜层板-${k + 1}` : `层板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: realLen, width: sDepth, grain: 'length', edge: edge(E1, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${pos}mm${tiltNote}`, layer: layerOf(t) });
     });
     hardware.push({ id: `HW_${cabId}_${uid}_PIN`, nameZh: '层板托', kind: 'shelfPin', qty: s.count * 4, spec: '每块层板 4 只', belongsTo: `${cabId}.${uid}` });
     if (s.ledStrip && s.ledStrip !== 'none') {
@@ -336,8 +352,21 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     const x0 = unitX0[i];
     const netW = nets[i];
     if (u.shelves && u.shelves.count > 0) {
+      const tilt = u.shelves.tilt ?? 0;
+      const shift = tilt > 0 ? Math.round(netW * Math.tan((tilt * Math.PI) / 180)) : 0;
       equalSpacing(innerH, u.shelves.count).forEach((pos) => {
-        elevation.push({ k: 'poly', pts: rectPts(x0, innerBottomY + pos, netW, t), closed: true, layer: L_STRUCT, lw: 1 });
+        const yb = innerBottomY + pos;
+        // 斜层板：平行四边形（右端下沉 shift），与四视图（views.ts）同源表达
+        const pts =
+          shift > 0
+            ? [
+                { x: x0, y: yb },
+                { x: x0 + netW, y: yb - shift },
+                { x: x0 + netW, y: yb - shift + t },
+                { x: x0, y: yb + t },
+              ]
+            : rectPts(x0, yb, netW, t);
+        elevation.push({ k: 'poly', pts, closed: true, layer: L_STRUCT, lw: 1 });
       });
     }
     if (u.drawers) {

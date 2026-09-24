@@ -3671,6 +3671,56 @@ async function waitForApp(url, timeoutMs = 25000) {
       rb.isDoc && rb.cover && rb.triptych && rb.trace && rb.summary, JSON.stringify(rb));
 
     // ═══════════════════════════════════════════════════════════
+    section('B33 异形图元：酒柜斜层板 tilt 落地 + 见光板语义切换（真实总线）');
+
+    const vB33 = await statusVersion();
+    // ① 在运行中的 app 内用真实总线创建酒柜（与 UI 放置走同一 create 管线）
+    const wine = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const { createCabinetFromTemplate } = await import('/src/core/docFactory.ts');
+      const roomId = (s.bus.getState().cabinets[0] || { roomId: 'r1' }).roomId || 'r1';
+      // 与真实 UI 放置路径一致：传 takenIds 让 docFactory 分配唯一 id，
+      // 否则默认 id（cab_001）会撞上项目里已存在的首柜 → planStructural 返回 null → 结构性失败。
+      // 放点 (4000,4000)：房间外空地 —— 不撞墙（mem_002）、不与衣柜重叠（mem_003），
+      // 让这条断言只验「模板 tilt 落地」，不被布置类记忆合法拦截。
+      const c = createCabinetFromTemplate({ templateId: 'wine_cabinet', name: '探针酒柜', roomId, x: 4000, y: 4000, rotation: 0, rules: s.RULESET, takenIds: s.bus.getState().cabinets.map((x) => x.id) });
+      // 与真实 UI 放置路径一致：结构性命令也带 changes:[]（CommandBus 契约要求，
+      // 否则记忆门 pathForbidden 检查读 cmd.changes 会崩）。createCabinet() 也是这么发的。
+      const r = s.bus.execute({ id: 'probe_wine_create', op: 'cabinet.create', source: 'ui', target: { kind: 'project', id: 'project' }, changes: [], payload: { cabinet: c } }, 'B33 探针：放酒柜');
+      if (r.error) return { err: r.error };
+      const cab = s.bus.getState().cabinets.find((x) => x.id === c.id);
+      return { id: c.id, tilt: cab.layout.units[0].shelves.tilt, ver: s.bus.getVersion() };
+    })()`);
+    ok('B33 放置酒柜：版本 +1、斜层板 tilt=12 从模板落地（语义字段同源）',
+      !wine.err && wine.tilt === 12 && wine.ver === vB33 + 1, JSON.stringify(wine));
+
+    // ② 见光板语义切换：finishedEnds=both → 侧板命名「见光板-左/右」（派生现算）
+    const fe = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const { generateCabinet } = await import('/src/core/geometry/generate.ts');
+      const r = s.bus.execute({ id: 'probe_fe', op: 'cabinet.update', source: 'ui',
+        target: { kind: 'cabinet', id: '${wine.id}' },
+        changes: [{ path: 'params.finishedEnds', op: 'set', value: 'both' }] }, 'B33 探针：见光板');
+      if (r.error) return { err: r.error };
+      const cab = s.bus.getState().cabinets.find((x) => x.id === '${wine.id}');
+      const g = generateCabinet(cab, s.RULESET);
+      const left = g.panels.find((p) => p.role === 'LeftSidePanel');
+      const right = g.panels.find((p) => p.role === 'RightSidePanel');
+      return { left: left && left.nameZh, right: right && right.nameZh, ver: s.bus.getVersion(), fe: cab.params.finishedEnds };
+    })()`);
+    ok('B33 见光板切换：finishedEnds=both → 侧板命名「见光板-左/右」、不改结构板数',
+      !fe.err && fe.fe === 'both' && fe.left === '见光板-左' && fe.right === '见光板-右', JSON.stringify(fe));
+
+    // ③ 收尾：undo 两次（create + update）撤销酒柜，不污染后续样式审计。
+    //    注意本项目语义：undo 本身也是一次状态变更（版本 +1，见 B8），
+    //    所以 create+update+undo×2 = 版本推进 4，而不是回到 vB33。
+    await evalJs(`(async()=>{ const s = await import('/src/state/store.ts'); s.bus.undo(); s.bus.undo(); })()`);
+    const after33 = await evalJs(`(async()=>{ const s = await import('/src/state/store.ts');
+      return { ver: s.bus.getVersion(), gone: !s.bus.getState().cabinets.some((x) => x.id === '${wine.id}') }; })()`);
+    ok('B33 undo 收尾：酒柜不残留、版本按 create+update+undo×2 各 +1 推进',
+      after33.gone && after33.ver === vB33 + 4, JSON.stringify({ ...after33, vB33 }));
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

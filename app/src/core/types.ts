@@ -61,6 +61,15 @@ export interface CabinetParams {
   };
   bodyLift: number;
   shelfFrontClearance: number;
+  /**
+   * 见光板（圆弧见光，Phase E 表达异形）。
+   *   酒柜/衣柜/橱柜靠墙一端外露时，外露的端板做"见光板"工艺处理：
+   *   本应用用 R36 前缘圆弧表达（见光面工艺，不是结构问题）。
+   *   'none' = 不做（默认）；'left'/'right'/'both' = 左/右/两端侧板改为见光板。
+   * 这是**表达异形**：不改结构板数量，只改端板命名 + 侧视图前缘圆弧 + 标注，
+   * 与"结构异形走图元扩展"严格分流（见方案文档 §2.3 / §7）。
+   */
+  finishedEnds?: 'none' | 'left' | 'right' | 'both';
 }
 
 export interface DrawerSpec {
@@ -91,6 +100,15 @@ export interface UnitSpec {
      * 语义字段进清单派生（五金自动出 HW_LED_*），内视图标注挂 Phase D。
      */
     ledStrip?: 'none' | 'center' | 'front' | 'angled45';
+    /**
+     * 斜层板倾角（酒柜等，Phase E 异形图元）。
+     *   0 = 平层板（默认，显式补齐，不留隐式回退）；
+     *   1..45 = 层板沿前立面方向倾斜的角度（度），酒瓶斜放时常用 10~15°。
+     * 这是**几何图元扩展**：板件真实裁切长 = 水平跨度 / cos(tilt)，
+     * 四视图里画成平行四边形（与销售图纸同款），不引入第二套几何来源。
+     * 只影响板件尺寸与图面表达，不影响分区净宽分配（净宽仍是水平投影）。
+     */
+    tilt?: number;
   };
   doors?: {
     type: 'hinged';

@@ -31,7 +31,7 @@ const HELP: Array<[string, string]> = [
   ['ZE', '缩放到图幅'],
   ['GRID / SNAP / ORTHO', '切换栅格 / 捕捉 / 正交'],
   ['ROOM', '新建 3.2×2.6m 矩形房间'],
-  ['TPL / TPL shoe_cabinet', '列出柜型预设 / 切换放置柜型（鞋柜·吊柜·电视柜）'],
+  ['TPL / TPL wine_cabinet', '列出柜型预设 / 切换放置柜型（鞋柜·吊柜·电视柜·酒柜）'],
   ['{ ... }', '把一段 Command JSON 直接送进 CommandBus（AI 通道演示）'],
 ];
 

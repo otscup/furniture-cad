@@ -2,6 +2,7 @@ import type { Cabinet, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec,
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
+import { validateCornerInterference } from './rules/corner.ts';
 import { createRoom, defaultCabinetParams, defaultUnits } from './docFactory.ts';
 import { nextId } from './ids.ts';
 import type { Gate, GateHit } from '../ai/memory.ts';
@@ -167,7 +168,7 @@ const WRITABLE: Record<string, RegExp[]> = {
    */
   'cabinet.resize': [/^params\.(width|height|depth)$/, /^placement\.(x|y)$/],
   'cabinet.update': [
-    /^params\.(width|height|depth|bodyLift|shelfFrontClearance)$/,
+    /^params\.(width|height|depth|bodyLift|shelfFrontClearance|finishedEnds)$/,
     /^params\.backPanel\.(grooveDepth|grooveSetback|clearance|material|method)$/,
     /^params\.boardMaterial$/,
   ],
@@ -181,7 +182,7 @@ const WRITABLE: Record<string, RegExp[]> = {
     /^layout\.widthMode$/,
     /^layout\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
     /^layout\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
-    /^layout\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip)$/,
+    /^layout\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
     /^layout\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
   ],
@@ -1001,6 +1002,8 @@ export class CommandBus {
       if (!g) continue; // 生成器已为它报了 GEN-ERROR，不再继续校验
       issues.push(...validateCabinet(cab, g, this.rules));
     }
+    // 跨柜规则（Phase E）：L 型转角处铰链门开门撞邻柜的软建议
+    issues.push(...validateCornerInterference(p, this.rules));
     return { geom, issues };
   }
 

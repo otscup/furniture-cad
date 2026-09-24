@@ -106,6 +106,13 @@ export function setBodyLift(cab: Cabinet, mm: number, source: CommandSource = 'u
   ], `「${cab.name}」踢脚高 → ${mm}mm`);
 }
 
+/** 见光板（圆弧见光工艺，Phase E 表达异形）：none / left / right / both */
+export function setFinishedEnds(cab: Cabinet, value: 'none' | 'left' | 'right' | 'both', source: CommandSource = 'ui'): Command {
+  return cmd('cabinet.update', source, cabTarget(cab.id), [
+    { path: 'params.finishedEnds', op: 'set', value },
+  ], `「${cab.name}」见光板 → ${value === 'none' ? '无' : value}`);
+}
+
 export function renameCabinet(cab: Cabinet, name: string, source: CommandSource = 'ui'): Command {
   return cmd('cabinet.rename', source, cabTarget(cab.id), [{ path: 'name', op: 'set', value: name }], `重命名「${cab.name}」→「${name}」`);
 }

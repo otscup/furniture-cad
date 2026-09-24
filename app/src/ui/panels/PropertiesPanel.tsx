@@ -199,6 +199,18 @@ function CabinetProps(props: {
         <Row label="踢脚高" hint="bodyLift：箱体底面离地高度">
           <NumField value={p.bodyLift} min={0} max={300} onCommit={(v) => props.onRun(CMD.setBodyLift(cab, v))} />
         </Row>
+        <Row label="见光板" hint="finishedEnds：外露端板做 R36 圆弧前缘（表达异形，不改结构板）">
+          <select
+            className="input"
+            value={p.finishedEnds ?? 'none'}
+            onChange={(e) => props.onRun(CMD.setFinishedEnds(cab, e.target.value as 'none' | 'left' | 'right' | 'both'))}
+          >
+            <option value="none">无</option>
+            <option value="left">左端</option>
+            <option value="right">右端</option>
+            <option value="both">左右两端</option>
+          </select>
+        </Row>
       </Section>
 
       <Section title="位置（背左角 + 旋转）">

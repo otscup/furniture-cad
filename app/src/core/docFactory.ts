@@ -45,6 +45,7 @@ export function defaultCabinetParams(rules?: RuleSet): CabinetParams {
     },
     bodyLift: 80,
     shelfFrontClearance: 10,
+    finishedEnds: 'none',
   };
 }
 
@@ -160,6 +161,7 @@ export function createCabinetFromTemplate(opts: {
             depth: tpl.params.depth,
             count: u.count,
             rodHeight: u.rodHeight,
+            tilt: u.tilt,
             doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
           })
         );
@@ -207,6 +209,11 @@ export function makeUnit(opts: {
   /** 仅 hanging 有效：挂衣杆离柜内底高度 */
   rodHeight?: number;
   /**
+   * 斜层板倾角（度）。仅 shelves 分区使用；由模板/AI/UI 透传，
+   * 缺省 0（平层板，显式默认）。不靠"字段缺失"表达倾斜状态。
+   */
+  tilt?: number;
+  /**
    * 门板。**必须在这里挂，不能在调用方自己拼 UnitSpec** ——
    * 本函数是"新分区的唯一构造点"，门板引用规则集里的 `pickHinge()`，
    * 调用方拿不到、也不该自己去挑铰链型号。
@@ -235,7 +242,7 @@ export function makeUnit(opts: {
       unit = {
         ...base,
         nickname,
-        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
+        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5, ledStrip: 'none', tilt: opts.tilt ?? 0 },
       };
       break;
     case 'hanging':

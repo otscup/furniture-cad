@@ -26,6 +26,8 @@ export interface TemplateUnit {
   rodHeight?: number;
   /** 门板。缺省 = 无门；显式 null 也表示无门（跟"忘了填"区分开） */
   doors?: { count: number; hingeSide?: 'left' | 'right' } | null;
+  /** 斜层板倾角（度，仅 shelves 分区；酒柜展示架常用 10~15）。缺省 = 0 平层板 */
+  tilt?: number;
   nickname?: string;
 }
 
@@ -77,6 +79,13 @@ export const CABINET_TEMPLATES: CabinetTemplate[] = [
       { kind: 'shelves', width: { ratio: 0.44 }, count: 1, nickname: '设备格' },
       { kind: 'drawerBank', width: { ratio: 0.28 }, count: 2, nickname: '右抽' },
     ],
+  },
+  {
+    id: 'wine_cabinet',
+    name: '酒柜',
+    hint: '展示酒柜 · 浅进深 350 · 6 层斜层板（12°）· 开放无门',
+    params: { width: 600, height: 2000, depth: 350 },
+    units: [{ kind: 'shelves', width: { ratio: 1 }, count: 6, tilt: 12, nickname: '斜层板' }],
   },
 ];
 

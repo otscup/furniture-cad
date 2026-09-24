@@ -179,7 +179,9 @@ function buildCheck(spec: CheckSpec): { run: (ctx: GateCtx) => boolean; describe
     case 'pathForbidden':
       return {
         describe: `禁止写入 ${spec.path}*`,
-        run: (ctx) => ctx.cmd.changes.some((ch) => ch.path === spec.path || ch.path.startsWith(`${spec.path}.`)),
+        // 结构性命令（cabinet.create 等）可能不带 changes 字段 —— 用 ?? [] 兜底，
+        // 避免门自己因 cmd.changes 为 undefined 而崩（门崩了比"漏拦一次"更糟）。
+        run: (ctx) => (ctx.cmd.changes ?? []).some((ch) => ch.path === spec.path || ch.path.startsWith(`${spec.path}.`)),
       };
   }
 }

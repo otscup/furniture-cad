@@ -151,6 +151,10 @@ interface ViewPainter {
   line(a0: number, a1: number, b0: number, b1: number, layer: string, lw: number, dash?: number[]): void;
   fillRect(a0: number, a1: number, b0: number, b1: number, layer: string, alpha: number): void;
   text(a: number, b: number, s: string, size: number, layer: string, align?: Align, rot?: number): void;
+  /** 任意多边形（斜层板平行四边形 / 见光板圆弧离散点共用） */
+  poly(pts: Array<{ x: number; y: number }>, layer: string, lw: number, closed?: boolean, dash?: number[]): void;
+  /** 圆弧（离散为折线，见光板 R36 前缘圆弧） */
+  arc(cx: number, cy: number, r: number, a0: number, a1: number, layer: string, lw: number, dash?: number[], segments?: number): void;
 }
 
 function makePainter(out: Prim[], map: Mapper): ViewPainter {
@@ -173,6 +177,19 @@ function makePainter(out: Prim[], map: Mapper): ViewPainter {
     },
     text(a, b, s, size, layer, align = 'c', rot) {
       out.push({ k: 'text', p: map(a, b), text: s, size, layer, align, ...(rot ? { rot } : {}) });
+    },
+    /** 任意多边形（Phase E 斜层板平行四边形 / 见光板圆弧离散点共用） */
+    poly(pts: Array<{ x: number; y: number }>, layer: string, lw: number, closed = false, dash?: number[]) {
+      out.push({ k: 'poly', pts: pts.map((p) => map(p.x, p.y)), closed, layer, lw, ...(dash ? { dash } : {}) });
+    },
+    /** 圆弧（离散为折线，Phase E 见光板 R36 前缘圆弧） */
+    arc(cx: number, cy: number, r: number, a0: number, a1: number, layer: string, lw: number, dash?: number[], segments = 16) {
+      const pts: Array<{ x: number; y: number }> = [];
+      for (let i = 0; i <= segments; i++) {
+        const a = a0 + ((a1 - a0) * i) / segments;
+        pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+      }
+      out.push({ k: 'poly', pts: pts.map((p) => map(p.x, p.y)), closed: false, layer, lw, ...(dash ? { dash } : {}) });
     },
   };
 }
@@ -256,6 +273,10 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   const W = p.width;
   const H = p.height;
   const D = p.depth;
+  // Phase E 表达异形：见光板 R36 前缘圆弧。提升到外层作用域，
+  // 供正视图（drawFrontLike）、侧视图（第 3 节）、内部图标签同源引用。
+  const feFront = p.finishedEnds ?? 'none';
+  const R36 = 36;
   const bodyLift = p.bodyLift;
   const innerW = L.innerW;
   const innerH = L.innerH;
@@ -380,6 +401,11 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   // ═══════════════ 3. 侧视图（从左往右看）═══════════════
   // 横轴 = 进深 Y（左边贴正视图 = 柜背，右边 = 柜门）；纵轴 = 高度 Z。
   S.rect(0, D, 0, H, L_FRAME, 2.4);
+  // 见光板 R36 前缘圆弧：侧视图里近端（左）端板整面可见，前上角在 (faceY0, H)。
+  // 'right' 仅见光板属远端（左视图看不到），由前视图右端条带圆弧表达，此处不画。
+  if (feFront === 'left' || feFront === 'both') {
+    S.arc(faceY0, H, R36, Math.PI * 1.5, Math.PI * 2, layerOfThickness(t), 1.2);
+  }
   S.rect(0, bodyD, H - t, H, layerOfThickness(t), 1); // 顶板
   S.rect(0, bodyD, bodyLift, bodyLift + t, layerOfThickness(t), 1); // 底板
   S.rect(faceY0 - t, faceY0, 0, bodyLift, layerOfThickness(t), 1); // 踢脚板（前挡板）
@@ -536,6 +562,12 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       ? `⚠ 内部结构图有 ${labelUnfitted.length} 个板件名标签没能找到不重叠的位置（${labelUnfitted.join('、')}）—— 该视图的标注密度已超出可用空间。如实报出，不静默压字。`
       : '',
     '模型空间内不互相遮挡隐藏：板件按板厚分图层着色以表达结构层次，隐藏线（HIDDEN 线型）留到出图阶段处理。',
+    (p.finishedEnds && p.finishedEnds !== 'none')
+      ? `见光板（${p.finishedEnds === 'both' ? '左右两端' : p.finishedEnds === 'left' ? '左端' : '右端'}）：外露端板前缘做 R36 圆弧（侧视图近端角画出，前视图两端条带角画出）。它只是端板工艺表达，不改变结构板数量与尺寸。`
+      : '',
+    (cab.layout.units.some((u) => (u.shelves?.tilt ?? 0) > 0))
+      ? '斜层板：层板沿前立面倾斜，板件真实裁切长 = 水平跨度 ÷ cos(倾角)，四视图画成平行四边形（与销售图纸酒柜同款）。净宽分配仍按水平投影，倾斜不改变分区占用。'
+      : '',
   ].filter((s) => s !== '');
 
   const allPts: Vec2[] = [];
@@ -590,6 +622,18 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     P.rect(t, W - t, H - t, H, layerOfThickness(t), 1); // 顶板
     P.rect(t, W - t, bodyLift, bodyLift + t, layerOfThickness(t), 1); // 底板
 
+    // ── 见光板 R36 前缘圆弧（Phase E 表达异形）──
+    // 外露端板的前缘（顶部）做 R36 圆弧：在端板条带的上端角画四分之一圆弧。
+    // 左端板在 (t, H) 角、右端板在 (W-t, H) 角；前视图能同时看到两端，
+    // 因此左右见光板都在这里表达（侧视图只画近端的那一块，见下方侧视图）。
+    // feFront / R36 已提升到 buildCabinetViews 外层作用域，此处直接复用。
+    if (feFront === 'left' || feFront === 'both') {
+      P.arc(t, H, R36, Math.PI, Math.PI * 1.5, layerOfThickness(t), 1.2); // 左上角圆弧向左上
+    }
+    if (feFront === 'right' || feFront === 'both') {
+      P.arc(W - t, H, R36, Math.PI * 1.5, Math.PI * 2, layerOfThickness(t), 1.2); // 右上角圆弧向右上
+    }
+
     /**
      * ── 正视图是【门板图】，不是"结构图加门"（一次真实缺陷的修正）──
      *
@@ -611,8 +655,28 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       // 层板：只在内部图，或门板图的开放格里画
       if (u.shelves && u.shelves.count > 0 && (!withFronts || openUnit)) {
         const s = shelfSpanX(i);
+        const tilt = u.shelves.tilt ?? 0;
+        const span = s.b - s.a;
+        // 斜层板（Phase E 图元扩展）：右端按 tan(tilt) 下沉，画成平行四边形。
+        // tilt=0 时 shift=0 → 退化为普通矩形，与旧行为一致（不留隐式分支）。
+        const shift = tilt > 0 ? Math.round(span * Math.tan((tilt * Math.PI) / 180)) : 0;
         equalSpacing(innerH, u.shelves.count).forEach((pos) => {
-          P.rect(s.a, s.b, innerBottomZ + pos, innerBottomZ + pos + t, layerOfThickness(t), 1);
+          const yb = innerBottomZ + pos;
+          if (shift > 0) {
+            P.poly(
+              [
+                { x: s.a, y: yb },
+                { x: s.b, y: yb - shift },
+                { x: s.b, y: yb - shift + t },
+                { x: s.a, y: yb + t },
+              ],
+              layerOfThickness(t),
+              1,
+              true
+            );
+          } else {
+            P.rect(s.a, s.b, yb, yb + t, layerOfThickness(t), 1);
+          }
         });
       }
 
@@ -753,6 +817,11 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     put(t / 2, midZ, '左侧板', 118, L_TEXT, 'c', 90);
     put(W - t / 2, midZ, '右侧板', 118, L_TEXT, 'c', 90);
 
+    // ②b 见光板（Phase E 表达异形）：外露端板做 R36 圆弧，标签贴在该端板顶部
+    const feLbl = p.finishedEnds ?? 'none';
+    if (feLbl === 'left' || feLbl === 'both') put(t / 2, H - 220, '见光板 R36', 95, L_TEXT, 'c');
+    if (feLbl === 'right' || feLbl === 'both') put(W - t / 2, H - 220, '见光板 R36', 95, L_TEXT, 'c');
+
     // ③ 踢脚板 → 底板 → 顶板：**先放下面的**。
     // 避让器优先向上让，如果先放底板，踢脚板的标签会被顶到 245 那条线以上，
     // 于是图上出现"踢脚板在底板上面"的倒序 —— 那是会误导人的。先放踢脚板，
@@ -773,7 +842,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       if (u.shelves && u.shelves.count > 0) {
         const positions = equalSpacing(innerH, u.shelves.count);
         const zLow = innerBottomZ + positions[0];
-        put(cx, zLow + t + 180, `层板 ×${u.shelves.count}`, 108, L_TEXT, 'c');
+        const tilt = u.shelves.tilt ?? 0;
+        put(cx, zLow + t + 180, tilt > 0 ? `斜层板 ×${u.shelves.count}（${tilt}°）` : `层板 ×${u.shelves.count}`, 108, L_TEXT, 'c');
       }
       if (u.drawers) {
         put(cx, innerBottomZ + innerH * 0.55, `抽屉面板 ×${u.drawers.count}`, 112, L_TEXT, 'c');

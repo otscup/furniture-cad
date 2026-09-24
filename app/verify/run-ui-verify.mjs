@@ -68,6 +68,10 @@ fs.writeFileSync(
     // 假 key 必然被服务商拒绝。压短超时，让"拉取失败必须如实说失败"这条断言
     // 在无网络的环境下也能快速收敛，而不是把验收卡 20 秒。
     'AI_TIMEOUT_MS=6000',
+    // 邮箱注册验收走落盘发信模式：不碰真 SMTP，验证码写到这个文件里供探针读取
+    'SMTP_MODE=file',
+    `SMTP_FILE_OUT=${path.join(TMP, 'memory', 'outbox.jsonl')}`,
+    'SMTP_FROM=cad-verify@example.com',
     '',
   ].join('\n'),
   'utf8'
@@ -347,6 +351,7 @@ const probe = spawn(process.execPath, ['verify/browser-probe.cjs'], {
     VERIFY_MEM_PATH: TMP_MEM,
     VERIFY_ACCOUNTS_PATH: TMP_ACCOUNTS,
     VERIFY_AUDIT_PATH: TMP_AUDIT,
+    VERIFY_SMTP_OUTBOX: path.join(TMP, 'memory', 'outbox.jsonl'),
     VERIFY_FAKE_KEY: FAKE_KEY,
     VERIFY_FAKE_KEY2: FAKE_KEY2,
     VERIFY_MOCK_URL: MOCK_URL,

@@ -51,6 +51,21 @@ interface ModelList {
   error?: string;
 }
 
+/** 邮件 / SMTP 设置 —— 口令只回打码值（与 AI API Key 同一纪律） */
+interface SmtpSettings {
+  mode: 'smtp' | 'file';
+  configured: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  from: string;
+  passMasked: string;
+  passSet: boolean;
+  fileOut: string;
+  signupOpen: boolean;
+}
+
 export function AdminPanel(props: { token: string | null }): ReactNode {
   const [health, setHealth] = useState<'checking' | 'online' | 'offline'>('checking');
   const [healthInfo, setHealthInfo] = useState<Record<string, unknown> | null>(null);
@@ -58,6 +73,11 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
   const [models, setModels] = useState<ModelList | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [modelChoice, setModelChoice] = useState('');
+  // ── 邮件 / SMTP ──
+  const [smtp, setSmtp] = useState<SmtpSettings | null>(null);
+  const [smtpForm, setSmtpForm] = useState<{ host: string; port: string; secure: boolean; user: string; from: string; pass: string; mode: 'smtp' | 'file' } | null>(null);
+  const [signupOpen, setSignupOpen] = useState(false);
+  const [testTo, setTestTo] = useState('');
 
   // ── 用量 / 账号 / 审计（Task #27：把后端已有的数据变成"看得见"的界面）──
   interface QuotaInfo {
@@ -145,6 +165,15 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
       if (a) setAccounts(((await a.json()) as { accounts?: AcctRow[] }).accounts ?? []);
       const al = await authed('/api/security/audit?limit=50');
       if (al) setAudit(((await al.json()) as { entries?: AuditEntry[] }).entries ?? []);
+      // SMTP 设置独立拉取：读失败（未登录/无权限）不影响上面的面板
+      const sm = await authed('/api/settings/smtp');
+      if (sm) {
+        const d = (await sm.json()) as SmtpSettings;
+        setSmtp(d);
+        setSignupOpen(d.signupOpen);
+        setSmtpForm({ host: d.host, port: String(d.port || ''), secure: d.secure, user: d.user, from: d.from, pass: '', mode: d.mode });
+        setTestTo(d.from || d.user || '');
+      }
     })();
     try {
       const sr = await authed('/api/settings');
@@ -258,6 +287,94 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
       setBusy(null);
     }
   }, [authed, say]);
+
+  const saveSmtp = useCallback(async () => {
+    if (!smtpForm) return;
+    setBusy('smtp-save');
+    try {
+      const r = await authed('/api/settings/smtp', {
+        method: 'PUT',
+        body: JSON.stringify({
+          mode: smtpForm.mode,
+          host: smtpForm.host,
+          ...(smtpForm.port.trim() ? { port: Number(smtpForm.port) } : { port: '' }),
+          secure: smtpForm.secure,
+          user: smtpForm.user,
+          from: smtpForm.from,
+          // 留空 = 不修改 —— 前端根本没有原文，也不可能"原样发回"
+          ...(smtpForm.pass.trim() ? { pass: smtpForm.pass.trim() } : {}),
+          signupOpen,
+        }),
+      });
+      if (!r) return;
+      const data = (await r.json()) as SmtpSettings;
+      setSmtp(data);
+      setSignupOpen(data.signupOpen);
+      setSmtpForm({ host: data.host, port: String(data.port || ''), secure: data.secure, user: data.user, from: data.from, pass: '', mode: data.mode });
+      say(
+        data.configured
+          ? `SMTP 已保存并就绪（模式：${data.mode === 'file' ? `落盘 ${data.fileOut}` : `${data.host}:${data.port}`}）`
+          : 'SMTP 已保存，但配置还不完整 —— 邮箱注册在配置齐全前会明确报错'
+      );
+    } catch (e) {
+      say(`SMTP 保存失败：${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }, [authed, say, signupOpen, smtpForm]);
+
+  const testSmtp = useCallback(async () => {
+    if (!smtpForm) return;
+    // 先存再测：测的是"当前表单里的配置"，不是磁盘上的旧配置 —— 否则测通过一次，保存后却是另一套
+    const saved = await (async () => {
+      setBusy('smtp-test');
+      try {
+        const r = await authed('/api/settings/smtp', {
+          method: 'PUT',
+          body: JSON.stringify({
+            mode: smtpForm.mode,
+            host: smtpForm.host,
+            ...(smtpForm.port.trim() ? { port: Number(smtpForm.port) } : { port: '' }),
+            secure: smtpForm.secure,
+            user: smtpForm.user,
+            from: smtpForm.from,
+            ...(smtpForm.pass.trim() ? { pass: smtpForm.pass.trim() } : {}),
+            signupOpen,
+          }),
+        });
+        if (!r) return null;
+        const data = (await r.json()) as SmtpSettings;
+        setSmtp(data);
+        setSmtpForm({ host: data.host, port: String(data.port || ''), secure: data.secure, user: data.user, from: data.from, pass: '', mode: data.mode });
+        return data;
+      } catch (e) {
+        say(`SMTP 保存失败：${(e as Error).message}`);
+        return null;
+      }
+    })();
+    if (!saved) {
+      setBusy(null);
+      return;
+    }
+    try {
+      const r = await authed('/api/settings/smtp/test', { method: 'POST', body: JSON.stringify({ to: testTo.trim() || undefined }) });
+      if (!r) return;
+      const data = (await r.json()) as { ok: boolean; mode?: string; to?: string; file?: string; messageId?: string; error?: string };
+      if (data.ok) {
+        say(
+          data.mode === 'file'
+            ? `✓ 落盘模式：邮件已写入 ${data.file}（没有真发网）`
+            : `✓ 测试邮件已发给 ${data.to}（messageId ${String(data.messageId ?? '').slice(0, 24)}…）`
+        );
+      } else {
+        say(`✗ 测试邮件发送失败：${data.error ?? '未知原因'}`);
+      }
+    } catch (e) {
+      say(`测试邮件失败：${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }, [authed, say, signupOpen, smtpForm, testTo]);
 
   const exportMemory = useCallback(async () => {
     setBusy('memout');
@@ -618,6 +735,112 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
                 )}
               </div>
             ) : null}
+          </Section>
+
+          <Section title="邮件 / SMTP">
+            {smtp && smtpForm ? (
+              <>
+                <Row label="发信模式" hint="file = 落盘模式，不发网，邮件追加写入文件（本地调试与验收用）；smtp = 真发信">
+                  <select
+                    className="input"
+                    value={smtpForm.mode}
+                    onChange={(e) => setSmtpForm({ ...smtpForm, mode: e.target.value as 'smtp' | 'file' })}
+                  >
+                    <option value="smtp">SMTP 发信</option>
+                    <option value="file">落盘模式（不发网）</option>
+                  </select>
+                </Row>
+                {smtpForm.mode === 'file' ? (
+                  <Row label="落盘文件" hint="邮件以 JSONL 追加写入这里，注册验证码可从文件里读">
+                    <input
+                      className="input"
+                      value={smtpForm.mode === smtp.mode ? smtp.fileOut : ''}
+                      placeholder="保存后生效（默认 memory/outbox.jsonl）"
+                      readOnly
+                    />
+                  </Row>
+                ) : (
+                  <>
+                    <Row label="SMTP 服务器">
+                      <input
+                        className="input"
+                        value={smtpForm.host}
+                        placeholder="smtp.qq.com / smtp.163.com / …"
+                        onChange={(e) => setSmtpForm({ ...smtpForm, host: e.target.value })}
+                      />
+                    </Row>
+                    <Row label="端口" hint="465 = SSL（勾选安全连接）；587 = STARTTLS">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        value={smtpForm.port}
+                        placeholder={smtpForm.secure ? '465' : '587'}
+                        onChange={(e) => setSmtpForm({ ...smtpForm, port: e.target.value })}
+                      />
+                    </Row>
+                    <Row label="安全连接 (SSL)">
+                      <input
+                        type="checkbox"
+                        checked={smtpForm.secure}
+                        onChange={(e) => setSmtpForm({ ...smtpForm, secure: e.target.checked })}
+                      />
+                    </Row>
+                  </>
+                )}
+                <Row label="账号（发信邮箱）">
+                  <input
+                    className="input"
+                    value={smtpForm.user}
+                    placeholder="you@example.com"
+                    onChange={(e) => setSmtpForm({ ...smtpForm, user: e.target.value })}
+                  />
+                </Row>
+                <Row label="授权码 / 口令" hint="QQ/163 邮箱用的是「授权码」不是登录密码；留空表示不修改">
+                  <input
+                    className="input"
+                    type="password"
+                    value={smtpForm.pass}
+                    placeholder={smtp.passSet ? `已保存 ${smtp.passMasked}（留空不改）` : '还没有设置'}
+                    onChange={(e) => setSmtpForm({ ...smtpForm, pass: e.target.value })}
+                    autoComplete="new-password"
+                  />
+                </Row>
+                <Row label="发件人" hint="多数服务商要求与账号一致，不一致会被拒信">
+                  <input
+                    className="input"
+                    value={smtpForm.from}
+                    placeholder="you@example.com"
+                    onChange={(e) => setSmtpForm({ ...smtpForm, from: e.target.value })}
+                  />
+                </Row>
+                <Row label="开放注册" hint="开启后，任何人可用邮箱验证码自助注册（角色=设计师、档位=免费）。关闭时只有无账号阶段可自助建号">
+                  <input type="checkbox" checked={signupOpen} onChange={(e) => setSignupOpen(e.target.checked)} />
+                  <span className="muted-sm">{signupOpen ? '已开放' : '未开放'}</span>
+                </Row>
+                <Row label="收测试邮件到">
+                  <input
+                    className="input"
+                    value={testTo}
+                    placeholder="留空 = 发给发件人自己"
+                    onChange={(e) => setTestTo(e.target.value)}
+                  />
+                </Row>
+                <div className="btn-row">
+                  <button type="button" className="tb-btn active" disabled={busy !== null} onClick={() => void saveSmtp()}>
+                    保存
+                  </button>
+                  <button type="button" className="tb-btn" disabled={busy !== null} onClick={() => void testSmtp()}>
+                    保存并发测试邮件
+                  </button>
+                </div>
+                {smtp.mode === 'file' && smtp.configured ? (
+                  <div className="muted-sm">当前是落盘模式：邮件没有真的发出去，只是写进了文件 —— 界面上如实显示，别当成已发网。</div>
+                ) : null}
+              </>
+            ) : (
+              <Text>读取中…</Text>
+            )}
           </Section>
 
           <Section title="记忆同步">

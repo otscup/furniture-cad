@@ -3752,6 +3752,70 @@ async function waitForApp(url, timeoutMs = 25000) {
       `status=${rootRes.status} hasRoot=${rootHtml.includes('id="root"')}`);
 
     // ═══════════════════════════════════════════════════════════
+    section('B35 邮箱注册：SMTP 落盘发信全流程 + 管理端开关与打码');
+
+    // 此时 B18 已建 owner（accounts 模式），owner token 还在 sessionStorage
+    const TOKEN35 = await evalJs(`sessionStorage.getItem('furniture-cad.auth.token')`);
+    // 浏览器侧 fetch（走 vite 代理）→ 与真实 UI 同源同路径
+    const api35b = async (path, { method = 'GET', token, body } = {}) => evalJs(`(async()=>{
+      const r = await fetch(${JSON.stringify(path)}, {
+        method: ${JSON.stringify(method)},
+        headers: Object.assign({'Content-Type':'application/json'}, ${token ? `{Authorization:'Bearer ${String(token).replace(/'/g, '')}'}` : '{}'}),
+        ${body ? `body: ${JSON.stringify(JSON.stringify(body))}` : 'undefined'}
+      });
+      return { status: r.status, body: await r.json().catch(()=>({})) };
+    })()`);
+
+    const smtpGet = await api35b('/api/settings/smtp', { token: TOKEN35 });
+    ok('B35 GET smtp：落盘模式、未开注册、口令未设置',
+      smtpGet.status === 200 && smtpGet.body.mode === 'file' && smtpGet.body.signupOpen === false, JSON.stringify(smtpGet.body));
+
+    const badEmail = await api35b('/api/auth/register-email', { method: 'POST', body: { email: 'nope' } });
+    ok('B35 非法邮箱 400', badEmail.status === 400 && badEmail.body.code === 'BAD_EMAIL', JSON.stringify(badEmail));
+
+    const closed35 = await api35b('/api/auth/register-email', { method: 'POST', body: { email: 'probe-a@example.com' } });
+    ok('B35 未开「开放注册」→ 403 SIGNUP_CLOSED（accounts 模式注册不是后门）',
+      closed35.status === 403 && closed35.body.code === 'SIGNUP_CLOSED', JSON.stringify(closed35));
+
+    const openPut = await api35b('/api/settings/smtp', { method: 'PUT', token: TOKEN35, body: { signupOpen: true } });
+    ok('B35 管理端 PUT：开启「开放注册」', openPut.status === 200 && openPut.body.signupOpen === true, JSON.stringify(openPut.body));
+
+    // UI：后台页「邮件 / SMTP」区块（owner 登录态才可见）—— 落盘模式提示 + 开放注册开关
+    await activateRightTab('后台');
+    await sleep(900);
+    ok('B35 后台页出现「邮件 / SMTP」区块', /邮件 \/ SMTP/.test(await panelTextAll()), (await panelTextAll()).slice(0, 160));
+    ok('B35 后台页有「开放注册」开关与落盘模式提示（不假装邮件真发了）',
+      /开放注册/.test(await panelTextAll()) && /落盘/.test(await panelTextAll()), (await panelTextAll()).slice(-300));
+
+    // UI：退出登录后账号页出现「邮箱注册」区块 —— 该区块只在未登录时渲染（已登录者不需要注册）
+    await activateRightTab('账号');
+    await sleep(500);
+    await clickPanelBtn('退出登录');
+    await sleep(900);
+    ok('B35 退出登录后账号页出现「邮箱注册」区块（signupOpen 实时生效）', /邮箱注册/.test(await panelTextAll()), (await panelTextAll()).slice(0, 200));
+
+    // 全流程：请求验证码 → 读落盘邮件 → 错码被拒 → 弱口令被拒 → 建号
+    const e35 = 'probe-b@example.com';
+    const req1 = await api35b('/api/auth/register-email', { method: 'POST', body: { email: e35 } });
+    ok('B35 开放注册下请求验证码成功（sendMode=file）', req1.status === 200 && req1.body.sendMode === 'file', JSON.stringify(req1));
+    const OUTBOX35 = process.env.VERIFY_SMTP_OUTBOX || '';
+    const mails35 = fs.existsSync(OUTBOX35)
+      ? fs.readFileSync(OUTBOX35, 'utf8').split(/\r?\n/).filter((l) => l.trim()).map((l) => JSON.parse(l)).filter((m) => m.to === e35)
+      : [];
+    const code35 = (/验证码：(\d{6})/.exec(String(mails35[mails35.length - 1]?.subject ?? '')) || [])[1];
+    ok('B35 落盘邮件里读出 6 位验证码', /^\d{6}$/.test(code35 ?? ''), `mails=${mails35.length} code=${code35}`);
+    const wrong35 = await api35b('/api/auth/register-email/verify', { method: 'POST', body: { email: e35, code: code35 === '123456' ? '654321' : '123456', password: 'Vf9-tRw2-Kqp7' } });
+    ok('B35 错误验证码被 400 拒绝', wrong35.status === 400 && wrong35.body.code === 'BAD_CODE', JSON.stringify(wrong35));
+    const weak35 = await api35b('/api/auth/register-email/verify', { method: 'POST', body: { email: e35, code: code35, password: '12345678' } });
+    ok('B35 验证码对、弱口令仍被拒（hold：不白吃验证码）', weak35.status === 400 && /纯数字/.test(weak35.body.error ?? ''), JSON.stringify(weak35));
+    const good35 = await api35b('/api/auth/register-email/verify', { method: 'POST', body: { email: e35, code: code35, password: 'Vf9-tRw2-Kqp7' } });
+    ok('B35 同一验证码 + 强口令建号成功并自动登录',
+      good35.status === 200 && typeof good35.body.token === 'string' && good35.body.account?.email === e35 && good35.body.account?.role === 'designer',
+      JSON.stringify({ ...good35.body, token: good35.body.token ? '***' : null }));
+    const me35 = await api35b('/api/auth/me', { token: good35.body.token });
+    ok('B35 新账号 /api/auth/me 透出邮箱', me35.body.account?.email === e35, JSON.stringify(me35.body.account ?? {}));
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

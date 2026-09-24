@@ -38,6 +38,8 @@ import { spawn } from 'node:child_process';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
 import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
+import * as mailer from './mailer.mjs';
+import { RegistrationStore, EMAIL_RE } from './registration.mjs';
 import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS } from '../shared/aiContract.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -57,6 +59,7 @@ const ENV_PATH = process.env.APP_ENV_PATH ? resolve(process.env.APP_ENV_PATH) : 
 const MEM_PATH = process.env.APP_MEM_PATH ? resolve(process.env.APP_MEM_PATH) : join(ROOT, 'memory', 'corrections.jsonl');
 const ACCOUNTS_PATH = process.env.APP_ACCOUNTS_PATH ? resolve(process.env.APP_ACCOUNTS_PATH) : join(ROOT, 'memory', 'accounts.json');
 const AUDIT_PATH = process.env.APP_AUDIT_PATH ? resolve(process.env.APP_AUDIT_PATH) : join(ROOT, 'memory', 'audit.jsonl');
+const REGISTRATIONS_PATH = process.env.APP_REGISTRATIONS_PATH ? resolve(process.env.APP_REGISTRATIONS_PATH) : join(ROOT, 'memory', 'pending-registrations.json');
 const MEM_DIR = dirname(MEM_PATH);
 const DIST = join(ROOT, 'dist');
 
@@ -141,6 +144,16 @@ try {
 } catch (e) {
   console.error(`\n[致命] ${e.message}\n`);
   console.error('账号库是鉴权的唯一依据，损坏时无法安全运行。请修复或移走该文件后重启。');
+  process.exit(1);
+}
+
+/** 邮箱注册验证码库 —— 损坏同样拒绝启动（清零重来等于绕过限频） */
+let registrations;
+try {
+  registrations = new RegistrationStore({ storePath: REGISTRATIONS_PATH, audit: (e) => auth.audit(e) });
+} catch (e) {
+  console.error(`\n[致命] ${e.message}\n`);
+  console.error('注册验证码库损坏会破坏注册限频的公正性，请修复或移走该文件后重启。');
   process.exit(1);
 }
 
@@ -300,7 +313,14 @@ async function fetchWithTimeout(url, init, timeoutMs) {
  * 免鉴权白名单（**精确**匹配，不用前缀 —— 前缀匹配是"忘记加鉴权"的温床）。
  * 只有在 accounts 模式下才有意义；local-open 模式下一切都不需要 token。
  */
-const PUBLIC_API = new Set(['/api/health', '/api/auth/register', '/api/auth/login', '/api/auth/mode']);
+const PUBLIC_API = new Set([
+  '/api/health',
+  '/api/auth/register',
+  '/api/auth/register-email',
+  '/api/auth/register-email/verify',
+  '/api/auth/login',
+  '/api/auth/mode',
+]);
 
 /** 取 Bearer token */
 function bearer(req) {
@@ -375,6 +395,8 @@ async function handleApi(req, res, pathname) {
       ok: true,
       mode: auth.mode,
       accountCount: auth.data.accounts.length,
+      /** 注册入口开关：local-open 时邮箱注册天然可用（建的就是 owner）；账号模式下由管理员控制 */
+      signupOpen: !auth.enabled || readEnv().SIGNUP_OPEN === '1',
       note:
         auth.mode === 'local-open'
           ? '还没有账号。此时全部接口免登录 —— 这是"先自用"的默认状态。建立第一个账号后，所有接口都会要求登录，且不可回退。'
@@ -401,6 +423,54 @@ async function handleApi(req, res, pathname) {
     if (!r.ok) return json(res, 400, { ok: false, error: r.error });
     const l = auth.login(body.username, body.password, clientMeta(req));
     return json(res, 200, { ok: true, account: r.account, token: l.token ?? null, expiresAt: l.expiresAt ?? null, mode: auth.mode });
+  }
+
+  // ── 邮箱验证码注册（两步：请求验证码 → 凭码建号）──
+  //
+  // 开放性判定与「建第一个账号」共用一把尺子：
+  //   · 没有任何账号：邮箱注册天然可用（建的是 owner，与 /api/auth/register 同为 bootstrap 通道）
+  //   · 已有账号：必须由管理员在管理后台显式开启 SIGNUP_OPEN —— 否则注册接口就是后门
+  const signupAllowed = () => (!auth.enabled ? true : readEnv().SIGNUP_OPEN === '1');
+
+  if (pathname === '/api/auth/register-email' && req.method === 'POST') {
+    const body = await readBody(req);
+    const email = String(body.email ?? '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: '邮箱格式不正确', code: 'BAD_EMAIL' });
+    if (!signupAllowed()) {
+      return json(res, 403, { ok: false, error: '当前未开放注册：已存在账号体系，需管理员在「管理后台 → 邮件 / SMTP」里开启', code: 'SIGNUP_CLOSED' });
+    }
+    if (!mailer.isConfigured(env)) {
+      return json(res, 503, { ok: false, error: '邮件服务未配置：请由管理员在「管理后台 → 邮件 / SMTP」里填写设置（本地调试可设 SMTP_MODE=file 落盘模式）', code: 'SMTP_NOT_CONFIGURED' });
+    }
+    const meta = clientMeta(req);
+    const r = registrations.issue(email, meta.ip);
+    if (!r.ok) return json(res, r.code === 'BAD_EMAIL' ? 400 : 429, { ok: false, error: r.error, code: r.code });
+    const sent = await mailer.sendVerificationCode(env, email, r.code, r.expiresInMin);
+    if (!sent.ok) {
+      // 发送失败就撤掉刚签发的记录 —— 用户修好配置后能立刻重试，而不是干等 60 秒限频
+      registrations.revoke(email, sent.error ?? 'send_failed');
+      return json(res, 502, { ok: false, error: sent.error ?? '验证码发送失败', code: 'SMTP_SEND_FAILED' });
+    }
+    return json(res, 200, { ok: true, expiresInMin: r.expiresInMin, sendMode: sent.mode });
+  }
+
+  if (pathname === '/api/auth/register-email/verify' && req.method === 'POST') {
+    const body = await readBody(req);
+    const email = String(body.email ?? '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) return json(res, 400, { ok: false, error: '邮箱格式不正确', code: 'BAD_EMAIL' });
+    if (!signupAllowed()) return json(res, 403, { ok: false, error: '当前未开放注册', code: 'SIGNUP_CLOSED' });
+    // hold=true：验证码核对通过先保留，等账号真正落库再 consume ——
+    // 否则口令不合规则时会白吃掉一条验证码，用户还得干等 60 秒重拿
+    const v = registrations.verify(email, body.code, clientMeta(req).ip, { hold: true });
+    if (!v.ok) return json(res, 400, { ok: false, error: v.error, code: v.code });
+    // 用户名缺省 = 邮箱本身（username 规则允许 @；带 + 号等特殊字符的邮箱会在这里被拦下，请用户显式给一个）
+    const username = String(body.username ?? '').trim() || email;
+    const displayName = String(body.displayName ?? '').trim() || username.split('@')[0];
+    const cr = auth.create({ username, password: body.password, displayName, email, actor: 'email-registration' });
+    if (!cr.ok) return json(res, 400, { ok: false, error: cr.error });
+    registrations.consume(email);
+    const l = auth.login(username, body.password, clientMeta(req));
+    return json(res, 200, { ok: true, account: cr.account, token: l.token ?? null, expiresAt: l.expiresAt ?? null, mode: auth.mode });
   }
 
   if (pathname === '/api/auth/login' && req.method === 'POST') {
@@ -560,6 +630,39 @@ async function handleApi(req, res, pathname) {
 
     writeEnv(patch);
     return json(res, 200, { ok: true, ...currentSettings() });
+  }
+
+  // ── SMTP 设置（管理后台「邮件 / SMTP」区块的数据源）──
+  // 与 AI API Key 同一纪律：口令只落 .env，GET 只回打码值，PUT 留空 = 不修改。
+  if (pathname === '/api/settings/smtp' && req.method === 'GET') {
+    return json(res, 200, { ok: true, ...mailer.describe(env) });
+  }
+
+  if (pathname === '/api/settings/smtp' && (req.method === 'PUT' || req.method === 'POST')) {
+    const body = await readBody(req);
+    const patch = {};
+    if (typeof body.host === 'string') patch.SMTP_HOST = body.host.trim();
+    if (body.port === null || body.port === undefined || body.port === '') patch.SMTP_PORT = '';
+    else if (Number.isFinite(Number(body.port)) && Number(body.port) > 0) patch.SMTP_PORT = String(Math.round(Number(body.port)));
+    if (body.secure === true || body.secure === false) patch.SMTP_SECURE = body.secure ? '1' : '0';
+    if (typeof body.user === 'string') patch.SMTP_USER = body.user.trim();
+    if (typeof body.from === 'string') patch.SMTP_FROM = body.from.trim();
+    if (body.mode === 'smtp' || body.mode === 'file') patch.SMTP_MODE = body.mode;
+    if (typeof body.pass === 'string' && body.pass.trim() !== '') patch.SMTP_PASS = body.pass.trim(); // 缺省 = 不修改
+    if (body.signupOpen === true || body.signupOpen === false) patch.SIGNUP_OPEN = body.signupOpen ? '1' : '0';
+    writeEnv(patch);
+    auth.audit({ actor: gate.account?.id ?? 'local-open', action: 'settings.smtp', result: 'ok', host: patch.SMTP_HOST ?? '(unchanged)' });
+    return json(res, 200, { ok: true, ...mailer.describe(readEnv()) });
+  }
+
+  if (pathname === '/api/settings/smtp/test' && req.method === 'POST') {
+    const body = await readBody(req);
+    const to = String(body.to ?? '').trim() || mailer.readConfig(env).from;
+    if (!to) return json(res, 400, { ok: false, error: '没有收件地址：请在表单里填一个收件邮箱，或先配置发件人' });
+    const r = await mailer.sendTest(env, to);
+    auth.audit({ actor: gate.account?.id ?? 'local-open', action: 'settings.smtp.test', target: to, result: r.ok ? 'ok' : 'fail', error: r.ok ? undefined : r.error });
+    if (!r.ok) return json(res, 502, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, mode: r.mode, to, messageId: r.messageId ?? null, file: r.file ?? null });
   }
 
   if (pathname === '/api/models' && req.method === 'GET') {
@@ -1192,8 +1295,10 @@ server.listen(PORT, HOST, () => {
   console.log('  接口：GET /api/health · GET|PUT /api/settings · GET /api/models · POST /api/models/refresh');
   console.log('        POST /api/test · POST /api/ai/chat · POST /api/ai/plan · GET|PUT /api/memory');
   console.log('        POST /api/auth/register|login|logout|password · GET /api/auth/me|mode');
+  console.log('        POST /api/auth/register-email · POST /api/auth/register-email/verify');
   console.log('        GET|POST /api/account/accounts · PATCH /api/account/account');
   console.log('        GET /api/usage · GET /api/security/policy · GET /api/security/audit');
+  console.log('        GET|PUT /api/settings/smtp · POST /api/settings/smtp/test');
   if (process.env.APP_ENV_PATH || process.env.APP_MEM_PATH || process.env.APP_ACCOUNTS_PATH || process.env.APP_AUDIT_PATH) {
     console.log('  （本次运行使用了 APP_*_PATH 覆盖，未落在项目默认位置）');
   }

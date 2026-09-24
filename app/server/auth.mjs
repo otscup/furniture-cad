@@ -196,6 +196,7 @@ export class AuthStore {  /**
       roleLabel: ROLES[a.role]?.label ?? a.role,
       plan: a.plan,
       planLabel: PLANS[a.plan]?.label ?? a.plan,
+      email: a.email ?? null,
       status: a.status,
       tenantId: a.tenantId,
       createdAt: a.createdAt,
@@ -226,11 +227,19 @@ export class AuthStore {  /**
   /**
    * 建账号。第一个账号必然是 owner —— 且**只**允许在没有账号时自助创建，
    * 之后创建账号必须有 owner/admin 身份（由调用方先判定权限）。
+   *
+   * email 可选：邮箱注册路径会带上（登录用 username，邮箱用于找回与通知的落点）。
+   * 格式与唯一性在这里判定 —— 调用方给的邮箱必须过了同一把尺子才落库。
    */
-  create({ username, password, displayName, role, plan, actor = null }) {
+  create({ username, password, displayName, role, plan, email, actor = null }) {
     const u = String(username ?? '').trim();
     if (!/^[A-Za-z0-9_.@-]{3,32}$/.test(u)) return { ok: false, error: '用户名只能由字母、数字、_ . @ - 组成，3~32 位' };
     if (this.findByUsername(u)) return { ok: false, error: '用户名已存在' };
+    const mail = String(email ?? '').trim().toLowerCase();
+    if (mail) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail)) return { ok: false, error: '邮箱格式不正确' };
+      if (this.data.accounts.some((a) => a.email === mail)) return { ok: false, error: '这个邮箱已经注册过账号' };
+    }
     const pwErr = checkPasswordStrength(password);
     if (pwErr) return { ok: false, error: pwErr };
     const first = this.data.accounts.length === 0;
@@ -243,6 +252,7 @@ export class AuthStore {  /**
       role: finalRole,
       plan: plan && PLANS[plan] ? plan : 'free',
       status: 'active',
+      email: mail || null,
       /**
        * 租户 id —— 商用上线后所有业务数据（项目/规则集/订单）都要按它隔离。
        * 现在只有一个租户，但字段从第一天就在，将来不必做数据迁移。
@@ -598,6 +608,7 @@ export function securityPolicy({ mode, accountsPath, auditPath, host }) {
       '失败登录计数与锁定窗口',
       '角色（owner/admin/designer/viewer）与最小权限判定',
       'AI 调用额度（月 token / 日次数）与模型白名单',
+      '邮箱验证码注册：验证码只落哈希、10 分钟过期、限次限频（SMTP / 落盘两种发信模式）',
       '管理操作与 AI 调用全量审计（actor / action / target / ip / 时间）',
       '账号库损坏时**拒绝启动**，不降级为无账号模式',
     ],

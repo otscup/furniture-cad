@@ -51,6 +51,8 @@ interface AuditEntry {
 export function AccountPanel(props: { token: string | null; setToken: (t: string | null) => void; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
   const [online, setOnline] = useState<'checking' | 'online' | 'offline'>('checking');
   const [mode, setMode] = useState<'local-open' | 'accounts' | null>(null);
+  /** 管理员是否开放了邮箱自助注册（/api/auth/mode 的 signupOpen；local-open 时天然可注册） */
+  const [signupOpen, setSignupOpen] = useState(false);
   const [me, setMe] = useState<AuthAccount | null>(null);
   const [permissions, setPermissions] = useState<{ canManage?: boolean; canDesign?: boolean; canView?: boolean } | null>(null);
   const [sessions, setSessions] = useState(0);
@@ -73,11 +75,19 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
   const [newUserPw, setNewUserPw] = useState('');
   const [newUserRole, setNewUserRole] = useState('designer');
 
+  // 邮箱注册表单
+  const [regEmail, setRegEmail] = useState('');
+  const [regCode, setRegCode] = useState('');
+  const [regUser, setRegUser] = useState('');
+  const [regDisp, setRegDisp] = useState('');
+  const [regPass, setRegPass] = useState('');
+  const [codeSent, setCodeSent] = useState<{ expiresInMin: number; sendMode: string } | null>(null);
+
   const say = useCallback((s: string) => setMsg(s), []);
 
   const refresh = useCallback(async () => {
     const t = props.token;
-    const modeR = await api<{ mode: string; accountCount: number }>('/api/auth/mode');
+    const modeR = await api<{ mode: string; accountCount: number; signupOpen?: boolean }>('/api/auth/mode');
     if (modeR.status === 0) {
       setOnline('offline');
       setMode(null);
@@ -85,6 +95,7 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
     }
     setOnline('online');
     setMode(modeR.data.mode === 'accounts' ? 'accounts' : 'local-open');
+    setSignupOpen(Boolean(modeR.data.signupOpen));
 
     const meR = await api<{ account: AuthAccount | null; sessions?: number; permissions?: { canManage?: boolean } }>('/api/auth/me', { token: t });
     if (meR.ok && meR.data.account) {
@@ -141,8 +152,56 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
     }
   }, [p, p2, props, refresh, u]);
 
-  const doLogin = useCallback(async () => {
+  /** 第一步：请求验证码。SMTP 没配 / 未开放注册时，服务端的报错原样透出 —— 不替服务端圆场 */
+  const sendRegCode = useCallback(async () => {
     setErr('');
+    setBusy(true);
+    try {
+      const r = await api<{ expiresInMin: number; sendMode: string }>('/api/auth/register-email', { method: 'POST', body: { email: regEmail.trim() } });
+      if (!r.ok) {
+        setErr(r.error ?? '验证码发送失败');
+        return;
+      }
+      setCodeSent({ expiresInMin: r.data.expiresInMin, sendMode: r.data.sendMode });
+      say(
+        r.data.sendMode === 'file'
+          ? `验证码已生成（落盘模式，没有真发信）—— ${r.data.expiresInMin} 分钟内有效`
+          : `验证码已发到 ${regEmail.trim()} —— ${r.data.expiresInMin} 分钟内有效`
+      );
+    } finally {
+      setBusy(false);
+    }
+  }, [regEmail, say]);
+
+  /** 第二步：凭码建号。无账号时建的是 owner；开放注册时建的是设计师/免费档 */
+  const doEmailRegister = useCallback(async () => {
+    setErr('');
+    setBusy(true);
+    try {
+      const r = await api<{ token: string | null }>('/api/auth/register-email/verify', {
+        method: 'POST',
+        body: { email: regEmail.trim(), code: regCode.trim(), password: regPass, username: regUser.trim() || undefined, displayName: regDisp.trim() || undefined },
+      });
+      if (!r.ok) {
+        setErr(r.error ?? '注册失败');
+        return;
+      }
+      props.setToken(r.data.token ?? null);
+      saveToken(r.data.token ?? null);
+      setRegEmail('');
+      setRegCode('');
+      setRegUser('');
+      setRegDisp('');
+      setRegPass('');
+      setCodeSent(null);
+      props.onToast?.('ok', '注册成功，已自动登录');
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [regCode, regDisp, regEmail, regPass, regUser, props, refresh]);
+
+  const doLogin = useCallback(async () => {    setErr('');
     setBusy(true);
     try {
       const r = await api<{ token: string }>('/api/auth/login', { method: 'POST', body: { username: u, password: p } });
@@ -292,6 +351,52 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
           >
             {mode === 'local-open' ? '建立账号并进入账号模式' : '登录'}
           </button>
+        </Section>
+      ) : null}
+
+      {!props.token && signupOpen ? (
+        <Section title={mode === 'local-open' ? '邮箱注册（第一个账号 = 所有者）' : '邮箱注册'} defaultOpen={mode !== 'local-open'}>
+          <p className="note">
+            两步：填邮箱拿验证码 → 凭验证码设口令。{mode === 'accounts' ? '开放注册期间新建的账号是「设计师 / 免费档」；' : ''}
+            验证码 10 分钟有效，每次最多错 5 次。
+          </p>
+          <Row label="邮箱">
+            <input
+              className="input"
+              value={regEmail}
+              placeholder="you@example.com"
+              autoComplete="email"
+              onChange={(e) => setRegEmail(e.target.value)}
+            />
+          </Row>
+          {codeSent ? (
+            <>
+              <Row label="验证码" hint={`${codeSent.expiresInMin} 分钟内有效`}>
+                <input className="input" value={regCode} placeholder="6 位数字" inputMode="numeric" onChange={(e) => setRegCode(e.target.value)} />
+              </Row>
+              <Row label="用户名（可选）" hint="留空 = 用邮箱当用户名">
+                <input className="input" value={regUser} placeholder="3~32 位字母数字 _ . @ -" onChange={(e) => setRegUser(e.target.value)} />
+              </Row>
+              <Row label="显示名（可选）" hint="留空 = 用户名 @ 前的部分">
+                <input className="input" value={regDisp} onChange={(e) => setRegDisp(e.target.value)} />
+              </Row>
+              <Row label="口令" hint="至少 8 位；不能是纯数字、常见弱口令或连续序列">
+                <input className="input" type="password" value={regPass} autoComplete="new-password" onChange={(e) => setRegPass(e.target.value)} />
+              </Row>
+              <div className="btn-row">
+                <button type="button" className="tb-btn primary" disabled={busy || !regCode.trim() || !regPass} onClick={() => void doEmailRegister()}>
+                  创建账号并登录
+                </button>
+                <button type="button" className="tb-btn" disabled={busy || !regEmail.trim()} onClick={() => void sendRegCode()}>
+                  重新发送验证码
+                </button>
+              </div>
+            </>
+          ) : (
+            <button type="button" className="tb-btn primary" disabled={busy || !regEmail.trim()} onClick={() => void sendRegCode()}>
+              发送验证码
+            </button>
+          )}
         </Section>
       ) : null}
 

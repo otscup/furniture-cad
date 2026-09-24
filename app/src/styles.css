@@ -70,6 +70,7 @@ kbd {
 .side-right { border-left: 1px solid var(--line); }
 
 .stage { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.loading3d { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--text-dim, #888); font-size: 13px; }
 
 .panel-scroll { flex: 1; overflow: auto; padding: 6px 8px 14px; min-height: 0; }
 

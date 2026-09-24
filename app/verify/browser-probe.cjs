@@ -3427,9 +3427,12 @@ async function waitForApp(url, timeoutMs = 25000) {
     // 工具栏按钮 → 切 3D
     const btn3d = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('3D'));if(b)b.click();return !!b})()`);
     ok('工具栏上有「3D」按钮且能点到（不是隐藏功能）', btn3d === true, `btn=${btn3d}`);
-    await sleep(700); // 首帧渲染 + 取景
-    ok('切过去后 3D HUD 提示在（只读说明是给用户的第一句话）',
-      (await evalJs(`!!document.querySelector('.vp-hud-3d')`)) === true);
+    // 3D 视口是 lazy chunk：首次切入要下载并解析 three.js（~558KB），
+    // Suspense 期间是 fallback 占位 —— 必须轮询等 canvas 真正挂载，固定 sleep 会在慢机器上飘
+    const mounted3d = await waitFor(`!!document.querySelector('.vp-3d canvas')`, 15000, 150);
+    await sleep(600); // 首帧渲染 + 取景
+    ok('切过去后 3D 视口完成懒加载并挂载（chunk 下载 → Suspense → canvas）',
+      mounted3d === true && (await evalJs(`!!document.querySelector('.vp-hud-3d')`)) === true);
     const canvas3d = await evalJs(`(()=>{const c=document.querySelector('.vp-3d canvas');return c?{w:c.width,h:c.height}:null})()`);
     ok('WebGL 画布真的挂载且有尺寸（不是空壳 div）', !!canvas3d && canvas3d.w > 100 && canvas3d.h > 100, JSON.stringify(canvas3d));
     const v3d = await statusVersion();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
 import type { Vec2 } from '../core/types.ts';
 import type { Command, ExecResult } from '../core/commandBus.ts';
 import * as CMD from '../core/commands.ts';
@@ -10,7 +10,11 @@ import type { SnapSettings } from '../viewport/snapping.ts';
 import { defaultHiddenLayers } from '../viewport/layers.ts';
 import type { Camera } from '../viewport/camera.ts';
 import { Viewport } from './Viewport.tsx';
-import { ThreeViewport } from './ThreeViewport.tsx';
+/**
+ * 3D 视口懒加载：three.js 约 1MB（gzip ~300KB），静态引入会把只看 2D 的用户
+ * 也拖下水。lazy 后 three 只在首次切到 3D 模式时才下载 —— 首屏主包立即减重。
+ */
+const ThreeViewport = lazy(() => import('./ThreeViewport.tsx').then((m) => ({ default: m.ThreeViewport })));
 import { Toolbar } from './Toolbar.tsx';
 import type { RightTab } from './Toolbar.tsx';
 import { ContextMenu } from './ContextMenu.tsx';
@@ -885,7 +889,9 @@ export function App() {
 
         <main className="stage">
           {mode === '3d' ? (
-            <ThreeViewport bus={bus} version={version} selection={selection} setSelection={setSelection} />
+            <Suspense fallback={<div className="loading3d">3D 视口加载中…</div>}>
+              <ThreeViewport bus={bus} version={version} selection={selection} setSelection={setSelection} />
+            </Suspense>
           ) : (
             <Viewport
               bus={bus}

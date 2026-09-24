@@ -3482,6 +3482,100 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('3D 视图截图已保存（人工目视用）', true, 'app-3d-viewport.png');
 
     // ═══════════════════════════════════════════════════════════
+    section('B30 柜型预设库：模板选择 → 放置 → 语义参数落地');
+
+    // ① 工具栏下拉列出全部模板
+    const tplOpts = await evalJs(`(()=>{
+      const s=document.querySelector('.toolbar .tb-select');
+      return s?[...s.options].map(o=>o.value):null;
+    })()`);
+    ok('工具栏有柜型预设下拉且列出全部模板',
+      Array.isArray(tplOpts) && tplOpts.length >= 4 && tplOpts.includes('default') &&
+      tplOpts.includes('shoe_cabinet') && tplOpts.includes('wall_cabinet') && tplOpts.includes('tv_stand'),
+      JSON.stringify(tplOpts));
+
+    // ② TPL 命令：裸命令列出全部（含当前标记）
+    await runCommandLine('TPL');
+    const tplListMsg = await text('.cmd-msg');
+    ok('裸 TPL 列出全部柜型并标出当前', /鞋柜/.test(tplListMsg) && /吊柜/.test(tplListMsg) && /电视柜/.test(tplListMsg) && /▶/.test(tplListMsg),
+      tplListMsg);
+
+    // ③ TPL shoe_cabinet → 工具栏下拉同步（两个入口共用同一个状态）
+    await runCommandLine('TPL shoe_cabinet');
+    const tplSelVal = await evalJs(`(()=>{const s=document.querySelector('.toolbar .tb-select');return s?s.value:null})()`);
+    ok('TPL shoe_cabinet 后工具栏下拉同步为 shoe_cabinet（UI 与命令行同状态）', tplSelVal === 'shoe_cabinet', `select=${tplSelVal}`);
+
+    // ④ 放置鞋柜：贴东墙。断言直接读 store —— 浅进深/层板数/门数都是语义参数
+    const vB30 = await statusVersion();
+    const cal30 = await calib25();
+    ok('B30 平面图重标定成功', !!cal30 && cal30.good === true, JSON.stringify(!!cal30 && cal30.good));
+    await runCommandLine('CAB');
+    {
+      const c = cal30.toClient(3000, 1300); // 东墙内表面 x=3140，靠近它
+      await mouseDown(c.x, c.y);
+      await sleep(80);
+      await mouseUp(c.x, c.y);
+      await sleep(460);
+    }
+    const shoeCab = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const c=s.bus.getState().cabinets.at(-1);
+      return {name:c.name,w:c.params.width,h:c.params.height,d:c.params.depth,lift:c.params.bodyLift,
+        units:c.layout.units.map(u=>({kind:u.kind,shelves:u.shelves?u.shelves.count:0,drawers:u.drawers?u.drawers.count:0,doors:u.doors?u.doors.count:0}))};})()`);
+    ok('放置鞋柜：版本 +1（真写入了模型）', (await statusVersion()) === vB30 + 1);
+    ok('放置鞋柜：名字与外形来自模板（900×2400×350 浅进深）',
+      /^鞋柜/.test(shoeCab.name) && shoeCab.w === 900 && shoeCab.h === 2400 && shoeCab.d === 350, JSON.stringify(shoeCab));
+    ok('放置鞋柜：分区骨架 = 模板声明（8 层鞋格 + 对开门，五金/材质不进模板）',
+      shoeCab.units.length === 1 && shoeCab.units[0].kind === 'shelves' && shoeCab.units[0].shelves === 8 && shoeCab.units[0].doors === 2,
+      JSON.stringify(shoeCab.units));
+
+    // ⑤ TPL tv_stand → 放电视柜：比例宽度 + 中间开放设备格
+    await runCommandLine('TPL tv_stand');
+    const tplTvMsg = await text('.cmd-msg');
+    ok('TPL tv_stand 切换成功（回执说出柜型）', /电视柜/.test(tplTvMsg), tplTvMsg);
+    const dbgB30 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      return {
+        cabs:s.bus.getState().cabinets.map(c=>({n:c.name,x:c.placement.x,y:c.placement.y,w:c.params.width,d:c.params.depth,rot:c.placement.rotation})),
+        active:(document.querySelector('.toolbar .tb-btn.active')||{}).textContent||'',
+        sel:document.querySelector('.toolbar .tb-select')?document.querySelector('.toolbar .tb-select').value:''
+      };})()`);
+    await runCommandLine('CAB');
+    let tvClick = null;
+    {
+      // 西墙南侧空档：通体挂衣柜占北墙（footprint x 400..2800, y 1940..2540），
+      // 1800 宽的电视柜贴西墙必须整体落在 y < 1940 —— y_c=970 → y 70..1870，
+      // 与通体挂衣留 70mm 间隙、与南墙内表面（y=60）留 10mm，都不重叠。
+      // （第一次跑点位选 y_c=1600，被 mem_003_no_cabinet_overlap 真实拦下 ——
+      //   语义护栏正确工作，错的是探针的点位，不能为了绿绕开护栏。）
+      const c = cal30.toClient(200, 970);
+      tvClick = { c, r: cal30.rect };
+      await mouseDown(c.x, c.y);
+      await sleep(80);
+      await mouseUp(c.x, c.y);
+      await sleep(460);
+    }
+    const tvToasts = await text('.toasts');
+    const tvCab = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const c=s.bus.getState().cabinets.at(-1);
+      return {name:c.name,w:c.params.width,h:c.params.height,d:c.params.depth,
+        units:c.layout.units.map(u=>({kind:u.kind,shelves:u.shelves?u.shelves.count:0,drawers:u.drawers?u.drawers.count:0,doors:u.doors?u.doors.count:0}))};})()`);
+    ok('放置电视柜：矮柜 1800×450×400，抽 + 设备格 + 抽 三分区',
+      /^电视柜/.test(tvCab.name) && tvCab.w === 1800 && tvCab.h === 450 && tvCab.d === 400 &&
+      tvCab.units.length === 3 && tvCab.units[0].drawers === 2 && tvCab.units[1].kind === 'shelves' && tvCab.units[1].doors === 0 && tvCab.units[2].drawers === 2,
+      JSON.stringify({ tvCab, tplTvMsg, dbg: dbgB30, click: tvClick, toasts: tvToasts }));
+    ok('放置电视柜：全程只 create 不改既有对象（版本恰好 +1）', (await statusVersion()) === vB30 + 2);
+
+    // ⑥ 负样本：未知模板必须报错且给出可用清单（不静默、不回退默认）
+    await runCommandLine('TPL no_such');
+    const tplErr = await text('.cmd-msg');
+    ok('TPL 未知 id 报错并列出可用模板', /未知柜型/.test(tplErr) && /shoe_cabinet/.test(tplErr) && /tv_stand/.test(tplErr), tplErr);
+
+    // ⑦ 收尾：切回 default，不污染后续样式审计
+    await runCommandLine('TPL default');
+    ok('TPL default 切回标准柜', /标准柜/.test(await text('.cmd-msg')));
+    await keyPress('Escape', 'Escape', 27);
+    await sleep(200);
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

@@ -9,6 +9,7 @@ import type {
   Wall,
 } from './types.ts';
 import { nextId } from './ids.ts';
+import { findCabinetTemplate, resolveTemplateUnitWidths } from './templates.ts';
 
 /**
  * 文档工厂 —— 所有"新对象"的唯一构造点。
@@ -117,6 +118,64 @@ export function createCabinet(opts: {
 }
 
 /**
+ * 按柜型预设构造柜体 —— 模板机制的唯一解释点（Phase B）。
+ *
+ * 模板只是声明式骨架（见 core/templates.ts），真正的分区构造仍然全部
+ * 走 makeUnit：五金从规则集挑、子规格一个不漏。模板不产生第二套构造
+ * 逻辑，UI / AI / MCP / 命令行四条通道共用这一个入口。
+ */
+export function createCabinetFromTemplate(opts: {
+  templateId: string;
+  name?: string;
+  roomId: string;
+  x: number;
+  y: number;
+  rotation?: number;
+  rules: RuleSet;
+  takenIds?: Iterable<string>;
+  id?: string;
+  params?: Partial<CabinetParams>;
+}): Cabinet {
+  const tpl = findCabinetTemplate(opts.templateId);
+  const widths = resolveTemplateUnitWidths(tpl);
+  const units: UnitSpec[] =
+    tpl.units.length === 0
+      ? defaultUnits(tpl.params.width, opts.rules)
+      : tpl.units.map((u, i) =>
+          makeUnit({
+            id: `unit_${String(i + 1).padStart(3, '0')}`,
+            kind: u.kind,
+            requestedWidth: widths[i]!,
+            nickname: u.nickname,
+            rules: opts.rules,
+            depth: tpl.params.depth,
+            count: u.count,
+            rodHeight: u.rodHeight,
+            doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
+          })
+        );
+  // 模板外形参数覆盖默认值；bodyLift 只有显式给了才覆盖（undefined 不许抹掉默认 80）
+  const tplParams: Partial<CabinetParams> = {
+    width: tpl.params.width,
+    height: tpl.params.height,
+    depth: tpl.params.depth,
+  };
+  if (tpl.params.bodyLift != null) tplParams.bodyLift = tpl.params.bodyLift;
+  return createCabinet({
+    id: opts.id,
+    name: opts.name ?? tpl.name,
+    roomId: opts.roomId,
+    x: opts.x,
+    y: opts.y,
+    rotation: opts.rotation,
+    rules: opts.rules,
+    takenIds: opts.takenIds,
+    params: { ...tplParams, ...opts.params },
+    units,
+  });
+}
+
+/**
  * 按 kind 造一个分区 —— **新分区的唯一构造点**。
  *
  * 为什么必须抽出来：默认三分区（defaultUnits）和 AI 的「新增分区」动作
@@ -144,7 +203,7 @@ export function makeUnit(opts: {
    * 调用方拿不到、也不该自己去挑铰链型号。
    * 风格预设（RuleSet.stylePresets）通过它给分区带门。
    */
-  doors?: { count: number; gapMid?: number; gapOuter?: number };
+  doors?: { count: number; gapMid?: number; gapOuter?: number; hingeSide?: 'left' | 'right' };
 }): UnitSpec {
   const id = opts.id ?? nextId('unit', opts.takenIds ?? []);
   const base = { id, kind: opts.kind, requestedWidth: Math.round(opts.requestedWidth) };
@@ -188,7 +247,7 @@ export function makeUnit(opts: {
       gapOuter: opts.doors.gapOuter ?? 2,
       gapMid: opts.doors.gapMid ?? 3,
       hinge: pickHinge(opts.rules),
-      hingeSide: 'left',
+      hingeSide: opts.doors.hingeSide ?? 'left',
     };
   }
   return unit;
@@ -198,8 +257,7 @@ function clampInt(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, Math.round(v)));
 }
 
-export function defaultNickname(kind: UnitSpec['kind']): string {
-  switch (kind) {
+export function defaultNickname(kind: UnitSpec['kind']): string {  switch (kind) {
     case 'drawerBank':
       return '抽屉';
     case 'hanging':

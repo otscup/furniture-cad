@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import type { SnapSettings } from '../viewport/snapping.ts';
 import { TOOLS } from './types.ts';
 import type { Tool } from './types.ts';
+import { CABINET_TEMPLATES } from '../core/templates.ts';
 
 export type RightTab =
   | 'props'
@@ -33,6 +34,9 @@ export function Toolbar(props: {
   snap: SnapSettings;
   setSnap: (s: SnapSettings) => void;
   onNewRoom: () => void;
+  /** 放置柜体使用的柜型预设（与命令行 TPL 共用状态） */
+  templateId: string;
+  setTemplateId: (id: string) => void;
   onDuplicate: () => void;
   onDelete: () => void;
   hasSelection: boolean;
@@ -149,6 +153,18 @@ export function Toolbar(props: {
         <button type="button" className="tb-btn" title="新建一个 3.2×2.6m 矩形房间" onClick={props.onNewRoom}>
           + 房间
         </button>
+        <select
+          className="tb-select"
+          title={`放置柜型：${CABINET_TEMPLATES.find((t) => t.id === props.templateId)?.hint ?? ''}（命令行 TPL 可切换）`}
+          value={props.templateId}
+          onChange={(e) => props.setTemplateId(e.target.value)}
+        >
+          {CABINET_TEMPLATES.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name} {t.params.width}×{t.params.height}×{t.params.depth}
+            </option>
+          ))}
+        </select>
         <button type="button" className="tb-btn" disabled={!props.canDuplicate} title="复制选中柜体（Ctrl+D）" onClick={props.onDuplicate}>
           复制
         </button>

@@ -3,7 +3,8 @@ import type { Vec2 } from '../core/types.ts';
 import type { Command, ExecResult } from '../core/commandBus.ts';
 import * as CMD from '../core/commands.ts';
 import { bus, useBusVersion, RULESET } from '../state/store.ts';
-import { createCabinet as makeCabinet, createWall as makeWall, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, rectRoom, sampleProject } from '../core/docFactory.ts';
+import { createWall as makeWall, createCabinetFromTemplate, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, rectRoom, sampleProject } from '../core/docFactory.ts';
+import { CABINET_TEMPLATES } from '../core/templates.ts';
 import { placeAgainstNearestWall } from '../core/snapPlace.ts';
 import { DEFAULT_SNAP } from '../viewport/snapping.ts';
 import type { SnapSettings } from '../viewport/snapping.ts';
@@ -70,6 +71,8 @@ export function App() {
    */
   const [explode, setExplodeRaw] = useState(false);
   const [tool, setTool] = useState<Tool>('select');
+  /** 放置柜体使用的柜型预设（工具栏下拉 / 命令行 TPL 共用同一个状态） */
+  const [templateId, setTemplateId] = useState<string>('default');
   const [selection, setSelection] = useState<string[]>([]);
   const [snap, setSnap] = useState<SnapSettings>(DEFAULT_SNAP);
   const [showGrid, setShowGrid] = useState(true);
@@ -272,19 +275,21 @@ export function App() {
         toast('info', '还没有房间，先在工具栏点「+ 房间」，或直接用「画墙」工具画一面墙（会自动建房间）');
         return;
       }
-      const width = 900;
-      const placed = placeAgainstNearestWall(project, p, width);
+      // 柜型预设：外形尺寸来自模板（鞋柜浅进深 / 吊柜矮 / 电视柜宽矮），
+      // 分区骨架由模板声明、经 docFactory 唯一构造点落地 —— UI 不自己拼 UnitSpec
+      const tpl = CABINET_TEMPLATES.find((t) => t.id === templateId) ?? CABINET_TEMPLATES[0]!;
+      const placed = placeAgainstNearestWall(project, p, tpl.params.width);
       // 柜体必须归属"吸附到的那面墙所在的房间"，否则会出现跨房间归属混乱
       const ownerRoom =
         project.rooms.find((r) => placed.wallId && r.walls.some((w) => w.id === placed.wallId)) ?? project.rooms[0];
-      const cab = makeCabinet({
-        name: `柜体 ${project.cabinets.length + 1}`,
+      const cab = createCabinetFromTemplate({
+        templateId: tpl.id,
+        name: `${tpl.name} ${project.cabinets.length + 1}`,
         roomId: ownerRoom.id,
         x: placed.x,
         y: placed.y,
         rotation: placed.rotation,
         rules: bus.getRules(),
-        params: { width },
         takenIds: project.cabinets.map((c) => c.id),
       });
       if (run(CMD.createCabinet(cab))) {
@@ -298,7 +303,7 @@ export function App() {
         );
       }
     },
-    [run, toast]
+    [run, templateId, toast]
   );
 
   const onCreateWall = useCallback(
@@ -530,6 +535,22 @@ export function App() {
           setTool('cabinet');
           setLastMsg('放柜体：在墙上点一下会自动贴墙');
           return null;
+        // ── TPL：柜型预设切换。裸 TPL 列出全部，TPL <id> 切换当前放置柜型 ──
+        // 与工具栏下拉共用 templateId 状态，四条通道同权同位。
+        case 'TPL':
+        case 'TEMPLATE': {
+          if (!arg) {
+            const list = CABINET_TEMPLATES.map((t) => `${t.id === templateId ? '▶' : '　'}${t.id}（${t.name}，${t.params.width}×${t.params.height}×${t.params.depth}）`);
+            return [`当前柜型：${CABINET_TEMPLATES.find((t) => t.id === templateId)?.name ?? templateId}`, ...list].join('\n');
+          }
+          const tpl = CABINET_TEMPLATES.find((t) => t.id === arg.toLowerCase() || t.name === arg);
+          if (!tpl) {
+            return `未知柜型「${arg}」—— 可用：${CABINET_TEMPLATES.map((t) => t.id).join('、')}`;
+          }
+          setTemplateId(tpl.id);
+          setLastMsg(`放置柜型已切到「${tpl.name}」`);
+          return `放置柜型已切到「${tpl.name}」：${tpl.hint}`;
+        }
         case 'S':
         case 'SELECT':
           setTool('select');
@@ -684,7 +705,7 @@ export function App() {
           return `未知命令：${head}`;
       }
     },
-    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onMirror, onNewRoom, onRotate90, run, savedAt, selectedCabs, setExplode, setMode, startMove, toast]
+    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onMirror, onNewRoom, onRotate90, run, savedAt, selectedCabs, setExplode, setMode, startMove, templateId, toast]
   );
 
   // ── 键盘 ──
@@ -845,6 +866,8 @@ export function App() {
       <Toolbar
         tool={tool}
         setTool={setTool}
+        templateId={templateId}
+        setTemplateId={setTemplateId}
         mode={mode}
         setMode={setMode}
         explode={explode}

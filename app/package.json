@@ -23,6 +23,7 @@
     "verify:projectfile": "node verify/projectfile-acceptance.ts",
     "verify:pickline": "node verify/pickline-acceptance.ts",
     "verify:sheetedit": "node verify/sheet-edit-acceptance.ts",
+    "shot:sheetedit": "node verify/shot-sheet-edit.cjs",
     "verify:bodies3d": "node verify/bodies3d-acceptance.ts",
     "verify:admin": "node verify/admin-acceptance.ts",
     "verify:templates": "node verify/templates-acceptance.ts",

@@ -104,7 +104,15 @@ function run(cmd, args, opts = {}) {
 }
 
 const PORT = Number(process.env.PORT ?? 8787);
-const HOST = '127.0.0.1'; // ← 绝不改成 0.0.0.0
+/**
+ * 监听地址：默认**只绑回环**（127.0.0.1）——本地优先，接口不出网。
+ * 这是安全模型的一部分（无 TLS、JSON 文件存储都建立在"不出网"的前提上），
+ * 所以没有 APP_HOST 显式指定时绝不变。容器化部署是唯一例外：
+ * Docker 的端口发布要求进程绑 0.0.0.0（容器网络边界由 Docker NAT 承担，
+ * 公网 TLS 必须由前置反代终止——见 DEPLOY.md）。非回环启动时横幅会大声警告。
+ */
+const HOST = process.env.APP_HOST?.trim() || '127.0.0.1';
+const IS_LOOPBACK = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
 
 /**
  * ── 「只监听 127.0.0.1」管的是**入站**，和"能不能连局域网的模型"是两件事 ──
@@ -1301,5 +1309,11 @@ server.listen(PORT, HOST, () => {
   console.log('        GET|PUT /api/settings/smtp · POST /api/settings/smtp/test');
   if (process.env.APP_ENV_PATH || process.env.APP_MEM_PATH || process.env.APP_ACCOUNTS_PATH || process.env.APP_AUDIT_PATH) {
     console.log('  （本次运行使用了 APP_*_PATH 覆盖，未落在项目默认位置）');
+  }
+  if (!IS_LOOPBACK) {
+    console.log('');
+    console.log('  ⚠⚠⚠ 正在监听非回环地址：接口已暴露到容器/网络。');
+    console.log('  ⚠ 本服务没有 TLS —— 公网部署必须由反向代理终止 HTTPS（见 DEPLOY.md）。');
+    console.log('  ⚠ 请确认已建立第一个账号（accounts 模式），否则全部接口免登录。');
   }
 });

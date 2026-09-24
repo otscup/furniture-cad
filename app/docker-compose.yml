@@ -1,0 +1,32 @@
+# ══════════════════════════════════════════════════════════════════════
+#  家具 CAD —— 容器编排
+#
+#  用法（在服务器上）：
+#    1. 把项目 clone / 上传到服务器，cd app
+#    2. mkdir -p data && cp .env data/.env（没有 .env 就先建一个空的，
+#       AI Key 与 SMTP 都可以在管理后台 UI 里配，会写进 data/.env）
+#    3. docker compose up -d --build
+#    4. 浏览器开 http://服务器IP:8787 —— 立即建立第一个账号（owner），
+#       之后全接口要求登录；公网请务必在前面挂 nginx/caddy 终止 TLS。
+#
+#  数据持久化：./data 挂到 /app/data，账号库、审计、记忆、SMTP/AI 配置
+#  全在里面 —— 升级镜像 = 重建容器，数据不动。
+# ══════════════════════════════════════════════════════════════════════
+services:
+  furniture-cad:
+    build: .
+    container_name: furniture-cad
+    restart: unless-stopped
+    ports:
+      - '8787:8787'
+    environment:
+      # 运行时数据全部收进一个卷：账号库 / 审计 / 记忆 / 验证码库 / .env
+      APP_ENV_PATH: /app/data/.env
+      APP_MEM_PATH: /app/data/corrections.jsonl
+      APP_ACCOUNTS_PATH: /app/data/accounts.json
+      APP_AUDIT_PATH: /app/data/audit.jsonl
+      APP_REGISTRATIONS_PATH: /app/data/pending-registrations.json
+      # 落盘发信模式的默认落点也放进卷（管理后台可改 SMTP_FILE_OUT）
+      SMTP_FILE_OUT: /app/data/outbox.jsonl
+    volumes:
+      - ./data:/app/data

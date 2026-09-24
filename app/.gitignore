@@ -21,3 +21,6 @@ verify/out/chrome-profile-*/
 
 # 注册验证码库 —— 运行时数据（与账号库同理，每台机器各自生成）
 memory/pending-registrations.json
+
+# 服务器部署的运行时数据卷（账号库/审计/.env 等）—— 绝不入库
+data/

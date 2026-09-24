@@ -30,9 +30,11 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, createReadStream, mkdtempSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
 import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS } from '../shared/aiContract.mjs';
 
@@ -55,6 +57,45 @@ const ACCOUNTS_PATH = process.env.APP_ACCOUNTS_PATH ? resolve(process.env.APP_AC
 const AUDIT_PATH = process.env.APP_AUDIT_PATH ? resolve(process.env.APP_AUDIT_PATH) : join(ROOT, 'memory', 'audit.jsonl');
 const MEM_DIR = dirname(MEM_PATH);
 const DIST = join(ROOT, 'dist');
+
+// ── 导出链路的外部程序 ──
+const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
+const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
+
+/**
+ * Python 解释器：优先环境变量，其次项目根的 .venv（spike 用的就是它，ezdxf 装在那里）。
+ * 找不到就如实报错，不许"假装导出成功"。
+ */
+function pythonExe() {
+  // 注意 .venv 在**项目根**，不是 app/ 下（ROOT = app）。spike/run.sh 用的也是 ../.venv。
+  const cand = [
+    process.env.APP_PYTHON,
+    join(ROOT, '.venv', 'Scripts', 'python.exe'),
+    join(ROOT, '..', '.venv', 'Scripts', 'python.exe'),
+    join(ROOT, '..', '.venv', 'bin', 'python'),
+    'python',
+  ]
+    .filter(Boolean)
+    // 显式给的路径必须真的存在才用；裸命令名（'python'）无法 existsSync，直接保留作兜底
+    .filter((c) => (c.includes('/') || c.includes('\\') ? existsSync(c) : true));
+  return cand[0] ?? 'python';
+}
+
+/** 跑一个子进程并收齐 stdout/stderr。cwd 固定到项目根，相对路径才不会飘。 */
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { cwd: ROOT, ...opts });
+    let out = '';
+    let err = '';
+    if (opts.input !== undefined) p.stdin.end(opts.input);
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('error', reject);
+    p.on('close', (code) =>
+      code === 0 ? resolve({ out, err }) : reject(new Error(`${cmd} 退出码 ${code}：${(err || out).slice(0, 600)}`))
+    );
+  });
+}
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = '127.0.0.1'; // ← 绝不改成 0.0.0.0
@@ -936,7 +977,90 @@ async function handleApi(req, res, pathname) {
     return json(res, 200, { ok: true, path: MEM_PATH, bytes: Buffer.byteLength(text), backup: `${MEM_PATH}.bak` });
   }
 
+  // ───────────────────────────── 导出 ─────────────────────────────
+  //
+  // 几何**必须由后端从语义模型重算**，不接受浏览器上传的图元：
+  // 接受上传等于接受一份没人校验过的几何，"图 = 料" 这条线当场断掉。
+  // 所以链路是：project(JSON，几 KB) → node 跑 TS 生成中立格式 → python 序列化成 DXF。
+  // Python 只做序列化，不做任何计算 —— 这是这条链路存在的理由。
+
+  if (pathname === '/api/export/dxf' && req.method === 'POST') {
+    const body = await readBody(req);
+    const project = body.project;
+    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    const which = Array.isArray(body.which) && body.which.length ? body.which.filter((x) => x === 'plan' || x === 'sheet') : ['plan', 'sheet'];
+    if (which.length === 0) return json(res, 400, { ok: false, error: 'which 只能是 plan / sheet' });
+    const version = body.version === 'R2000' ? 'R2000' : 'R2007'; // R2000/GBK 只作兼容备用
+
+    const dir = mkdtempSync(join(tmpdir(), 'furniture-dxf-'));
+    const neutralPath = join(dir, 'neutral.json');
+    const dxfPath = join(dir, 'out.dxf');
+    try {
+      const neutralOut = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
+        input: JSON.stringify({ project, which, modelVersion: String(body.modelVersion ?? 'unknown') }),
+      });
+      writeFileSync(neutralPath, neutralOut.out, 'utf8');
+      const infoRaw = await run(pythonExe(), [EXPORT_DXF_PY, neutralPath, dxfPath, version]);
+      const info = JSON.parse(infoRaw.out || '{}');
+      const stamp = new Date().toISOString().slice(0, 10);
+      const base = `${String(project.name || 'project')}_${which.join('-')}_${stamp}_${version}.dxf`;
+      res.writeHead(200, {
+        'Content-Type': 'application/dxf',
+        // 中文文件名必须走 RFC 5987，否则浏览器下载下来是乱码
+        'Content-Disposition': `attachment; filename="export.dxf"; filename*=UTF-8''${encodeURIComponent(base)}`,
+        'X-Export-Info': encodeURIComponent(JSON.stringify(info)),
+      });
+      createReadStream(dxfPath).pipe(res);
+      return;
+    } catch (e) {
+      return json(res, 500, { ok: false, error: `DXF 导出失败：${e.message}` });
+    }
+  }
+
+  /** 开料单（板件清单）。纯文本 CSV，Excel 直接能开 —— 加 BOM 否则中文乱码。 */
+  if (pathname === '/api/export/cutlist' && req.method === 'POST') {
+    const body = await readBody(req);
+    const project = body.project;
+    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    try {
+      const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
+        input: JSON.stringify({ project, which: [], modelVersion: String(body.modelVersion ?? 'unknown') }),
+      });
+      const n = JSON.parse(r.out);
+      const rows = [
+        ['序号', '板件ID', '名称', '角色', '所属', '材质', '厚(mm)', '长(mm)', '宽(mm)', '数量', '纹理', '单件面积(m²)'],
+      ];
+      // 开料习惯：先按材质 + 厚度分组，组内按面积从大到小 —— 排版时一眼看到大板
+      const panels = [...n.panels].sort(
+        (a, b) => a.material.localeCompare(b.material) || a.thickness - b.thickness || b.length * b.width - a.length * a.width
+      );
+      panels.forEach((p, i) => {
+        rows.push([
+          i + 1, p.id, p.nameZh, p.role, p.belongsTo, p.material, p.thickness, p.length, p.width, p.qty, p.grain,
+          ((p.length * p.width) / 1e6).toFixed(3),
+        ]);
+      });
+      const csv = '\uFEFF' + rows.map((r2) => r2.map(csvCell).join(',')).join('\r\n') + '\r\n';
+      const base = `${String(project.name || 'project')}_开料单_${new Date().toISOString().slice(0, 10)}.csv`;
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="cutlist.csv"; filename*=UTF-8''${encodeURIComponent(base)}`,
+        'X-Export-Stats': encodeURIComponent(JSON.stringify(n.stats)),
+      });
+      res.end(csv);
+      return;
+    } catch (e) {
+      return json(res, 500, { ok: false, error: `开料单生成失败：${e.message}` });
+    }
+  }
+
   return json(res, 404, { ok: false, error: `未知接口 ${req.method} ${pathname}` });
+}
+
+/** CSV 单元格转义：含逗号/引号/换行时必须包起来，内部引号翻倍 */
+function csvCell(v) {
+  const s = String(v ?? '');
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 // ───────────────────────────── 静态文件 ─────────────────────────────

@@ -30,7 +30,7 @@ import type { VariantDraft, VariantSpec } from '../src/core/variants.ts';
  *      所以断言正视图图框的**宽度必须等于柜宽而不是柜深**（侧视图宽 = 柜深）。
  *
  *   ② **风格只改分格，不许改规格。**
- *      三份方案的宽/高/深必须逐字相同。风格是"怎么分"，不是"多大"。
+ *      每份方案的宽/高/深必须逐字相同。风格是"怎么分"，不是"多大"。
  *
  *   ③ **候选不是模型，采用时 id 必须换。**
  *      候选里的 `unit_001` 与项目里已有的 `unit_001` 会撞 ——
@@ -94,7 +94,7 @@ ok('每个预设产出一份候选', variants.length === presets.length, `${vari
  * 板件 id 是 `…_unit_00N_SH1` 拼出来的，三个分区同名就让多块板撞成同一个 id：
  * 校验器报 `DUP-PANEL-ID`，而清单里两块不同的板会变成一块 —— **到了生产就是下错料**。
  * 这种撞法在任何一层都不报错，只是静默共用一条记录。
- * 而「通体四门」只有一个分区，所以这个缺陷在它身上完全看不出来 ——
+ * 而「通体挂衣」只有一个分区，所以这个缺陷在它身上完全看不出来 ——
  * 下面第二条断言就是为了防止"只有单分区方案"时这条变成空断言。
  */
 ok(
@@ -116,7 +116,7 @@ ok('每份候选都没有派生错误', variants.every((v) => !v.error), JSON.st
 ok('每份候选都派出了非空的正视图', variants.every((v) => v.front.length > 0), JSON.stringify(variants.map((v) => [v.presetId, v.front.length])));
 
 ok(
-  '【铁律】风格只改分格，不改规格：三份候选的宽/高/深逐字等于规格',
+  '【铁律】风格只改分格，不改规格：每份候选的宽/高/深都逐字等于规格',
   variants.every((v) => v.cabinet.params.width === 2400 && v.cabinet.params.height === 2400 && v.cabinet.params.depth === 600),
   JSON.stringify(variants.map((v) => [v.presetId, v.cabinet.params.width, v.cabinet.params.height, v.cabinet.params.depth]))
 );
@@ -163,21 +163,35 @@ ok('各方案的分区数不全相同（否则"选风格"就是假的）', new S
 const doorCounts = variants.map((v) => v.cabinet.layout.units.reduce((a, u) => a + (u.doors?.count ?? 0), 0));
 ok('各方案的门扇配置不全相同', new Set(doorCounts).size >= 2, JSON.stringify(doorCounts));
 
-const full = byId('STYLE_FULL_FRONT');
+const full = byId('STYLE_FULL_HANGING');
 const three = byId('STYLE_THREE_PART');
-ok('「通体四门」是 1 个满宽分区', full?.cabinet.layout.units.length === 1, JSON.stringify(full?.summary));
+const half = byId('STYLE_HALF_HALF');
+ok('「通体挂衣」是 1 个满宽分区', full?.cabinet.layout.units.length === 1, JSON.stringify(full?.summary));
 ok('「三段分格」是 3 个分区', three?.cabinet.layout.units.length === 3, JSON.stringify(three?.summary));
 ok(
-  '「通体四门」带门板，「三段分格」只在层板区带门 —— 分格方式确实不同',
-  Boolean(full?.cabinet.layout.units[0].doors) && three?.cabinet.layout.units.filter((u) => u.doors).length === 1,
+  '「通体挂衣」整柜带门，「三段分格」只有挂衣区与层板区带门（抽屉区自带面板，不该再挂门）',
+  Boolean(full?.cabinet.layout.units[0].doors) && three?.cabinet.layout.units.filter((u) => u.doors).length === 2,
   JSON.stringify([full?.cabinet.layout.units.map((u) => u.doors?.count ?? 0), three?.cabinet.layout.units.map((u) => u.doors?.count ?? 0)])
+);
+/**
+ * 「对半分格」是这次新增的常用款，它的特征不在分区数（也是 2 个），
+ * 而在**两个挂衣区的挂衣杆高度不同**（短衣 1050 / 长衣 1800）。
+ * 只比分区数会把它和「叠放为主」混为一谈 —— 那正是"选风格"失效的样子。
+ */
+ok(
+  '「对半分格」两个挂衣区的挂衣杆高度必须不同（短衣 1050 / 长衣 1800）',
+  (() => {
+    const rods = (half?.cabinet.layout.units ?? []).map((u) => u.rod?.heightFromBottom ?? 0);
+    return rods.length === 2 && rods[0] !== rods[1];
+  })(),
+  JSON.stringify(half?.cabinet.layout.units.map((u) => [u.nickname, u.rod?.heightFromBottom]))
 );
 
 // ───────────────────────── E. 方案自带问题：选风格时就看得见 ─────────────────────────
 
 section('E. 每份候选自带 problem list（客户选风格时就看得见）');
 
-const wide = buildVariants({ ...SPEC, width: 3600 }, rules).find((v) => v.presetId === 'STYLE_FULL_FRONT')!;
+const wide = buildVariants({ ...SPEC, width: 3600 }, rules).find((v) => v.presetId === 'STYLE_FULL_HANGING')!;
 /**
  * 注意：这里断言的是"**包含** RULE-DOOR-MAX-WIDTH"，不是"topIssue 就是它"。
  * 3600mm 宽会同时触发好几个 ERROR（板件超幅面排在前），topIssue 返回的是**第一条** ERROR。
@@ -185,7 +199,7 @@ const wide = buildVariants({ ...SPEC, width: 3600 }, rules).find((v) => v.preset
  * 那次失败是断言自己写错，不是产品缺陷。
  */
 ok(
-  '3600mm 宽 + 通体四门 → 单扇门约 895mm，必然触发 RULE-DOOR-MAX-WIDTH',
+  '3600mm 宽 + 通体挂衣 → 单扇门约 895mm，必然触发 RULE-DOOR-MAX-WIDTH',
   wide.issues.some((i) => i.code === 'RULE-DOOR-MAX-WIDTH'),
   JSON.stringify(wide.issues.map((i) => i.code))
 );
@@ -196,7 +210,7 @@ ok(
 );
 
 ok(
-  '2400mm 宽 + 通体四门 → 单扇约 588mm，不超 600mm 上限（证明上面的报错不是"一律报错"）',
+  '2400mm 宽 + 通体挂衣 → 单扇约 588mm，不超 600mm 上限（证明上面的报错不是"一律报错"）',
   !byId('STYLE_FULL_FRONT')?.issues.some((i) => i.code === 'RULE-DOOR-MAX-WIDTH'),
   JSON.stringify(byId('STYLE_FULL_FRONT')?.issues.map((i) => i.code))
 );

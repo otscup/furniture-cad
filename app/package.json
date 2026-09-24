@@ -14,11 +14,12 @@
     "verify:views": "node verify/views-acceptance.ts",
     "verify:memory": "node verify/memory-acceptance.ts",
     "verify:ui": "node verify/run-ui-verify.mjs",
-    "verify:all": "npm run typecheck && npm run verify && npm run verify:views && npm run verify:memory && npm run verify:assembly && npm run verify:ai && npm run verify:variants && npm run verify:ui",
+    "verify:all": "npm run typecheck && npm run verify && npm run verify:views && npm run verify:memory && npm run verify:assembly && npm run verify:ai && npm run verify:variants && npm run verify:export && npm run verify:ui",
     "verify:assembly": "node verify/assembly-acceptance.ts",
     "verify:ai": "node verify/ai-acceptance.ts",
     "verify:lan": "node verify/lan-probe.mjs",
-    "verify:variants": "node verify/variants-acceptance.ts"
+    "verify:variants": "node verify/variants-acceptance.ts",
+    "verify:export": "node verify/export-acceptance.ts"
   },
   "dependencies": {
     "react": "^19.3.0",

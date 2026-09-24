@@ -25,6 +25,7 @@ import { AdminPanel } from './panels/AdminPanel.tsx';
 import { AIPanel } from './panels/AIPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
+import { ExportPanel } from './panels/ExportPanel.tsx';
 import { loadToken, saveToken } from '../ai/aiClient.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
@@ -758,6 +759,9 @@ export function App() {
             <button type="button" className={rightTab === 'variant' ? 'on' : ''} onClick={() => setRightTab('variant')}>
               方案
             </button>
+            <button type="button" className={rightTab === 'export' ? 'on' : ''} onClick={() => setRightTab('export')}>
+              导出
+            </button>
             <button type="button" className={rightTab === 'ai' ? 'on' : ''} onClick={() => setRightTab('ai')}>
               AI
             </button>
@@ -804,6 +808,7 @@ export function App() {
               }}
             />
           ) : null}
+          {rightTab === 'export' ? <ExportPanel bus={bus} version={version} token={token} onToast={toast} /> : null}
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} onToast={toast} /> : null}

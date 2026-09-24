@@ -2921,6 +2921,57 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ═══════════════════════════════════════════════════════════
     /**
+     * B23 —— 导出面板。
+     *
+     * 这里**故意不真点「导出 DXF」**：那会触发浏览器下载，headless 下的下载行为
+     * 不可控（挂起 / 落到下载目录 / 触发权限提示），会把验收拖进环境问题。
+     * 真实导出链路（spawn node → python → 回读）已由 verify:export 用真 HTTP 覆盖。
+     * 这里钉的是**面板自身的可点性与如实性**：
+     *   · 一张图都不选时按钮必须禁用（否则导出空文件）
+     *   · 有 ERROR 时必须先说话，而不是让人高高兴兴导出一份错图
+     *   · "1:1 不缩放 / 三件套可复现"这两件事必须写在界面上 —— 它们是承诺，不是注释
+     */
+    section('B23 导出面板：图纸选择 / 版本选择 / ERROR 提示 / 禁用逻辑');
+
+    await activateRightTab('导出');
+    await sleep(420);
+
+    const expChecks = await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].map(i=>i.checked)`);
+    ok('「导出」页签在，且默认勾选了平面图与四视图两张', Array.isArray(expChecks) && expChecks.length === 2 && expChecks.every(Boolean), JSON.stringify(expChecks));
+
+    ok(
+      'DXF 版本下拉默认 R2007（原生 UTF-8 主交付，不是兼容备用的 R2000）',
+      (await evalJs(`(()=>{const s=document.querySelector('.side-right select.input');return s?s.value:null})()`)) === 'R2007'
+    );
+
+    const exportBtn = async () => evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')]
+      .find(x=>x.textContent.includes('导出 DXF'));return b?{disabled:b.disabled}:null})()`);
+    ok('「导出 DXF」按钮在', (await exportBtn()) !== null, JSON.stringify(await exportBtn()));
+
+    // 两张图都不勾 → 必须禁用。这条防的是"导出一份空文件"。
+    await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].forEach(i=>{i.click()})`);
+    await sleep(260);
+    ok(
+      '两张图都不选时「导出 DXF」被禁用（不许导出空文件）',
+      ((await exportBtn()) || {}).disabled === true,
+      JSON.stringify(await exportBtn())
+    );
+    ok('面板同时给出一句话解释（禁用不许是无声的）', /至少选一张图/.test(await panelTextAll()));
+    await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].forEach(i=>{i.click()})`);
+    await sleep(260);
+    ok('恢复勾选后按钮回到可用', ((await exportBtn()) || {}).disabled === false, JSON.stringify(await exportBtn()));
+
+    ok(
+      '界面写明"模型空间 1:1"（这是出图纪律的承诺，不是注释里的私事）',
+      /1:1/.test(await panelTextAll())
+    );
+    ok(
+      '界面写明三件套可复现（模型版本 + 生成器 + 规则集）',
+      /三件套/.test(await panelTextAll())
+    );
+
+    // ═══════════════════════════════════════════════════════════
+    /**
      * B19 —— "界面用到的类名，样式表里必须有规则"。
      *
      * 这条断言的由来是一次真实的视觉缺陷：`.note` / `.alert` / `.muted-sm` /
@@ -2973,7 +3024,7 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 它当初漏掉过「方案」，于是那个面板的类名一个都没被审计到 ——
      * "新面板没写样式"这类缺陷会安静地躺在绿灯底下。
      */
-    const RIGHT_TABS = ['属性', '问题', '历史', '图层', '视图', 'AI', '记忆', '后台', '账号', '方案'];
+    const RIGHT_TABS = ['属性', '问题', '历史', '图层', '视图', '方案', '导出', 'AI', '记忆', '后台', '账号'];
     for (const tab of RIGHT_TABS) {
       await activateRightTab(tab);
       if ((await evalJs(`document.querySelectorAll('.side-right .panel-scroll').length`)) === 0) noScrollContainer.push(tab);

@@ -10,6 +10,7 @@ export type RightTab =
   | 'layers'
   | 'views'
   | 'variant'
+  | 'export'
   | 'memory'
   | 'admin'
   | 'ai'

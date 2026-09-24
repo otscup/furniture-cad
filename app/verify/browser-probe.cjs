@@ -96,6 +96,14 @@ const FACT = {
 const results = [];
 let currentGroup = '';
 
+/**
+ * ONLY=<小节关键字> 时只统计/打印该小节 —— 排查单节失败时不必每次等满 3 分钟。
+ * 注意：其他小节的**动作照样执行**（很多小节依赖前序留下的状态），
+ * 只是不记账。所以它是排查工具，不是"跳过前置"的开关。
+ */
+const ONLY = (process.env.ONLY || '').trim();
+const focused = () => !ONLY || currentGroup.includes(ONLY);
+
 function section(title) {
   currentGroup = title;
   console.log(`\n── ${title} ──`);
@@ -103,8 +111,10 @@ function section(title) {
 
 function ok(name, cond, detail) {
   const pass = !!cond;
-  results.push({ group: currentGroup, name, pass, detail });
-  console.log(`${pass ? '  \u2713' : '  \u2717'} ${name}${pass || !detail ? '' : `\n      → ${detail}`}`);
+  if (focused()) {
+    results.push({ group: currentGroup, name, pass, detail });
+    console.log(`${pass ? '  \u2713' : '  \u2717'} ${name}${pass || !detail ? '' : `\n      → ${detail}`}`);
+  }
   return pass;
 }
 
@@ -1227,7 +1237,14 @@ async function waitForApp(url, timeoutMs = 25000) {
       fourNames.every((n) => viewsPanel.includes(n)),
       viewsPanel.slice(0, 220)
     );
-    ok('面板明说四视图是只读派生视图（要改尺寸得回平面图）', /只读派生视图/.test(viewsPanel));
+    // Task #48 之后四视图可编辑了：这条断言的意义从"它声明只读"变为
+    // "它如实说明可编辑 + 四图同源同步 + 哪些不能拖"。文案必须跟着产品走。
+    ok(
+      '面板如实说明四视图可编辑，且改一处四图同步（不再写"只读"骗人）',
+      /可以直接编辑/.test(viewsPanel) && /其余三张同步更新/.test(viewsPanel) && !/只读派生视图/.test(viewsPanel),
+      viewsPanel.slice(0, 160)
+    );
+    ok('面板点明"层板/抽屉由数量派生、不能拖"（把不能做的也讲清楚）', /数量/.test(viewsPanel) && /不能拖/.test(viewsPanel));
     ok(
       '面板写明排布依据是第一角投影（GB / ISO-E），并点名长对正 / 高平齐 / 宽相等',
       /第一角投影/.test(viewsPanel) && /长对正/.test(viewsPanel) && /高平齐/.test(viewsPanel) && /宽相等/.test(viewsPanel)
@@ -1403,7 +1420,9 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('切过去后「▤ 四视图」变成激活态、平面图退出激活', sheetBtnActive === true);
 
     const hudSheet = await text('.vp-hud-sheet');
-    ok('HUD 明说这是「四视图图幅 · 只读」（并且在图上给出怎么改模型）', /四视图图幅/.test(hudSheet) && /只读/.test(hudSheet), hudSheet || '(缺失)');
+    // Task #48：图幅可编辑之后，HUD 不能再写"只读"骗人 —— 必须告诉用户"蓝线可拖"。
+    ok('HUD 明说这是「四视图图幅 · 可编辑」（不再写"只读"误导用户）',
+      /四视图图幅/.test(hudSheet) && /可编辑/.test(hudSheet) && !/只读/.test(hudSheet), hudSheet || '(缺失)');
     ok('图幅模式下不再显示平面坐标读数（X/Y 是平面图的概念，不混进图幅）', (await hudWorld()) === null, JSON.stringify(await hudWorld()));
 
     const sheetCursor = await evalJs(`getComputedStyle(document.querySelector('.vp')).cursor`);
@@ -3304,6 +3323,15 @@ async function waitForApp(url, timeoutMs = 25000) {
     // 点击前的气泡快照（条目级）—— mem_003 之类旧拦截气泡有 8 秒寿命，
     // 断言只看"点击之后**新增**的那几条"（基线差集），旧账不往点选头上算。
     const toastItems = () => evalJs(`[...document.querySelectorAll('.toasts > *')].map(n=>n.textContent)`);
+    /** 等到气泡自然过期清空（非 error 气泡寿命 4.5s），让"新增气泡"的判定不受旧账干扰 */
+    const waitToastsClear = async (limit = 9000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < limit) {
+        if (((await toastItems()) || []).length === 0) return true;
+        await sleep(500);
+      }
+      return false;
+    };
     const baseline26 = (await toastItems()) || [];
     const baseSet26 = new Set(baseline26);
     const freshToasts = async () => {
@@ -3352,6 +3380,245 @@ async function waitForApp(url, timeoutMs = 25000) {
         ok('点线没有写模型（解析是读操作，改不改由用户决定）', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx + 1} → v${await statusVersion()}`);
       }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B36 —— 四视图可编辑：**真鼠标拖动**一条线 = 改一个语义参数。
+     *
+     * 为什么要跑到浏览器里拖一次：node 侧已经验证了映射与命令，
+     * 但"鼠标按下 → 命中 → 预览 → 松手写入"这条**真实链路**只在浏览器里存在。
+     * 历史上"预览与提交不一致"的事故都发生在这条链路上，所以必须真拖。
+     *
+     * 关键断言不是"值变了"，而是三条结构性事实：
+     *   ① 拖完写的确实是语义参数（模型里的 width 变了，不是图元坐标）
+     *   ② 四张图同步（改宽之后，俯视图那条宽线跟着走到同一个数）
+     *   ③ 拖不动的线会**说出原因**，且不改模型
+     *
+     * ── 这一节为什么开头先把工程复位 ──
+     *   第一次跑通时，松手后被"墙体记忆"拦下：气泡说"这次操作把柜体扎进了墙体里"。
+     *   查下来不是产品的错，是**探针的错**：B36 排在 B24（导入测试项目）之后，
+     *   那时 cabinets[0] 已经不是示例里的那个衣柜，而是导入工程里贴着墙的柜子。
+     *   探针不该靠前序小节"遗留的状态"活着 —— 所以 B36 先把工程复位成干净的
+     *   示例工程，让它自成一体、可重复。（复位前的状态照样打印出来，作为证据。）
+     *
+     * ── 为什么往"收窄"方向拖 ──
+     *   示例衣柜 2400mm 已在板材幅面（2440）边缘，再加宽必然新增
+     *   RULE-PANEL-OVER-SHEET。那会让"拖动到底写没写进去"和"板件超幅面"
+     *   两件事混在一起说不清。超幅面另有规则小节覆盖，这里挑一个干净的方向。
+     */
+    // ═══════════════════════════════════════════════════════════
+    section('B36 四视图可编辑：真鼠标拖动 → 写语义参数，四图同步，不可拖的给出理由');
+
+    // 证据：复位前这一节究竟在跑哪个工程、哪个柜子（别让"状态被污染"停留在猜测）
+    const dirty36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState(); const c=p.cabinets[0];
+      return {proj:p.name, cabCount:p.cabinets.length, id:c&&c.id, name:c&&c.name,
+        place:c&&JSON.stringify(c.placement), width:c&&c.params.width};})()`);
+    console.log('[B36 复位前状态] ' + JSON.stringify(dirty36));
+
+    // 先把现场存起来。本节为了可重复必须复位工程，但**下游小节（B30 等）依赖
+    // 前序留下的柜子**——第一轮修完 B36 就顺手把 B30 冲挂了。所以用完必须还原：
+    // "自成一体"不等于"可以随便改全局状态"。
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      window.__b36Saved = structuredClone(s.bus.getState()); return true;})()`);
+
+    // 复位成干净示例工程 —— 本节自成一体
+    const reset36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const df=await import('/src/core/docFactory.ts');
+      s.bus.replaceProject(df.sampleProject(s.RULESET), 'B36 复位为示例工程');
+      const p=s.bus.getState(); const c=p.cabinets[0];
+      return {proj:p.name, id:c.id, name:c.name, width:c.params.width, ver:s.bus.getVersion()};})()`);
+    ok('B36 跑在干净的示例工程上（本节自成一体，不依赖前序小节遗留的状态）',
+      Boolean(reset36) && reset36.proj === '示例户型' && reset36.width === 2400, JSON.stringify(reset36));
+    await sleep(260);
+
+    // 必须在图幅模式下拖：若在平面模式，图纸坐标全在屏幕外，点位换算会失败 ——
+    // 那会让后面几条断言"静默跳过"，看着像通过，其实什么都没验。所以先断言模式。
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b&&!document.querySelector('.vp-hud-sheet'))b.click();return true})()`);
+    await sleep(420);
+    ok('B36 拖动发生在四视图图幅模式下（否则后面的断言会静默跳过）',
+      (await evalJs(`!!document.querySelector('.vp-hud-sheet')`)) === true,
+      `sheet-hud=${await evalJs(`!!document.querySelector('.vp-hud-sheet')`)}`);
+
+    const snap36 = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const v=s.bus.derive().geom.views.pickLines;
+      const find=(view,part,edge)=>{const pl=v.find(x=>x.view===view&&x.part===part&&(edge===undefined||x.edge===edge));
+        return pl?{x:pl.pts[0].x,y:pl.pts[0].y}:null;};
+      return {ver:s.bus.getVersion(), width:s.bus.getState().cabinets[0].params.width,
+        frontW:find('front','outer.width','max'), topW:find('top','outer.width','max'),
+        frontMin:find('front','outer.width','min'),
+        // 基准边那条竖线的**中点**：不要用端点再偏移一个固定值 ——
+        // 图幅缩放下命中容差只有一百多毫米，固定偏移会直接打空，
+        // 于是"拖了没反应"会被误当成"产品没给理由"。
+        frontMinMid:(()=>{const pl=v.find(x=>x.view==='front'&&x.part==='outer.width'&&x.edge==='min');
+          return pl?{x:(pl.pts[0].x+pl.pts[1].x)/2, y:(pl.pts[0].y+pl.pts[1].y)/2}:null;})(),
+        hasSide:!!v.find(x=>x.view==='side'), hasTop:!!v.find(x=>x.view==='top')};})()`);
+
+    const s0 = await snap36();
+    ok('B36 反查层覆盖侧视图与俯视图（这两张图以前没有可点线）', s0.hasSide && s0.hasTop, JSON.stringify({ hasSide: s0.hasSide, hasTop: s0.hasTop }));
+
+    // 拖正视图右外轮廓 +100mm：像素量 = 100 × 当前 scale（与渲染同款换算的逆运算）
+    const line36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const v=s.bus.derive().geom.views.pickLines;
+      const pl=v.find(x=>x.view==='front'&&x.part==='outer.width'&&x.edge==='max');
+      return pl?{mid:{x:(pl.pts[0].x+pl.pts[1].x)/2, y:(pl.pts[0].y+pl.pts[1].y)/2}}:null;})()`);
+    ok('B36 取到正视图右外轮廓（= 柜宽那条边）', line36 !== null, JSON.stringify(line36));
+
+    // 先用**产品自己的命中测试**在算出的世界点上打一枪：这样"坐标算错"与
+    // "鼠标事件没进到处理函数"两类失败就能分开，不用猜。
+    if (line36) {
+      const selfHit = await evalJs(`(async()=>{
+        const s=await import('/src/state/store.ts');
+        const ht=await import('/src/viewport/hitTest.ts');
+        const sn=await import('/src/viewport/snapping.ts');
+        const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+        const tol=sn.snapToleranceWorld(8, cd.cam.scale);
+        const hit=ht.hitPart(s.bus.derive().geom.views.pickLines, {x:${line36.mid.x}, y:${line36.mid.y}}, tol);
+        return hit?{view:hit.view, part:hit.part, edge:hit.edge, unit:hit.unitIndex}:null;})()`);
+      ok('B36 产品自身的命中测试在该世界坐标上命中了"正视图·柜宽·末端边"',
+        selfHit !== null && selfHit.view === 'front' && selfHit.part === 'outer.width' && selfHit.edge === 'max',
+        JSON.stringify(selfHit));
+    }
+
+    // 页面内直接跑一遍 dragPlanOf：读的是**界面正在用的同一份模块**，
+    // 任何隐藏异常（比如契约导入失败）都会在这里现形，而不是变成"拖了没反应"。
+    const plan36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const sd=await import('/src/viewport/sheetDrag.ts');
+      const pl=s.bus.derive().geom.views.pickLines.find(x=>x.view==='front'&&x.part==='outer.width'&&x.edge==='max');
+      const p=sd.dragPlanOf(pl);
+      return p.ok?{ok:true,label:p.spec.labelZh,axis:p.spec.axis,sign:p.spec.sign,min:p.spec.min,max:p.spec.max}:{ok:false,reason:p.reason};})()`);
+    ok('B36 页面内 dragPlanOf 判定这条线可拖（与界面同一份模块）', Boolean(plan36 && plan36.ok), JSON.stringify(plan36));
+
+    // 拖之前的硬错数：拖完不许变多（拖动只该改这一个尺寸，不该顺手造出新问题）
+    const errCount36 = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      return s.bus.derive().issues.filter(i=>i.severity==='ERROR').length;})()`);
+
+    if (line36) {
+      const c36 = await clientOfSheet(line36.mid.x, line36.mid.y);
+      ok('B36 拖动起点换算成功且落在视口内', inViewport(c36), JSON.stringify(c36));
+      if (inViewport(c36)) {
+        // 往"收窄"方向拖 ~100mm。图幅模式为了塞下四张图，scale 很小（约 0.047 px/mm），
+        // 100mm 只有 5px 左右 —— 所以**不能**断言"正好 100mm"，像素取整本身就带误差。
+        // 误差上限 = 半个像素对应的毫米数，这里照实算出来，不拍脑袋写死。
+        const px36 = -Math.max(3, Math.round(100 * c36.scale));
+        const halfPxMm = Math.ceil(0.5 / c36.scale) + 1;
+        const errBefore36 = await errCount36();
+        await mouseDown(c36.x, c36.y);
+        await sleep(90);
+        await moveMouse(c36.x + Math.round(px36 / 2), c36.y, 1);
+        await sleep(90);
+        const read36 = await hudReadout();
+        await moveMouse(c36.x + px36, c36.y, 1);
+        await sleep(120);
+        const read36b = await hudReadout();
+        await mouseUp(c36.x + px36, c36.y);
+        await sleep(320);
+        // 诊断：把"松手瞬间"的读数与气泡打进日志 —— 命令若被规则拒绝，气泡里就是原因
+        const toastsUp36 = ((await toastItems()) || []).slice(-3).join(' | ');
+        console.log(`[B36 诊断] 目标像素位移=${px36}px scale=${c36.scale} 半像素=${halfPxMm}mm 松手前读数=[${read36b}] 松手后气泡=[${toastsUp36}]`);
+
+        const s1 = await snap36();
+        const errAfter36 = await errCount36();
+        // 悬停读数形如"柜宽 2400mm · 左右拖…"，拖动读数形如"柜宽 → 2300mm"（含箭头）。
+        // 必须断言箭头，否则"悬停有读数"会冒充"拖动有读数"，把真失败盖过去。
+        ok('B36 拖动过程有读数：显示"柜宽 → 目标值mm"（所见即所得，且是拖动态不是悬停态）',
+          /柜宽/.test(String(read36 || '')) && /→/.test(String(read36 || '')),
+          `拖动中读数=[${read36}] 末=[${read36b}]`);
+        ok('B36 松手后模型版本 +1（一次拖动 = 一条命令 = 一次撤销）', s1.ver === s0.ver + 1, `v${s0.ver} → v${s1.ver}`);
+        ok('B36 模型里的柜宽真的变了（写的是语义参数，不是图元坐标）',
+          s1.width !== s0.width && s1.width < s0.width, `${s0.width} → ${s1.width}`);
+        ok('B36 位移量 ≈ 100mm（差值是像素取整带来的，已按半像素算过上限）',
+          Math.abs(Math.abs(s1.width - s0.width) - 100) <= halfPxMm,
+          `Δ=${Math.abs(s1.width - s0.width)}mm 允许±${halfPxMm}mm`);
+
+        // 这条是本项目最重要的一条交互铁律：界面上给的数，就是最终落库的数。
+        // 历史上"预览与提交不一致"的事故，都是因为没人把读数与落库值对起来比过。
+        const readNum36 = Number((String(read36b || '').match(/(\d+)\s*mm/) || [])[1] || NaN);
+        ok('B36 松手瞬间的读数 === 真正落库的值（所见即所得，不是"差不多"）',
+          Number.isFinite(readNum36) && Math.abs(readNum36 - s1.width) <= 1,
+          `读数=${read36b} 落库=${s1.width}`);
+
+        ok('B36 四视图同步：俯视图那条宽线也走到同一个数（多视图 = 同一份模型）',
+          Boolean(s1.topW) && Boolean(s1.frontW) && Math.abs(s1.topW.x - s1.frontW.x) <= 1
+            && Math.abs(s1.topW.x - s0.topW.x - (s1.width - s0.width)) <= 1,
+          `front.x=${s1.frontW?.x} top.x=${s1.topW?.x} width=${s1.width}`);
+        ok('B36 拖完没有新增硬错（只改了这一个尺寸，没顺手造出新问题）',
+          errAfter36 === errBefore36, `ERROR ${errBefore36} → ${errAfter36}`);
+      }
+    }
+
+    // 负样本：拖"基准边"—— 必须给出理由，且不许改模型
+    if (s0.frontMinMid) {
+      const cMin = await clientOfSheet(s0.frontMinMid.x, s0.frontMinMid.y);
+      ok('B36 基准边中点落在视口内（否则下面两条会静默跳过）', inViewport(cMin), JSON.stringify(cMin));
+      // 先确认这一枪真能打中：否则"没冒气泡"到底是产品没给理由、还是根本没点中，
+      // 就永远说不清。上一轮就是这么被自己的坐标骗过去的。
+      const hitMin = await evalJs(`(async()=>{
+        const s=await import('/src/state/store.ts');
+        const ht=await import('/src/viewport/hitTest.ts');
+        const sn=await import('/src/viewport/snapping.ts');
+        const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+        const tol=sn.snapToleranceWorld(8, cd.cam.scale);
+        const hit=ht.hitPart(s.bus.derive().geom.views.pickLines, {x:${s0.frontMinMid.x}, y:${s0.frontMinMid.y}}, tol);
+        return hit?{view:hit.view, part:hit.part, edge:hit.edge}:null;})()`);
+      ok('B36 基准边在世界坐标上确实能被命中（点位算对了才谈得上"拖不动"）',
+        hitMin !== null && hitMin.part === 'outer.width' && hitMin.edge === 'min', JSON.stringify(hitMin));
+      if (inViewport(cMin)) {
+        // ── 判定"新增气泡"为什么必须先等气泡清空 ──
+        // 气泡寿命 4.5s，上一条同文本气泡（B26 刚点过同一条基准边）还在屏上时：
+        //   ① 按**文本**做差集 → 新气泡被当成"旧的"过滤掉，明明冒了却判成没冒；
+        //   ② 改成**计数** → 旧气泡恰在观察窗口里过期，"旧的没了新的来了"变成 1→1，
+        //      照样判不出来（这两种都真实发生过，各花了一轮 3 分钟才看清）。
+        // 结论：别跟旧气泡较劲，等它清空，之后屏上任何一条都是这一次产生的。
+        const cleared36 = await waitToastsClear();
+        ok('B36 负样本开始前气泡已清空（否则"新增气泡"判不准，会冤枉产品）',
+          cleared36, `残留=${JSON.stringify((await toastItems()) || [])}`);
+        const before36 = await snap36();
+        const base36 = new Set((await toastItems()) || []);
+        // 诊断三件套：真实落点反解 / 相机有没有被平移 / 全部气泡（不是差集）。
+        // 差集为空有两种可能——"没冒气泡"或"冒了但和旧气泡同文本被过滤"，
+        // 只看差集永远分不清，所以两个都打。
+        const rawMin = await evalJs(`(async()=>{
+          const m=await import('/src/viewport/camera.ts');
+          const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+          const rect=document.querySelector('.vp').getBoundingClientRect();
+          const w=m.screenToWorld({x:${cMin.x}-rect.left, y:${cMin.y}-rect.top}, cd.cam, cd.vw, cd.vh);
+          return {x:Math.round(w.x*10)/10, y:Math.round(w.y*10)/10};})()`);
+        // 注意：Runtime.evaluate 里没有顶层 await，必须包 async IIFE ——
+        // 否则 `await import(...)` 会被解析成 `await` 后紧跟一个 `import` 记号，
+        // 报 "Unexpected token 'import'"，整节探针直接崩掉（踩过一次）。
+        const camBefore36 = await evalJs(`(async()=>JSON.stringify((await import('/src/viewport/camDebug.ts')).camDebug.cam))()`);
+        await mouseDown(cMin.x, cMin.y);
+        await sleep(90);
+        await moveMouse(cMin.x + 40, cMin.y, 1);
+        await sleep(90);
+        await mouseUp(cMin.x + 40, cMin.y);
+        await sleep(300);
+        const camAfter36 = await evalJs(`(async()=>JSON.stringify((await import('/src/viewport/camDebug.ts')).camDebug.cam))()`);
+        const all36 = (await toastItems()) || [];
+        console.log(`[B36 基准边诊断] 期望世界点=(${s0.frontMinMid.x},${s0.frontMinMid.y}) 真实落点=${JSON.stringify(rawMin)}`);
+        console.log(`[B36 基准边诊断] 相机 before=${camBefore36} after=${camAfter36}（相机变了说明这一下被当成平移了）`);
+        console.log(`[B36 基准边诊断] 全部气泡=${JSON.stringify(all36)}`);
+        const after36 = await snap36();
+        const fresh36 = all36.filter((t) => !base36.has(t)).join(' | ');
+        ok('B36 基准边拖不动 → 界面说清为什么（不许静默无反应）',
+          /基准边/.test(fresh36), `新增气泡=[${fresh36 || '(无)'}] 全部=${JSON.stringify(all36)}`);
+        ok('B36 基准边拖不动 → 模型一字未改（不是"改了又退回"）',
+          after36.ver === before36.ver && after36.width === before36.width,
+          `v${before36.ver}→v${after36.ver} w${before36.width}→${after36.width}`);
+      }
+    }
+
+    // 还原现场：下游 B30 等小节依赖前序留下的柜子，本节不能把它们冲掉
+    const restored36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      if (!window.__b36Saved) return null;
+      s.bus.replaceProject(window.__b36Saved, 'B36 还原现场');
+      const p=s.bus.getState();
+      return {proj:p.name, cabCount:p.cabinets.length};})()`);
+    ok('B36 结束后把现场还原了（自成一体 ≠ 可以随便改全局状态）',
+      Boolean(restored36) && restored36.cabCount === dirty36.cabCount && restored36.proj === dirty36.proj,
+      `还原=${JSON.stringify(restored36)} 复位前=${JSON.stringify({ proj: dirty36.proj, cabCount: dirty36.cabCount })}`);
+    await sleep(200);
 
     // ═══════════════════════════════════════════════════════════
     /**

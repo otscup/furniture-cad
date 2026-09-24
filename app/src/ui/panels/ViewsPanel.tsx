@@ -48,7 +48,14 @@ export function ViewsPanel(props: {
           </button>
         </div>
         <div className="hint-line">
-          四视图是<strong>只读派生视图</strong>：它和平面图来自同一份语义模型、同一次派生。要改尺寸请回平面图。
+          四视图<strong>可以直接编辑</strong>：把鼠标放到图上一条线，蓝线=可拖（拖它改对应尺寸），
+          红虚线=这条看得见但拖不动（状态栏会说明原因）。四张图来自同一份模型，
+          <strong>在任意一张图上改完，其余三张同步更新</strong> —— 不需要、也不存在"手动同步"。
+        </div>
+        <div className="hint-line">
+          可拖的：柜宽（正/俯视图左右拖）、柜高（正/侧视图上下拖）、柜深（侧视图左右拖、俯视图上下拖）、
+          踢脚高、分区分界（左右两区此消彼长，总宽不变）、门扇中缝。
+          层板/抽屉分格由<strong>数量</strong>派生，不能拖 —— 请改数量或让 AI 改。
         </div>
       </Section>
 

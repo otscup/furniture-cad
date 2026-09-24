@@ -1,7 +1,7 @@
 import type { BBox, Cabinet, Prim, Project, RuleSet, Vec2 } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights } from './layout.ts';
-import { buildFrontPickLines } from './pickLines.ts';
+import { buildFrontPickLines, buildSideTopPickLines } from './pickLines.ts';
 import type { PickLine } from './pickLines.ts';
 import { bboxOf } from './transform.ts';
 import { LabelPlacer, primVisualExtent } from './labels.ts';
@@ -354,10 +354,16 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
   /**
    * PickLine（几何 → 语义反查表，A1）。
-   * 必须与正视图图元在**同一处**生成：mapper 传的就是上面那对画图用的，
+   * 必须与图元在**同一处**生成：mapper 传的就是上面那对画图用的，
    * 点位与图元逐位一致 —— 与几何同源，结构上不可能漂移。
+   *
+   * 四张图各有一份（正视图+内部图 / 侧视图+俯视图），用的都是各自的画图 mapper：
+   * 用户在任意一张图上拖动，命中的都是同一套语义部件 → 同一条写路径。
    */
-  const pickLines = buildFrontPickLines(cab, L, rules, mapFront, mapInt);
+  const pickLines = [
+    ...buildFrontPickLines(cab, L, rules, mapFront, mapInt),
+    ...buildSideTopPickLines(cab, L, mapSide, mapTop),
+  ];
 
   // ═══════════════ 1. 正视图（从前看，含门 / 抽面）═══════════════
   F.rect(0, W, 0, H, L_FRAME, 2.4);

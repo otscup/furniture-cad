@@ -66,6 +66,14 @@ export interface RenderInput {
    * 再也分不开。这里只负责画，布局仍然完全由 explode.ts 决定。
    */
   explodePrims: Prim[];
+  /**
+   * 图纸模式下鼠标悬停到的可点线段（PickLine）。
+   *
+   * 为什么要画它：**"看不出来能点"等于没有这个功能。**
+   * 可拖的线画成蓝色高亮，不可拖的画成淡红 —— 用户在动手之前就知道结果，
+   * 而不是拖了半天没反应才怀疑软件坏了。
+   */
+  sheetHover?: { pts: Vec2[]; draggable: boolean } | null;
 }
 
 type P2S = (p: Vec2) => Vec2;
@@ -126,6 +134,38 @@ function drawSheet(inp: RenderInput, to: P2S): void {
   // 分解图最后画：它在下方的独立图幅里，与四视图的图元本来就不重叠，
   // 顺序只影响"万一以后两者贴到一起"时的叠压关系 —— 分解图应该在上面。
   if (explode.length > 0) drawPrims(ctx, explode, to, hiddenLayers, cam.scale);
+  drawSheetHover(inp, to);
+}
+
+/**
+ * 悬停到的那条线的反馈。
+ * 可拖（蓝，实线）+ 两端端帽：告诉用户"抓住的是这一条，方向是延长/缩短"；
+ * 不可拖（红，虚线）：告诉用户"这条看得见但动手没用"，配合状态栏的理由文字。
+ */
+function drawSheetHover(inp: RenderInput, to: P2S): void {
+  const h = inp.sheetHover;
+  if (!h || h.pts.length < 2) return;
+  const { ctx } = inp;
+  const pts = h.pts.map(to);
+  ctx.save();
+  ctx.strokeStyle = h.draggable ? UI_COLORS.grip : UI_COLORS.problem;
+  ctx.lineWidth = h.draggable ? 3.2 : 2;
+  ctx.globalAlpha = 0.95;
+  if (!h.draggable) ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+  if (h.draggable) {
+    ctx.setLineDash([]);
+    ctx.fillStyle = UI_COLORS.grip;
+    for (const p of [pts[0], pts[pts.length - 1]]) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
 }
 
 // ───────────────────────────── 栅格 ─────────────────────────────

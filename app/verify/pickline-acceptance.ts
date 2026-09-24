@@ -56,7 +56,17 @@ const byPart = (p: string): PickLine[] => PL.filter((x) => x.part === p);
 console.log('\n── A. PickLine 与图元同源产出，部件解析正确 ──');
 
 const unitCount = cab0.layout.units.length;
-ok('每个分区之间的中立板都有一条 unit.divider', byPart('unit.divider').length === unitCount - 1, `${byPart('unit.divider').length} vs ${unitCount - 1}`);
+// Task #48：分区线现在在**两张图**上都登记了（正视图 + 俯视图），所以按视图分别断言。
+// 顺带锁死一条结构性不变量：多视图 ≠ 多真相 —— 两张图上的同一条线必须指向同一个写路径。
+const divFront = byPart('unit.divider').filter((d) => d.view === 'front');
+const divTop = byPart('unit.divider').filter((d) => d.view === 'top');
+ok('每个分区之间的中立板都有一条 unit.divider（正视图）', divFront.length === unitCount - 1, `${divFront.length} vs ${unitCount - 1}`);
+ok('俯视图上同一批分区线也在（多视图反查）', divTop.length === unitCount - 1, `${divTop.length} vs ${unitCount - 1}`);
+ok(
+  '正/俯两图上的分区线指向**同一个写路径**（多视图不是多真相）',
+  divFront.map((d) => d.paramPath).join('|') === divTop.map((d) => d.paramPath).join('|'),
+  `${divFront.map((d) => d.paramPath).join('|')} ≠ ${divTop.map((d) => d.paramPath).join('|')}`
+);
 ok(
   '分区线的参数路径逐条对上（第 i 条 → layout.units[i].requestedWidth）',
   byPart('unit.divider').every((pl) => {
@@ -185,7 +195,12 @@ const v5 = validateAction({
   params: { mm: 120 },
 });
 ok('target.rect（坐标！）被白名单拒收 —— AI 永远不许拿到坐标', !v5.ok && v5.code === 'EXTRA_TARGET_KEY', JSON.stringify(v5));
-ok('契约的 PARTS 是闭合的（7 个部件名，6 类语义）', PARTS.size === 7, String(PARTS.size));
+// Task #48：加了 outer.depth（侧/俯视图上那两条框架边）之后是 8 个。
+// 这条断言的意义是"词汇表必须闭合"—— 每加一个部件都必须同步到契约与反查层，
+// 所以数字必须写死，不能写成 PARTS.size === PARTS.size 那种自我实现的断言。
+ok('契约的 PARTS 是闭合的（8 个部件名，7 类语义）', PARTS.size === 8, String(PARTS.size));
+ok('新增的 outer.depth 在契约里 —— 否则界面只能偷偷按坐标改进深（第二个真相源）', PARTS.has('outer.depth'), [...PARTS].join(','));
+ok('outer.depth 的写路径是 params.depth（不是任何派生字段）', partParamPath('outer.depth', 0) === 'params.depth', partParamPath('outer.depth', 0));
 
 // ───────────────────────── E. planRunner：圈选展开 + 影响面（A5） ─────────────────────────
 

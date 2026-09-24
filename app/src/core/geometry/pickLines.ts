@@ -26,10 +26,18 @@ import type { Cabinet, Vec2, CabinetDerived, RuleSet } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import { drawerCellHeights } from './layout.ts';
 
-/** 语义部件：闭合词汇表，契约与编译器都按这份清单校验 */
+/**
+ * 语义部件：闭合词汇表，契约与编译器都按这份清单校验
+ *
+ * ── 为什么把 depth 补进来（7 类而不是 6 类）──
+ *    四视图里侧视图 / 俯视图的框架边就是进深。要让这两张图也能拖动改尺寸，
+ *    就必须存在"这条线 = 柜深"这个词。**没有它，界面就只能偷偷按坐标改，
+ *    那正是本文件存在的理由所禁止的。**
+ */
 export type CabinetPart =
   | 'outer.width' // 左右最外轮廓（= 柜宽）
   | 'outer.height' // 上下最外轮廓（= 柜高）
+  | 'outer.depth' // 前后最外轮廓（= 柜深，含门）
   | 'bodyLift' // 踢脚线
   | 'unit.divider' // 分区之间的中立板竖线
   | 'door.gapMid' // 门扇之间的中缝
@@ -39,6 +47,7 @@ export type CabinetPart =
 export const PART_ZH: Record<CabinetPart, string> = {
   'outer.width': '左右外轮廓（柜宽）',
   'outer.height': '上下外轮廓（柜高）',
+  'outer.depth': '前后外轮廓（柜深）',
   'bodyLift': '踢脚线',
   'unit.divider': '分区中立板',
   'door.gapMid': '门扇中缝',
@@ -53,6 +62,8 @@ export function partParamPath(part: CabinetPart, unitIndex: number): string {
       return 'params.width';
     case 'outer.height':
       return 'params.height';
+    case 'outer.depth':
+      return 'params.depth';
     case 'bodyLift':
       return 'params.bodyLift';
     case 'unit.divider':
@@ -67,8 +78,8 @@ export function partParamPath(part: CabinetPart, unitIndex: number): string {
 }
 
 export interface PickLine {
-  /** 线画在哪个视图里（正视图上的线和内部图上的层板线不是一回事） */
-  view: 'front' | 'internal';
+  /** 线画在哪个视图里（正视图上的线和俯视图上的线代表不同的轴） */
+  view: PickView;
   cabinetId: string;
   part: CabinetPart;
   /** 部件落在哪个分区上（外轮廓/踢脚类为 0）—— 界面显示与编译校验都用 */
@@ -78,16 +89,38 @@ export interface PickLine {
   labelZh: string;
   /** 图元上的点（图幅绝对坐标），用于命中测试 */
   pts: Vec2[];
+  /**
+   * 这条线代表它所测量范围的哪一端：'min' = 起点侧（0 那一端），'max' = 末端（尺寸值那一端）。
+   *
+   * 为什么必须带：模型是**锚定**的（0..W / 0..H / 0..D），只有 'max' 端能拖来改尺寸，
+   * 拖动 'min' 端在语义上要求平移原点，而模型没有这个概念 —— 这条信息让我们能
+   * **在命中时就说清为什么不能拖**，而不是等用户拖了半天没反应。
+   * 边界线与 Tick 类（如门缝、分区线）不需要它：它们改的是比例/间隙，双向都有意义。
+   */
+  edge?: 'min' | 'max';
 }
 
-/** 一个柜体上"到底存在哪些可点部件"的语义清单 —— 编译器校验 part 是否仍然存在就靠它 */
+/** 图纸视图（A1 部件词汇表所在的视图空间） */
+export type PickView = 'front' | 'side' | 'top' | 'internal';
+
+/**
+ * 一个柜体上"到底存在哪些可点部件"的语义清单 —— 编译器校验 part 是否仍然存在就靠它。
+ *
+ * 注意这里**按部件去重**（不按视图展开）：同一个 'outer.width' 在正视图和俯视图上各有一条线，
+ * 但它是同一个语义部件、同一条写路径。多视图是为了让用户在任意视图下都能点到它。
+ */
 export function pickPartsOf(cab: Cabinet): Array<{ part: CabinetPart; unitIndex: number; paramPath: string; labelZh: string }> {
   const out: Array<{ part: CabinetPart; unitIndex: number; paramPath: string; labelZh: string }> = [];
+  const seen = new Set<string>();
   const push = (part: CabinetPart, unitIndex: number): void => {
+    const key = `${part}@${unitIndex}`;
+    if (seen.has(key)) return;
+    seen.add(key);
     out.push({ part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part] });
   };
   push('outer.width', 0);
   push('outer.height', 0);
+  push('outer.depth', 0);
   push('bodyLift', 0);
   for (let i = 0; i < cab.layout.units.length - 1; i++) push('unit.divider', i);
   cab.layout.units.forEach((u, i) => {
@@ -114,8 +147,8 @@ export function buildFrontPickLines(
   mapInt: Mapper
 ): PickLine[] {
   const out: PickLine[] = [];
-  const add = (view: PickLine['view'], part: CabinetPart, unitIndex: number, pts: Vec2[]): void => {
-    out.push({ view, cabinetId: cab.id, part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part], pts });
+  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max'): void => {
+    out.push({ view, cabinetId: cab.id, part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part], pts, edge });
   };
   const W = cab.params.width;
   const H = cab.params.height;
@@ -129,12 +162,12 @@ export function buildFrontPickLines(
   const units = cab.layout.units;
 
   // 外轮廓（正视图）：左右边 = 柜宽，上下边 = 柜高
-  add('front', 'outer.width', 0, [mapFront(0, 0), mapFront(0, H)]);
-  add('front', 'outer.width', 0, [mapFront(W, 0), mapFront(W, H)]);
-  add('front', 'outer.height', 0, [mapFront(0, 0), mapFront(W, 0)]);
-  add('front', 'outer.height', 0, [mapFront(0, H), mapFront(W, H)]);
+  add('front', 'outer.width', 0, [mapFront(0, 0), mapFront(0, H)], 'min');
+  add('front', 'outer.width', 0, [mapFront(W, 0), mapFront(W, H)], 'max');
+  add('front', 'outer.height', 0, [mapFront(0, 0), mapFront(W, 0)], 'min');
+  add('front', 'outer.height', 0, [mapFront(0, H), mapFront(W, H)], 'max');
   // 踢脚线：踢脚区的顶边
-  add('front', 'bodyLift', 0, [mapFront(0, bodyLift), mapFront(W, bodyLift)]);
+  add('front', 'bodyLift', 0, [mapFront(0, bodyLift), mapFront(W, bodyLift)], 'max');
   // 分区中立板的竖线（内空段）
   for (let i = 0; i < units.length - 1; i++) {
     const x = unitX0[i] + nets[i];
@@ -171,6 +204,68 @@ export function buildFrontPickLines(
         add('internal', 'drawer.divider', i, [mapInt(x0, z), mapInt(x1, z)]);
         z += u.drawers.gap;
       }
+    }
+  });
+  return out;
+}
+
+/**
+ * 侧视图 / 俯视图的反查表。与 buildFrontPickLines 完全同源：
+ * mapSide / mapTop 就是 views.ts 里画这两张图用的那一对 mapper，
+ * 所以**命中的必然屏幕上看得见的那条框架线**，不会出现"看着能拖实际拖不动"。
+ *
+ * ── 两张图各自的轴（由 mapper 决定，不要在这里另解一遍）──
+ *    mapSide(Y, Z)：横向 = 进深 Y，纵向 = 高 Z
+ *    mapTop(X, Y) ：横向 = 宽 X，    纵向 = 进深 Y（注意 y = ty0 - Y，进深轴是反的）
+ *
+ * ── 只给画面上真的画出来的线造可点对象 ──
+ *    外框线（S.rect(0,D,0,H) / T.rect(0,W,0,D)）、分区中立板、门缝都在图上有，
+ *    所以登记表里就是这些 —— "点到看不见的线"比"漏掉一条线"更伤信任。
+ */
+export function buildSideTopPickLines(
+  cab: Cabinet,
+  L: CabinetDerived,
+  mapSide: Mapper,
+  mapTop: Mapper
+): PickLine[] {
+  const out: PickLine[] = [];
+  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max'): void => {
+    out.push({ view, cabinetId: cab.id, part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part], pts, edge });
+  };
+  const W = cab.params.width;
+  const H = cab.params.height;
+  const D = cab.params.depth;
+  const bodyLift = cab.params.bodyLift;
+  const units = cab.layout.units;
+  const nets = L.nets;
+  const unitX0 = L.unitX0;
+
+  // ── 侧视图框架：横向跨度 = 柜深，纵向跨度 = 柜高 ──
+  add('side', 'outer.height', 0, [mapSide(0, H), mapSide(D, H)], 'max');
+  // Z=0 是模型的基准面，登记出来是为了能"解释为什么这条不能拖"，而不是毫无反应
+  add('side', 'outer.height', 0, [mapSide(0, 0), mapSide(D, 0)], 'min');
+  add('side', 'outer.depth', 0, [mapSide(D, 0), mapSide(D, H)], 'max');
+  add('side', 'outer.depth', 0, [mapSide(0, 0), mapSide(0, H)], 'min');
+  // 踢脚线：底板底边（= 踢脚区顶边），上下拖
+  add('side', 'bodyLift', 0, [mapSide(0, bodyLift), mapSide(D, bodyLift)], 'max');
+
+  // ── 俯视图框架：横向跨度 = 柜宽，纵向跨度 = 柜深 ──
+  add('top', 'outer.width', 0, [mapTop(W, 0), mapTop(W, D)], 'max');
+  add('top', 'outer.width', 0, [mapTop(0, 0), mapTop(0, D)], 'min');
+  add('top', 'outer.depth', 0, [mapTop(0, D), mapTop(W, D)], 'max');
+  add('top', 'outer.depth', 0, [mapTop(0, 0), mapTop(W, 0)], 'min');
+  // 中立板与门扇缝在俯视图上同样画出来了 —— 横跨进深方向，**横向拖动**改分区比例 / 中缝间隙
+  for (let i = 0; i < units.length - 1; i++) {
+    const x = unitX0[i] + nets[i];
+    add('top', 'unit.divider', i, [mapTop(x, 0), mapTop(x, D)]);
+  }
+  units.forEach((u, i) => {
+    if (!u.doors || u.doors.count <= 1) return;
+    const x0 = unitX0[i];
+    const x1 = x0 + nets[i];
+    for (let k = 1; k < u.doors.count; k++) {
+      const xk = x0 + ((x1 - x0) * k) / u.doors.count;
+      add('top', 'door.gapMid', i, [mapTop(xk, 0), mapTop(xk, D)]);
     }
   });
   return out;

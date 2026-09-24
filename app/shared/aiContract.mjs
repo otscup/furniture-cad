@@ -261,6 +261,9 @@ const TARGET_KEYS = new Set(['cabinetId', 'cabinetName', 'roomId', 'roomName', '
 export const PARTS = new Set([
   'outer.width',
   'outer.height',
+  // Phase E 之后：侧视图/俯视图也能点选和拖动，必须有"这条线 = 柜深"这个词，
+  // 否则界面就只能偷偷按坐标改 —— 那是第二个真相源的开头
+  'outer.depth',
   'bodyLift',
   'unit.divider',
   'door.gapMid',

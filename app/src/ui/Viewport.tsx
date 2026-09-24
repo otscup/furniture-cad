@@ -13,6 +13,8 @@ import { boxSelect, hitPart, hitTest } from '../viewport/hitTest.ts';
 import { camDebug } from '../viewport/camDebug.ts';
 import type { PickLine } from '../core/geometry/pickLines.ts';
 import { planCabinetGripDrag, planWallGripDrag } from '../viewport/gripDrag.ts';
+import type { SheetDragSpec } from '../viewport/sheetDrag.ts';
+import { dragPlanOf, dragValueOf, dragClamped } from '../viewport/sheetDrag.ts';
 import type { Scene } from '../viewport/renderer.ts';
 import { renderScene } from '../viewport/renderer.ts';
 import * as CMD from '../core/commands.ts';
@@ -35,7 +37,22 @@ type Drag =
   | { kind: 'pan'; last: Vec2 }
   | { kind: 'marquee'; a: Vec2; b: Vec2 }
   | { kind: 'grip'; grip: Grip; cab: Cabinet | null; wall: Wall | null; startPointer: Vec2 }
-  | { kind: 'body'; cabs: Cabinet[]; startPointer: Vec2 };
+  | { kind: 'body'; cabs: Cabinet[]; startPointer: Vec2 }
+  /**
+   * 图纸上拖动一条线 = 改一个语义参数（Task #48）。
+   *
+   * 与平面图拖夹点走的是**同一条链路**：bus.preview 把命令跑在试探模型上，
+   * 屏幕上看到的就是将要写入的结果；松手时才真正提交。
+   * 这里存的是语义部件（part/spec），从来没有"这条线的坐标"。
+   */
+  | {
+      kind: 'sheetDim';
+      pl: PickLine;
+      spec: SheetDragSpec;
+      cab: Cabinet;
+      startWorld: Vec2;
+      value: number;
+    };
 
 export interface ViewportProps {
   bus: CommandBus;
@@ -102,6 +119,8 @@ export function Viewport(props: ViewportProps) {
   const [hover, setHover] = useState<string | null>(null);
   const [hoverGrip, setHoverGrip] = useState<Grip | null>(null);
   const [activeGrip, setActiveGrip] = useState<Grip | null>(null);
+  /** 图纸模式悬停到的那条线 —— 决定能不能拖、拖了改什么（悬停即告知，不等用户试错） */
+  const [sheetHoverPl, setSheetHoverPl] = useState<PickLine | null>(null);
   const [preview, setPreview] = useState<Scene | null>(null);
   const [readout, setReadout] = useState('');
 
@@ -266,8 +285,9 @@ export function Viewport(props: ViewportProps) {
       marquee: drag?.kind === 'marquee' ? { a: drag.a, b: drag.b } : null,
       draftWall: draft ? { a: draft.a, b: draft.b, thickness: DEFAULT_WALL_THICKNESS } : null,
       explodePrims: explodeSet?.prims ?? [],
+      sheetHover: sheetHoverPl ? { pts: sheetHoverPl.pts, draggable: dragPlanOf(sheetHoverPl).ok } : null,
     });
-  }, [size, cam, version, preview, selection, hover, hoverGrip, activeGrip, hiddenLayers, showGrid, snap, drag, draft, bus, props.mode, explodeSet]);
+  }, [size, cam, version, preview, selection, hover, hoverGrip, activeGrip, hiddenLayers, showGrid, snap, drag, draft, bus, props.mode, explodeSet, sheetHoverPl]);
 
   // ── 坐标换算 ──
   const toCanvas = useCallback((e: { clientX: number; clientY: number }): Vec2 => {
@@ -325,15 +345,30 @@ export function Viewport(props: ViewportProps) {
     const raw = toWorld(sp);
     setCursor(sp);
 
-    // 图幅是只读视图：不放柜、不拖柜。但"点一条线"解析语义参数是允许的（A 组）。
-    // 注意顺序：点选判断必须在平移分支**之前**，否则左键永远先进平移、点选永远轮不到。
+    // 图幅曾经是只读视图；现在允许"拖一条线 = 改一个语义参数"，走的仍是
+    // 与平面图拖夹点完全相同的一条链路（preview → 确认 → 提交），
+    // 所以它依然是**派生自同一份模型**的白盒操作，不是偷偷改图元。
+    // 注意顺序：点选判断必须在平移分支**之前**，否则左键永远先进平移。
     if (sheet) {
-      if (e.button === 0 && !spaceRef.current && props.onPickPart) {
+      if (e.button === 0 && !spaceRef.current) {
         const tol = snapToleranceWorld(8, cam.scale);
         const hit = hitPart(bus.derive().geom.views.pickLines, raw, tol);
         if (hit) {
-          props.onPickPart(hit);
-          return;
+          // 交给 AI 助攻（把语义部件喂给 AI 面板），任何时候都保留
+          props.onPickPart?.(hit);
+          const plan = dragPlanOf(hit);
+          if (plan.ok) {
+            const cab = bus.getState().cabinets.find((c) => c.id === hit.cabinetId);
+            if (cab) {
+              setDrag({ kind: 'sheetDim', pl: hit, spec: plan.spec, cab, startWorld: raw, value: plan.spec.read(cab) });
+              setReadout(`${plan.spec.labelZh} ${Math.round(plan.spec.read(cab))}mm · ${plan.spec.hintZh}`);
+              return;
+            }
+          } else {
+            // 能点但拖不动 —— 必须当场说清为什么，静默无反应是最伤信任的交互
+            props.onToast('info', `${plan.labelZh}：${plan.reason}`);
+            return;
+          }
         }
       }
       // 空白处照旧平移 —— 图幅的左键平移不能因为有点选就消失
@@ -418,11 +453,22 @@ export function Viewport(props: ViewportProps) {
 
     if (!drag) {
       if (sheet) {
-        // 图幅模式没有可选择的对象，不留悬停/捕捉残留
+        // 图幅模式下悬停到一条线：高亮它，并预告"拖它会改什么"或"为什么不能拖"。
+        // 让用户在动手**之前**就知道结果 —— 这比拖了没反应再去看文档强得多。
+        const tol = snapToleranceWorld(8, cam.scale);
+        const hit = hitPart(bus.derive().geom.views.pickLines, raw, tol);
         setHover(null);
         setHoverGrip(null);
         setSnap(null);
-        setReadout('');
+        setSheetHoverPl(hit);
+        if (hit) {
+          const plan = dragPlanOf(hit);
+          const cab = bus.getState().cabinets.find((c) => c.id === hit.cabinetId);
+          if (plan.ok && cab) setReadout(`${plan.spec.labelZh} ${Math.round(plan.spec.read(cab))}mm · ${plan.spec.hintZh}`);
+          else setReadout(plan.ok ? plan.spec.hintZh : `${plan.labelZh}：${plan.reason}`);
+        } else {
+          setReadout('');
+        }
         return;
       }
       const base = draft ? draft.a : (pendingMove?.base ?? null);
@@ -469,6 +515,15 @@ export function Viewport(props: ViewportProps) {
         previewCommand(plan.command);
         return;
       }
+      case 'sheetDim': {
+        const value = dragValueOf(drag.spec, drag.cab, drag.startWorld, raw);
+        setDrag({ ...drag, value });
+        // 读数必须是**真正会被写入的那个值**（项目原则第 9 条：所见即所得）
+        const clampedNote = dragClamped(drag.spec, value) ? `（已到边界 ${drag.spec.min}~${drag.spec.max}mm）` : '';
+        setReadout(`${drag.spec.labelZh} → ${value}mm${clampedNote}`);
+        previewCommand(drag.spec.build(drag.cab, drag.pl.unitIndex, value));
+        return;
+      }
       case 'body': {
         const s = resolveAt(raw, drag.startPointer);
         setSnap(s);
@@ -497,6 +552,16 @@ export function Viewport(props: ViewportProps) {
     if (drag.kind === 'marquee') {
       const ids = boxSelect(bus.getState(), drag.a, drag.b);
       if (ids.length > 0) setSelection(ids);
+    } else if (drag.kind === 'sheetDim') {
+      // 松手时的最终值：与刚才预览用的是同一个算法、同一个模型，
+      // 所以"预览 === 提交"是结构性保证，不是巧合。
+      const value = dragValueOf(drag.spec, drag.cab, drag.startWorld, raw);
+      const before = drag.spec.read(drag.cab);
+      if (value !== before) {
+        const r = bus.execute(drag.spec.build(drag.cab, drag.pl.unitIndex, value), { commitLabel: `${drag.spec.labelZh} 拖动` });
+        if (!r.ok) props.onToast('error', `改${drag.spec.labelZh}失败：${r.error ?? '被规则拒绝'}`);
+        else if (dragClamped(drag.spec, value)) props.onToast('info', `${drag.spec.labelZh}已到上下限（${drag.spec.min}~${drag.spec.max}mm）：这是规则允许的边界`);
+      }
     } else if (drag.kind === 'grip') {
       const s = resolveAt(raw, drag.startPointer);
       const plan = drag.cab
@@ -580,9 +645,16 @@ export function Viewport(props: ViewportProps) {
 
       <div className="vp-hud">
         {sheet ? (
-          <span className="vp-hud-item vp-hud-sheet">
-            四视图图幅{props.explode ? ' + 分解图（下方）' : ''} · 只读 · 拖动平移 / 滚轮缩放 · 要改模型请切回「平面图」
-          </span>
+          <>
+            <span className="vp-hud-item vp-hud-sheet">
+              四视图图幅{props.explode ? ' + 分解图（下方）' : ''} · 可编辑：蓝线可拖改尺寸 · 拖动平移 / 滚轮缩放
+            </span>
+            {/*
+              读数在图纸模式下**必须**出现：拖动时它会显示"柜宽 → 2400mm"，
+              也就是松手真正写入的那个值。没有它，"所见即所得"这条原则在图纸上就断了。
+            */}
+            {readout ? <span className="vp-hud-item vp-hud-read">{readout}</span> : null}
+          </>
         ) : (
           <>
             <span className="vp-hud-item">
@@ -595,7 +667,8 @@ export function Viewport(props: ViewportProps) {
         )}
       </div>
 
-      {!sheet && preview ? <div className="vp-preview-badge">预览中 · 松手提交</div> : null}
+      {/* 图纸拖动同样走 bus.preview，所以同样要显示预览徽标 —— 否则用户不知道"还没落定" */}
+      {preview ? <div className="vp-preview-badge">预览中 · 松手提交</div> : null}
 
       {!sheet && pendingMove ? (
         <div className="vp-prompt">

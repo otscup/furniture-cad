@@ -21,6 +21,9 @@ memory/*.bak
 # Chrome 临时 profile（验收时建在系统临时目录，偶尔因删除保护残留在这里）
 app/verify/out/chrome-profile-*/
 
+# 验收运行日志：每次跑都变，且体积不小，不进版本控制
+app/verify/out/*.log
+
 # ── WorkBuddy ──
 # 只把「决策记忆」入库（它是项目决策与踩坑的记录）；
 # 其余是工具自己的运行时数据，不进版本控制。

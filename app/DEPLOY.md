@@ -75,7 +75,40 @@ PORT=8787 node server/server.mjs
 - [ ] `data/` 目录权限 700，定期备份
 - [ ] 知道边界：无二次验证、无密码找回（管理员重置）、审计无防篡改——见 `/api/security/policy` 照实自述
 
-## 五、本机没有 Docker？——镜像构建在服务器上做
+## 五、容器里访问 NAS 上的其他服务（AI 网关为例）★ 血泪坑
+
+**症状**：「自动拉取」模型列表报 `拉取失败：fetch failed`；此时密钥是对的，NAS 本机 curl 也正常。
+
+**根因**：容器在自己的 bridge 网络里（如 `xxx_default`，网关 192.168.16.x），
+**访问 NAS 的局域网 IP（`192.168.2.2`）的发布端口会被丢包**——超时/ECONNRESET。
+这不是防火墙没开，也不是密钥问题，是 Docker bridge → 宿主机 LAN IP 的回环 NAT 在群晖上不通。
+
+**解法（三选一，推荐 ①）**：
+
+1. **走 Docker 网桥网关**：把地址换成 `http://172.17.0.1:<端口>/v1`（默认 bridge 的网关地址）。
+   容器内实测可达。缺点：IP 是约定俗成的默认值，换环境要重确认。
+2. **加入同一张 Docker 网络**：在 compose 里声明外部网络并加入服务，
+   之后可用容器名互访（`http://gpt-load:3002/v1`），不受 IP 变化影响：
+   ```yaml
+   networks:
+     gpt-load_default: { external: true }
+   services:
+     furniture-cad:
+       networks: [gpt-load_default]
+   ```
+3. **`network_mode: host`**：直接用宿主机网络，`127.0.0.1` 即可达；代价是端口占用与隔离变弱。
+
+**配套检查**：拉通之后还要确认**模型名真的在清单里**。
+本项目的「自动拉取」会如实显示 `source: live` 与真实模型 id；若配置的 `AI_MODEL`
+不在其中（例如填了 `deepseek-reasoner` 而网关只提供 `openrouter/free`），
+看得见的模型列表和看不见的对话调用都会失败。
+
+**排障口诀**：容器内 `curl` 通常不存在，用 `docker exec <容器> node -e "fetch(...)"` 代替；
+三个变量分别验——网络可达（TCP 通不通）→ 鉴权（401 还是 200）→ 模型名（在不在列表里）。
+
+**改配置不用重启**：服务端每次请求都重读 env 文件（`readEnv()`），改完立即生效。
+
+## 六、本机没有 Docker？——镜像构建在服务器上做
 
 Dockerfile 采用两阶段构建，构建期需要拉取 npm 依赖与 ezdxf wheel（国内服务器建议配置镜像加速）。
 镜像构建完成后 `docker save` / `docker load` 也可以离线搬运。

@@ -17,8 +17,8 @@ import { Pill, Row, Section, Text } from './common.tsx';
 export function ViewsPanel(props: {
   bus: CommandBus;
   version: number;
-  mode: 'plan' | 'sheet';
-  setMode: (m: 'plan' | 'sheet') => void;
+  mode: 'plan' | 'sheet' | '3d';
+  setMode: (m: 'plan' | 'sheet' | '3d') => void;
   explode: boolean;
   setExplode: (v: boolean) => void;
 }): ReactNode {

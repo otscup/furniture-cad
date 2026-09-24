@@ -148,10 +148,12 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
     }
 
     if (u.rod && u.rod.count > 0) {
-      // 挂衣杆用细长盒表达（圆柱渲染留给后续，视觉可辨即可）
+      // 挂衣杆用细长盒表达（圆柱渲染留给后续，视觉可辨即可）：
+      // 沿柜宽横向、进深居中、离柜内底 rodHeight
       const rz = innerBottom + u.rod.heightFromBottom;
+      const yMid = L.backT + L.shelfDepth / 2; // 进深方向居中（在层板深度带内）
       push('rod', `${cab.id}_${u.id}_ROD`, '挂衣杆',
-        x0 + 30, x0 + netW - 30, L.backT + L.shelfDepth - 60, L.shelfDepth + L.backT - 60,
+        x0 + 30, x0 + netW - 30, yMid - 15, yMid + 15,
         rz - 15, rz + 15, mat);
     }
   });

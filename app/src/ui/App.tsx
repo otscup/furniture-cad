@@ -10,6 +10,7 @@ import type { SnapSettings } from '../viewport/snapping.ts';
 import { defaultHiddenLayers } from '../viewport/layers.ts';
 import type { Camera } from '../viewport/camera.ts';
 import { Viewport } from './Viewport.tsx';
+import { ThreeViewport } from './ThreeViewport.tsx';
 import { Toolbar } from './Toolbar.tsx';
 import type { RightTab } from './Toolbar.tsx';
 import { ContextMenu } from './ContextMenu.tsx';
@@ -56,7 +57,7 @@ export function App() {
   const memoryPending = corrections.filter((c) => c.status === 'pending').length;
 
   const [cam, setCam] = useState<Camera>({ cx: 900, cy: 1000, scale: 0.26 });
-  const [mode, setModeRaw] = useState<'plan' | 'sheet'>('plan');
+  const [mode, setModeRaw] = useState<'plan' | 'sheet' | '3d'>('plan');
   /**
    * 分解图开关。**默认关闭** —— 用户的说法是"4 视图调整好后**可以选择**生成
    * 分解图用于生产，也可以选择关闭"。所以默认状态必须是"关"，
@@ -208,9 +209,21 @@ export function App() {
   }, [toast]);
 
   // ── 视图模式：切换时收掉一切编辑态，避免"图幅上还留着夹点/草稿墙/选择框" ──
-  const setMode = useCallback((m: 'plan' | 'sheet') => {
-    setModeRaw(m);
-  }, []);
+  /**
+   * 选择跨越模式切换的规则（两句话）：
+   *   · 从 3D 切出：选择跟着走 —— 3D 的点选是完整功能，「3D 里选中柜体 →
+   *     回平面图改尺寸」是自然工作流，选择不该在切换时蒸发；
+   *   · 其余切换：维持原行为（清空，防图幅上残留夹点 —— 有既有断言钉着）。
+   * VariantPanel 的"采用后带选择切换"走 ref 显式赋值，与这条规则正交。
+   */
+  const selectionOnModeChange = useRef<string[] | null>(null);
+
+  const setMode = useCallback((m: 'plan' | 'sheet' | '3d') => {
+    setModeRaw((prev) => {
+      if (prev === '3d' && m !== '3d') selectionOnModeChange.current = selection;
+      return m;
+    });
+  }, [selection]);
 
   /** 分解图开关。打开时顺带切到图幅 —— 分解图只在图幅里有意义 */
   const setExplode = useCallback((v: boolean) => {
@@ -226,8 +239,6 @@ export function App() {
    * 把刚设上去的选中又清成空 —— 于是"采用后新柜体是选中的"这件事静默失效。
    * 这类缺陷在只比对文本的断言里看不见：界面上什么都没报错，只是选中没了。
    */
-  const selectionOnModeChange = useRef<string[] | null>(null);
-
   useEffect(() => {
     setTool('select');
     setPendingMove(null);
@@ -596,6 +607,10 @@ export function App() {
         case 'PL':
           setMode('plan');
           return '已切回平面图（唯一可编辑视图）';
+        case '3D':
+        case 'V3D':
+          setMode('3d');
+          return '已切到 3D 视图（只读体块预览：拖动旋转 / 点击选中）';
         case 'GRID':
           setShowGrid((v) => !v);
           return null;
@@ -869,30 +884,34 @@ export function App() {
         </aside>
 
         <main className="stage">
-          <Viewport
-            bus={bus}
-            version={version}
-            cam={cam}
-            setCam={setCam}
-            fitSignal={fitSignal}
-            cancelSignal={cancelSignal}
-            mode={mode}
-            explode={explode}
-            tool={tool}
-            selection={selection}
-            setSelection={setSelection}
-            snapSettings={snap}
-            showGrid={showGrid}
-            hiddenLayers={hiddenLayers}
-            pendingMove={pendingMove}
-            onMovePick={onMovePick}
-            onPlaceCabinet={onPlaceCabinet}
-            onCreateWall={onCreateWall}
-            onContextMenu={onViewportContextMenu}
-            onPickPart={onPickPart}
-            onToast={toast}
-            cursorStyle={tool === 'select' ? 'default' : 'crosshair'}
-          />
+          {mode === '3d' ? (
+            <ThreeViewport bus={bus} version={version} selection={selection} setSelection={setSelection} />
+          ) : (
+            <Viewport
+              bus={bus}
+              version={version}
+              cam={cam}
+              setCam={setCam}
+              fitSignal={fitSignal}
+              cancelSignal={cancelSignal}
+              mode={mode}
+              explode={explode}
+              tool={tool}
+              selection={selection}
+              setSelection={setSelection}
+              snapSettings={snap}
+              showGrid={showGrid}
+              hiddenLayers={hiddenLayers}
+              pendingMove={pendingMove}
+              onMovePick={onMovePick}
+              onPlaceCabinet={onPlaceCabinet}
+              onCreateWall={onCreateWall}
+              onContextMenu={onViewportContextMenu}
+              onPickPart={onPickPart}
+              onToast={toast}
+              cursorStyle={tool === 'select' ? 'default' : 'crosshair'}
+            />
+          )}
           {cmdOpen ? <CommandLine onCommand={runText} onClose={() => setCmdOpen(false)} lastMessage={lastMsg} /> : null}
         </main>
 

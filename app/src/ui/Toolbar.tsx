@@ -19,8 +19,8 @@ export type RightTab =
 export function Toolbar(props: {
   tool: Tool;
   setTool: (t: Tool) => void;
-  mode: 'plan' | 'sheet';
-  setMode: (m: 'plan' | 'sheet') => void;
+  mode: 'plan' | 'sheet' | '3d';
+  setMode: (m: 'plan' | 'sheet' | '3d') => void;
   explode: boolean;
   setExplode: (v: boolean) => void;
   canUndo: boolean;
@@ -96,6 +96,14 @@ export function Toolbar(props: {
           onClick={() => props.setMode('sheet')}
         >
           ▤ 四视图
+        </button>
+        <button
+          type="button"
+          className={`tb-btn ${props.mode === '3d' ? 'active' : ''}`}
+          title="3D 视图：体块预览（只读）。拖动旋转 / 滚轮缩放 / 点击柜体选中，改尺寸回平面图"
+          onClick={() => props.setMode('3d')}
+        >
+          ⬢ 3D
         </button>
         <button
           type="button"

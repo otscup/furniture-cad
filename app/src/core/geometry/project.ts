@@ -2,6 +2,7 @@ import type { BBox, Issue, Prim, Project, ProjectGeometry, RuleSet, Vec2, Wall }
 import { bboxOf } from './transform.ts';
 import { generateCabinet, getCabinetFootprint } from './generate.ts';
 import { buildProjectViews } from './views.ts';
+import { buildProjectBodies } from './bodies3d.ts';
 
 const L_WALL = 'A-WALL';
 const L_WALL_TEXT = 'A-TEXT';
@@ -83,7 +84,10 @@ export function generateProject(project: Project, rules: RuleSet): ProjectGeomet
    */
   const views = buildProjectViews(project, rules);
 
-  return { cabinets, plan, issues, bbox, views };
+  /** 3D 体块：同一份派生骨架的第三个视图（内部已对单柜失败容错） */
+  const bodies3d = buildProjectBodies(project, rules);
+
+  return { cabinets, plan, issues, bbox, views, bodies3d };
 }
 
 function overlap(a: BBox, b: BBox): boolean {

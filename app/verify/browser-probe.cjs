@@ -3383,6 +3383,64 @@ async function waitForApp(url, timeoutMs = 25000) {
     await keyPress('Escape', 'Escape', 27);
     await sleep(260);
 
+    // ═══════════════════════════════════════════════════════════
+    section('B28 3D 视口：体块派生的只读渲染 + 点选联动');
+
+    // 工具栏按钮 → 切 3D
+    const btn3d = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('3D'));if(b)b.click();return !!b})()`);
+    ok('工具栏上有「3D」按钮且能点到（不是隐藏功能）', btn3d === true, `btn=${btn3d}`);
+    await sleep(700); // 首帧渲染 + 取景
+    ok('切过去后 3D HUD 提示在（只读说明是给用户的第一句话）',
+      (await evalJs(`!!document.querySelector('.vp-hud-3d')`)) === true);
+    const canvas3d = await evalJs(`(()=>{const c=document.querySelector('.vp-3d canvas');return c?{w:c.width,h:c.height}:null})()`);
+    ok('WebGL 画布真的挂载且有尺寸（不是空壳 div）', !!canvas3d && canvas3d.w > 100 && canvas3d.h > 100, JSON.stringify(canvas3d));
+    const v3d = await statusVersion();
+
+    // 点选联动：fit 后柜群在画布中央，扫描几个候选点直到 raycast 命中
+    const rect3d = await evalJs(`(()=>{const c=document.querySelector('.vp-3d canvas').getBoundingClientRect();return {l:c.left,t:c.top,w:c.width,h:c.height}})()`);
+    const cands = [
+      { x: rect3d.l + rect3d.w * 0.5, y: rect3d.t + rect3d.h * 0.45 },
+      { x: rect3d.l + rect3d.w * 0.4, y: rect3d.t + rect3d.h * 0.5 },
+      { x: rect3d.l + rect3d.w * 0.6, y: rect3d.t + rect3d.h * 0.55 },
+      { x: rect3d.l + rect3d.w * 0.35, y: rect3d.t + rect3d.h * 0.4 },
+    ];
+    let sel3d = null;
+    for (const p of cands) {
+      await mouseDown(p.x, p.y);
+      await sleep(80);
+      await mouseUp(p.x, p.y);
+      await sleep(340);
+      sel3d = await statusSelection();
+      if (sel3d === 1) break;
+      // 点空白清了选择也无妨，继续扫下一个点
+    }
+    ok('点击柜体 → 3D raycast 命中并落成选择集（3D 渲染与几何同时被证明）',
+      sel3d === 1, `扫描 ${cands.length} 个点后选中=${sel3d}`);
+    ok('3D 是只读视图：整个 B28 没有写模型', (await statusVersion()) === v3d, `v${v3d} → v${await statusVersion()}`);
+
+    // 点空白清空选择（CAD 习惯）
+    await mouseDown(rect3d.l + rect3d.w * 0.03, rect3d.t + rect3d.h * 0.06);
+    await sleep(80);
+    await mouseUp(rect3d.l + rect3d.w * 0.03, rect3d.t + rect3d.h * 0.06);
+    await sleep(320);
+    const selBlank = await statusSelection();
+    ok('点空白 → 清空选择（null 或 0 都算清空）', selBlank === null || selBlank === 0, `实为 ${selBlank}`);
+
+    // 跨模式联动：重新选中 → 切回平面图 → 选择保持
+    await mouseDown(rect3d.l + rect3d.w * 0.5, rect3d.t + rect3d.h * 0.45);
+    await sleep(80);
+    await mouseUp(rect3d.l + rect3d.w * 0.5, rect3d.t + rect3d.h * 0.45);
+    await sleep(340);
+    const selBack = await statusSelection();
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='平面图');if(b)b.click();return !!b})()`);
+    await sleep(420);
+    ok('3D 里选中的柜体，切回平面图后选择保持（选择是跨模式的视图状态）',
+      selBack === 1 && (await statusSelection()) === 1, `3D=${selBack} plan=${await statusSelection()}`);
+    // 收尾：留截图
+    await shot(path.join(OUT_DIR, 'app-3d-viewport.png'));
+    ok('3D 视图截图已保存（人工目视用）', true, 'app-3d-viewport.png');
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

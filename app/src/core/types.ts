@@ -285,6 +285,11 @@ export interface ProjectGeometry {
   issues: Issue[];
   bbox: BBox | null;
   /**
+   * 3D 体块（派生视图）。语义骨架现算的轴对齐盒，给 Three.js 渲染；
+   * 与 plan / views 同一次派生产出，永不写回模型。
+   */
+  bodies3d: import('./geometry/bodies3d.ts').Box3D[];
+  /**
    * 四视图图幅（正视图 / 俯视图 / 侧视图 / 内部结构图，多柜并排）。
    *
    * 与 plan 一样是**派生视图**：和平面图来自同一份模型、同一次 derive，

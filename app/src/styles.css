@@ -604,6 +604,19 @@ kbd {
 .assume-warn { color: var(--warn); font-weight: 600; }
 .vp-hud-sheet { color: var(--muted); }
 
+/* 3D 视口的 HUD：只读提示，样式与图幅 HUD 同族（同是"看图"模式） */
+.vp-hud-3d {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 3px 8px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+
 /* 右侧栏 tab 变多后允许换行，避免被压成不能读的窄条 */
 .side-right .tabs { flex-wrap: wrap; row-gap: 3px; }
 .tab-badge-warn { background: var(--warn); color: #fff; }

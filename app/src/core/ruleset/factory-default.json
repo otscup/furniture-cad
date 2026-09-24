@@ -46,6 +46,17 @@
       ],
       "grain": false,
       "density": 0.72
+    },
+    "M_GLASS_8_GREY": {
+      "name": "8mm 灰玻（门板）",
+      "thickness": 8,
+      "kind": "glass",
+      "maxSheet": [
+        2000,
+        1000
+      ],
+      "grain": false,
+      "density": 2.5
     }
   },
   "edgebanding": {
@@ -78,6 +89,26 @@
     "HW_HANDLE_128": {
       "name": "拉手 128mm",
       "unit": "只"
+    },
+    "HW_DAMPER": {
+      "name": "阻尼反弹器",
+      "unit": "只"
+    },
+    "HW_LED_CENTER": {
+      "name": "LED 灯带（层板居中）",
+      "unit": "条"
+    },
+    "HW_LED_FRONT": {
+      "name": "LED 灯带（贴前沿）",
+      "unit": "条"
+    },
+    "HW_LED_ANGLED45": {
+      "name": "LED 灯带（45° 斜光）",
+      "unit": "条"
+    },
+    "HW_BASKET": {
+      "name": "碗碟拉篮",
+      "unit": "个"
     }
   },
   "limits": {

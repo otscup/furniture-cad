@@ -1,4 +1,4 @@
-import type { BBox, Issue, Panel, Prim, Project, RuleSet, Vec2 } from '../core/types.ts';
+import type { BBox, Issue, Panel, Prim, Project, PurchasedItem, RuleSet, Vec2 } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
 import { buildProjectViews } from '../core/geometry/views.ts';
 
@@ -66,6 +66,16 @@ export interface NeutralExport {
     grain: string;
   }>;
   issues: Issue[];
+  /** 甲购/外采件（玻璃门等，按材质 kind 从板件清单分流出来，不进开料） */
+  purchased: Array<{
+    id: string;
+    nameZh: string;
+    kind: string;
+    material: string;
+    spec: string;
+    qty: number;
+    belongsTo: string;
+  }>;
   stats: { panelKinds: number; totalPieces: number; boardAreaM2: number; estWeightKg: number };
 }
 
@@ -113,6 +123,16 @@ const panelRow = (p: Panel) => ({
   width: p.width,
   qty: p.qty,
   grain: p.grain,
+});
+
+const purchasedRow = (x: PurchasedItem) => ({
+  id: x.id,
+  nameZh: x.nameZh,
+  kind: x.kind,
+  material: x.material,
+  spec: x.spec,
+  qty: x.qty,
+  belongsTo: x.belongsTo,
 });
 
 /**
@@ -178,6 +198,7 @@ export function toNeutralExport(
     },
     sheets,
     panels: cabinetGeoms.flatMap((c) => c.panels.map(panelRow)),
+    purchased: cabinetGeoms.flatMap((c) => c.purchased.map(purchasedRow)),
     issues: geom.issues,
     stats: {
       panelKinds: cabinetGeoms.reduce((a, c) => a + c.stats.panelKinds, 0),

@@ -1077,6 +1077,15 @@ async function handleApi(req, res, pathname) {
           ((p.length * p.width) / 1e6).toFixed(3),
         ]);
       });
+      // 甲购/外采件（玻璃门等）单独一节 —— 它们不走开料机，混进板件清单会误导排产
+      if (n.purchased && n.purchased.length > 0) {
+        rows.push([]);
+        rows.push(['—— 甲购/外采件（不进开料）——']);
+        rows.push(['序号', '件ID', '名称', '类型', '所属', '材质', '规格/工艺要求', '数量']);
+        n.purchased.forEach((x, i) => {
+          rows.push([i + 1, x.id, x.nameZh, x.kind, x.belongsTo, x.material, x.spec, x.qty]);
+        });
+      }
       const csv = '\uFEFF' + rows.map((r2) => r2.map(csvCell).join(',')).join('\r\n') + '\r\n';
       const base = `${String(project.name || 'project')}_开料单_${new Date().toISOString().slice(0, 10)}.csv`;
       res.writeHead(200, {

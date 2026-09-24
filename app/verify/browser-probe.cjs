@@ -3576,6 +3576,63 @@ async function waitForApp(url, timeoutMs = 25000) {
     await sleep(200);
 
     // ═══════════════════════════════════════════════════════════
+    section('B31 玻璃门材质：语义字段 → 斜线填充 + 甲购分流');
+
+    const vB31 = await statusVersion();
+    // ① 总线改玻璃（ui 与 AI 同权同位 —— 探针走的就是用户会走的通道）
+    const glassSet = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const b = s.bus;
+      const cab = b.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors));
+      const idx = cab.layout.units.findIndex((u) => u.doors);
+      const r = b.execute({ id: 'probe_glass', op: 'cabinet.layout', source: 'ui', target: { kind: 'cabinet', id: cab.id },
+        changes: [{ path: 'layout.units[' + idx + '].doors.material', op: 'set', value: 'M_GLASS_8_GREY' }] }, 'B31 探针：改玻璃门');
+      return { ver: b.getVersion(), err: r.error ?? null, mat: b.getState().cabinets.find((c) => c.id === cab.id).layout.units[idx].doors.material };
+    })()`);
+    ok('总线放行 doors.material 改玻璃（版本 +1、落进模型）',
+      glassSet.ver === vB31 + 1 && !glassSet.err && glassSet.mat === 'M_GLASS_8_GREY', JSON.stringify(glassSet));
+
+    // ② 派生：门板图出现灰玻填充 + 45° 斜线（材质表达，与开向对角线可区分）
+    const glassView = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const v = await import('/src/core/geometry/views.ts');
+      const cab = s.bus.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors && u.doors.material === 'M_GLASS_8_GREY'));
+      const vs = v.buildCabinetViews(cab, s.RULESET);
+      const is45 = (dx, dy) => Math.abs(Math.abs(dx) - Math.abs(dy)) < 0.5 && Math.abs(dx) > 1;
+      return {
+        fills: vs.prims.front.filter((p) => p.k === 'fill').length,
+        hatch: vs.prims.front.filter((p) => p.k === 'poly' && !p.closed && p.pts.length === 2 && is45(p.pts[1].x - p.pts[0].x, p.pts[1].y - p.pts[0].y)).length,
+      };
+    })()`);
+    ok('门板图出现灰玻填充与 45° 斜线（黑框灰玻，销售图纸同款）', glassView.fills >= 1 && glassView.hatch >= 2, JSON.stringify(glassView));
+
+    // ③ 清单分流：开料单无玻璃，甲购件清单有玻璃
+    const glassCut = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const n = await import('/src/export/neutralSheet.ts');
+      const out = n.toNeutralExport(s.bus.getState(), s.RULESET, [], 'probe-b31');
+      return {
+        panelsGlass: out.panels.filter((p) => p.material === 'M_GLASS_8_GREY').length,
+        purchased: out.purchased.length,
+        kind: out.purchased[0] ? out.purchased[0].kind : null,
+      };
+    })()`);
+    ok('开料清单不含玻璃、甲购件清单有玻璃（分流成立）',
+      glassCut.panelsGlass === 0 && glassCut.purchased >= 1 && glassCut.kind === 'glassDoor', JSON.stringify(glassCut));
+
+    // ④ 还原：改回默认木门，不污染后续审计（undo 走总线）
+    const glassBack = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const b = s.bus;
+      b.undo();
+      const cab = b.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors));
+      const u = cab.layout.units.find((u) => u.doors);
+      return u.doors.material;
+    })()`);
+    ok('undo 还原为默认门板材质（写入可回退）', glassBack !== 'M_GLASS_8_GREY', String(glassBack));
+    await shot(path.join(OUT_DIR, 'b31-glass-door.png'));
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

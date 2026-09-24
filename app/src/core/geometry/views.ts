@@ -149,6 +149,7 @@ type Align = 'l' | 'c' | 'r';
 interface ViewPainter {
   rect(a0: number, a1: number, b0: number, b1: number, layer: string, lw: number, dash?: number[]): void;
   line(a0: number, a1: number, b0: number, b1: number, layer: string, lw: number, dash?: number[]): void;
+  fillRect(a0: number, a1: number, b0: number, b1: number, layer: string, alpha: number): void;
   text(a: number, b: number, s: string, size: number, layer: string, align?: Align, rot?: number): void;
 }
 
@@ -166,6 +167,9 @@ function makePainter(out: Prim[], map: Mapper): ViewPainter {
     },
     line(a0, a1, b0, b1, layer, lw, dash) {
       out.push({ k: 'poly', pts: [map(a0, b0), map(a1, b1)], closed: false, layer, lw, ...(dash ? { dash } : {}) });
+    },
+    fillRect(a0, a1, b0, b1, layer, alpha) {
+      out.push({ k: 'fill', pts: [map(a0, b0), map(a1, b0), map(a1, b1), map(a0, b1)], layer, alpha });
     },
     text(a, b, s, size, layer, align = 'c', rot) {
       out.push({ k: 'text', p: map(a, b), text: s, size, layer, align, ...(rot ? { rot } : {}) });
@@ -627,6 +631,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       if (u.doors) {
         const dr = u.doors;
         const widths = doorWidths(u, netW, rules);
+        // 玻璃门：材质 kind='glass' → 门板图画「黑框灰玻」斜线填充（销售图纸同款）
+        const isGlass = dr.material ? rules.materials[dr.material]?.kind === 'glass' : false;
         let x = x0 + dr.gapOuter;
         for (let k = 0; k < widths.length; k++) {
           const w = widths[k];
@@ -635,6 +641,19 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const zTop = innerBottomZ + dr.gapOuter;
           const zBot = innerBottomZ + innerH - dr.gapOuter;
           P.rect(left, right, zTop, zBot, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+
+          if (withFronts && isGlass) {
+            // 斜线只表示材质（灰玻），不表示开向 —— 开向仍由下方对角线表达。
+            // 45° 斜线在门洞矩形内截断，两道，避开与开向 X 的视觉混淆。
+            P.fillRect(left, right, zTop, zBot, L_FRONT, 0.12);
+            const hatch = (f: number): void => {
+              const hx = left + w * f;
+              const run = Math.min(right - hx, zBot - zTop);
+              if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
+            };
+            hatch(0.33);
+            hatch(0.66);
+          }
 
           if (withFronts) {
             /**

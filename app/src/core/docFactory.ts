@@ -67,6 +67,15 @@ function pickHinge(rules: RuleSet): string {
   const hit = Object.entries(rules.hardware).find(([id]) => /hinge|HINGE|铰链/.test(id));
   return hit ? hit[0] : Object.keys(rules.hardware)[0];
 }
+/**
+ * 默认门板材质：规则集里 kind='board' 且厚度最大的那块（门板要刚度，取厚板）。
+ * 不硬编码材质 ID —— 换工厂规则集后自动跟随；找不出 board 材质时才兜底第一个。
+ */
+function pickDoorMaterial(rules: RuleSet): string {
+  const boards = Object.entries(rules.materials).filter(([, m]) => m.kind === 'board');
+  if (boards.length === 0) return Object.keys(rules.materials)[0]!;
+  return boards.sort((a, b) => b[1].thickness - a[1].thickness)[0]![0];
+}
 function pickRod(rules: RuleSet): string {
   const hit = Object.entries(rules.hardware).find(([id]) => /rod|ROD|挂衣杆/.test(id));
   return hit ? hit[0] : Object.keys(rules.hardware)[0];
@@ -203,7 +212,14 @@ export function makeUnit(opts: {
    * 调用方拿不到、也不该自己去挑铰链型号。
    * 风格预设（RuleSet.stylePresets）通过它给分区带门。
    */
-  doors?: { count: number; gapMid?: number; gapOuter?: number; hingeSide?: 'left' | 'right' };
+  doors?: {
+    count: number;
+    gapMid?: number;
+    gapOuter?: number;
+    hingeSide?: 'left' | 'right';
+    /** 门板材质 ID（引用 RuleSet.materials）；缺省 = 规则集默认门板材质 */
+    material?: string;
+  };
 }): UnitSpec {
   const id = opts.id ?? nextId('unit', opts.takenIds ?? []);
   const base = { id, kind: opts.kind, requestedWidth: Math.round(opts.requestedWidth) };
@@ -219,7 +235,7 @@ export function makeUnit(opts: {
       unit = {
         ...base,
         nickname,
-        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5 },
+        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       };
       break;
     case 'hanging':
@@ -228,7 +244,7 @@ export function makeUnit(opts: {
         nickname,
         // 挂衣区自带一块顶层层板 —— 与 defaultUnits 的挂衣区结构一致
         rod: { count: 1, heightFromBottom: Math.round(opts.rodHeight ?? 1800), hardware: pickRod(opts.rules) },
-        shelves: { count: 1, mode: 'equal', gapPerSide: 0.5 },
+        shelves: { count: 1, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       };
       break;
     case 'open':
@@ -248,6 +264,7 @@ export function makeUnit(opts: {
       gapMid: opts.doors.gapMid ?? 3,
       hinge: pickHinge(opts.rules),
       hingeSide: opts.doors.hingeSide ?? 'left',
+      material: opts.doors.material ?? pickDoorMaterial(opts.rules),
     };
   }
   return unit;
@@ -404,14 +421,14 @@ export function sampleProject(rules: RuleSet): Project {
         requestedWidth: 1200,
         nickname: '挂衣',
         rod: { count: 1, heightFromBottom: 1800, hardware: pickRod(rules) },
-        shelves: { count: 1, mode: 'equal', gapPerSide: 0.5 },
+        shelves: { count: 1, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       },
       {
         id: 'unit_003',
         kind: 'shelves',
         requestedWidth: 600,
         nickname: '层板',
-        shelves: { count: 4, mode: 'equal', gapPerSide: 0.5 },
+        shelves: { count: 4, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
         doors: {
           type: 'hinged',
           count: 2,
@@ -421,6 +438,7 @@ export function sampleProject(rules: RuleSet): Project {
           gapMid: 3,
           hinge: pickHinge(rules),
           hingeSide: 'left',
+          material: pickDoorMaterial(rules),
         },
       },
     ],

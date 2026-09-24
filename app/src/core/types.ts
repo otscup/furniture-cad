@@ -80,7 +80,18 @@ export interface UnitSpec {
   requestedWidth: number;
   nickname?: string;
   drawers?: DrawerSpec;
-  shelves?: { count: number; mode: 'equal'; gapPerSide: number };
+  shelves?: {
+    count: number;
+    mode: 'equal';
+    gapPerSide: number;
+    /**
+     * 灯带安装位（销售图纸里开放格灯带的三种画法）：
+     *   'none' = 不装（显式默认，docFactory 补齐 —— 不靠"字段缺失"表达状态）；
+     *   'center' = 层板前缘居中；'front' = 贴前沿；'angled45' = 45° 斜光朝前。
+     * 语义字段进清单派生（五金自动出 HW_LED_*），内视图标注挂 Phase D。
+     */
+    ledStrip?: 'none' | 'center' | 'front' | 'angled45';
+  };
   doors?: {
     type: 'hinged';
     count: number;
@@ -97,6 +108,13 @@ export interface UnitSpec {
      * 缺省 = 'left'（docFactory 补齐）。只影响图面表达，不影响板件清单。
      */
     hingeSide?: 'left' | 'right';
+    /**
+     * 门板材质 ID（引用 RuleSet.materials）。
+     * 玻璃 / 镜面等甲购件与木门共用这一个字段 —— 板件清单按材质 kind 分流：
+     * kind='glass' 的门板不进开料清单，进「甲购/外采件」。
+     * 缺省 = 规则集默认门板材质（docFactory 补齐，显式覆盖不留隐式回退）。
+     */
+    material?: string;
   };
   rod?: { count: number; heightFromBottom: number; hardware: string };
 }
@@ -241,6 +259,22 @@ export interface HardwareItem {
   belongsTo: string;
 }
 
+/**
+ * 甲购 / 外采件（玻璃门、镜面、成品拉篮等）。
+ * 与 HardwareItem 的区别：它们不是安装五金，是**要花钱买的成品件**，
+ * 清单上单独一节，绝不进板式开料清单（玻璃不走开料机）。
+ */
+export interface PurchasedItem {
+  id: string;
+  nameZh: string;
+  kind: string;
+  material: string;
+  /** 规格描述（尺寸 / 厚度 / 工艺要求），生产下单时直接可读 */
+  spec: string;
+  qty: number;
+  belongsTo: string;
+}
+
 // ─────────────────────────── 派生：2D 图元 ───────────────────────────
 
 export type Prim =
@@ -266,6 +300,8 @@ export interface CabinetGeometry {
   cabinetId: string;
   panels: Panel[];
   hardware: HardwareItem[];
+  /** 甲购/外采件（玻璃门等，kind='glass' 的材质分流到这里，不进 panels） */
+  purchased: PurchasedItem[];
   plan: Prim[];
   /** 板件在立面上的投影（用于侧栏缩略图 / 后续立面图） */
   elevation: Prim[];

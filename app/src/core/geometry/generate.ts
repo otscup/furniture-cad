@@ -6,6 +6,7 @@ import type {
   Issue,
   Panel,
   Prim,
+  PurchasedItem,
   RuleSet,
   Vec2,
 } from '../types.ts';
@@ -47,6 +48,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const issues: Issue[] = [];
   const panels: Panel[] = [];
   const hardware: HardwareItem[] = [];
+  const purchased: PurchasedItem[] = [];
   const plan: Prim[] = [];
   const elevation: Prim[] = [];
 
@@ -207,15 +209,56 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       push({ id: `P_${cabId}_${uid}_SH${k + 1}`, role: 'ShelfPanel', nameZh: `层板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: shelfW, width: sDepth, grain: 'length', edge: edge(E1, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${pos}mm`, layer: layerOf(t) });
     });
     hardware.push({ id: `HW_${cabId}_${uid}_PIN`, nameZh: '层板托', kind: 'shelfPin', qty: s.count * 4, spec: '每块层板 4 只', belongsTo: `${cabId}.${uid}` });
+    if (s.ledStrip && s.ledStrip !== 'none') {
+      // 灯带：安装位是语义字段（center/front/angled45），五金 ID 由安装位映射到规则集目录
+      const ledId = s.ledStrip === 'center' ? 'HW_LED_CENTER' : s.ledStrip === 'front' ? 'HW_LED_FRONT' : 'HW_LED_ANGLED45';
+      hardware.push({
+        id: `HW_${cabId}_${uid}_LED`,
+        nameZh: '层板灯带',
+        kind: 'ledStrip',
+        qty: s.count,
+        spec: `${rules.hardware[ledId]?.name ?? ledId}，每块层板 1 条（L=${Math.round(netW)}mm）`,
+        belongsTo: `${cabId}.${uid}`,
+      });
+    }
   }
 
   function buildDoors(uid: string, unit: Cabinet['layout']['units'][number], netW: number, netH: number): void {
     const dr = unit.doors!;
     const doorH = netH - 2 * dr.gapOuter;
     const widths = doorWidths(unit, netW, rules);
-    widths.forEach((w, k) => {
-      push({ id: `P_${cabId}_${uid}_DOOR${k + 1}`, role: 'DoorPanel', nameZh: `门板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: doorH, width: w, grain: 'length', edge: edge(E1, E1, E1, E1), edgeLabel: '四周 1mm（可见面）', layer: layerOf(t) });
-    });
+    /**
+     * 门板材质从语义字段 dr.material 派生（docFactory 已显式补齐）。
+     * 未知材质 ID 不静默吞掉 —— 报 WARNING 并回退柜体板材，否则一张
+     * 引用了已删材质的门板会带着错误厚度一路走到开料。
+     */
+    const mId = dr.material && rules.materials[dr.material] ? dr.material : p.boardMaterial;
+    if (mId !== dr.material) {
+      issues.push({ severity: 'WARNING', code: 'RULE-DOOR-MATERIAL', target: `${cabId}.${uid}`, targetKind: 'unit', message: `门板材质「${dr.material}」不在材质库，已回退「${p.boardMaterial}」`, fixHint: '改用规则集里存在的材质 ID' });
+    }
+    const mDef = rules.materials[mId]!;
+    if (mDef.kind === 'glass') {
+      /**
+       * 清单分流：玻璃门是甲购/外采件 —— 它不走开料机，进 purchased
+       * （开料单上单独一节），绝不混进板件清单。这是「派生视图按用途分流」
+       * 的实例：模型里只有 material 一个字段，分流发生在派生层。
+       */
+      widths.forEach((w, k) => {
+        purchased.push({
+          id: `PC_${cabId}_${uid}_GLASS${k + 1}`,
+          nameZh: `玻璃门-${k + 1}`,
+          kind: 'glassDoor',
+          material: mId,
+          spec: `${mDef.name}，${Math.round(doorH)}×${Math.round(w)}×${mDef.thickness}mm，四周铝合金框（黑框灰玻）`,
+          qty: 1,
+          belongsTo: `${cabId}.${uid}`,
+        });
+      });
+    } else {
+      widths.forEach((w, k) => {
+        push({ id: `P_${cabId}_${uid}_DOOR${k + 1}`, role: 'DoorPanel', nameZh: `门板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: mId, thickness: mDef.thickness, length: doorH, width: w, grain: mDef.grain ? 'length' : 'none', edge: edge(E1, E1, E1, E1), edgeLabel: '四周 1mm（可见面）', layer: layerOf(mDef.thickness) });
+      });
+    }
     const hingePerDoor = Math.max(2, Math.ceil(doorH / rules.limits.hingeSpacingMax));
     hardware.push({ id: `HW_${cabId}_${uid}_HINGE`, nameZh: '门铰链', kind: 'hinge', qty: hingePerDoor * dr.count, spec: `${rules.hardware[dr.hinge]?.name ?? dr.hinge}，每扇 ${hingePerDoor} 只（门高 ${Math.round(doorH)}mm ÷ 间距上限 ${rules.limits.hingeSpacingMax}mm）`, belongsTo: `${cabId}.${uid}` });
     hardware.push({ id: `HW_${cabId}_${uid}_HANDLE`, nameZh: '拉手', kind: 'handle', qty: dr.count, spec: 'HW_HANDLE_128 128mm 孔距', belongsTo: `${cabId}.${uid}` });
@@ -333,6 +376,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     cabinetId: cabId,
     panels,
     hardware,
+    purchased,
     plan,
     elevation,
     issues,

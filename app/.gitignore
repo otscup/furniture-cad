@@ -18,3 +18,6 @@ memory/audit.jsonl
 # 验收截图是证据，保留；
 # 但 Chrome 临时 profile 若因环境删除保护而残留，不要入库
 verify/out/chrome-profile-*/
+
+# 注册验证码库 —— 运行时数据（与账号库同理，每台机器各自生成）
+memory/pending-registrations.json

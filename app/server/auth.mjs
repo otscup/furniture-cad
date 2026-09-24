@@ -434,6 +434,60 @@ export class AuthStore {  /**
     return (a.sessions ?? []).filter((s) => new Date(s.expiresAt).getTime() > now).length;
   }
 
+  // ───────────────────────── 会话管理（管理员轮换） ─────────────────────────
+  //
+  // 为什么管理员需要能"踢下线"而不只是等 TTL：账号被怀疑泄露（丢了笔记本 /
+  // token 曾贴进过错误的窗口）时，等待自然过期是在赌博。改密与停用虽然也会
+  // 清会话，但那两个动作各有副作用；"只清会话、账号照常"是独立的运维动作。
+
+  /**
+   * 查看指定账号的活跃会话。
+   * 哈希只回**前 8 位**做短 ID（够管理员辨认"哪条是我刚踢的"），
+   * 全文不给 —— 审计日志会到处走，落全文等于把哈希当明文管。
+   */
+  listSessions(id) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const now = Date.now();
+    const sessions = (a.sessions ?? [])
+      .filter((s) => new Date(s.expiresAt).getTime() > now)
+      .map((s) => ({
+        id: s.hash.slice(0, 8),
+        createdAt: s.createdAt,
+        expiresAt: s.expiresAt,
+        ip: s.ip ?? '',
+        ua: s.ua ?? '',
+      }));
+    return { ok: true, sessions, active: sessions.length };
+  }
+
+  /** 撤销指定会话（按短 ID 前缀匹配）。返回实际撤销条数 —— 撤 0 条不是错误，但要如实报 */
+  revokeSession(id, sessionId, actor = null) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const sid = String(sessionId ?? '').trim();
+    if (!sid) return { ok: false, error: 'SESSION_ID_REQUIRED' };
+    const before = (a.sessions ?? []).length;
+    a.sessions = (a.sessions ?? []).filter((s) => !s.hash.startsWith(sid));
+    const removed = before - a.sessions.length;
+    if (removed > 0) this.#save();
+    this.audit({ actor, action: 'account.revokeSession', target: id, sessionId: sid, result: removed > 0 ? 'ok' : 'no_session' });
+    return { ok: true, removed };
+  }
+
+  /** 撤销全部会话（踢下线）。audit 留痕 —— 这是运营动作，出事时必须能查到是谁按的 */
+  revokeAllSessions(id, actor = null) {
+    const a = this.findById(id);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const removed = (a.sessions ?? []).length;
+    if (removed > 0) {
+      a.sessions = [];
+      this.#save();
+    }
+    this.audit({ actor, action: 'account.revokeAllSessions', target: id, removed, result: 'ok' });
+    return { ok: true, removed };
+  }
+
   // ───────────────────────── 额度与用量 ─────────────────────────
 
   /** 额度检查 —— 在**发起 AI 调用之前**执行，不是事后统计 */

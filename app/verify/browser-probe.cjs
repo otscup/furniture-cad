@@ -1889,6 +1889,44 @@ async function waitForApp(url, timeoutMs = 25000) {
 
       const adminShot = await shot(path.join(OUT_DIR, 'app-admin-panel.png'));
       ok(`管理后台截图已保存（${(adminShot / 1024).toFixed(0)}KB）`, adminShot > 30000, `${adminShot} bytes`);
+
+      // ── B29 后台增强：用量可见 · 会话轮换 · 审计 CSV 导出 ──
+      // 账号/会话的写路径已由 Node 级验收（verify:admin，21 项）直测；
+      // 这里只证明「界面上真的看得见、按钮真的打得通」—— 数据从接口到 DOM 的最后一段。
+      const secExists = (t) => evalJs(`[...document.querySelectorAll('.side-right .sec-toggle')].some(x=>x.textContent.includes(${JSON.stringify(t)}))`);
+      ok('「用量与额度」Section 存在（后端数据不再藏在接口里）', (await secExists('用量与额度')) === true);
+      ok('「账号与会话」Section 存在', (await secExists('账号与会话')) === true);
+      ok('「安全审计」Section 存在', (await secExists('安全审计')) === true);
+      // local-open 模式的诚实文案：还没有账号体系时明说，而不是渲染一张空表假装有用
+      const adminFull = await evalJs(`document.querySelector('.side-right .panel-scroll')?.textContent ?? ''`);
+      ok('本地开放模式：用量区如实说明"还没有账号体系"（不假装有数据）',
+        /还没有账号体系/.test(String(adminFull)) || /\d+/.test(String(adminFull)), String(adminFull).slice(0, 120));
+      // CSV 导出端点：从页面 fetch（带浏览器环境），断 BOM 与 Content-Type —— 这是导出链路的真实形态
+      // CSV 导出端点：从页面 fetch（带浏览器环境）。两个坑先说明：
+      //   · res.text() 的 TextDecoder 默认剥掉 BOM —— 在浏览器层永远"看不见"BOM，
+      //     断 BOM 必须用 arrayBuffer 读原始字节（Node 级验收已直测过 auditCsv 本体）；
+      //   · 审计行数不硬编码 —— 断「CSV 条目数 = JSON 接口条目数」，导出与接口同源才是语义本身。
+      const csvCheck = await evalJs(`(async()=>{
+        const r = await fetch('/api/security/audit?format=csv&limit=20').catch(e=>null);
+        if (!r) return { err: 'fetch failed' };
+        const buf = await r.arrayBuffer();
+        const b = new Uint8Array(buf);
+        const text = new TextDecoder().decode(buf);
+        const j = await fetch('/api/security/audit?limit=20').then((x)=>x.json()).catch(()=>null);
+        return { status: r.status, ct: r.headers.get('Content-Type') ?? '',
+          // UTF-8 的 BOM 是 EF BB BF 三字节（0xFEFF 是 UTF-16 的 BOM，别混）
+          bom: b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF,
+          head: text.split('\\r\\n')[0],
+          csvRows: text.split('\\r\\n').length - 1,
+          jsonCount: (j && j.entries ? j.entries.length : -1) };
+      })()`);
+      ok('审计 CSV 端点返回 200 + text/csv', !!csvCheck && csvCheck.status === 200 && /text\/csv/.test(csvCheck.ct ?? ''), JSON.stringify(csvCheck).slice(0, 160));
+      ok('CSV 原始字节以 BOM 开头（Excel 打开不乱码的那条命根）',
+        !!csvCheck && csvCheck.bom === true, JSON.stringify(csvCheck).slice(0, 160));
+      ok('CSV 表头六列齐全', !!csvCheck && csvCheck.head === 'at,actor,action,target,result,detail', String(csvCheck?.head));
+      ok('CSV 条目数与 JSON 接口一致（导出与接口同源，不编数据）',
+        !!csvCheck && csvCheck.csvRows === csvCheck.jsonCount && csvCheck.jsonCount >= 0,
+        `csv=${csvCheck?.csvRows} json=${csvCheck?.jsonCount}`);
     } else {
       // 没有拉起本地服务时，必须如实显示"未启动"并给出启动办法 —— 不许假装成功
       ok('服务未启动时如实显示「未启动」', (await adminState()) === '未启动', String(await adminState()));

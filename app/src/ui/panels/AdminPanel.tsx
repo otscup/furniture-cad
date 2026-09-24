@@ -58,6 +58,32 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
   const [models, setModels] = useState<ModelList | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [modelChoice, setModelChoice] = useState('');
+
+  // ── 用量 / 账号 / 审计（Task #27：把后端已有的数据变成"看得见"的界面）──
+  interface QuotaInfo {
+    monthlyTokens?: number;
+    dailyCalls?: number;
+    used?: { monthTokens?: number; dayCalls?: number; month?: string; totalTokens?: number; totalCalls?: number };
+  }
+  interface UsageAccount {
+    id: string;
+    username: string;
+    plan: string;
+    quota?: QuotaInfo;
+    lastLoginAt?: string | null;
+  }
+  interface AcctRow extends UsageAccount {
+    role?: string;
+    roleLabel?: string;
+    planLabel?: string;
+    status?: string;
+  }
+  interface SessionRow { id: string; createdAt: string; expiresAt: string; ip?: string; ua?: string }
+  interface AuditEntry { at?: string; actor?: string; action?: string; target?: string; result?: string }
+  const [usage, setUsage] = useState<UsageAccount[] | null>(null);
+  const [accounts, setAccounts] = useState<AcctRow[] | null>(null);
+  const [audit, setAudit] = useState<AuditEntry[] | null>(null);
+  const [sessionRows, setSessionRows] = useState<Record<string, { sessions: SessionRow[]; active: number }>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   /** 被权限拦下时的原因。非空 = 这个面板现在**只能显示这句话**，不许渲染配置表单 */
@@ -111,6 +137,15 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
       say(`本地服务未响应：${(e as Error).message}`);
       return;
     }
+    // 用量 / 账号 / 审计：并行拉，各自独立成败 —— 一个 403 不拖垮其余面板
+    void (async () => {
+      const u = await authed('/api/usage');
+      if (u) setUsage(((await u.json()) as { accounts?: UsageAccount[] }).accounts ?? []);
+      const a = await authed('/api/account/accounts');
+      if (a) setAccounts(((await a.json()) as { accounts?: AcctRow[] }).accounts ?? []);
+      const al = await authed('/api/security/audit?limit=50');
+      if (al) setAudit(((await al.json()) as { entries?: AuditEntry[] }).entries ?? []);
+    })();
     try {
       const sr = await authed('/api/settings');
       if (!sr) return;
@@ -264,6 +299,64 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
   }, [authed, say]);
 
   const providerList = settings ? Object.entries(settings.providers) : [];
+
+  // ── 会话轮换 / 审计导出（Task #27）──
+  const loadSessions = useCallback(
+    async (id: string) => {
+      setBusy(`sess-${id}`);
+      try {
+        const r = await authed(`/api/account/sessions?id=${encodeURIComponent(id)}`);
+        if (!r) return;
+        const data = (await r.json()) as { sessions?: SessionRow[]; active?: number };
+        setSessionRows((prev) => ({ ...prev, [id]: { sessions: data.sessions ?? [], active: data.active ?? 0 } }));
+      } catch (e) {
+        say(`读取会话失败：${(e as Error).message}`);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [authed, say]
+  );
+
+  const kickAll = useCallback(
+    async (id: string) => {
+      setBusy(`kick-${id}`);
+      try {
+        const r = await authed('/api/account/revoke-all-sessions', { method: 'POST', body: JSON.stringify({ id }) });
+        if (!r) return;
+        const data = (await r.json()) as { removed?: number };
+        say(`已踢下线 ${data.removed ?? 0} 个会话（被踢设备需要重新登录）`);
+        setSessionRows((prev) => ({ ...prev, [id]: { sessions: [], active: 0 } }));
+      } catch (e) {
+        say(`踢下线失败：${(e as Error).message}`);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [authed, say]
+  );
+
+  const exportAuditCsv = useCallback(async () => {
+    setBusy('audit-csv');
+    try {
+      const r = await authed('/api/security/audit?format=csv&limit=1000');
+      if (!r) return;
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `audit-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      say('审计日志已导出 CSV（带 BOM，Excel 打开中文不乱码）');
+    } catch (e) {
+      say(`导出失败：${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }, [authed, say]);
+
+  const fmtNum = (v: number | undefined): string => (typeof v === 'number' ? v.toLocaleString('zh-CN') : '—');
   const modelOptions = (() => {
     const base = models?.models ?? [];
     const cur = modelChoice || settings?.model || '';
@@ -316,6 +409,114 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
 
       {health === 'online' && settings && !denied ? (
         <>
+          <Section title="用量与额度" defaultOpen>
+            {usage === null ? (
+              <Text>读取中…</Text>
+            ) : usage.length === 0 ? (
+              <Text>本地开放模式：还没有账号体系，用量统计在创建账号后生效</Text>
+            ) : (
+              usage.map((a) => {
+                const used = a.quota?.used;
+                const pct = a.quota?.monthlyTokens && a.quota.monthlyTokens > 0 && used?.monthTokens !== undefined
+                  ? Math.min(100, Math.round((used.monthTokens / a.quota.monthlyTokens) * 100))
+                  : null;
+                return (
+                  <div key={a.id} className="view-item">
+                    <div className="view-item-head">
+                      <b>{a.username}</b>
+                      <Pill kind={pct !== null && pct > 85 ? 'WARNING' : 'muted'}>{a.plan}</Pill>
+                    </div>
+                    <div className="view-item-note">
+                      本月 {fmtNum(used?.monthTokens)} / {fmtNum(a.quota?.monthlyTokens)} token
+                      {pct !== null ? `（${pct}%）` : ''} · 今日调用 {fmtNum(used?.dayCalls)} / {fmtNum(a.quota?.dailyCalls)} · 累计{' '}
+                      {fmtNum(used?.totalTokens)} token
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </Section>
+
+          <Section title="账号与会话">
+            {accounts === null ? (
+              <Text>读取中…</Text>
+            ) : accounts.length === 0 ? (
+              <Text>本地开放模式：无账号（创建第一个账号后这里会出现账号列表）</Text>
+            ) : (
+              <>
+                {accounts.map((a) => (
+                  <div key={a.id} className="view-item">
+                    <div className="view-item-head">
+                      <b>{a.username}</b>
+                      <span>
+                        <Pill kind="muted">{a.roleLabel ?? a.role ?? '—'}</Pill>{' '}
+                        {a.status !== 'active' ? <Pill kind="ERROR">{a.status}</Pill> : null}
+                      </span>
+                    </div>
+                    <div className="view-item-note">
+                      {a.planLabel ?? a.plan} · 最近登录 {a.lastLoginAt ? String(a.lastLoginAt).slice(0, 16).replace('T', ' ') : '从未'}
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                      <button
+                        type="button"
+                        className="tb-btn"
+                        disabled={busy === `sess-${a.id}`}
+                        onClick={() => void loadSessions(a.id)}
+                      >
+                        {busy === `sess-${a.id}` ? '读取中…' : '查看活跃会话'}
+                      </button>
+                      <button
+                        type="button"
+                        className="tb-btn"
+                        disabled={busy === `kick-${a.id}`}
+                        onClick={() => void kickAll(a.id)}
+                      >
+                        {busy === `kick-${a.id}` ? '踢下线中…' : '全部踢下线'}
+                      </button>
+                    </div>
+                    {sessionRows[a.id] ? (
+                      sessionRows[a.id].sessions.length === 0 ? (
+                        <div className="view-item-note">当前没有活跃会话（0 个）</div>
+                      ) : (
+                        sessionRows[a.id].sessions.map((s) => (
+                          <div key={s.id} className="view-item-note" title={`${s.ip ?? ''} ${s.ua ?? ''}`}>
+                            会话 {s.id}… · 登录 {s.createdAt.slice(0, 16).replace('T', ' ')} · 过期 {s.expiresAt.slice(0, 16).replace('T', ' ')}
+                          </div>
+                        ))
+                      )
+                    ) : null}
+                  </div>
+                ))}
+                <div className="muted-sm">
+                  会话哈希只显示前 8 位 —— 审计数据会四处走，落全文等于把哈希当明文管。
+                  「全部踢下线」后账号本身不受影响，被踢设备需要重新登录。
+                </div>
+              </>
+            )}
+          </Section>
+
+          <Section title="安全审计">
+            {audit === null ? (
+              <Text>读取中…</Text>
+            ) : (
+              <>
+                {audit.slice(0, 12).map((e, i) => (
+                  <div key={i} className="view-item-note">
+                    {String(e.at ?? '').slice(5, 19).replace('T', ' ')} · {e.action ?? '—'} · {e.actor ?? '—'}
+                    {e.target ? ` → ${e.target}` : ''}
+                    {e.result ? ` · ${e.result}` : ''}
+                  </div>
+                ))}
+                {audit.length === 0 ? <Text>还没有审计记录</Text> : null}
+                <div style={{ marginTop: 6 }}>
+                  <button type="button" className="tb-btn" disabled={busy === 'audit-csv'} onClick={() => void exportAuditCsv()}>
+                    {busy === 'audit-csv' ? '导出中…' : '导出审计 CSV（近 1000 条）'}
+                  </button>
+                </div>
+              </>
+            )}
+          </Section>
+
           <Section title="AI 模型">
             <Row label="服务商">
               <select

@@ -36,6 +36,8 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
+import { auditCsv } from './auditCsv.mjs';
+import { csvCell } from './csvCell.mjs';
 import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS } from '../shared/aiContract.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -479,6 +481,30 @@ async function handleApi(req, res, pathname) {
     return json(res, 200, { ok: true, account: acc ? AuthStore.publicView(acc) : null });
   }
 
+  // ───────────────────────── 会话轮换（管理员踢下线） ─────────────────────────
+
+  if (pathname === '/api/account/sessions' && req.method === 'GET') {
+    const url = new URL(req.url ?? '/', 'http://x');
+    const id = String(url.searchParams.get('id') ?? '');
+    const r = auth.listSessions(id);
+    if (!r.ok) return json(res, 404, { ok: false, error: '账号不存在' });
+    return json(res, 200, { ok: true, ...r });
+  }
+
+  if (pathname === '/api/account/revoke-session' && req.method === 'POST') {
+    const body = await readBody(req);
+    const r = auth.revokeSession(String(body.id ?? ''), String(body.sessionId ?? ''), actor);
+    if (!r.ok) return json(res, r.error === 'ACCOUNT_NOT_FOUND' ? 404 : 400, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, ...r });
+  }
+
+  if (pathname === '/api/account/revoke-all-sessions' && req.method === 'POST') {
+    const body = await readBody(req);
+    const r = auth.revokeAllSessions(String(body.id ?? ''), actor);
+    if (!r.ok) return json(res, 404, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, ...r });
+  }
+
   // ───────────────────────── 用量 / 审计 / 安全自述 ─────────────────────────
 
   if (pathname === '/api/usage' && req.method === 'GET') {
@@ -498,7 +524,18 @@ async function handleApi(req, res, pathname) {
   if (pathname === '/api/security/audit' && req.method === 'GET') {
     const url = new URL(req.url ?? '/', 'http://x');
     const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get('limit') ?? 200)));
-    return json(res, 200, { ok: true, path: AUDIT_PATH, entries: auth.readAudit(limit) });
+    const entries = auth.readAudit(limit);
+    // CSV 导出：给表格软件的第二种消费方式。序列化抽到 auditCsv.mjs —— Node 级验收直接断它。
+    if (url.searchParams.get('format') === 'csv') {
+      const text = auditCsv(entries);
+      res.writeHead(200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="audit-${Date.now()}.csv"`,
+        'Content-Length': Buffer.byteLength(text),
+      });
+      return res.end(text);
+    }
+    return json(res, 200, { ok: true, path: AUDIT_PATH, entries });
   }
 
   if (pathname === '/api/settings' && req.method === 'GET') {
@@ -1058,10 +1095,6 @@ async function handleApi(req, res, pathname) {
 }
 
 /** CSV 单元格转义：含逗号/引号/换行时必须包起来，内部引号翻倍 */
-function csvCell(v) {
-  const s = String(v ?? '');
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
 
 // ───────────────────────────── 静态文件 ─────────────────────────────
 

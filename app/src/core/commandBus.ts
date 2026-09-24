@@ -182,7 +182,7 @@ const WRITABLE: Record<string, RegExp[]> = {
     /^layout\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
     /^layout\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
     /^layout\.units\[\d+\]\.(shelves)\.(count|gapPerSide)$/,
-    /^layout\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge)$/,
+    /^layout\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide)$/,
     /^layout\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
   ],
   'wall.move': [/^(start|end)\.[xy]$/],

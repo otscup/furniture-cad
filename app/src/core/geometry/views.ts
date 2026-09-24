@@ -579,28 +579,40 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   function drawFrontLike(P: ViewPainter, withFronts: boolean): void {
     const hidden = withFronts ? undefined : HIDDEN_DASH;
 
+    // 箱体骨架（外框）两种图都画 —— 这是同一个柜子
     P.rect(t, W - t, 0, bodyLift, layerOfThickness(t), 1); // 踢脚板
     P.rect(0, t, bodyLift, H, layerOfThickness(t), 1); // 左侧板
     P.rect(W - t, W, bodyLift, H, layerOfThickness(t), 1); // 右侧板
     P.rect(t, W - t, H - t, H, layerOfThickness(t), 1); // 顶板
     P.rect(t, W - t, bodyLift, bodyLift + t, layerOfThickness(t), 1); // 底板
 
-    for (let i = 0; i < unitCount - 1; i++) {
-      const dx = unitX0[i] + nets[i];
-      P.rect(dx, dx + t, innerBottomZ, innerTopZ, layerOfThickness(t), 1); // 中立板
-    }
-
+    /**
+     * ── 正视图是【门板图】，不是"结构图加门"（一次真实缺陷的修正）──
+     *
+     * 行业图纸（销售设计图）的正立面外观图，有门的地方只画【整块门板 +
+     * 开向对角线】，开放格才透出内部层板。此前正视图把层板 / 中立板 /
+     * 门板全部叠画在一张图上 —— 小隔层的门被内部线切成"多块板件"，
+     * 客户看图会以为门是拼的。修正规则（对照销售图纸的标准画法）：
+     *   · 有门的分区：只画整块门板 + 开向线，内部一概不透；
+     *   · 有抽的分区：画抽面（抽屉本来就是一格一面）；
+     *   · 开放分区（无门无抽）：画层板 / 挂衣杆 —— 外观图上它们真的可见；
+     *   · 中立板：只画在两侧都是开放区的位置（被门挡住的不画）。
+     * 内部结构图（withFronts=false）维持原样：去掉门板，结构全画。
+     */
     cab.layout.units.forEach((u, i) => {
       const x0 = unitX0[i];
       const netW = nets[i];
+      const openUnit = !u.doors && !u.drawers; // 开放格：外观图上能看见内部
 
-      if (u.shelves && u.shelves.count > 0) {
+      // 层板：只在内部图，或门板图的开放格里画
+      if (u.shelves && u.shelves.count > 0 && (!withFronts || openUnit)) {
         const s = shelfSpanX(i);
         equalSpacing(innerH, u.shelves.count).forEach((pos) => {
           P.rect(s.a, s.b, innerBottomZ + pos, innerBottomZ + pos + t, layerOfThickness(t), 1);
         });
       }
 
+      // 抽面：一格一面，两种图都画（内部图弱化线宽）
       if (u.drawers) {
         const d = u.drawers;
         const cellH = drawerCellHeights(u, innerH, rules);
@@ -611,29 +623,73 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         }
       }
 
+      // 门板：整块 + 开向对角线（行业画法）
       if (u.doors) {
         const dr = u.doors;
         const widths = doorWidths(u, netW, rules);
         let x = x0 + dr.gapOuter;
-        for (const w of widths) {
-          P.rect(
-            x,
-            x + w,
-            innerBottomZ + dr.gapOuter,
-            innerBottomZ + innerH - dr.gapOuter,
-            L_FRONT,
-            withFronts ? 1.8 : 1.2,
-            hidden
-          );
+        for (let k = 0; k < widths.length; k++) {
+          const w = widths[k];
+          const left = x;
+          const right = x + w;
+          const zTop = innerBottomZ + dr.gapOuter;
+          const zBot = innerBottomZ + innerH - dr.gapOuter;
+          P.rect(left, right, zTop, zBot, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+
+          if (withFronts) {
+            /**
+             * 开向对角线 —— 与销售图纸同款：
+             *   · 双扇对开画 X 形（左扇 ↘、右扇 ↗，两条线在门缝处交叉）；
+             *   · 单扇按 hingeSide：铰链在左 → 线从左上到右下；
+             *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
+             * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
+             */
+            const diag = (x1: number, z1: number, x2: number, z2: number): void => {
+              P.line(x1, x2, z1, z2, L_FRONT, 0.9);
+            };
+            if (widths.length === 2) {
+              // 对开 X 形：整个门洞画一个大 X，两条线跨过门缝在中点交叉
+              // （行业画法；与铰链侧无关 —— 两扇铰链天然在两侧）。
+              // 注意必须用门洞边界而非循环内的扇叶边界，否则 X 会被门缝切成两个小 X。
+              if (k === 0) {
+                const openL = x0 + dr.gapOuter;
+                const openR = openL + widths[0]! + dr.gapMid + widths[1]!;
+                diag(openL, zBot, openR, zTop);
+                diag(openL, zTop, openR, zBot);
+              }
+            } else if (widths.length === 1) {
+              if ((dr.hingeSide ?? 'left') === 'left') diag(left, zTop, right, zBot);
+              else diag(right, zTop, left, zBot);
+            } else {
+              const side = (dr.hingeSide ?? 'left') === 'left';
+              for (let j = 0; j < widths.length; j++) {
+                const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
+                const r2 = l2 + widths[j];
+                if (side) diag(l2, zTop, r2, zBot);
+                else diag(r2, zTop, l2, zBot);
+              }
+            }
+          }
           x += w + dr.gapMid;
         }
       }
 
-      if (u.rod && u.rod.count > 0) {
+      // 挂衣杆：只在开放格可见（门后的杆在外观图上不画，内部图照画）
+      if (u.rod && u.rod.count > 0 && (!withFronts || openUnit)) {
         const rz = innerBottomZ + u.rod.heightFromBottom;
         P.line(x0 + 2, x0 + netW - 2, rz, rz, L_HW, 1.6, ROD_DASH);
       }
     });
+
+    // 中立板：内部图全画；门板图只画两侧都开放的（其余被门挡住）
+    for (let i = 0; i < unitCount - 1; i++) {
+      const bothOpen = !cab.layout.units[i].doors && !cab.layout.units[i].drawers
+        && !cab.layout.units[i + 1].doors && !cab.layout.units[i + 1].drawers;
+      if (!withFronts || bothOpen) {
+        const dx = unitX0[i] + nets[i];
+        P.rect(dx, dx + t, innerBottomZ, innerTopZ, layerOfThickness(t), 1); // 中立板
+      }
+    }
 
     if (!withFronts) {
       // 背板在正视图方向被完全遮挡 → 只画内空轮廓，提示"这里还有一层板"

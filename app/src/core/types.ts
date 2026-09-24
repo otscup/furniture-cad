@@ -89,6 +89,14 @@ export interface UnitSpec {
     gapOuter: number;
     gapMid: number;
     hinge: string;
+    /**
+     * 门铰链侧（开向标注的数据来源）。
+     *   count===1：'left' = 铰链在左、门往右开；
+     *   count===2 且 style 为对开：两扇铰链在两侧（V 形开向线），此字段标记主扇（左扇）方向；
+     *   更多扇：暂按每扇同向对角线表达（行业简画）。
+     * 缺省 = 'left'（docFactory 补齐）。只影响图面表达，不影响板件清单。
+     */
+    hingeSide?: 'left' | 'right';
   };
   rod?: { count: number; heightFromBottom: number; hardware: string };
 }

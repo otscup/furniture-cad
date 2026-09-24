@@ -188,6 +188,7 @@ export function makeUnit(opts: {
       gapOuter: opts.doors.gapOuter ?? 2,
       gapMid: opts.doors.gapMid ?? 3,
       hinge: pickHinge(opts.rules),
+      hingeSide: 'left',
     };
   }
   return unit;
@@ -361,6 +362,7 @@ export function sampleProject(rules: RuleSet): Project {
           gapOuter: 2,
           gapMid: 3,
           hinge: pickHinge(rules),
+          hingeSide: 'left',
         },
       },
     ],

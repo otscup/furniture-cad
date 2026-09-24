@@ -211,6 +211,20 @@ function shelfCentersMatch(vs: ViewSet, cab: Cabinet, ruleSet: RuleSet): boolean
   return front.every((v, i) => Math.abs(v - side[i]) < TOL);
 }
 
+/**
+ * 开向对角线识别：2 点开放 poly、门板图层、斜向（dx 与 dy 都 > 1mm）。
+ * 轴向线（标注线 / 踢脚 / 抽缝）全部被 dx|dy≈0 条件排除，不会误伤。
+ */
+function frontDiagonals(view: Prim[], inv: (p: Vec2) => Vec2): Vec2[][] {
+  return view
+    .filter(
+      (p): p is Extract<Prim, { k: 'poly' }> =>
+        p.k === 'poly' && !p.closed && p.pts.length === 2 && p.layer === 'F-CAB-FRONT'
+    )
+    .map((p) => p.pts.map(inv))
+    .filter(([a, b]) => Math.abs(a.x - b.x) > 1 && Math.abs(a.y - b.y) > 1);
+}
+
 // ───────────────────────────── 主流程 ─────────────────────────────
 
 console.log('四视图投影对齐验收');
@@ -311,28 +325,46 @@ ok(
   hasRect(R.front, 0, t, bodyLift, H) && hasRect(R.top, 0, t, 0, bodyD) && hasRect(R.front, W - t, W, bodyLift, H)
 );
 
-// C4 中立板：俯视图里的 X 位置必须与正视图里的 X 位置逐一对齐
+// C4 中立板：俯视图里的 X 位置必须与正视图里的 X 位置逐一对齐。
+// 正视图现在是【门板图】：中立板只画在两侧都开放的分区之间（被门挡住的不画），
+// 所以守护意图从"全等"改为"子集 + 两侧开放者必现"。
 const divX: number[] = [];
 for (let i = 0; i < cab.layout.units.length - 1; i++) divX.push(L.unitX0[i] + L.nets[i]);
+const isOpenUnit = (i: number): boolean => {
+  const u = cab.layout.units[i];
+  return !u.doors && !u.drawers;
+};
+const bothOpenDivs = divX.filter((_, i) => isOpenUnit(i) && isOpenUnit(i + 1));
 ok(
-  `C4 中立板 ${divX.length} 块：正视与俯视的 X 区间逐一对齐`,
-  divX.every((dx) => hasRect(R.front, dx, dx + t, innerBottomZ, innerTopZ) && hasRect(R.top, dx, dx + t, 0, bodyD)),
-  `divX=${JSON.stringify(divX)}`
+  `C4 中立板：正视图中出现的 ${divX.length} 块必须与俯视逐一对齐；两侧开放的 ${bothOpenDivs.length} 块必须出现在正视图`,
+  divX.every((dx) => hasRect(R.top, dx, dx + t, 0, bodyD))
+    && divX.every((dx) => !hasRect(R.front, dx, dx + t, innerBottomZ, innerTopZ) || hasRect(R.top, dx, dx + t, 0, bodyD))
+    && bothOpenDivs.every((dx) => hasRect(R.front, dx, dx + t, innerBottomZ, innerTopZ)),
+  `divX=${JSON.stringify(divX)} bothOpen=${JSON.stringify(bothOpenDivs)}`
 );
 
-// C5 层板：数量 + 尺寸 + 高度集合 + 进深
+// C5 层板：数量 + 尺寸 + 高度集合 + 进深。
+// 门板图语义：正视图只画【开放格】的层板（门挡住的透不出来）；侧视图全部可见。
 let expectShelfCount = 0;
-cab.layout.units.forEach((u) => {
-  if (u.shelves && u.shelves.count > 0) expectShelfCount += u.shelves.count;
+let expectFrontShelfCount = 0;
+cab.layout.units.forEach((u, i) => {
+  if (u.shelves && u.shelves.count > 0) {
+    expectShelfCount += u.shelves.count;
+    if (!u.doors && !u.drawers) expectFrontShelfCount += u.shelves.count;
+  }
 });
 const shelfY0 = Math.max(backY0 + cab.params.backPanel.grooveDepth, backY1);
 const shelfSummary = shelfCenters(vs, cab, rules);
 ok(
-  `C5a 层板数量：正视 ${expectShelfCount} 块 / 侧视 ${expectShelfCount} 块`,
-  shelfSummary.front.length === expectShelfCount && shelfSummary.side.length === expectShelfCount,
+  `C5a 层板数量：正视（开放格）${expectFrontShelfCount} 块 / 侧视（全部）${expectShelfCount} 块`,
+  shelfSummary.front.length === expectFrontShelfCount && shelfSummary.side.length === expectShelfCount,
   JSON.stringify(shelfSummary)
 );
-ok('C5b 层板高度集合：正视图 === 侧视图（逐块对齐）', shelfCentersMatch(vs, cab, rules), JSON.stringify(shelfSummary));
+ok(
+  'C5b 层板高度集合：正视图 ⊆ 侧视图（开放格层板逐块对齐）',
+  expectFrontShelfCount === 0 || shelfSummary.front.every((fz: number) => shelfSummary.side.some((sz: number) => Math.abs(fz - sz) < 0.5)),
+  JSON.stringify(shelfSummary)
+);
 
 const sideShelfRects = rectsOf(vs.prims.side, inv.side).filter(
   (r) => Math.abs(r.y1 - r.y0 - t) < TOL && Math.abs(r.x1 - r.x0 - L.shelfDepth) < TOL
@@ -346,11 +378,14 @@ ok(
 
 const frontShelfByWidth = new Map<number, number>();
 cab.layout.units.forEach((u, i) => {
-  if (u.shelves && u.shelves.count > 0) frontShelfByWidth.set(L.nets[i] - 2 * u.shelves.gapPerSide, u.shelves.count);
+  // 门板图：只有开放格的层板出现在正视图
+  if (u.shelves && u.shelves.count > 0 && !u.doors && !u.drawers) {
+    frontShelfByWidth.set(L.nets[i] - 2 * u.shelves.gapPerSide, u.shelves.count);
+  }
 });
 ok(
-  `C5d 层板宽度：正视图层板宽度 = 分区净宽 - 2×侧向间隙（与板件清单同源）`,
-  expectShelfCount > 0 && [...frontShelfByWidth].every(([w, n]) => countRects(R.front, w, t) === n),
+  `C5d 层板宽度：正视（开放格）层板宽度 = 分区净宽 - 2×侧向间隙（与板件清单同源）`,
+  expectFrontShelfCount > 0 && [...frontShelfByWidth].every(([w, n]) => countRects(R.front, w, t) === n),
   `期望 ${JSON.stringify([...frontShelfByWidth])}，实际 ${JSON.stringify(R.front.filter((r) => Math.abs(r.y1 - r.y0 - t) < TOL).map((r) => [r.x0, r.x1, r.y0, r.y1]))}`
 );
 
@@ -377,6 +412,75 @@ if (doorUnit) {
     `C7b 门板厚度：俯视 Y∈[${faceY0},${D}] / 侧视 Y∈[${faceY0},${D}] × 内空高`,
     hasRect(R.top, x0, x0 + netW, faceY0, D) &&
       hasRect(R.side, faceY0, D, innerBottomZ + doorUnit.doors!.gapOuter, innerBottomZ + innerH - doorUnit.doors!.gapOuter)
+  );
+
+  // ── C7c–C7f 门板图语义（正视图 = 外观图，不是"结构图加门"）──
+  const dr = doorUnit.doors!;
+  const idx2 = cab.layout.units.indexOf(doorUnit);
+  const netW2 = L.nets[idx2];
+  const x02 = L.unitX0[idx2];
+  const widths2 = doorWidths(doorUnit, netW2, rules);
+  const zTop = innerBottomZ + dr.gapOuter;
+  const zBot = innerBottomZ + innerH - dr.gapOuter;
+  const diags = frontDiagonals(vs.prims.front, inv.front);
+
+  // C7c 整块门板：每扇门以 doorWidths 同源尺寸整块出现在正视图（小隔层的门不许被内部线切成多块）
+  let leafOk = true;
+  let lx = x02 + dr.gapOuter;
+  for (const w of widths2) {
+    leafOk = leafOk && hasRect(R.front, lx, lx + w, zTop, zBot);
+    lx += w + dr.gapMid;
+  }
+  ok(
+    `C7c 门板图：正视图有门分区画 ${widths2.length} 块整块门板（尺寸与 doorWidths 同源，内部一概不透）`,
+    leafOk && widths2.length > 0,
+    JSON.stringify({ widths: widths2, zTop, zBot })
+  );
+
+  // C7d 开向标注：双扇对开 = X 形 2 条斜线，端点都落在门板范围内
+  ok(
+    `C7d 开向标注：双扇对开正视图有 ${widths2.length} 条斜向开向线（X 形交叉），端点落在门板范围内`,
+    diags.length === widths2.length &&
+      diags.every((seg) => {
+        const xs = seg.map((q) => q.x);
+        const ys = seg.map((q) => q.y);
+        return (
+          Math.min(...xs) >= x02 + dr.gapOuter - TOL &&
+          Math.max(...xs) <= x02 + netW2 - dr.gapOuter + TOL &&
+          Math.min(...ys) >= zTop - TOL && // 画布 y 向下：zTop 是小值（图面顶部），zBot 是大值（图面底部）
+          Math.max(...ys) <= zBot + TOL
+        );
+      }),
+    JSON.stringify(diags)
+  );
+
+  // C7e 门板图不透结构：有门分区的层板在正视图里一块都不许出现
+  const doorShelfW = doorUnit.shelves && doorUnit.shelves.count > 0 ? netW2 - 2 * doorUnit.shelves.gapPerSide : null;
+  ok(
+    `C7e 门板图不透结构：有门分区的层板（宽 ${doorShelfW ?? '—'}）在正视图出现 0 块`,
+    doorShelfW === null || countRects(R.front, doorShelfW, t) === 0,
+    doorShelfW === null ? '该分区无层板' : JSON.stringify(R.front.filter((r) => Math.abs(r.y1 - r.y0 - t) < TOL))
+  );
+
+  // C7f 单扇门开向方向：hingeSide=left → 对角线左上→右下；hingeSide=right → 右上→左下
+  const singleCab = JSON.parse(JSON.stringify(cab)) as typeof cab;
+  const sdu = singleCab.layout.units[idx2]!;
+  sdu.doors = { ...sdu.doors!, count: 1, hingeSide: 'left' };
+  const diagL = frontDiagonals(buildCabinetViews(singleCab, rules).prims.front, inv.front);
+  sdu.doors = { ...sdu.doors!, hingeSide: 'right' };
+  const diagR = frontDiagonals(buildCabinetViews(singleCab, rules).prims.front, inv.front);
+  const oneW = doorWidths(sdu, netW2, rules)[0]!;
+  const lx0 = x02 + dr.gapOuter;
+  const rx1 = lx0 + oneW;
+  const dirOk = (d: Vec2[][], fromLeft: boolean): boolean =>
+    d.length === 1 &&
+    (fromLeft
+      ? Math.abs(d[0]![0].x - lx0) < TOL && Math.abs(d[0]![0].y - zTop) < TOL && Math.abs(d[0]![1].x - rx1) < TOL && Math.abs(d[0]![1].y - zBot) < TOL
+      : Math.abs(d[0]![0].x - rx1) < TOL && Math.abs(d[0]![0].y - zTop) < TOL && Math.abs(d[0]![1].x - lx0) < TOL && Math.abs(d[0]![1].y - zBot) < TOL);
+  ok(
+    'C7f 单扇门开向：hingeSide=left 对角线从左上到右下；hingeSide=right 从右上到左下（hingeSide 只影响图面，不影响板件清单）',
+    dirOk(diagL, true) && dirOk(diagR, false),
+    JSON.stringify({ left: diagL, right: diagR })
   );
 }
 
@@ -478,6 +582,18 @@ ok(
 );
 const noShelf = { ...vs, prims: { ...vs.prims, front: vs.prims.front.filter((p) => !(p.k === 'poly' && p.closed && Math.abs(bboxOf(p.pts.map(inv.front)).max.y - bboxOf(p.pts.map(inv.front)).min.y - t) < TOL && bboxOf(p.pts.map(inv.front)).min.y > innerBottomZ + 10 && bboxOf(p.pts.map(inv.front)).max.y < innerTopZ - 10)) } };
 ok('G6 删掉正视图里全部层板 → 层板高度集合一致性必须失败', !shelfCentersMatch(noShelf, cab, rules));
+
+// G7 负样本：删掉正视图全部开向对角线 → 开向计数必须归零（证明 C7d 的检测器不是恒真）
+const isDiagPrim = (p: Prim): boolean => {
+  if (p.k !== 'poly' || p.closed || p.pts.length !== 2 || p.layer !== 'F-CAB-FRONT') return false;
+  const [a, b] = p.pts.map(inv.front);
+  return Math.abs(a.x - b.x) > 1 && Math.abs(a.y - b.y) > 1;
+};
+const noDiagView = vs.prims.front.filter((p) => !isDiagPrim(p));
+ok(
+  'G7 负样本：删掉正视图全部开向对角线 → C7d 的计数必须归零（检测器不是恒真）',
+  frontDiagonals(noDiagView, inv.front).length === 0 && frontDiagonals(vs.prims.front, inv.front).length > 0
+);
 
 section('H. 多柜并排（buildProjectViews）');
 const twoCabProject = sampleProject(rules);

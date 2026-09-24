@@ -87,7 +87,14 @@ export type SideEffect =
   | { kind: 'insertRoom'; room: Room; index: number }
   | { kind: 'removeRoom'; room: Room; index: number }
   | { kind: 'insertWall'; roomId: string; wall: Wall; index: number }
-  | { kind: 'removeWall'; roomId: string; wall: Wall; index: number };
+  | { kind: 'removeWall'; roomId: string; wall: Wall; index: number }
+  /**
+   * 整项目替换（导入 / 恢复草稿）。它换掉的是【对象引用】而不是某个字段，
+   * 所以不能走路径回退，undo/redo 里单独处理 —— 必须同时携带前后两份快照，
+   * 两个方向都要能走。（这条曾缺失：replaceProject 声称可撤销，实际 undo 后
+   * 路径回退静默失败，模型仍是导入后的项目 —— 断言第一次抓到的就是它。）
+   */
+  | { kind: 'replaceProject'; prev: Project; next: Project };
 
 export interface LogEntry {
   seq: number;
@@ -878,6 +885,12 @@ export class CommandBus {
   /** forward=true 重做，false 撤销。路径编辑与结构性变更统一在这里处理。 */
   private revert(e: LogEntry, forward: boolean): void {
     if (e.sideEffects && e.sideEffects.length > 0) {
+      // 整项目替换换掉的是对象引用，不能走逐字段回退 —— 单独处理（replace 永远是单条）
+      if (e.sideEffects.length === 1 && e.sideEffects[0].kind === 'replaceProject') {
+        const se = e.sideEffects[0];
+        this.project = structuredClone(forward ? se.next : se.prev);
+        return;
+      }
       applySideEffects(this.project, e.sideEffects, forward);
       return;
     }
@@ -917,17 +930,20 @@ export class CommandBus {
 
   /** 直接替换整个项目（导入 / 恢复版本）—— 也走日志，可撤销 */
   replaceProject(next: Project, label: string): void {
+    const prev = this.project;
     this.project = structuredClone(next);
     if (this.pointer + 1 < this.entries.length) this.entries = this.entries.slice(0, this.pointer + 1);
     this.modelVersion++;
     this.geomCache = null;
+    this.explodeCache = null;
     this.entries.push({
       seq: this.entries.length + 1,
       at: Date.now(),
       command: { id: `cmd_replace_${Date.now().toString(36)}`, op: 'project.replace', source: 'system', changes: [], label },
       label,
-      diff: [{ path: '(project)', from: '旧项目', to: next.name }],
+      diff: [{ path: '(project)', from: prev.name, to: next.name }],
       inverse: [],
+      sideEffects: [{ kind: 'replaceProject', prev: structuredClone(prev), next: structuredClone(next) }],
       derived: this.sumDerived(this.derive().geom),
       issueDelta: { errors: 0, warnings: 0, added: [] },
       applied: true,

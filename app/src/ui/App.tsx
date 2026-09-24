@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Vec2 } from '../core/types.ts';
 import type { Command, ExecResult } from '../core/commandBus.ts';
 import * as CMD from '../core/commands.ts';
-import { bus, useBusVersion } from '../state/store.ts';
-import { createCabinet as makeCabinet, createWall as makeWall, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, rectRoom } from '../core/docFactory.ts';
+import { bus, useBusVersion, RULESET } from '../state/store.ts';
+import { createCabinet as makeCabinet, createWall as makeWall, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, rectRoom, sampleProject } from '../core/docFactory.ts';
 import { placeAgainstNearestWall } from '../core/snapPlace.ts';
 import { DEFAULT_SNAP } from '../viewport/snapping.ts';
 import type { SnapSettings } from '../viewport/snapping.ts';
@@ -27,6 +27,7 @@ import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
 import { loadToken, saveToken } from '../ai/aiClient.ts';
+import { loadDraft, saveDraft, clearDraft, fmtSavedAt } from '../state/draftStore.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
 import type { Toast, ToastKind, Tool } from './types.ts';
@@ -82,6 +83,51 @@ export function App() {
   const setToken = useCallback((t: string | null) => {
     setTokenRaw(t);
     saveToken(t);
+  }, []);
+
+  // ── 本地草稿 ──
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+
+  /**
+   * 启动时恢复草稿。
+   *
+   * 放在自动保存 effect **之前**声明不是随意的：mount 时两个 effect 按声明序执行，
+   * 恢复先把旧项目装回总线，随后自动保存才会以恢复后的项目为准 ——
+   * 否则第一次自动保存会把默认示例项目写回去，把真草稿冲掉。
+   *
+   * 恢复采用「直接回来 + 气泡告知」而不是弹窗询问：用户上一句话是
+   * "现在刷新就丢，等于没法真正用" —— 恢复是默认期望，丢弃才需要用户主动做
+   * （命令行 NEW）。弹窗在自动化验收与日常使用里都是噪音。
+   */
+  useEffect(() => {
+    const d = loadDraft();
+    if (!d) return;
+    bus.replaceProject(d.project, `恢复本地草稿（${fmtSavedAt(d.savedAt)}）`);
+    setSavedAt(d.savedAt);
+    toast(
+      'info',
+      `已恢复上次草稿「${d.project.name}」：${d.project.rooms.length} 房间 / ${d.project.cabinets.length} 柜体（保存于 ${fmtSavedAt(d.savedAt)}）。想要全新项目，按 \` 打开命令行输入 NEW`,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 模型一变就排一次自动保存（去抖 800ms：连拖几个夹点只写一次）
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      const at = saveDraft(bus.getState());
+      if (at) setSavedAt(at);
+      // 存不进去（隐私模式 / 超配额）就不更新时间 —— 界面不说"已保存"的谎
+    }, 800);
+    return () => window.clearTimeout(t);
+  }, [version]);
+
+  // 关标签页前把没来得及去抖的那份冲进 localStorage
+  useEffect(() => {
+    const flush = () => {
+      saveDraft(bus.getState());
+    };
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
   }, []);
 
   // ── 提示气泡 ──
@@ -541,12 +587,26 @@ export function App() {
           toast('info', `已把模型 JSON 打印到控制台（${json.length} 字符）—— 这就是唯一的真相源`);
           return '已输出到控制台';
         }
+        case 'SAVE':
+        case 'QSAVE':
+          setRightTab('export');
+          return savedAt
+            ? `草稿已自动保存于 ${fmtSavedAt(savedAt)}。要拿走文件，「导出」页签 → 项目存档 → 存为 .json`
+            : '草稿还没存过 —— 已打开「导出」页签，从项目存档导出 .json';
+        case 'NEW': {
+          bus.replaceProject(sampleProject(RULESET), '新建项目');
+          clearDraft();
+          setSelection([]);
+          setFitSignal((v) => v + 1);
+          toast('ok', '已新建项目（草稿已清空，之前的模型可在历史里找回）');
+          return '已新建项目';
+        }
         default:
           toast('warn', `未知命令：${head}（输入 HELP 查看）`);
           return `未知命令：${head}`;
       }
     },
-    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onNewRoom, onRotate90, run, selectedCabs, setExplode, setMode, startMove, toast]
+    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onNewRoom, onRotate90, run, savedAt, selectedCabs, setExplode, setMode, startMove, toast]
   );
 
   // ── 键盘 ──
@@ -808,7 +868,7 @@ export function App() {
               }}
             />
           ) : null}
-          {rightTab === 'export' ? <ExportPanel bus={bus} version={version} token={token} onToast={toast} /> : null}
+          {rightTab === 'export' ? <ExportPanel bus={bus} version={version} token={token} savedAt={savedAt} onToast={toast} /> : null}
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} onToast={toast} /> : null}
@@ -823,7 +883,7 @@ export function App() {
         </div>
       )}
 
-      <StatusBar bus={bus} version={version} cam={cam} snap={snap} tool={tool} selectionCount={selection.length} />
+      <StatusBar bus={bus} version={version} cam={cam} snap={snap} tool={tool} selectionCount={selection.length} savedAt={savedAt} />
 
       <div className="toasts">
         {toasts.map((t) => (

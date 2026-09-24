@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import type { CommandBus } from '../core/commandBus.ts';
 import type { Camera } from '../viewport/camera.ts';
 import type { SnapSettings } from '../viewport/snapping.ts';
+import { fmtSavedAt } from '../state/draftStore.ts';
 import type { Tool } from './types.ts';
 
 export function StatusBar(props: {
@@ -11,6 +12,8 @@ export function StatusBar(props: {
   snap: SnapSettings;
   tool: Tool;
   selectionCount: number;
+  /** 最近一次草稿自动保存时间（ISO）；null = 还没存过 */
+  savedAt: string | null;
 }): ReactNode {
   const { bus, cam, snap, tool } = props;
   const project = bus.getState();
@@ -41,6 +44,13 @@ export function StatusBar(props: {
       <span className="sb-spacer" />
 
       {props.selectionCount > 0 ? <span className="sb-item sb-sel">已选 {props.selectionCount} 项</span> : null}
+
+      <span
+        className="sb-item"
+        title="草稿自动保存到浏览器本地（localStorage），刷新不丢；「导出」页签可存为 .json 文件"
+      >
+        草稿 {props.savedAt ? <>已存 <b>{fmtSavedAt(props.savedAt)}</b></> : '未保存'}
+      </span>
 
       <span className="sb-mode" title="当前工具">
         {tool === 'select' ? '选择' : tool === 'wall' ? '画墙' : '放柜体'}

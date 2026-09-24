@@ -27,6 +27,9 @@
  *  B18 账号与安全：默认可不登录 · 建号后一个漏网接口都没有 · 缺口照实列出
  *  B18b 账号模式下未登录访问：宁可什么都不显示，也不显示一份假配置
  *  B19 样式完整性：界面上用到的类名必须在样式表里有规则
+ *  B22 新建房间：连建多个房间都成功（id 必须避开项目里已用的）
+ *  B23 导出面板：图纸选择 / 版本选择 / ERROR 提示 / 禁用逻辑
+ *  B24 项目存盘与加载：自动保存 / 打开项目文件 / 坏文件拒绝
  *
  *  用法：先起本地服务与 dev server，再跑本脚本（见 package.json 的 verify:ui）。
  *  ══════════════════════════════════════════════════════════════════════
@@ -2969,6 +2972,93 @@ async function waitForApp(url, timeoutMs = 25000) {
       '界面写明三件套可复现（模型版本 + 生成器 + 规则集）',
       /三件套/.test(await panelTextAll())
     );
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B24 —— 项目存盘与加载（Task #23）。
+     *
+     * 上一轮用户的原话是"现在刷新就丢，等于没法真正用"。这一组钉四件事：
+     *   · 自动保存真的在写 localStorage，且写进去的是当前模型（不是旧快照）
+     *   · 界面上的"已保存几点几分"是给用户看的承诺，必须随变更更新
+     *   · 打开合法项目文件走 bus.replaceProject —— 项目名真的出现在对象树上
+     *   · 打开别家 .json 被拒，且给出人能看懂的理由（导入的文件是攻击面）
+     *
+     * 导入用 DataTransfer 构造 File 再真触发 change —— 绕过 file input 会漏掉
+     * 整条 onImportFile 链路；坏文件的拒绝断言必须真的走这条链。
+     */
+    section('B24 项目存盘与加载：自动保存 / 打开项目文件 / 坏文件拒绝');
+
+    // B23 结束时就在「导出」页签 —— 项目存档组就在这个面板里
+    ok(
+      '「项目存档」组在导出面板里（存为 .json 与 打开… 两个按钮都在）',
+      (await evalJs(`(()=>{const btns=[...document.querySelectorAll('.side-right .exp-btns .tb-btn')].map(b=>b.textContent.trim());
+        return btns.some(t=>/存为项目文件/.test(t)) && btns.some(t=>/打开项目文件/.test(t));})()`)
+      ) === true,
+      await evalJs(`JSON.stringify([...document.querySelectorAll('.side-right .exp-btns .tb-btn')].map(b=>b.textContent.trim()))`)
+    );
+    ok('存档组写明"导入会作为一条命令进历史，可以撤销"', /可以撤销/.test(await panelTextAll()));
+
+    // 自动保存是去抖 800ms：B22 已连建两个房间，等窗口过去再看状态
+    await sleep(1500);
+    const draftStatus = await text('[data-testid="draft-status"]');
+    ok('模型变更后，面板写明草稿已自动保存到几点几分（不是一句静态文案）', /已自动保存\s*\d{2}:\d{2}/.test(draftStatus), draftStatus);
+
+    const draftMatch = await evalJs(`(async()=>{
+      try {
+        const s = await import('/src/state/store.ts');
+        const p = s.bus.getState();
+        const raw = localStorage.getItem('furnicad.draft.v1') || '';
+        let d = null; try { d = JSON.parse(raw); } catch(e) {}
+        return { ok: true, cabNow: p.cabinets.length, cabDraft: d && d.project ? d.project.cabinets.length : -1,
+                 roomNow: p.rooms.length, roomDraft: d && d.project ? d.project.rooms.length : -1, hasEnvelope: !!d && d.format === 'furniture-cad-project' };
+      } catch(e) { return { ok:false, err: String(e) }; }
+    })()`);
+    ok('localStorage 里的草稿是本项目格式（带信封）', draftMatch.ok && draftMatch.hasEnvelope === true, JSON.stringify(draftMatch));
+    ok(
+      '草稿里的房间/柜体数与当前模型一致（自动保存写进的是真模型，不是旧快照）',
+      draftMatch.ok && draftMatch.cabNow === draftMatch.cabDraft && draftMatch.roomNow === draftMatch.roomDraft,
+      JSON.stringify(draftMatch)
+    );
+
+    // 坏文件：别家 JSON 必须在门口被拒
+    const badImport = await evalJs(`(async()=>{
+      const input = document.querySelector('.side-right input[type=file]');
+      if (!input) return 'NO_INPUT';
+      const dt = new DataTransfer();
+      dt.items.add(new File(['{"name":"not-our-app"}'], 'bad.json', { type: 'application/json' }));
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'OK';
+    })()`);
+    ok('构造别家 .json 真触发了打开链路（change 事件）', badImport === 'OK', String(badImport));
+    await sleep(460);
+    const badToast = await text('.toast-error');
+    ok(
+      '坏文件被拒，理由人能看懂（导入失败 + 不是本系统的文件）',
+      /导入失败/.test(badToast) && /不是本系统导出的项目文件/.test(badToast),
+      badToast
+    );
+
+    // 好文件：拿草稿改个项目名再导入 —— 名字必须真的出现在对象树上
+    const goodImport = await evalJs(`(async()=>{
+      const input = document.querySelector('.side-right input[type=file]');
+      if (!input) return 'NO_INPUT';
+      const raw = localStorage.getItem('furnicad.draft.v1');
+      if (!raw) return 'NO_DRAFT';
+      const env = JSON.parse(raw);
+      env.project.name = '导入测试项目';
+      const dt = new DataTransfer();
+      dt.items.add(new File([JSON.stringify(env)], 'good.json', { type: 'application/json' }));
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'OK';
+    })()`);
+    ok('打开合法项目文件触发导入', goodImport === 'OK', String(goodImport));
+    await sleep(560);
+    ok('导入成功有回执（不静默生效）', /已导入\s*good\.json/.test(await text('.toasts')), await text('.toasts'));
+    const treeRootName = await evalJs(`(()=>{const el=document.querySelector('.side-left .tree-root .tree-node-label');return el?el.textContent.trim():''})()`);
+    ok('导入后对象树根节点显示新项目名（replaceProject 真的生效）', treeRootName === '导入测试项目', treeRootName);
+    ok('面板留下导入结果（几个房间 / 几个柜体）', /已导入\s*good\.json/.test(await panelTextAll()), (await panelTextAll()).slice(0, 160));
 
     // ═══════════════════════════════════════════════════════════
     /**

@@ -1,18 +1,25 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
+import { parseProjectFile, serializeProjectFile } from '../../core/projectFile.ts';
+import { fmtSavedAt } from '../../state/draftStore.ts';
 import type { ToastKind } from '../types.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  导出：DXF 图纸 + 开料单
+ *  导出：项目存档 + DXF 图纸 + 开料单
  *
- *  ── 这个面板只做"把当前模型交给后端"，不做任何几何计算 ──
+ *  ── 这个面板只做"把当前模型交给外部"，不做任何几何计算 ──
  *
  *  模型 100% 归 CommandBus，这里只把 `bus.getState()` 整个 project 发过去；
  *  几何由后端从语义模型重算（见 server/server.mjs 的 /api/export/*）。
  *  如果这里改成"先把图元算好再上传"，就等于让浏览器成为几何的第二个来源，
  *  "图 = 料" 这条线会当场断掉。
+ *
+ *  ── 项目存档（.json）──
+ *    DXF/CSV 是"给生产的东西"，项目文件是"给自己的存档"。
+ *    导入走 bus.replaceProject()：同样的唯一写入口、同样进历史可撤销，
+ *    导入也是一条普通命令，没有特权。
  *
  *  ── 为什么导出前必须先摆出问题 ──
  *    一张"看起来没问题"的图纸比一张报错的图纸危险得多：
@@ -28,6 +35,8 @@ export interface ExportPanelProps {
   bus: CommandBus;
   version: number;
   token: string | null;
+  /** 最近一次草稿自动保存时间（ISO）——null 表示还没存过 */
+  savedAt: string | null;
   onToast: (kind: ToastKind, msg: string) => void;
 }
 
@@ -47,16 +56,60 @@ function fileNameOf(header: string | null, fallback: string): string {
 }
 
 export function ExportPanel(props: ExportPanelProps): ReactNode {
-  const { bus, version, token, onToast } = props;
+  const { bus, version, token, savedAt, onToast } = props;
   const [plan, setPlan] = useState(true);
   const [sheet, setSheet] = useState(true);
   const [dxfVersion, setDxfVersion] = useState<'R2007' | 'R2000'>('R2007');
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState<string>('');
+  /** 文件选择器是"看不见状态的隐藏 input"，导入结果必须显式留在界面上 */
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [importNote, setImportNote] = useState<string>('');
 
   const issues = bus.issues();
   const errors = issues.filter((i) => i.severity === 'ERROR');
   const warnings = issues.filter((i) => i.severity === 'WARNING');
+
+  // ── 项目存档 ──
+  function exportProject(): void {
+    const name = `${bus.getState().name || '项目'}.json`;
+    const blob = new Blob([serializeProjectFile(bus.getState())], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setImportNote(`已导出 ${name}（${Math.round(blob.size / 1024)} KB）`);
+    onToast('ok', `已导出项目文件 ${name}`);
+  }
+
+  async function importProject(file: File): Promise<void> {
+    let raw: string;
+    try {
+      raw = await file.text();
+    } catch (e) {
+      onToast('error', `读文件失败：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const r = parseProjectFile(raw);
+    if (!r.ok) {
+      setImportNote(`✗ ${file.name}：${r.error}`);
+      onToast('error', `导入失败：${r.error}`);
+      return;
+    }
+    if (r.project.ruleSetId && r.project.ruleSetId !== bus.getRules().id) {
+      onToast('warn', `规则集不一致：文件要求 ${r.project.ruleSetId}，当前 ${bus.getRules().id}。已按当前规则集打开，几何按当前规则重新校验。`);
+    }
+    for (const w of r.warnings) onToast('warn', w);
+    bus.replaceProject(r.project, `导入项目文件 ${file.name}`);
+    setImportNote(
+      `已导入 ${file.name}：${r.project.rooms.length} 房间 / ${r.project.cabinets.length} 柜体${r.warnings.length > 0 ? `（${r.warnings.length} 条提示，见气泡）` : ''}`
+    );
+    onToast('ok', `已导入 ${file.name}（可在历史里撤销这次导入）`);
+  }
 
   async function post(kind: 'dxf' | 'cutlist'): Promise<void> {
     if (busy) return;
@@ -108,6 +161,37 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
 
   return (
     <div className="panel-scroll">
+      <div className="exp-group">
+        <div className="exp-title">项目存档</div>
+        <div className="ts" data-testid="draft-status">
+          {savedAt ? <>草稿已自动保存 <b>{fmtSavedAt(savedAt)}</b>（浏览器本地，刷新不丢）</> : '草稿尚未保存 —— 模型有变更后会自动保存到浏览器本地'}
+        </div>
+        <div className="exp-btns">
+          <button type="button" className="tb-btn" onClick={exportProject}>
+            存为项目文件 .json
+          </button>
+          <button type="button" className="tb-btn" onClick={() => fileRef.current?.click()}>
+            打开项目文件…
+          </button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = '';
+              if (f) void importProject(f);
+            }}
+          />
+        </div>
+        {importNote ? <div className="ts">{importNote}</div> : null}
+        <div className="ts vnote">
+          项目文件只含语义模型（权威字段），不含派生几何 —— 打开后一切现算，"图 = 料"不靠文件里存的那份图。
+          导入会作为一条命令进历史，可以撤销。
+        </div>
+      </div>
+
       {errors.length > 0 ? (
         <div className="vissue vissue-error">
           ✗ 当前模型还有 {errors.length} 条 ERROR。可以先导出，但这份图纸会带着这些问题走到开料 ——

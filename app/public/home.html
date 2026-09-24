@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="AI 网页版 CAD —— 语义参数化定制家具设计与生产数据系统。真相源是参数化模型，图纸与清单全部同源派生。"
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6feb'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2.2'%3E%3Crect x='8' y='7' width='16' height='18'/%3E%3Cpath d='M8 19h16M16 7v12M16 19v6'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <title>家具 CAD · 产品介绍</title>
+    <style>
+      /* 设计基调与工作台一致：浅色、蓝主色、克制装饰。零依赖、零 JS 框架。 */
+      :root {
+        --accent: #1f6feb;
+        --accent-soft: #eaf1fe;
+        --ink: #1c2333;
+        --ink-2: #4a5568;
+        --ink-3: #8b95a7;
+        --line: #e3e8f0;
+        --bg: #f6f8fb;
+        --card: #ffffff;
+        --warn: #b45309;
+        --warn-bg: #fef3c7;
+        --ok: #0e7a3d;
+        --radius: 12px;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+        line-height: 1.7;
+      }
+      .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+      /* ── 顶栏 ── */
+      header {
+        background: var(--card);
+        border-bottom: 1px solid var(--line);
+        position: sticky; top: 0; z-index: 10;
+      }
+      .nav {
+        display: flex; align-items: center; justify-content: space-between;
+        height: 60px;
+      }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; }
+      .brand svg { display: block; }
+      .nav a.cta {
+        background: var(--accent); color: #fff; text-decoration: none;
+        padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 600;
+      }
+      .nav a.cta:hover { filter: brightness(1.08); }
+
+      /* ── Hero ── */
+      .hero { padding: 72px 0 56px; text-align: center; }
+      .hero h1 { font-size: 38px; line-height: 1.3; letter-spacing: 0.5px; }
+      .hero h1 em { font-style: normal; color: var(--accent); }
+      .hero p.lead {
+        max-width: 640px; margin: 18px auto 32px;
+        color: var(--ink-2); font-size: 17px;
+      }
+      .hero .actions { display: flex; gap: 14px; justify-content: center; }
+      .btn {
+        display: inline-block; padding: 12px 32px; border-radius: 10px;
+        font-size: 16px; font-weight: 600; text-decoration: none;
+      }
+      .btn.primary { background: var(--accent); color: #fff; }
+      .btn.primary:hover { filter: brightness(1.08); }
+      .btn.ghost { border: 1.5px solid var(--line); color: var(--ink-2); background: var(--card); }
+      .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+      /* ── 能力区 ── */
+      section { padding: 40px 0; }
+      h2 { font-size: 24px; margin-bottom: 8px; }
+      .sub { color: var(--ink-3); font-size: 14px; margin-bottom: 28px; }
+      .grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 18px;
+      }
+      .card {
+        background: var(--card); border: 1px solid var(--line);
+        border-radius: var(--radius); padding: 22px 24px;
+      }
+      .card h3 { font-size: 16px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+      .card h3 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+      .card p { color: var(--ink-2); font-size: 14px; }
+
+      /* ── 档位表 ── */
+      table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: var(--radius); overflow: hidden; }
+      th, td { padding: 13px 18px; text-align: left; font-size: 14px; border-bottom: 1px solid var(--line); }
+      th { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+      tr:last-child td { border-bottom: none; }
+      td b { color: var(--accent); }
+      .tbl-note { color: var(--ink-3); font-size: 13px; margin-top: 10px; }
+
+      /* ── 诚实清单 ── */
+      .honest { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+      @media (max-width: 720px) { .honest { grid-template-columns: 1fr; } }
+      .honest ul { list-style: none; }
+      .honest li { padding: 6px 0 6px 24px; position: relative; font-size: 14px; color: var(--ink-2); }
+      .honest li.ok::before { content: '✓'; position: absolute; left: 4px; color: var(--ok); font-weight: 700; }
+      .honest li.todo::before { content: '△'; position: absolute; left: 4px; color: var(--warn); font-weight: 700; }
+      .banner {
+        background: var(--warn-bg); border: 1px solid #f3d98b; border-radius: var(--radius);
+        padding: 14px 20px; font-size: 14px; color: var(--warn); margin-top: 18px;
+      }
+
+      footer { border-top: 1px solid var(--line); margin-top: 40px; padding: 28px 0 40px; }
+      .foot {
+        display: flex; justify-content: space-between; align-items: center;
+        color: var(--ink-3); font-size: 13px; flex-wrap: wrap; gap: 12px;
+      }
+      .foot a { color: var(--accent); text-decoration: none; }
+      #mode-chip {
+        display: inline-block; padding: 2px 10px; border-radius: 99px;
+        background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap nav">
+        <div class="brand">
+          <svg width="26" height="26" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#1f6feb"/><g fill="none" stroke="#fff" stroke-width="2.2"><rect x="8" y="7" width="16" height="18"/><path d="M8 19h16M16 7v12M16 19v6"/></g></svg>
+          家具 CAD
+        </div>
+        <a class="cta" href="/">进入工作台</a>
+      </div>
+    </header>
+
+    <div class="wrap">
+      <div class="hero">
+        <h1>说一句话，<em>画出一套柜子</em></h1>
+        <p class="lead">
+          AI 网页版定制家具设计与生产数据系统。真相源是语义参数化模型——
+          平面图、立面图、3D、开料清单、DXF 全部同源派生，改一处、处处一致。
+        </p>
+        <div class="actions">
+          <a class="btn primary" href="/">进入工作台</a>
+          <a class="btn ghost" href="#plans">查看订阅档位</a>
+        </div>
+      </div>
+
+      <section>
+        <h2>核心能力</h2>
+        <p class="sub">结构异形走模板与图元扩展，表达异形走材质与标注——核心构造逻辑始终只有一套。</p>
+        <div class="grid">
+          <div class="card">
+            <h3><span class="dot"></span>自然语言设计入口</h3>
+            <p>用中文描述需求，AI 产出 Command 而非几何：所有变更走 dry-run 预览 → 确认 → 提交，失败不落任何状态。</p>
+          </div>
+          <div class="card">
+            <h3><span class="dot"></span>参数化模型是唯一真相源</h3>
+            <p>2D 三视图、3D、板件清单、DXF 全部现算派生，永不回写。项目文件里只有你真正定下的语义字段。</p>
+          </div>
+          <div class="card">
+            <h3><span class="dot"></span>可交付生产的图纸与数据</h3>
+            <p>R2007 UTF-8 DXF（中文不乱码）、按房间图纸册、开料清单与五金表，携带模型/生成器/规则集三件套版本，可完整复现。</p>
+          </div>
+          <div class="card">
+            <h3><span class="dot"></span>机器硬规则 + AI 软建议</h3>
+            <p>可判定的工艺规则阻断提交，不可判定的经验问题只提示不拦。两套分离，互不污染。</p>
+          </div>
+          <div class="card">
+            <h3><span class="dot"></span>真实 CAD 交互</h3>
+            <p>完整的鼠标交互与快捷键：捕捉、吸附、追踪线、夹点编辑。所见即所得——界面读数就是最终会用到的值。</p>
+          </div>
+          <div class="card">
+            <h3><span class="dot"></span>规则集即配置</h3>
+            <p>工艺默认值全部外置为规则集文件。换工厂 = 换一个 JSON，不改一行代码。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="plans">
+        <h2>订阅档位</h2>
+        <p class="sub">额度按自然月 token 总量计，AI 模型调用可按档位配置白名单。</p>
+        <table>
+          <thead>
+            <tr><th>档位</th><th>月 AI 额度</th><th>日调用次数</th><th>适合</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><b>免费</b></td><td>20 万 token</td><td>60 次</td><td>体验与轻度使用</td></tr>
+            <tr><td><b>专业</b></td><td>500 万 token</td><td>1200 次</td><td>个人设计师日常出图</td></tr>
+            <tr><td><b>团队</b></td><td>3000 万 token</td><td>6000 次</td><td>设计团队多人协作</td></tr>
+            <tr><td><b>不限</b></td><td>不限</td><td>不限</td><td>私有部署自用</td></tr>
+          </tbody>
+        </table>
+        <p class="tbl-note">当前账号体系状态：<span id="mode-chip">检测中…</span>　（local-open = 尚无账号、全部接口免登录；accounts = 已建账号、全接口需登录）</p>
+      </section>
+
+      <section>
+        <h2>安全与边界，照实说</h2>
+        <p class="sub">一个"看起来有登录框"的系统，比一个明说"我是单机自用"的系统危险。</p>
+        <div class="honest">
+          <div class="card">
+            <h3>已经做到</h3>
+            <ul>
+              <li class="ok">口令 scrypt 哈希 + 独立盐 + 定时安全比较</li>
+              <li class="ok">会话 token 只存哈希，支持过期与踢下线</li>
+              <li class="ok">失败登录计数与锁定窗口</li>
+              <li class="ok">角色权限（所有者/管理员/设计师/只读）</li>
+              <li class="ok">AI 额度与模型白名单</li>
+              <li class="ok">管理操作与 AI 调用全量审计日志</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>还没有做（上线前必须补）</h3>
+            <ul>
+              <li class="todo">HTTPS（上线由反向代理终止 TLS）</li>
+              <li class="todo">二次验证（邮件/短信/TOTP）</li>
+              <li class="todo">数据库存储（当前为本地 JSON 文件）</li>
+              <li class="todo">密码找回流程</li>
+              <li class="todo">审计日志防篡改</li>
+            </ul>
+          </div>
+        </div>
+        <div class="banner">
+          ⚠ 责任边界：本系统产出的生产数据，首批生产必须人工全检。尺寸与工艺规则按行业默认值内置，接单前请对照你的工厂标准核对规则集。
+        </div>
+      </section>
+
+      <footer>
+        <div class="foot">
+          <div>家具 CAD · AI 网页版定制家具设计与生产系统</div>
+          <div><a href="/">进入工作台 →</a></div>
+        </div>
+      </footer>
+    </div>
+
+    <script>
+      // 只取一个公开接口展示当前模式；失败就如实显示"未检测到"。
+      fetch('/api/auth/mode')
+        .then((r) => r.json())
+        .then((d) => {
+          const chip = document.getElementById('mode-chip');
+          const mode = d && (d.mode ?? (d.data && d.data.mode));
+          chip.textContent = mode === 'accounts' ? '账号模式（已启用登录）' : mode === 'local-open' ? '本机开放模式（尚未建账号）' : '未检测到';
+        })
+        .catch(() => {
+          document.getElementById('mode-chip').textContent = '未检测到（服务未启动）';
+        });
+    </script>
+  </body>
+</html>

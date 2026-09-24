@@ -3721,6 +3721,37 @@ async function waitForApp(url, timeoutMs = 25000) {
       after33.gone && after33.ver === vB33 + 4, JSON.stringify({ ...after33, vB33 }));
 
     // ═══════════════════════════════════════════════════════════
+    section('B34 首页介绍页：/home.html 可达、内容齐全、/ 仍是工作台');
+
+    // ① 介绍页可达且关键区块齐全（hero / 能力 / 档位 / 诚实清单 / 责任边界）
+    const homeRes = await fetch(`${APP_URL}home.html`);
+    const homeHtml = homeRes.ok ? await homeRes.text() : '';
+    const homeHas = (s) => homeHtml.includes(s);
+    ok('B34 介绍页 /home.html 返回 200 且 UTF-8 中文正常',
+      homeRes.status === 200 && homeHas('说一句话') && homeHas('订阅档位'),
+      `status=${homeRes.status} len=${homeHtml.length}`);
+    ok('B34 介绍页四个关键区块齐全：能力 / 档位表 / 安全自述 / 责任边界',
+      homeHas('核心能力') && homeHas('不限') && homeHas('还没有做') && homeHas('责任边界'),
+      `core=${homeHas('核心能力')} plans=${homeHas('不限')} honest=${homeHas('还没有做')} duty=${homeHas('责任边界')}`);
+    ok('B34 介绍页档位表与 auth.mjs PLANS 一致（20万/500万/3000万/不限）',
+      homeHas('20 万 token') && homeHas('500 万 token') && homeHas('3000 万 token'),
+      `free=${homeHas('20 万 token')} pro=${homeHas('500 万 token')} team=${homeHas('3000 万 token')}`);
+
+    // ② /api/auth/mode 公开接口正常（介绍页的模式徽标数据源）
+    const modeRes = await fetch(`${APP_URL}api/auth/mode`);
+    const modeJson = await modeRes.json().catch(() => null);
+    ok('B34 /api/auth/mode 返回 ok+mode（介绍页徽标数据源可用）',
+      modeRes.status === 200 && modeJson?.ok === true && typeof modeJson?.mode === 'string',
+      JSON.stringify(modeJson));
+
+    // ③ / 仍然是工作台 —— 介绍页绝不抢工作台的入口（日常自用不受打扰）
+    const rootRes = await fetch(APP_URL);
+    const rootHtml = rootRes.ok ? await rootRes.text() : '';
+    ok('B34 / 仍是工作台（index.html 含 #root 挂载点，未被介绍页顶替）',
+      rootRes.status === 200 && rootHtml.includes('id="root"'),
+      `status=${rootRes.status} hasRoot=${rootHtml.includes('id="root"')}`);
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

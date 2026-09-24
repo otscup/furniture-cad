@@ -83,19 +83,25 @@ PORT=8787 node server/server.mjs
 **访问 NAS 的局域网 IP（`192.168.2.2`）的发布端口会被丢包**——超时/ECONNRESET。
 这不是防火墙没开，也不是密钥问题，是 Docker bridge → 宿主机 LAN IP 的回环 NAT 在群晖上不通。
 
-**解法（三选一，推荐 ①）**：
+**解法（三选一，推荐 ②）**：
 
-1. **走 Docker 网桥网关**：把地址换成 `http://172.17.0.1:<端口>/v1`（默认 bridge 的网关地址）。
-   容器内实测可达。缺点：IP 是约定俗成的默认值，换环境要重确认。
-2. **加入同一张 Docker 网络**：在 compose 里声明外部网络并加入服务，
-   之后可用容器名互访（`http://gpt-load:3002/v1`），不受 IP 变化影响：
+1. **走 Docker 网桥网关**（`http://172.17.0.1:<端口>/v1`）：
+   实测**不稳定**——首次可能成功，之后持续连接超时（实测连打 10 次全挂），只能临时救急，不要作为长期方案。
+2. **加入同一张 Docker 网络（推荐）**：容器进到目标服务那张网后按**容器名**互访
+   （`http://gpt-load:3002/v1`），实测耗时从超时降到 **5~10ms，连打 10 次零失败**，
+   且不受 IP 变化影响。做法是写一个 `docker-compose.override.yml`（本机专用、
+   不会被基础 compose 覆盖），然后 `docker compose up -d` 重建：
    ```yaml
+   # docker-compose.override.yml
    networks:
-     gpt-load_default: { external: true }
+     gpt-load_default:
+       external: true
    services:
      furniture-cad:
        networks: [gpt-load_default]
    ```
+   临时不想重建容器也可以先 `docker network connect <目标网> furniture-cad`，
+   但那样重启容器后会丢 —— 声明式文件才是长期解。
 3. **`network_mode: host`**：直接用宿主机网络，`127.0.0.1` 即可达；代价是端口占用与隔离变弱。
 
 **配套检查**：拉通之后还要确认**模型名真的在清单里**。

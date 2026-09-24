@@ -11,12 +11,25 @@
 #
 #  数据持久化：./data 挂到 /app/data，账号库、审计、记忆、SMTP/AI 配置
 #  全在里面 —— 升级镜像 = 重建容器，数据不动。
+#
+#  ── 要访问宿主上新跑的其他容器（AI 网关等）时 ──
+#    不要把地址写成 NAS 的局域网 IP（192.168.2.x）：容器内访问宿主机 LAN IP
+#    的发布端口在群晖上不通；走 docker 网桥网关 172.17.0.1 也只是时灵时不灵。
+#    **正解：两个容器进同一张 Docker 网络，按容器名互访（http://容器名:端口）。**
+#    做法：把下面 networks 段落里的 external 网络改成目标网的真实名字
+#    （docker network ls 查），再 `docker compose up -d` 重建即可。
 # ══════════════════════════════════════════════════════════════════════
+networks:
+  # 示例：与同机的 AI 网关容器共享网络后，AI_BASE_URL 可填 http://gpt-load:3002/v1
+  # gpt-load_default:
+  #   external: true
+
 services:
   furniture-cad:
     build: .
     container_name: furniture-cad
     restart: unless-stopped
+    # networks: [gpt-load_default]   # ← 需要时解开注释（会与服务默认网络二选一）
     ports:
       - '8787:8787'
     environment:

@@ -252,7 +252,21 @@ export const ACTION_NAMES = Object.keys(ACTIONS);
 
 /** 除 target/params/reason 之外，顶层还允许出现的键（白名单，不是黑名单） */
 const TOP_KEYS = new Set(['action', 'target', 'params', 'reason']);
-const TARGET_KEYS = new Set(['cabinetId', 'cabinetName', 'roomId', 'roomName', 'unit']);
+const TARGET_KEYS = new Set(['cabinetId', 'cabinetName', 'roomId', 'roomName', 'unit', 'part', 'scope']);
+
+/**
+ * 部件词汇表（闭合，Task #25 A3）—— 来自 core/geometry/pickLines.ts 的 CabinetPart。
+ * AI 只允许用清单里的部件名指"图上那条线"；写别的一律整条拒收。
+ */
+export const PARTS = new Set([
+  'outer.width',
+  'outer.height',
+  'bodyLift',
+  'unit.divider',
+  'door.gapMid',
+  'shelf.line',
+  'drawer.divider',
+]);
 
 function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -302,9 +316,24 @@ export function validateAction(raw, ctx = {}) {
       }
     }
     if (raw.target.unit !== undefined) target.unit = raw.target.unit;
+    if (raw.target.part !== undefined) {
+      if (typeof raw.target.part !== 'string' || !PARTS.has(raw.target.part)) {
+        return { ok: false, code: 'BAD_PART', error: `target.part "${String(raw.target.part)}" 不是合法部件（可用：${[...PARTS].join(' | ')}）` };
+      }
+      target.part = raw.target.part;
+    }
+    if (raw.target.scope !== undefined) {
+      if (raw.target.scope !== 'selection') {
+        return { ok: false, code: 'BAD_SCOPE', error: `target.scope 只允许 "selection"（圈选当前选中的柜体），收到 "${String(raw.target.scope)}"` };
+      }
+      target.scope = 'selection';
+    }
+    if (target.part !== undefined && target.scope === 'selection') {
+      return { ok: false, code: 'PART_SCOPE_CLASH', error: 'part（点选某个柜体的某个部件）与 scope:"selection"（圈选一批柜体）只能二选一' };
+    }
   }
-  if (spec.target === 'cabinet' && !target.cabinetId && !target.cabinetName) {
-    return { ok: false, code: 'NO_CABINET', error: `动作 "${name}" 必须指明是哪个柜体（target.cabinetName 用柜体名字）` };
+  if (spec.target === 'cabinet' && !target.cabinetId && !target.cabinetName && target.scope !== 'selection') {
+    return { ok: false, code: 'NO_CABINET', error: `动作 "${name}" 必须指明是哪个柜体（target.cabinetName 用柜体名字；或 target.scope="selection" 圈选当前选中的柜体）` };
   }
   /**
    * 分区引用归 target 而不是 params —— 这是个**口径问题**，不是风格问题：
@@ -526,6 +555,7 @@ export function buildSystemPrompt() {
   }
   lines.push('');
   lines.push('target 用于指明"对哪个已有对象动手"：cabinetName 给柜体名字（不要编 id），unit 给分区（1 起序号或分区昵称），roomName 给房间名（只有 cabinet.create 需要）。');
+  lines.push('当用户指"图上的一条线 / 一个部件"时，用 target.part 部件名（合法值：' + [...PARTS].join(' | ') + '），它仍需 cabinetName 指明柜体；当用户说"选中的这些柜体都要…"时，用 target: { scope: "selection" } 且不要给 cabinetName。part 与 scope 不能同时出现。');
   lines.push('判断顺序：先认准用户说的是**哪个柜体**，再决定动作；一次把用户这一句话涉及的动作全部给出。');
   lines.push('用户说的中文数字（"三只抽屉"）要转成阿拉伯数字。"两米四"要转成 2400。');
   return lines.join('\n');

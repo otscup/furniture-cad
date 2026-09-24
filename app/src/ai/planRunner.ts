@@ -57,6 +57,12 @@ export interface PlanRun {
   /** true = 这批命令已经真的写进总线 */
   committed: boolean;
   /**
+   * 影响面提示（A5）：干跑后每个被连带改变的柜体一行 ——
+   * 「板件 31→30」「分区净宽 582/1164/582 → 780/960/582」这类。
+   * 由前后两次真实派生对比得出，不是静态表 —— 静态表会与生成器漂移。
+   */
+  impact: string[];
+  /**
    * 提交完成时的模型版本。
    *
    * 存在的理由只有一个，但很要紧：提交会 bump 版本号，而界面是"版本一变就作废这份计划"
@@ -75,7 +81,7 @@ export interface PlanRun {
  * 就会出现"预览看着没问题、一点应用弹出被记忆拦住"—— 两段式的意义就没了。
  * 传 `undefined` 表示"调用方没有记忆门"（例如命令行验收），传 `null` 表示显式关闭。
  */
-export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: Gate | null }): PlanRun {
+export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: Gate | null; selection?: string[] }): PlanRun {
   const { bus, actions } = opts;
   const rules: RuleSet = bus.getRules();
   const baseVersion = bus.getVersion();
@@ -83,11 +89,11 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
   if (opts.gate !== undefined) sandbox.setGate(opts.gate);
 
   const steps: PlanStep[] = [];
-  for (const action of actions) {
+  const runStep = (action: AiAction, displayAction: AiAction): void => {
     const compiled = compileAction(action, sandbox.getState(), rules);
     if (!compiled.ok) {
       steps.push({
-        action,
+        action: displayAction,
         label: '(未编译)',
         ok: false,
         error: compiled.error ?? '编译失败（编译器没有给出原因，这本身是个缺陷）',
@@ -98,7 +104,7 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
         memoryHits: [],
         blockingErrors: 0,
       });
-      continue;
+      return;
     }
     /**
      * strict: true —— AI 不能把模型改成"带 ERROR"的状态。
@@ -107,7 +113,7 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
      */
     const r = sandbox.execute(compiled.command, { strict: true, commitLabel: `AI：${compiled.summary}` });
     steps.push({
-      action,
+      action: displayAction,
       command: compiled.command,
       label: compiled.command.label ?? compiled.summary,
       ok: r.ok,
@@ -119,6 +125,41 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
       memoryHits: r.memoryHits,
       blockingErrors: r.blockingErrors,
     });
+  };
+
+  for (const action of actions) {
+    /**
+     * scope:"selection"（圈选）在这里展开成逐柜动作 —— 编译器没有"当前选择"的上下文，
+     * 展开是 planRunner 的职责（A3/A4）。展开后每一步的 target 都落成具体 cabinetId，
+     * 审计与 diff 才能说清"改的到底是谁"。选择集为空 → 如实报错，不静默跳过。
+     */
+    if (action.target?.scope === 'selection') {
+      const sel = opts.selection ?? [];
+      if (sel.length === 0) {
+        steps.push({
+          action,
+          label: '(未编译)',
+          ok: false,
+          error: '圈选（scope:"selection"）为空：图上还没有选中任何柜体。先在图上选中，再让 AI 执行',
+          diff: [],
+          newIssues: [],
+          resolvedIssues: [],
+          clamped: [],
+          memoryHits: [],
+          blockingErrors: 0,
+        });
+        continue;
+      }
+      for (const id of sel) {
+        // scope 必须剥掉：展开后的动作落成具体 cabinetId，
+        // 否则编译器的守卫会正确地拦下它（那是守卫的功劳，不是展开的功劳）
+        const { scope: _scope, ...targetRest } = action.target;
+        const expanded: AiAction = { ...action, target: { ...targetRest, cabinetId: id } };
+        runStep(expanded, expanded);
+      }
+      continue;
+    }
+    runStep(action, action);
   }
 
   const okCount = steps.filter((s) => s.ok).length;
@@ -130,7 +171,42 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
     draft: sandbox.getState(),
     baseVersion,
     committed: false,
+    impact: buildImpact(bus, sandbox),
   };
+}
+
+/** 影响面（A5）：干跑前后各派生一次，逐柜对比板件数 / 用板面积 / 分区净宽 —— 静态表会与生成器漂移，这里全部来自真实派生 */
+function buildImpact(bus: CommandBus, sandbox: CommandBus): string[] {
+  const before = bus.derive().geom.cabinets;
+  const after = sandbox.derive().geom.cabinets;
+  const cabs = sandbox.getState().cabinets;
+  const lines: string[] = [];
+  for (const [id, g] of Object.entries(after)) {
+    const b = before[id];
+    const name = cabs.find((c) => c.id === id)?.name ?? id;
+    if (!b) {
+      lines.push(`「${name}」新增：板件 ${g.stats.totalPieces} 件`);
+      continue;
+    }
+    const parts: string[] = [];
+    if (b.stats.totalPieces !== g.stats.totalPieces) parts.push(`板件 ${b.stats.totalPieces}→${g.stats.totalPieces} 件`);
+    /**
+     * 用板面积要覆盖"板件数不变但尺寸变"的情况：改踢脚高不增减板件、
+     * 不动分区净宽，但侧板/层板/背板都在变长变短 —— 面积是最老实的读数。
+     * 取 cm² 精度比较，避免浮点噪声把没变的判成变了。
+     */
+    const a0 = Math.round(b.stats.boardAreaM2 * 100);
+    const a1 = Math.round(g.stats.boardAreaM2 * 100);
+    if (a0 !== a1) parts.push(`用板面积 ${b.stats.boardAreaM2.toFixed(2)}→${g.stats.boardAreaM2.toFixed(2)} m²`);
+    const bn = b.layout.nets.join('/');
+    const an = g.layout.nets.join('/');
+    if (bn !== an) parts.push(`分区净宽 ${bn} → ${an}`);
+    if (parts.length > 0) lines.push(`「${name}」${parts.join(' · ')}`);
+  }
+  for (const id of Object.keys(before)) {
+    if (!after[id]) lines.push(`「${cabs.find((c) => c.id === id)?.name ?? id}」被删除`);
+  }
+  return lines;
 }
 
 export type CommitOutcome =

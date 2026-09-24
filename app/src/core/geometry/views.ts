@@ -1,6 +1,8 @@
 import type { BBox, Cabinet, Prim, Project, RuleSet, Vec2 } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights } from './layout.ts';
+import { buildFrontPickLines } from './pickLines.ts';
+import type { PickLine } from './pickLines.ts';
 import { bboxOf } from './transform.ts';
 import { LabelPlacer, primVisualExtent } from './labels.ts';
 
@@ -119,6 +121,11 @@ export interface ViewSet {
   gaps: { gapTop: number; gapSide: number; gapInt: number };
   /** 为画图而必须做的假设；没有工艺依据的地方必须说出来，不能悄悄画 */
   assumptions: string[];
+  /**
+   * 几何 → 语义的反查表（点选/圈选局部编辑用，A1）。
+   * 与图元在同一处生成、同一套 mapper —— 点位与屏幕上的线逐位一致。
+   */
+  pickLines: PickLine[];
 }
 
 export interface ViewOpts {
@@ -319,6 +326,13 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   const T = makePainter(prims.top, mapTop);
   const S = makePainter(prims.side, mapSide);
   const I = makePainter(prims.internal, mapInt);
+
+  /**
+   * PickLine（几何 → 语义反查表，A1）。
+   * 必须与正视图图元在**同一处**生成：mapper 传的就是上面那对画图用的，
+   * 点位与图元逐位一致 —— 与几何同源，结构上不可能漂移。
+   */
+  const pickLines = buildFrontPickLines(cab, L, rules, mapFront, mapInt);
 
   // ═══════════════ 1. 正视图（从前看，含门 / 抽面）═══════════════
   F.rect(0, W, 0, H, L_FRAME, 2.4);
@@ -558,6 +572,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     dims: { W, H, D },
     gaps,
     assumptions,
+    pickLines,
   };
 
   // ── 正视图 / 内部图共用的箱体绘制（两者方向完全相同，只差门 / 抽面画不画）──
@@ -733,6 +748,8 @@ export interface ProjectViewSet {
   assumptions: string[];
   /** 出现一次以上的假设（说明是全局性问题，不是单柜特例） */
   commonAssumptions: string[];
+  /** 全项目合并的 PickLine 反查表（四视图点选用） */
+  pickLines: PickLine[];
 }
 
 /**
@@ -741,6 +758,7 @@ export interface ProjectViewSet {
  */
 export function buildProjectViews(project: Project, rules: RuleSet): ProjectViewSet {
   const prims: Prim[] = [];
+  const pickLines: PickLine[] = [];
   const placements: Record<string, Vec2> = {};
   const titles: ProjectViewSet['titles'] = [];
   const seen = new Map<string, number>();
@@ -757,6 +775,7 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
     const occupied = W + vs.gaps.gapSide + D + vs.gaps.gapInt + W;
 
     prims.push(...vs.prims.front, ...vs.prims.top, ...vs.prims.side, ...vs.prims.internal, ...vs.hinge, ...vs.labels);
+    pickLines.push(...vs.pickLines);
 
     placements[cab.id] = { x: cursor, y: 0 };
     titles.push({ cabinetId: cab.id, name: cab.name, at: { x: cursor + occupied / 2, y: 0 } });
@@ -780,5 +799,6 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
     titles,
     assumptions,
     commonAssumptions: assumptions.filter((a) => (seen.get(a) ?? 0) > 1),
+    pickLines,
   };
 }

@@ -84,7 +84,7 @@ function loadChat(): ChatTurn[] {
   }
 }
 
-export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
+export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
 
@@ -213,7 +213,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       }
       // 干跑：拿真总线上的记忆门，跑在沙盒模型上
       const g = compiledRules().gate;
-      setRun(dryRunPlan({ bus, actions: r.actions, gate: g }));
+      setRun(dryRunPlan({ bus, actions: r.actions, gate: g, selection: props.selection }));
     } finally {
       setBusyKind('');
     }
@@ -496,6 +496,19 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           <Row label="干跑后模型里仍有 ERROR" derived hint="ERROR 会阻断生产数据导出；WARNING 不阻断">
             {run.blockingErrors > 0 ? <Pill kind="ERROR">{run.blockingErrors}</Pill> : <Pill kind="ok">0</Pill>}
           </Row>
+          {run.impact.length > 0 ? (
+            <Row
+              label="影响面（连带改变）"
+              derived
+              hint="由干跑前后两次真实派生对比得出。你点选的「一条线」背后连着门板高、抽屉分格、铰链数量 —— 这里列出的是它们实际会怎么变"
+            >
+              <ul className="diff-list">
+                {run.impact.map((line, i) => (
+                  <li key={i}>{line}</li>
+                ))}
+              </ul>
+            </Row>
+          ) : null}
           {lastApply ? <div className="alert alert-info">{lastApply}</div> : null}
         </Section>
       ) : null}

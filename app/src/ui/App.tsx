@@ -30,6 +30,7 @@ import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
 import { loadToken, saveToken } from '../ai/aiClient.ts';
 import { loadDraft, saveDraft, clearDraft, fmtSavedAt } from '../state/draftStore.ts';
+import type { PickLine } from '../core/geometry/pickLines.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
 import type { Toast, ToastKind, Tool } from './types.ts';
@@ -426,6 +427,17 @@ export function App() {
     setPendingMove({ base: null });
     setLastMsg('指定基点');
   }, [selectedCabs, toast]);
+
+  // ── 四视图点选部件（Task #25 A 组）──
+  const onPickPart = useCallback(
+    (pl: PickLine) => {
+      const cab = bus.getState().cabinets.find((c) => c.id === pl.cabinetId);
+      setSelection([pl.cabinetId]);
+      setLastMsg(`点选部件：${cab?.name ?? pl.cabinetId} · ${pl.labelZh} · ${pl.paramPath}`);
+      toast('info', `这是「${cab?.name ?? pl.cabinetId}」的${pl.labelZh} —— 由参数 ${pl.paramPath} 决定。改参数请到属性面板，或让 AI 改（会先干跑预览）`);
+    },
+    [toast]
+  );
 
   // ── 命令行解释器 ──
   const runText = useCallback(
@@ -847,6 +859,7 @@ export function App() {
             onPlaceCabinet={onPlaceCabinet}
             onCreateWall={onCreateWall}
             onContextMenu={onViewportContextMenu}
+            onPickPart={onPickPart}
             onToast={toast}
             cursorStyle={tool === 'select' ? 'default' : 'crosshair'}
           />
@@ -925,7 +938,7 @@ export function App() {
           {rightTab === 'export' ? <ExportPanel bus={bus} version={version} token={token} savedAt={savedAt} onToast={toast} /> : null}
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
-          {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} onToast={toast} /> : null}
+          {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} selection={selection} onToast={toast} /> : null}
           {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} /> : null}
         </aside>
       </div>

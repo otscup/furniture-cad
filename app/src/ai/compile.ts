@@ -4,6 +4,7 @@ import * as CMD from '../core/commands.ts';
 import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '../core/docFactory.ts';
 import { nextId } from '../core/ids.ts';
 import { unitParamRange } from '../../shared/aiContract.mjs';
+import { pickPartsOf } from '../core/geometry/pickLines.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -37,7 +38,17 @@ import { unitParamRange } from '../../shared/aiContract.mjs';
 /** 校验器归一化之后的动作（与 shared/aiContract.mjs 的 validateAction 输出同构） */
 export interface AiAction {
   action: string;
-  target: { cabinetId?: string; cabinetName?: string; roomId?: string; roomName?: string; unit?: number | string };
+  target: {
+    cabinetId?: string;
+    cabinetName?: string;
+    roomId?: string;
+    roomName?: string;
+    unit?: number | string;
+    /** 点选的部件（闭合词汇表，见 core/geometry/pickLines.ts） */
+    part?: string;
+    /** 圈选：作用于"当前选中的柜体集合"（由 planRunner 展开成逐柜动作） */
+    scope?: 'selection';
+  };
   params: Record<string, number | string>;
   reason: string;
   index: number;
@@ -128,6 +139,72 @@ const FAMILY_ACTION: Record<string, string> = {
  *                否则"先加一个分区、再改第 4 个分区"这类计划会因为下标没跟上而改错对象。
  */
 export function compileAction(action: AiAction, project: Project, rules: RuleSet): CompileResult {
+  // ── A4：part 目标的语义校验（点选的部件必须存在、改的路径必须与部件一致）──
+  if (action.target?.scope === 'selection') {
+    return { ok: false, error: 'scope:"selection" 要由 planRunner 按当前选择展开成逐柜动作，编译器不直接接受它' };
+  }
+  const partCheck = checkPartTarget(action, project);
+  if (!partCheck.ok) return partCheck;
+  const result = compileResolved(action, project, rules);
+  if (result.ok && partCheck.paramPath !== undefined) {
+    /**
+     * 一致性校验（这就是"踢脚线不许解析成 height"的那条断言的运行时形态）：
+     * AI 说要改某个部件，编译出的命令却动了别的路径 —— 拒绝。
+     * 例外：placement.* 是柜体外形补偿（拖边缘钉另一边），属于同一次部件变更的一部分。
+     */
+    const bad = result.command.changes.find(
+      (c) => c.path !== partCheck.paramPath && !c.path.startsWith('placement.')
+    );
+    if (bad) {
+      return {
+        ok: false,
+        error: `这条动作要改 ${bad.path}，与你点选的部件（${action.target.part}，由 ${partCheck.paramPath} 决定）不符 —— 一个部件一条动作，不要混改`,
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * part 目标的两步校验：
+ *  ① 部件在该柜体上是否仍然存在（引用失效 → 报出候选清单，不许静默改别的东西 —— 对齐 resolveUnit 的做法）
+ *  ② 部件落在哪个分区（多处命中且未指明 unit → 报出候选）
+ */
+function checkPartTarget(
+  action: AiAction,
+  project: Project
+): { ok: true; paramPath?: string } | { ok: false; error: string } {
+  const part = action.target?.part;
+  if (!part) return { ok: true };
+  const cab = resolveCabinet(project, action.target);
+  if (typeof cab === 'string') return { ok: false, error: cab };
+  const occurrences = pickPartsOf(cab).filter((x) => x.part === part);
+  if (occurrences.length === 0) {
+    const avail = pickPartsOf(cab).map((x) => `${x.part}(${x.unitIndex + 1})`).join('、');
+    return {
+      ok: false,
+      error: `柜体「${cab.name}」上没有部件 "${part}"（现有：${avail || '无'}）—— 引用的那条线可能已被上一步改掉`,
+    };
+  }
+  if (occurrences.length === 1) return { ok: true, paramPath: occurrences[0].paramPath };
+  if (action.target.unit === undefined) {
+    return {
+      ok: false,
+      error: `部件 "${part}" 在柜体「${cab.name}」上有 ${occurrences.length} 处（分区：${occurrences
+        .map((x) => x.unitIndex + 1)
+        .join('、')}）—— 请用 target.unit 指明是哪一个`,
+    };
+  }
+  const i = resolveUnitIndex(cab, action.target.unit);
+  if (typeof i === 'string') return { ok: false, error: i };
+  const found = occurrences.find((x) => x.unitIndex === i);
+  if (!found) {
+    return { ok: false, error: `第 ${i + 1} 分区上没有部件 "${part}"（${part} 在分区：${occurrences.map((x) => x.unitIndex + 1).join('、')}）` };
+  }
+  return { ok: true, paramPath: found.paramPath };
+}
+
+function compileResolved(action: AiAction, project: Project, rules: RuleSet): CompileResult {
   const p = action.params;
   const src = 'ai' as const;
 

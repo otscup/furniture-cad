@@ -9,7 +9,9 @@ import { fitBBox, niceGridStep, panByScreen, screenToWorld, zoomAt } from '../vi
 import type { SnapResult, SnapSettings } from '../viewport/snapping.ts';
 import { collectSnapNodes, resolveSnap, snapKindLabel, snapToleranceWorld } from '../viewport/snapping.ts';
 import type { Grip } from '../viewport/hitTest.ts';
-import { boxSelect, hitTest } from '../viewport/hitTest.ts';
+import { boxSelect, hitPart, hitTest } from '../viewport/hitTest.ts';
+import { camDebug } from '../viewport/camDebug.ts';
+import type { PickLine } from '../core/geometry/pickLines.ts';
 import { planCabinetGripDrag, planWallGripDrag } from '../viewport/gripDrag.ts';
 import type { Scene } from '../viewport/renderer.ts';
 import { renderScene } from '../viewport/renderer.ts';
@@ -67,6 +69,11 @@ export interface ViewportProps {
    * 把屏幕坐标交回 App —— 菜单里有什么项，由 App 按当前选择算。
    */
   onContextMenu?: (p: { x: number; y: number }) => void;
+  /**
+   * 四视图里点选一条线（Task #25 A 组）。Viewport 只负责命中，
+   * 解析结果 PickLine 交回 App —— 界面与 AI 拿到的都是 {cabinetId, part, paramPath}，不是坐标。
+   */
+  onPickPart?: (pl: PickLine) => void;
   onToast: (kind: ToastKind, text: string) => void;
   cursorStyle: string;
 }
@@ -131,6 +138,16 @@ export function Viewport(props: ViewportProps) {
     },
     [bus, sheet, props.explode, setCam]
   );
+
+  // 相机调试出口（仅供验收探针读数）：图幅模式按设计无 HUD 坐标读数（B20），
+  // 探针在 sheet 内无法做 HUD 两点标定，只能从这里读真实相机换算。
+  // 双向都写是因为 fit/滚轮/平移都改 cam —— 跟着 render cycle 走最不容易漏。
+  useEffect(() => {
+    camDebug.cam = cam;
+    camDebug.vw = size.w;
+    camDebug.vh = size.h;
+  }, [cam, size]);
+
 
   // ── 尺寸观察 ──
   useEffect(() => {
@@ -308,6 +325,23 @@ export function Viewport(props: ViewportProps) {
     const raw = toWorld(sp);
     setCursor(sp);
 
+    // 图幅是只读视图：不放柜、不拖柜。但"点一条线"解析语义参数是允许的（A 组）。
+    // 注意顺序：点选判断必须在平移分支**之前**，否则左键永远先进平移、点选永远轮不到。
+    if (sheet) {
+      if (e.button === 0 && !spaceRef.current && props.onPickPart) {
+        const tol = snapToleranceWorld(8, cam.scale);
+        const hit = hitPart(bus.derive().geom.views.pickLines, raw, tol);
+        if (hit) {
+          props.onPickPart(hit);
+          return;
+        }
+      }
+      // 空白处照旧平移 —— 图幅的左键平移不能因为有点选就消失
+      setDrag({ kind: 'pan', last: sp });
+      setPreview(null);
+      return;
+    }
+
     // 中键 或 空格+左键 → 平移（图幅模式下左键也可以直接拖动平移）
     if (e.button === 1 || (e.button === 0 && (spaceRef.current || sheet))) {
       setDrag({ kind: 'pan', last: sp });
@@ -315,9 +349,6 @@ export function Viewport(props: ViewportProps) {
       return;
     }
     if (e.button !== 0) return;
-
-    // 图幅是只读视图：不选择、不拖动、不放柜。要改模型请切回平面图。
-    if (sheet) return;
 
     const project = bus.getState();
     const base = draft ? draft.a : (pendingMove?.base ?? null);

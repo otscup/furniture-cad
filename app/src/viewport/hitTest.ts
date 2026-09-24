@@ -168,3 +168,27 @@ export function boxSelect(project: Project, a: Vec2, b: Vec2): string[] {
 export function boxSelectMode(a: Vec2, b: Vec2): 'window' | 'crossing' {
   return b.x < a.x ? 'crossing' : 'window';
 }
+
+/**
+ * ── PickLine 命中测试（A2，设计文档《Local-Pick-Edit》§2.2）──
+ *
+ * 四视图图幅是只读视图，但"点一条线"要的从来不是改线 ——
+ * 是解析出它背后的语义参数（哪个柜体的哪个部件、改哪条路径）。
+ * PickLine 的 pts 与图元同源生成（pickLines.ts），命中的就是屏幕上看得见的线。
+ */
+import type { PickLine } from '../core/geometry/pickLines.ts';
+
+export function hitPart(pickLines: PickLine[], world: Vec2, tolWorld: number): PickLine | null {
+  let best: PickLine | null = null;
+  let bestD = Infinity;
+  for (const pl of pickLines) {
+    for (let i = 0; i + 1 < pl.pts.length; i++) {
+      const d = distToSegment(world, pl.pts[i], pl.pts[i + 1]);
+      if (d <= tolWorld && d < bestD) {
+        bestD = d;
+        best = pl;
+      }
+    }
+  }
+  return best;
+}

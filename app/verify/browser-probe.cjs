@@ -31,6 +31,7 @@
  *  B23 导出面板：图纸选择 / 版本选择 / ERROR 提示 / 禁用逻辑
  *  B24 项目存盘与加载：自动保存 / 打开项目文件 / 坏文件拒绝
  *  B25 右键上下文菜单：右键即选中 / 选中态决定菜单 / 命令中右键=取消
+ *  B26 四视图点选线 → 语义解析（点选部件 → 参数路径，坐标不出管线）
  *
  *  用法：先起本地服务与 dev server，再跑本脚本（见 package.json 的 verify:ui）。
  *  ══════════════════════════════════════════════════════════════════════
@@ -3220,6 +3221,99 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('命令进行中右键：不弹菜单', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);
     ok('命令进行中右键 = 取消，回到选择工具', modeAfterR === '选择', modeAfterR);
     ok('取消没有写模型（版本不变）', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx + 1} → v${await statusVersion()}`);
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B26 —— 四视图点选线 → 语义解析（Task #25 A 组的浏览器闭环）。
+     *
+     * 在图幅上点一条线，界面必须说出"这是哪个柜体的什么部件、由哪个参数决定"，
+     * 并把所属柜体选上 —— AI 与用户从这里拿到的是 {cabinetId, part, paramPath}，
+     * 永远不是坐标。
+     *
+     * 点位不写死：从派生管线里现取 pickLines 的实际点位（与屏幕上那条线同源），
+     * 经独立标定换算成屏幕坐标 —— 写死坐标等于赌相机状态，迟早假红。
+     */
+    section('B26 四视图点选线 → 语义解析（外轮廓/层板线 → 参数路径）');
+
+    /**
+     * 图幅内点位换算 —— 为什么不做 HUD 两点标定：
+     *   ① 图幅模式按设计不显示 X/Y 坐标读数（B20 有这条断言），在图幅内标定必然失败；
+     *   ② "平面图标定带进图幅"也错 —— 切图幅必然触发一次重新取景（fit 到四图幅
+     *      bbox，Viewport 的 fitGeom 对 sheet 取 views.bbox），旧标定的 scale/原点
+     *      全部作废。B26 第一轮三连失败的真实根因就是探针假设了"相机跨模式共享"。
+     * 出路：从 camDebug 读产品**正在用**的真实相机，用渲染同款的 worldToScreen
+     * 换算 —— 与 hitPart 的反解互为逆运算，点位精度与用户点击完全同权。
+     */
+    const clientOfSheet = (wx, wy) => evalJs(`(async()=>{
+      const m = await import('/src/viewport/camera.ts');
+      const cd = (await import('/src/viewport/camDebug.ts')).camDebug;
+      if (!cd.cam) return null;
+      const rect = document.querySelector('.vp').getBoundingClientRect();
+      const s = m.worldToScreen({x:${wx}, y:${wy}}, cd.cam, cd.vw, cd.vh);
+      return { x: rect.left + s.x, y: rect.top + s.y, scale: cd.cam.scale,
+        rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom } };
+    })()`);
+    const inViewport = (c) => c && Number.isFinite(c.x) && Number.isFinite(c.y) && c.scale > 0
+      && c.x > c.rect.left + 8 && c.x < c.rect.right - 8 && c.y > c.rect.top + 8 && c.y < c.rect.bottom - 8;
+
+    // 进四视图
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
+    await sleep(420);
+    ok('四视图切换成功（图幅 HUD 提示在，平面读数不在）',
+      (await evalJs(`!!document.querySelector('.vp-hud-sheet')`)) === true,
+      `sheet-hud=${await evalJs(`!!document.querySelector('.vp-hud-sheet')`)} hudWorld=${JSON.stringify(await hudWorld())}`);
+
+    // 点击前的气泡快照（条目级）—— mem_003 之类旧拦截气泡有 8 秒寿命，
+    // 断言只看"点击之后**新增**的那几条"（基线差集），旧账不往点选头上算。
+    const toastItems = () => evalJs(`[...document.querySelectorAll('.toasts > *')].map(n=>n.textContent)`);
+    const baseline26 = (await toastItems()) || [];
+    const baseSet26 = new Set(baseline26);
+    const freshToasts = async () => {
+      const after = (await toastItems()) || [];
+      return after.filter((t) => !baseSet26.has(t)).join(' | ');
+    };
+
+    const pickOuter = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const v=s.bus.derive().geom.views.pickLines;
+      const pl=v.find(x=>x.part==='outer.width');
+      return pl?{mid:{x:(pl.pts[0].x+pl.pts[1].x)/2, y:(pl.pts[0].y+pl.pts[1].y)/2}, label:pl.labelZh, path:pl.paramPath, cab:pl.cabinetId}:null;})()`);
+    ok('派生管线里能取到 outer.width 的 PickLine', pickOuter !== null, JSON.stringify(pickOuter));
+    if (pickOuter) {
+      const c = await clientOfSheet(pickOuter.mid.x, pickOuter.mid.y);
+      ok('外轮廓点位换算成功且落在视口内', inViewport(c), JSON.stringify(c));
+      if (inViewport(c)) {
+        await mouseDown(c.x, c.y);
+        await sleep(120);
+        await mouseUp(c.x, c.y);
+        await sleep(460);
+        const fresh26 = await freshToasts();
+        ok('点击外轮廓 → 界面说出部件名与参数路径（这不是一条线，是柜宽）',
+          pickOuter.label && fresh26.includes(pickOuter.label) && fresh26.includes(pickOuter.path) && !fresh26.includes('mem_'),
+          `新增气泡=[${fresh26 || '(无)'}]`);
+        ok('点线即选中所属柜体（语义目标落成选择集，后续 AI 才有 scope 可用）', (await statusSelection()) === 1, `实为 ${await statusSelection()}`);
+      }
+    }
+
+    // 层板线：同样现取现点
+    const pickShelf = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const v=s.bus.derive().geom.views.pickLines;
+      const pl=v.find(x=>x.part==='shelf.line');
+      return pl?{mid:{x:(pl.pts[0].x+pl.pts[1].x)/2, y:(pl.pts[0].y+pl.pts[1].y)/2}, label:pl.labelZh, path:pl.paramPath}:null;})()`);
+    ok('派生管线里能取到 shelf.line 的 PickLine', pickShelf !== null, '样例柜体没有层板分区（不该发生）');
+    if (pickShelf) {
+      const c2 = await clientOfSheet(pickShelf.mid.x, pickShelf.mid.y);
+      if (inViewport(c2)) {
+        await mouseDown(c2.x, c2.y);
+        await sleep(120);
+        await mouseUp(c2.x, c2.y);
+        await sleep(460);
+        const fresh26b = await freshToasts();
+        ok('点击层板线 → 解析成 shelves.count（改层板 = 改数量参数，不是挪线）',
+          fresh26b.includes(pickShelf.label) && fresh26b.includes('shelves.count'),
+          `新增气泡=[${fresh26b || '(无)'}]`);
+        ok('点线没有写模型（解析是读操作，改不改由用户决定）', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx + 1} → v${await statusVersion()}`);
+      }
+    }
 
     // ═══════════════════════════════════════════════════════════
     /**

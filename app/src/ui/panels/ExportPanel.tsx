@@ -111,7 +111,7 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
     onToast('ok', `已导入 ${file.name}（可在历史里撤销这次导入）`);
   }
 
-  async function post(kind: 'dxf' | 'cutlist'): Promise<void> {
+  async function post(kind: 'dxf' | 'cutlist' | 'roombook'): Promise<void> {
     if (busy) return;
     setBusy(true);
     setLast('');
@@ -141,7 +141,8 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
         return;
       }
       const blob = await res.blob();
-      const name = fileNameOf(res.headers.get('Content-Disposition'), kind === 'dxf' ? 'export.dxf' : 'cutlist.csv');
+      const fallback = kind === 'dxf' ? 'export.dxf' : kind === 'roombook' ? 'roombook.html' : 'cutlist.csv';
+      const name = fileNameOf(res.headers.get('Content-Disposition'), fallback);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -234,6 +235,9 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
         </button>
         <button type="button" className="tb-btn" disabled={busy} onClick={() => void post('cutlist')}>
           {busy ? '正在生成…' : '导出开料单 CSV'}
+        </button>
+        <button type="button" className="tb-btn" disabled={busy} onClick={() => void post('roombook')} title="按房间排序的图纸册（HTML），下载后用浏览器打开、打印成 PDF">
+          {busy ? '正在生成…' : '导出按房间图纸册 (HTML→PDF)'}
         </button>
       </div>
 

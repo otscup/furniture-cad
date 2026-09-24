@@ -3633,6 +3633,44 @@ async function waitForApp(url, timeoutMs = 25000) {
     await shot(path.join(OUT_DIR, 'b31-glass-door.png'));
 
     // ═══════════════════════════════════════════════════════════
+    section('B32 按房间图纸册：端到端导出（真端点 + UI 按钮）');
+
+    // ① UI 按钮可达（导出面板里有「按房间图纸册」——先激活「导出」页签，面板才渲染）
+    await activateRightTab('导出');
+    await sleep(250);
+    const rbBtn = await evalJs(`(()=>{
+      const b=[...document.querySelectorAll('.tb-btn')].find(x=>x.textContent.includes('按房间图纸册'));
+      if(!b) return {found:false};
+      return {found:true, disabled:b.disabled};
+    })()`);
+    ok('导出面板有「按房间图纸册」按钮', rbBtn.found === true, JSON.stringify(rbBtn));
+
+    // ② 真端点：语义模型在后端重算 → 完整 HTML（含封面/三图/三件套/汇总）
+    //    注意：B29 账号组跑过之后 server 已是 accounts 模式 —— 探针必须带上会话 token（有则带）
+    const rb = await evalJs(`(async()=>{
+      const s = await import('/src/state/store.ts');
+      const token = sessionStorage.getItem('furniture-cad.auth.token');
+      const res = await fetch('/api/export/roombook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
+        body: JSON.stringify({ project: s.bus.getState(), modelVersion: 'b32-v1' }),
+      });
+      const html = await res.text();
+      return {
+        status: res.status,
+        ctype: res.headers.get('Content-Type') || '',
+        isDoc: html.startsWith('<!DOCTYPE html>') && html.includes('</html>'),
+        cover: html.includes('图纸册') && html.includes('客户'),
+        triptych: html.includes('平面图') && html.includes('立面外观（门板图）') && html.includes('立面结构（内视图）'),
+        trace: html.includes('b32-v1') && html.includes('factory_default_v1'),
+        summary: html.includes('清单汇总（按柜归类）'),
+      };
+    })()`);
+    ok('POST /api/export/roombook 返回 200 + text/html', rb.status === 200 && rb.ctype.includes('text/html'), JSON.stringify({ status: rb.status, ctype: rb.ctype }));
+    ok('图纸册结构齐全：封面客户表 + 每柜三图 + 版本三件套 + 尾页汇总',
+      rb.isDoc && rb.cover && rb.triptych && rb.trace && rb.summary, JSON.stringify(rb));
+
+    // ═══════════════════════════════════════════════════════════
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

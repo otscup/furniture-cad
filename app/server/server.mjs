@@ -62,6 +62,7 @@ const DIST = join(ROOT, 'dist');
 
 // ── 导出链路的外部程序 ──
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
+const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
 const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
 
 /**
@@ -1097,6 +1098,29 @@ async function handleApi(req, res, pathname) {
       return;
     } catch (e) {
       return json(res, 500, { ok: false, error: `开料单生成失败：${e.message}` });
+    }
+  }
+
+  /** 按房间排序的图纸册（HTML 打印版）。浏览器打开后「打印 → 另存为 PDF」。 */
+  if (pathname === '/api/export/roombook' && req.method === 'POST') {
+    const body = await readBody(req);
+    const project = body.project;
+    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    try {
+      const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_ROOMBOOK_TS], {
+        input: JSON.stringify({ project, modelVersion: String(body.modelVersion ?? 'unknown') }),
+      });
+      const html = r.out || '';
+      if (!html.trim()) throw new Error(r.err || '生成器无输出');
+      const base = `${String(project.name || 'project')}_图纸册_${new Date().toISOString().slice(0, 10)}.html`;
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Disposition': `attachment; filename="roombook.html"; filename*=UTF-8''${encodeURIComponent(base)}`,
+      });
+      res.end(html);
+      return;
+    } catch (e) {
+      return json(res, 500, { ok: false, error: `图纸册生成失败：${e.message}` });
     }
   }
 

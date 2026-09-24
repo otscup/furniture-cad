@@ -342,6 +342,8 @@ export function rectRoom(opts: {
   h: number;
   thickness?: number;
   height?: number;
+  /** 显式指定房间 ID（测试/夹具用；缺省自动分配） */
+  id?: string;
   takenIds?: Iterable<string>;
 }): Room {
   const t = opts.thickness ?? DEFAULT_WALL_THICKNESS;
@@ -373,7 +375,7 @@ export function rectRoom(opts: {
     used.add(w.id);
     walls.push(w);
   }
-  return createRoom({ name: opts.name, walls, takenIds: opts.takenIds });
+  return createRoom({ id: opts.id, name: opts.name, walls, takenIds: opts.takenIds });
 }
 
 export function emptyProject(opts: { name?: string; ruleSetId: string; id?: string } = { ruleSetId: 'factory_default_v1' }): Project {

@@ -7,6 +7,7 @@ import { CommandBus } from '../src/core/commandBus.ts';
 import { createCabinet, createWall, emptyProject, rectRoom, sampleProject } from '../src/core/docFactory.ts';
 import * as CMD from '../src/core/commands.ts';
 import { generateProject } from '../src/core/geometry/project.ts';
+import { computeCabinetLayout, backPanelSplit } from '../src/core/geometry/layout.ts';
 import { getCabinetFootprint } from '../src/core/geometry/generate.ts';
 import { placeAgainstNearestWall } from '../src/core/snapPlace.ts';
 import { validateCabinet } from '../src/core/rules/validate.ts';
@@ -382,6 +383,22 @@ section('【9b】背板超幅面必须在两个方向都拆块');
   const expect = g.layout.innerW + 2 * 8 - 1;
   const expectH = g.layout.innerH + 2 * 8 - 1;
   ok('拆块面积 = 整板面积（面积守恒）', total === expect * expectH, `${total} vs ${expect * expectH}`);
+
+  // 摆放取向（Task #27 后补的缺口）：拆块提示必须告诉工人"块对板材的哪条边"
+  const splitIssue = g.issues.find((x) => x.code === 'RULE-BACKPANEL-SPLIT');
+  ok('拆块 WARNING 存在', !!splitIssue, JSON.stringify(g.issues.map((x) => x.code)));
+  ok('提示里写明摆放取向（A=宽对短板边 / B=宽对长板边）',
+    /摆放取向 [AB]/.test(splitIssue!.message) && /(块宽对短板边|块宽对长板边)/.test(splitIssue!.message),
+    splitIssue!.message);
+  ok('提示里写明单块最大裁切尺寸（车间不用自己心算）', /单块最大 \d+×\d+mm/.test(splitIssue!.message), splitIssue!.message);
+  // orientation 字段与实际块尺寸自洽：A ⇒ 每块宽 ≤ 短板边 且 高 ≤ 长板边
+  const L2 = computeCabinetLayout(c, rules);
+  const bs = backPanelSplit(c, L2, rules);
+  const orientConsistent =
+    bs.orientation === 'A'
+      ? bs.colW.every((w) => w <= sheetS) && bs.rowH.every((h) => h <= sheetL)
+      : bs.colW.every((w) => w <= sheetL) && bs.rowH.every((h) => h <= sheetS);
+  ok('orientation 字段与实际块尺寸自洽（A ⇒ 宽对短板边）', orientConsistent, JSON.stringify({ o: bs.orientation, maxCol: Math.max(...bs.colW), maxRow: Math.max(...bs.rowH) }));
 }
 
 // ─────────────────────────────────────────────────────────────────

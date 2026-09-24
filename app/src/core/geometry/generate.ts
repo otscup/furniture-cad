@@ -128,12 +128,20 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
 
   if (backPieces > 1) {
     const [sheetL, sheetS] = rules.limits.maxSheetSize;
+    // 摆放取向写进提示 —— 工人开料需要知道"块对板材的哪条边"，
+    // 只说 nW×nH 等于把最后一步心算留给车间（拆块方案里选好的取向不该在这里丢失）
+    const maxCol = Math.max(...backSplit.colW);
+    const maxRow = Math.max(...backSplit.rowH);
+    const orientZh =
+      backSplit.orientation === 'A'
+        ? `块宽对短板边（≤${sheetS}）、块高对长板边（≤${sheetL}）`
+        : `块宽对长板边（≤${sheetL}）、块高对短板边（≤${sheetS}）`;
     issues.push({
       severity: 'WARNING',
       code: 'RULE-BACKPANEL-SPLIT',
       target: cabId,
       targetKind: 'cabinet',
-      message: `背板 ${Math.round(backW)}×${Math.round(backH)}mm 超出板材最大幅面 ${sheetL}×${sheetS}，已按 ${nW} 列 × ${nH} 行拆为 ${backPieces} 块。`,
+      message: `背板 ${Math.round(backW)}×${Math.round(backH)}mm 超出板材最大幅面 ${sheetL}×${sheetS}，已按 ${nW} 列 × ${nH} 行拆为 ${backPieces} 块。摆放取向 ${backSplit.orientation}：${orientZh}；单块最大 ${Math.round(maxCol)}×${Math.round(maxRow)}mm。`,
       fixHint: '确认拼接方向与压条方案；或改用 5mm 背板条（条状背板不受幅面限制）',
     });
   }

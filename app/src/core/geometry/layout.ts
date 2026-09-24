@@ -98,6 +98,13 @@ export interface BackSplit {
   rowH: number[];
   /** 是否真的拆了（pieces > 1） */
   split: boolean;
+  /**
+   * 摆放取向（开料时工人需要知道"块对板材的哪条边"）：
+   *   'A' = 块宽对短板边、块高对长板边（planA，列更多）
+   *   'B' = 块宽对长板边、块高对短板边（planB，行更多）
+   * 不拆块（pieces === 1）时同样给出取向 —— 单块背板进板材也有方向问题。
+   */
+  orientation: 'A' | 'B';
 }
 
 export function backPanelSplit(cab: Cabinet, layout: CabinetLayoutResult, rules: RuleSet): BackSplit {
@@ -119,6 +126,7 @@ export function backPanelSplit(cab: Cabinet, layout: CabinetLayoutResult, rules:
     colW: splitEqual(size.w, nW, 0, rules.policy.remainderPolicy),
     rowH: splitEqual(size.h, nH, 0, rules.policy.remainderPolicy),
     split: pieces > 1,
+    orientation: useA ? 'A' : 'B',
   };
 }
 

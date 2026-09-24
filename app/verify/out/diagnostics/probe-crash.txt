@@ -1,3 +1,5 @@
-TypeError: Cannot read properties of null (reading 'x')
-    at Object.toClient (E:\WorkBuddy\2026-09-23-16-08-40\app\verify\browser-probe.cjs:3116:52)
-    at E:\WorkBuddy\2026-09-23-16-08-40\app\verify\browser-probe.cjs:3250:23
+Error: 页面内报错: Uncaught :: TypeError: Cannot read properties of null (reading 'getBoundingClientRect')
+    at <anonymous>:1:54
+    at <anonymous>:1:127
+    at evalJs (E:\WorkBuddy\2026-09-23-16-08-40\app\verify\browser-probe.cjs:409:15)
+    at async E:\WorkBuddy\2026-09-23-16-08-40\app\verify\browser-probe.cjs:3438:20

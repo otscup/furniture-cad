@@ -411,6 +411,61 @@ section('【10】审计与状态跳转');
 }
 
 // ─────────────────────────────────────────────────────────────────
+section('【MI】cabinet.mirror：分区左右反序（语义化镜像，不是几何镜像）');
+
+{
+  const b = new CommandBus(sampleProject(rules), rules);
+  const cabId = b.getState().cabinets[0].id;
+  const unitIds = () => b.getState().cabinets.find((c) => c.id === cabId)!.layout.units.map((u) => u.id);
+
+  const before = unitIds();
+  ok('样例柜至少 2 个分区（否则镜像无从谈起）', before.length >= 2, `${before.length} 个`);
+  const cabAt = () => b.getState().cabinets.find((c) => c.id === cabId)!;
+
+  const r1 = b.execute(CMD.mirrorCabinet(cabAt()));
+  ok('镜像提交成功', r1.ok, r1.error ?? '');
+  const after = unitIds();
+  ok('分区序列确实反序了（最左分区换到最右）',
+    after.length === before.length && after.every((id, i) => id === before[before.length - 1 - i]),
+    `before=${before.join(',')} after=${after.join(',')}`);
+
+  b.undo();
+  ok('镜像的撤销回到原序（reverse 自逆）', snap(b.getState()) === snap(new CommandBus(sampleProject(rules), rules).getState()));
+  b.redo();
+  ok('重做再次反序', JSON.stringify(unitIds()) === JSON.stringify(after.slice().reverse()) || JSON.stringify(unitIds()) === JSON.stringify(after), JSON.stringify(unitIds()));
+
+  // 单分区柜：总线必须拒绝并说人话
+  const b2 = new CommandBus(sampleProject(rules), rules);
+  const c2 = b2.getState().cabinets[0];
+  // 用真实链路删到只剩 1 个分区（3 → 1）
+  for (const uid of c2.layout.units.slice(1).map((u) => u.id)) {
+    const rr = b2.execute(CMD.removeUnit(c2.id, c2.name, uid));
+    if (!rr.ok) { ok('删分区构造单分区柜', false, rr.error ?? ''); break; }
+  }
+  const single = b2.getState().cabinets[0];
+  ok('已构造出单分区柜', single.layout.units.length === 1, `${single.layout.units.length} 个`);
+  const r2 = b2.execute(CMD.mirrorCabinet(single));
+  ok('单分区镜像被拒，且拒绝理由说人话（不是静默成功）',
+    !r2.ok && (r2.error ?? '').includes('至少需要 2 个分区'),
+    r2.error ?? '竟然成功了');
+
+  // 预览 === 提交 对结构性命令同样成立
+  const b3 = new CommandBus(sampleProject(rules), rules);
+  const pv = b3.preview(CMD.mirrorCabinet(b3.getState().cabinets[0]));
+  const cm = new CommandBus(sampleProject(rules), rules);
+  cm.execute(CMD.mirrorCabinet(cm.getState().cabinets[0]));
+  ok('镜像的预览 === 提交（结构性命令同权）', pv.ok && snap(pv.project) === snap(cm.getState()));
+
+  // 镜像后派生管线照常工作
+  const b4 = new CommandBus(sampleProject(rules), rules);
+  b4.execute(CMD.mirrorCabinet(b4.getState().cabinets[0]));
+  const geom = b4.derive().geom;
+  ok('镜像后派生不炸（板件清单仍然完整）',
+    Object.values(geom.cabinets).every((g) => g.panels.length > 0),
+    JSON.stringify(Object.entries(geom.cabinets).map(([id, g]) => `${id}:${g.panels.length}`)));
+}
+
+// ─────────────────────────────────────────────────────────────────
 section('I. 贴墙判定：旋转过的柜体背靠墙面仍算相切，不算干涉');
 
 /**

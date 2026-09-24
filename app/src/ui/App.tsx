@@ -392,6 +392,16 @@ export function App() {
     }
   }, [run, selectedCabs, toast]);
 
+  /** MI 镜像：语义化 = 分区左右反序。单分区被总线拒绝时 afterExec 统一报原因 */
+  const onMirror = useCallback(() => {
+    const cabs = selectedCabs();
+    if (cabs.length === 0) {
+      toast('info', '请先选中柜体');
+      return;
+    }
+    for (const c of cabs) run(CMD.mirrorCabinet(c));
+  }, [run, selectedCabs, toast]);
+
   const onMovePick = useCallback(
     (p: Vec2) => {
       if (!pendingMove) return;
@@ -521,6 +531,25 @@ export function App() {
         case 'ROTATE':
           onRotate90();
           return null;
+        case 'MI':
+        case 'MIRROR':
+          onMirror();
+          return null;
+        // ── O / TR / EX：AutoCAD 习惯键位，但语义模型里没有线条可操作 ──
+        // 诚实拒绝 + 指路，不做"假装支持"：偏移一条不存在的线是违背
+        // "严禁改线条"铁律的空壳功能。用户敲了别名至少要知道去哪。
+        case 'O':
+        case 'OFFSET':
+          toast('info', '语义模型没有线条可偏移 —— 改柜宽用属性面板或 WIDTH；离墙距离用移动（M）');
+          return null;
+        case 'TR':
+        case 'TRIM':
+          toast('info', '语义模型没有线条可修剪 —— 改分区宽在属性面板拖分区夹点，或让 AI 改 requestedWidth');
+          return null;
+        case 'EX':
+        case 'EXTEND':
+          toast('info', '语义模型没有线条可延伸 —— 柜高顶到墙用属性面板改 height，加分区用 addUnit');
+          return null;
         case 'E':
         case 'DEL':
         case 'ERASE':
@@ -636,7 +665,7 @@ export function App() {
           return `未知命令：${head}`;
       }
     },
-    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onNewRoom, onRotate90, run, savedAt, selectedCabs, setExplode, setMode, startMove, toast]
+    [afterExec, doRedo, doUndo, onDelete, onDuplicate, onMirror, onNewRoom, onRotate90, run, savedAt, selectedCabs, setExplode, setMode, startMove, toast]
   );
 
   // ── 键盘 ──
@@ -757,6 +786,7 @@ export function App() {
         { key: 'props', label: '属性', hint: 'Ctrl+1', onSelect: () => setRightTab('props') },
         { key: 'dup', label: cabs.length > 1 ? `复制 ${cabs.length} 个柜体` : '复制', hint: 'Ctrl+D', onSelect: onDuplicate },
         { key: 'rot', label: '旋转 90°', hint: '逆时针', onSelect: onRotate90 },
+        { key: 'mir', label: '镜像（分区反序）', hint: 'MI', onSelect: onMirror },
       );
     } else if (walls.length > 0) {
       items.push({ key: 'props', label: '属性', hint: 'Ctrl+1', onSelect: () => setRightTab('props') });

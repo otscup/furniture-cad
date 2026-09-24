@@ -3330,6 +3330,59 @@ async function waitForApp(url, timeoutMs = 25000) {
      * （面板是按需挂载的，只查当前页会漏掉一大半），再和样式表里的选择器对账。
      * 例外必须显式登记并写清理由 —— 允许"有意不写样式"，不允许"忘了写"。
      */
+    // ═══════════════════════════════════════════════════════════
+    section('B27 命令行补齐：MI 镜像 / O·TR·EX 诚实拒绝');
+
+    // 回平面图重标定 —— B26 结束时在图幅模式，相机被 fit 过，旧标定作废
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='平面图');if(b)b.click();return !!b})()`);
+    await sleep(420);
+    cal25 = await calib25();
+    ok('B27 平面图重标定成功', cal25.good && cal25.scale > 0.05 && cal25.scale < 1, cal25.good ? `scale=${cal25.scale.toFixed(4)}` : 'HUD 读数失败');
+
+    // 点击柜体中心选中（镜像作用于选中集）
+    const c27 = cabCenter25();
+    await mouseDown(c27.x, c27.y);
+    await sleep(100);
+    await mouseUp(c27.x, c27.y);
+    await sleep(320);
+    ok('点击柜体中心完成选中', (await statusSelection()) === 1, `实为 ${await statusSelection()}`);
+
+    const unitIds27 = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets[0].layout.units.map(u=>u.id);})()`);
+    const before27 = await unitIds27();
+    const vB27 = await statusVersion();
+
+    await runCommandLine('MI');
+    const after27 = await unitIds27();
+    ok('MI 镜像：版本 +1', (await statusVersion()) === vB27 + 1, `v${vB27} → v${await statusVersion()}`);
+    ok('MI 镜像：分区序列左右反序（语义化镜像，不是几何镜像）',
+      after27.length === before27.length && after27.every((id, i) => id === before27[before27.length - 1 - i]),
+      `before=[${before27}] after=[${after27}]`);
+
+    await runCommandLine('U');
+    ok('镜像撤销回到原序（reverse 自逆）', JSON.stringify(await unitIds27()) === JSON.stringify(before27), JSON.stringify(await unitIds27()));
+
+    // O / TR / EX：AutoCAD 习惯键位 —— 语义模型没有线条，诚实拒绝 + 指路。
+    // 拒绝是设计行为：假装能偏移一条不存在的线，比拒绝更伤害信任。
+    const v27b = await statusVersion();
+    await runCommandLine('O');
+    const tO27 = await text('.toasts');
+    ok('O 偏移：明确说没有线条可偏移并指路（柜宽 / 移动）', tO27.includes('没有线条可偏移'), tO27.slice(-180));
+    await runCommandLine('TR');
+    const tTR27 = await text('.toasts');
+    ok('TR 修剪：明确说没有线条可修剪并指路（分区夹点 / AI）', tTR27.includes('没有线条可修剪'), tTR27.slice(-180));
+    await runCommandLine('EX');
+    const tEX27 = await text('.toasts');
+    ok('EX 延伸：明确说没有线条可延伸并指路（height / addUnit）', tEX27.includes('没有线条可延伸'), tEX27.slice(-180));
+    ok('O/TR/EX 三条都没有写模型', (await statusVersion()) === v27b, `v${v27b} → v${await statusVersion()}`);
+
+    // 右键菜单含镜像项（选中态决定菜单）
+    await mouseRightClick(c27.x, c27.y);
+    await sleep(340);
+    const ctxMir27 = await evalJs(`(()=>{const m=document.querySelector('.ctx-menu');return m?[...m.querySelectorAll('.ctx-item .ctx-label')].map(x=>x.textContent.trim()):[]})()`);
+    ok('右键菜单含「镜像（分区反序）」', ctxMir27.some((t) => /镜像/.test(t)), JSON.stringify(ctxMir27));
+    await keyPress('Escape', 'Escape', 27);
+    await sleep(260);
+
     section('B19 样式完整性：界面上用到的类名必须在样式表里有规则');
 
     const UNSTYLED_ALLOWED = new Map([

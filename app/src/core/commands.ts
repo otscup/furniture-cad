@@ -52,6 +52,18 @@ export function rotateCabinet(cab: Cabinet, deg: number, source: CommandSource =
 }
 
 /**
+ * 镜像柜体（MI）—— 语义化映射，不是几何镜像。
+ *
+ * AutoCAD 的 MI 镜像一条线段；语义模型里没有线，镜像的语义等价物是
+ * 【分区序列左右反序】：站在柜前看，最左的分区变成最右。
+ * 门扇按等分跟随分区翻转，铰链是五金型号（无左右向）不用动。
+ * 单分区柜体没有"左右"可翻 —— 总线拒绝，UI 提示而不是静默成功。
+ */
+export function mirrorCabinet(cab: Cabinet, source: CommandSource = 'ui'): Command {
+  return cmd('cabinet.mirror', source, cabTarget(cab.id), [], `镜像「${cab.name}」（分区左右反序）`);
+}
+
+/**
  * 多选移动：一次拖动 = 一条命令 = 一次撤销。
  * @param cabs 需要移动的柜体（含移动前的位置）
  * @param dx/dy 位移

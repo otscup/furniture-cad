@@ -89,6 +89,11 @@ export type SideEffect =
   | { kind: 'insertWall'; roomId: string; wall: Wall; index: number }
   | { kind: 'removeWall'; roomId: string; wall: Wall; index: number }
   /**
+   * 镜像柜体（MI）：分区序列左右反序。反序的自逆就是自身（reverse 两次还原），
+   * 所以 undo/redo 走同一个动作 —— 不需要快照前后两份。
+   */
+  | { kind: 'mirrorUnits'; cabinetId: string; from: string[]; to: string[] }
+  /**
    * 整项目替换（导入 / 恢复草稿）。它换掉的是【对象引用】而不是某个字段，
    * 所以不能走路径回退，undo/redo 里单独处理 —— 必须同时携带前后两份快照，
    * 两个方向都要能走。（这条曾缺失：replaceProject 声称可撤销，实际 undo 后
@@ -145,6 +150,7 @@ const STRUCTURAL_OPS = new Set([
   'cabinet.delete',
   'cabinet.layout.addUnit',
   'cabinet.layout.removeUnit',
+  'cabinet.mirror',
   'room.create',
   'wall.create',
   'wall.delete',
@@ -374,6 +380,18 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       }
       return;
     }
+    case 'mirrorUnits': {
+      const cab = project.cabinets.find((c) => c.id === se.cabinetId);
+      if (!cab) return;
+      // 反序自逆：undo / redo 都执行同一个 reverse（两次 reverse = 还原）。
+      // 照抄 se.from 校验一次，防止未来有人在别处动了顺序导致快照失真。
+      const cur = cab.layout.units.map((u) => u.id);
+      const expect = forward ? se.from : se.to;
+      if (cur.length === expect.length && cur.every((id, i) => id === expect[i])) {
+        cab.layout.units.reverse();
+      }
+      return;
+    }
   }
 }
 
@@ -554,7 +572,14 @@ export class CommandBus {
 
     if (isStructural) {
       const built = this.planStructural(cmd, draft);
-      if (!built) return { ok: false, error: `结构性命令失败：${cmd.op}` };
+      if (!built) {
+        // mirror 的最常见拒绝原因值得说人话：单分区柜没有"左右"可翻
+        const why =
+          cmd.op === 'cabinet.mirror'
+            ? '单分区柜体没有左右分区可翻（镜像至少需要 2 个分区）'
+            : cmd.op;
+        return { ok: false, error: `结构性命令失败：${why}` };
+      }
       sideEffects = built.sideEffects;
       diff.push(...built.diff);
       applySideEffects(draft, sideEffects, true);
@@ -791,6 +816,21 @@ export class CommandBus {
       return {
         sideEffects: [{ kind: 'removeUnit', cabinetId: id, unit, index }],
         diff: [{ path: `layout.units[${index}]`, from: unit.id, to: null }],
+      };
+    }
+
+    if (cmd.op === 'cabinet.mirror') {
+      const id = cmd.target?.id;
+      if (!id) return null;
+      const cab = draft.cabinets.find((c) => c.id === id);
+      if (!cab) return null;
+      // 单分区没有"左右"可翻 —— 拒绝，让 UI 给出解释而不是静默成功
+      if (cab.layout.units.length < 2) return null;
+      const from = cab.layout.units.map((u) => u.id);
+      const to = from.slice().reverse();
+      return {
+        sideEffects: [{ kind: 'mirrorUnits', cabinetId: id, from, to }],
+        diff: [{ path: 'layout.units', from: from.join('|'), to: to.join('|') }],
       };
     }
 

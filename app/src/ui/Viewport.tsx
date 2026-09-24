@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Dispatch, PointerEvent as RPointerEvent, SetStateAction } from 'react';
+import type { Dispatch, PointerEvent as RPointerEvent, SetStateAction, MouseEvent as ReactMouseEvent } from 'react';
 import type { Cabinet, Project, Vec2, Wall } from '../core/types.ts';
 import type { Command, CommandBus } from '../core/commandBus.ts';
 import { generateProject } from '../core/geometry/project.ts';
@@ -61,6 +61,12 @@ export interface ViewportProps {
   onMovePick: (p: Vec2) => void;
   onPlaceCabinet: (p: Vec2) => void;
   onCreateWall: (a: Vec2, b: Vec2) => void;
+  /**
+   * 右键上下文菜单（Task #24）。Viewport 只做三件事：
+   * 阻止浏览器默认菜单、把右键落点处的对象选上（CAD 惯例：右键即选中）、
+   * 把屏幕坐标交回 App —— 菜单里有什么项，由 App 按当前选择算。
+   */
+  onContextMenu?: (p: { x: number; y: number }) => void;
   onToast: (kind: ToastKind, text: string) => void;
   cursorStyle: string;
 }
@@ -494,6 +500,24 @@ export function Viewport(props: ViewportProps) {
     setSnap(null);
   };
 
+  // ── 右键上下文菜单：先"右键即选中"，再把屏幕坐标交回 App ──
+  const onContextMenu = (e: ReactMouseEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    if (!props.onContextMenu) return;
+    const sp = toCanvas(e as unknown as RPointerEvent<HTMLDivElement>);
+    const raw = toWorld(sp);
+    // 右键落在对象上且尚未选中 → 先把它选中（真实 CAD 的惯例），菜单项才说得通
+    if (!sheet) {
+      const project = bus.getState();
+      const tol = snapToleranceWorld(8, cam.scale);
+      const hit = hitTest(project, raw, tol, selection);
+      if ((hit.kind === 'cabinet' || hit.kind === 'wall') && !selection.includes(hit.id as string)) {
+        props.setSelection([hit.id as string]);
+      }
+    }
+    props.onContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
   // ── HUD ──
   /**
    * 坐标读数必须是【最终会被用到的那个点】，不是原始指针点。
@@ -519,7 +543,7 @@ export function Viewport(props: ViewportProps) {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       onPointerLeave={onPointerLeave}
-      onContextMenu={(e) => e.preventDefault()}
+      onContextMenu={onContextMenu}
     >
       <canvas ref={canvasRef} className="vp-canvas" />
 

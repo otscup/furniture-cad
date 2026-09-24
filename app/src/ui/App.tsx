@@ -12,6 +12,8 @@ import type { Camera } from '../viewport/camera.ts';
 import { Viewport } from './Viewport.tsx';
 import { Toolbar } from './Toolbar.tsx';
 import type { RightTab } from './Toolbar.tsx';
+import { ContextMenu } from './ContextMenu.tsx';
+import type { CtxItem } from './ContextMenu.tsx';
 import { StatusBar } from './StatusBar.tsx';
 import { CommandLine } from './CommandLine.tsx';
 import { ObjectTree } from './panels/ObjectTree.tsx';
@@ -87,7 +89,6 @@ export function App() {
 
   // ── 本地草稿 ──
   const [savedAt, setSavedAt] = useState<string | null>(null);
-
   /**
    * 启动时恢复草稿。
    *
@@ -129,6 +130,23 @@ export function App() {
     window.addEventListener('beforeunload', flush);
     return () => window.removeEventListener('beforeunload', flush);
   }, []);
+
+  // ── 右键上下文菜单（Task #24）──
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const onViewportContextMenu = useCallback(
+    (p: { x: number; y: number }) => {
+      // 有命令进行中（画墙画到一半 / 移动等第二点 / 其它工具）时，右键 = 取消，不弹菜单 —— 与 Esc 同义
+      if (tool !== 'select' || pendingMove) {
+        setTool('select');
+        setPendingMove(null);
+        setCancelSignal((v) => v + 1);
+        setCtxMenu(null);
+        return;
+      }
+      setCtxMenu(p);
+    },
+    [tool, pendingMove]
+  );
 
   // ── 提示气泡 ──
   const toast = useCallback((kind: ToastKind, text: string) => {
@@ -717,6 +735,41 @@ export function App() {
   const issues = bus.issues();
   const errCount = issues.filter((i) => i.severity === 'ERROR').length;
 
+  // ── 右键菜单项：按「当前选中了什么」算 —— 选中态不同，菜单就不同 ──
+  const buildCtxItems = (): CtxItem[] => {
+    const cabs = selectedCabs();
+    const walls = selectedWalls();
+    const items: CtxItem[] = [];
+    if (cabs.length > 0) {
+      items.push(
+        { key: 'props', label: '属性', hint: 'Ctrl+1', onSelect: () => setRightTab('props') },
+        { key: 'dup', label: cabs.length > 1 ? `复制 ${cabs.length} 个柜体` : '复制', hint: 'Ctrl+D', onSelect: onDuplicate },
+        { key: 'rot', label: '旋转 90°', hint: '逆时针', onSelect: onRotate90 },
+      );
+    } else if (walls.length > 0) {
+      items.push({ key: 'props', label: '属性', hint: 'Ctrl+1', onSelect: () => setRightTab('props') });
+    }
+    if (selection.length > 0) {
+      items.push({ key: 'del', label: `删除（${selection.length} 项）`, hint: 'Delete', danger: true, onSelect: onDelete });
+      items.push({ key: 'sep1', label: '' });
+    }
+    items.push(
+      {
+        key: 'selall',
+        label: '全选',
+        hint: '柜体 + 墙',
+        onSelect: () => {
+          const p = bus.getState();
+          setSelection([...p.cabinets.map((c) => c.id), ...p.rooms.flatMap((r) => r.walls.map((w) => w.id))]);
+        },
+      },
+      { key: 'room', label: '新建房间', onSelect: onNewRoom },
+      { key: 'zoom', label: '适应窗口', hint: 'Home', onSelect: () => setFitSignal((v) => v + 1) },
+      { key: 'cmd', label: '命令行…', hint: '`', onSelect: () => setCmdOpen(true) },
+    );
+    return items;
+  };
+
   const toggleLayer = useCallback((name: string) => {
     setHiddenLayers((prev) => {
       const next = new Set(prev);
@@ -793,6 +846,7 @@ export function App() {
             onMovePick={onMovePick}
             onPlaceCabinet={onPlaceCabinet}
             onCreateWall={onCreateWall}
+            onContextMenu={onViewportContextMenu}
             onToast={toast}
             cursorStyle={tool === 'select' ? 'default' : 'crosshair'}
           />
@@ -884,6 +938,8 @@ export function App() {
       )}
 
       <StatusBar bus={bus} version={version} cam={cam} snap={snap} tool={tool} selectionCount={selection.length} savedAt={savedAt} />
+
+      {ctxMenu ? <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={buildCtxItems()} onClose={() => setCtxMenu(null)} /> : null}
 
       <div className="toasts">
         {toasts.map((t) => (

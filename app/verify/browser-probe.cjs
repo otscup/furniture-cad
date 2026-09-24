@@ -30,6 +30,7 @@
  *  B22 新建房间：连建多个房间都成功（id 必须避开项目里已用的）
  *  B23 导出面板：图纸选择 / 版本选择 / ERROR 提示 / 禁用逻辑
  *  B24 项目存盘与加载：自动保存 / 打开项目文件 / 坏文件拒绝
+ *  B25 右键上下文菜单：右键即选中 / 选中态决定菜单 / 命令中右键=取消
  *
  *  用法：先起本地服务与 dev server，再跑本脚本（见 package.json 的 verify:ui）。
  *  ══════════════════════════════════════════════════════════════════════
@@ -423,6 +424,10 @@ async function waitForApp(url, timeoutMs = 25000) {
     const moveMouse = (x, y, buttons = 0) => mouse('mouseMoved', x, y, { button: 'none', buttons });
     const mouseDown = (x, y) => mouse('mousePressed', x, y, { button: 'left', buttons: 1 });
     const mouseUp = (x, y) => mouse('mouseReleased', x, y, { button: 'left', buttons: 0 });
+    const mouseRightClick = (x, y) => {
+      mouse('mousePressed', x, y, { button: 'right', buttons: 2 });
+      mouse('mouseReleased', x, y, { button: 'right', buttons: 0 });
+    };
 
     const keyPress = async (key, code, vk, modifiers = 0) => {
       await send('Input.dispatchKeyEvent', {
@@ -3059,6 +3064,162 @@ async function waitForApp(url, timeoutMs = 25000) {
     const treeRootName = await evalJs(`(()=>{const el=document.querySelector('.side-left .tree-root .tree-node-label');return el?el.textContent.trim():''})()`);
     ok('导入后对象树根节点显示新项目名（replaceProject 真的生效）', treeRootName === '导入测试项目', treeRootName);
     ok('面板留下导入结果（几个房间 / 几个柜体）', /已导入\s*good\.json/.test(await panelTextAll()), (await panelTextAll()).slice(0, 160));
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B25 —— 右键上下文菜单（Task #24）。
+     *
+     * 钉四件事：
+     *   · 右键即选中：右键落在柜体上，先选中它，菜单才有"复制/旋转/删除"可谈
+     *   · 选中态决定菜单：空白右键的菜单里没有柜体专属项
+     *   · 菜单项真的执行：旋转 90° 后版本 +1；执行完菜单收掉
+     *   · 命令进行中右键 = 取消（与 Esc 同义），不弹菜单、不写模型
+     *
+     * B22 建房间触发过 fit，B3 的相机标定已失效 —— 这里独立重新标定，
+     * 不复用旧 A/wa/scale（复用旧标定是 B5 之后差点埋过的一次暗雷）。
+     */
+    section('B25 右键上下文菜单：右键即选中 / 选中态决定菜单 / 命令中右键=取消');
+
+    // 回平面图 + 选择工具，关掉捕捉（HUD 才显示原始世界坐标，标定不被吸附污染）
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='平面图');if(b)b.click();return !!b})()`);
+    await sleep(360);
+    const snapWasOn25 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
+      .find(x=>x.textContent.trim().startsWith('捕捉'));return b?b.classList.contains('active'):null})()`);
+    if (snapWasOn25 === true) {
+      await keyPress('F3', 'F3', 114);
+      await sleep(260);
+    }
+
+    /**
+     * 相机标定（HUD 两点反解 px/mm）。做成函数是因为「新建房间」会触发
+     * fitSignal 重新取景 —— 相机一变旧标定就是错的，取景后必须重标一次。
+     * （复用旧标定是 B5 之后差点埋过的一次暗雷，这里在结构上禁止它。）
+     */
+    const calib25 = async () => {
+      const rect = await evalJs(`(()=>{const r=document.querySelector('.vp').getBoundingClientRect();
+        return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,w:r.width,h:r.height}})()`);
+      const A = { x: Math.round(rect.left + rect.w * 0.25), y: Math.round(rect.top + rect.h * 0.3) };
+      const B = { x: Math.round(rect.left + rect.w * 0.75), y: Math.round(rect.top + rect.h * 0.78) };
+      await moveMouse(A.x, A.y);
+      await sleep(220);
+      const wa = await hudWorld();
+      await moveMouse(B.x, B.y);
+      await sleep(220);
+      const wb = await hudWorld();
+      const good = wa && wb && wb.x !== wa.x && wb.y !== wa.y;
+      const scale = good ? ((B.x - A.x) / (wb.x - wa.x) + (A.y - B.y) / (wb.y - wa.y)) / 2 : null;
+      return {
+        rect,
+        good,
+        scale,
+        toClient: (wx, wy) => ({ x: A.x + (wx - wa.x) * scale, y: A.y - (wy - wa.y) * scale }),
+      };
+    };
+
+    let cal25 = await calib25();
+    ok('B25 独立重标定成功（HUD 两点反解 px/mm）', cal25.good && cal25.scale > 0.05 && cal25.scale < 1,
+      cal25.good ? `scale=${cal25.scale.toFixed(4)}` : 'HUD 读数失败');
+
+    const cabInfo25 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const c=s.bus.getState().cabinets[0];
+      return { id:c.id, x:c.placement.x, y:c.placement.y, rot:c.placement.rotation, w:c.params.width, d:c.params.depth };})()`);
+    ok('柜体 0 的旋转角是 0（右键点位按未旋转计算的前提）', cabInfo25.rot === 0, JSON.stringify(cabInfo25));
+    const cabCenter25 = () => cal25.toClient(cabInfo25.x + cabInfo25.w / 2, cabInfo25.y + cabInfo25.d / 2);
+    {
+      const c = cabCenter25();
+      ok('柜体中心点落在视口内（不然下面的右键都是空的）',
+        c.x > cal25.rect.left + 8 && c.x < cal25.rect.right - 8 && c.y > cal25.rect.top + 8 && c.y < cal25.rect.bottom - 8,
+        JSON.stringify(c));
+    }
+
+    // ① 右键柜体 → 先选中，菜单含柜体专属项
+    const vBeforeCtx = await statusVersion();
+    await mouseRightClick(cabCenter25().x, cabCenter25().y);
+    await sleep(380);
+    const ctxLabels1 = await evalJs(`(()=>{const m=document.querySelector('.ctx-menu');return m?[...m.querySelectorAll('.ctx-item .ctx-label')].map(x=>x.textContent.trim()):[]})()`);
+    ok('右键柜体弹出上下文菜单', ctxLabels1.length > 0, JSON.stringify(ctxLabels1));
+    ok('菜单里有柜体专属项（复制 / 旋转 90° / 删除）',
+      ctxLabels1.some((t) => /复制/.test(t)) && ctxLabels1.some((t) => /旋转 90°/.test(t)) && ctxLabels1.some((t) => /删除/.test(t)),
+      JSON.stringify(ctxLabels1));
+    const selAfterRclick = await statusSelection();
+    ok('右键即选中：状态栏显示 已选 1 项', selAfterRclick === 1, `实为 ${selAfterRclick}`);
+
+    // ② 点「旋转 90°」—— 注意：cab_001 贴墙摆放，绕左后角原地旋转 90° 会把柜体甩进墙里。
+    //    生效记忆 mem_002（柜体不许扎进墙）对右键菜单【一视同仁】地拦截 —— 这是设计行为：
+    //    "UI / AI / MCP / 脚本五条路同权"，门不豁免任何一条。这里断言的恰恰是这个。
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.ctx-menu .ctx-item')].find(x=>/旋转 90°/.test(x.textContent));if(b)b.click();return !!b})()`);
+    await sleep(420);
+    ok('菜单项执行后菜单收掉（不留残影）', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);
+    // 读整条 .toasts 而不是 .toast-error：toast 在 DOM 里要停 8 秒，
+    // B24 的"导入失败"气泡可能还挂着 —— 只读第一条会读到旧消息（B21 的同款坑）
+    const rotToasts = await text('.toasts');
+    ok('贴墙柜原地旋转被记忆门拦下（门对 UI 右键不豁免，五条路同权）', /记忆拦截/.test(rotToasts), rotToasts || '(无提示)');
+    ok('被拦下后模型未变（版本不变）', (await statusVersion()) === vBeforeCtx, `v${vBeforeCtx} → v${await statusVersion()}`);
+    ok('旋转角还是 0（拦截是真的拦了）', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets[0].placement.rotation})()`)) === 0);
+
+    // ②b 菜单项也要证明【能执行】：用空白菜单的「新建房间」（远离现有房间，干干净净）
+    const roomsBeforeCtx = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`);
+    await mouseRightClick(cabCenter25().x, cabCenter25().y);
+    await sleep(320);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.ctx-menu .ctx-item')].find(x=>x.textContent.trim()==='新建房间');if(b)b.click();return !!b})()`);
+    await sleep(520);
+    ok('菜单项能真的执行：「新建房间」后版本 +1', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx} → v${await statusVersion()}`);
+    ok('菜单项执行后菜单收掉', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);
+    ok('房间数 +1（不是只弹了个提示）', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBeforeCtx + 1);
+
+    // ③ Esc 关菜单（菜单开着再右键一次，然后按 Esc）
+    // 「新建房间」触发了 fitSignal 重新取景 —— 相机变了，旧标定作废，重标一次
+    cal25 = await calib25();
+    ok('取景后重新标定成功（相机变了，旧标定就是错的）', cal25.good && cal25.scale > 0.05 && cal25.scale < 1,
+      cal25.good ? `scale=${cal25.scale.toFixed(4)}` : 'HUD 读数失败');
+    await mouseRightClick(cabCenter25().x, cabCenter25().y);
+    await sleep(320);
+    ok('再次右键菜单重新打开', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === true);
+    await keyPress('Escape', 'Escape', 27);
+    await sleep(280);
+    ok('Esc 关掉菜单（不误伤模型）', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false && (await statusVersion()) === vBeforeCtx + 1);
+
+    // 再按一次 Esc 清掉选中 —— 不然空白右键的菜单里还挂着柜体专属项，④ 的判别式必假
+    // 注意：statusSelection 在「未选中」时返回 null（没有已选元素可读），不是 0 —— 断言要接住两种
+    await keyPress('Escape', 'Escape', 27);
+    await sleep(260);
+    const selAfterEsc2 = await statusSelection();
+    ok('再次 Esc 清掉了选中（空白菜单的前置条件）', selAfterEsc2 === 0 || selAfterEsc2 === null, `实为 ${selAfterEsc2}`);
+
+    // ④ 空白处右键：菜单里没有柜体专属项（在柜体对角线外侧找空白点）
+    let blankMenuOk = false;
+    let blankLabels = [];
+    for (const dist of [800, 1400, 2000, 2800]) {
+      const p = cal25.toClient(cabInfo25.x + cabInfo25.w + dist, cabInfo25.y - dist);
+      if (p.x < cal25.rect.left + 12 || p.x > cal25.rect.right - 12 || p.y < cal25.rect.top + 12 || p.y > cal25.rect.bottom - 12) continue;
+      await mouseRightClick(p.x, p.y);
+      await sleep(340);
+      blankLabels = await evalJs(`(()=>{const m=document.querySelector('.ctx-menu');return m?[...m.querySelectorAll('.ctx-item .ctx-label')].map(x=>x.textContent.trim()):[]})()`);
+      if (blankLabels.length > 0 && !blankLabels.some((t) => /复制/.test(t))) {
+        blankMenuOk = true;
+        break;
+      }
+      await keyPress('Escape', 'Escape', 27);
+      await sleep(220);
+    }
+    ok('空白处右键弹出通用菜单（含 新建房间 / 全选 / 适应窗口）',
+      blankMenuOk && blankLabels.some((t) => /新建房间/.test(t)) && blankLabels.some((t) => /全选/.test(t)) && blankLabels.some((t) => /适应窗口/.test(t)),
+      JSON.stringify(blankLabels));
+    ok('空白菜单里没有柜体专属项（选中态决定菜单，不是一套通吃）', !blankLabels.some((t) => /复制/.test(t)), JSON.stringify(blankLabels));
+    await keyPress('Escape', 'Escape', 27);
+    await sleep(220);
+
+    // ⑤ 画墙画到一半右键 = 取消（不弹菜单、不写模型、回到选择工具）
+    await keyPress('l', 'l', 76);
+    await sleep(300);
+    const modeWall = await evalJs(`(()=>{const el=document.querySelector('.sb-mode');return el?el.textContent.trim():''})()`);
+    ok('按 L 进入画墙工具（准备测"命令中右键"）', modeWall === '画墙', modeWall);
+    await mouseRightClick(cabCenter25().x, cabCenter25().y);
+    await sleep(340);
+    const modeAfterR = await evalJs(`(()=>{const el=document.querySelector('.sb-mode');return el?el.textContent.trim():''})()`);
+    ok('命令进行中右键：不弹菜单', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);
+    ok('命令进行中右键 = 取消，回到选择工具', modeAfterR === '选择', modeAfterR);
+    ok('取消没有写模型（版本不变）', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx + 1} → v${await statusVersion()}`);
 
     // ═══════════════════════════════════════════════════════════
     /**

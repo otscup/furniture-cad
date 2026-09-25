@@ -343,6 +343,17 @@ export interface Issue {
   targetKind: 'cabinet' | 'panel' | 'project' | 'unit';
   message: string;
   fixHint?: string;
+  /**
+   * 一键修复计划（由 issueCatalog 判定：只有"修法唯一可判定"的规则才有）。
+   * 没有这一项 = 这条要用户自己决定 —— 界面不许给假按钮。
+   */
+  autoFix?: {
+    op: string;
+    target: { kind: 'cabinet' | 'room' | 'wall' | 'unit' | 'project'; id: string };
+    changes: Array<{ path: string; op: 'set' | 'add'; value: string | number | boolean | null; unit?: string }>;
+    label: string;
+    note: string;
+  };
 }
 
 export interface BBox {

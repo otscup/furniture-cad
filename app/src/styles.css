@@ -327,26 +327,54 @@ kbd {
 .issue-INFO .issue-group-title { color: var(--accent); }
 
 .issue-item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  font-family: inherit;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   background: #fff;
   border: 1px solid var(--line);
   border-left-width: 3px;
   border-radius: 4px;
   padding: 6px 8px;
   margin-bottom: 5px;
-  cursor: pointer;
 }
 .issue-ERROR .issue-item { border-left-color: var(--danger); }
 .issue-WARNING .issue-item { border-left-color: var(--warn); }
 .issue-INFO .issue-item { border-left-color: var(--accent); }
 .issue-item:hover { background: var(--panel-2); border-color: var(--line-strong); }
-.issue-head { display: flex; justify-content: space-between; gap: 8px; padding-bottom: 3px; }
+.issue-main {
+  flex: 1 1 auto;
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.issue-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding-bottom: 3px; }
 .issue-code { color: var(--text-2); font-weight: 600; }
+.issue-title { color: var(--text); font-size: 11.5px; font-weight: 600; }
 .issue-target { color: var(--muted); }
 .issue-msg { font-size: 11.5px; color: var(--text); line-height: 1.55; }
+.issue-msg + .fix-hint { padding-top: 2px; }
+/* 「一键修复」按钮：只在规则真的判得出唯一修法时出现，不给假按钮 */
+.issue-fix {
+  flex: 0 0 auto;
+  align-self: center;
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 3px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.issue-fix:hover { filter: brightness(1.08); }
+/* 不能一键修的：如实说清是"要你决定"还是"程序缺陷"，而不是留白 */
+.fix-manual { font-size: 11px; color: var(--muted); line-height: 1.5; padding-top: 2px; }
 .issue-list { list-style: none; margin: 0; padding: 0; }
 .issue-list li { font-size: 11.5px; color: var(--text-2); line-height: 1.6; padding: 4px 0; border-bottom: 1px solid #f1f5f9; }
 

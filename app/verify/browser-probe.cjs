@@ -745,7 +745,10 @@ async function waitForApp(url, timeoutMs = 25000) {
     await activateRightTab('问题');
     const issuesText = await text('.side-right .panel-scroll');
     ok('WARNING 分组标题为 3 条', /WARNING · 需人工确认（3）/.test(issuesText), issuesText.slice(0, 200));
-    ok('列出 RULE-BACKPANEL-SPLIT 且说明了拆块', /RULE-BACKPANEL-SPLIT/.test(issuesText) && /拆为 2 块/.test(issuesText));
+    // 措辞随目录改版过一次（"拆为 N 块" → "按 a 列 × b 行拆成 N 块"）：
+    // 这里要的是"说明了拆了几块"，不是某个固定措辞 —— 措辞一换就红是脆断言。
+    ok('列出 RULE-BACKPANEL-SPLIT 且说明了拆块',
+      /RULE-BACKPANEL-SPLIT/.test(issuesText) && /拆(为|成) \d+ 块/.test(issuesText));
     ok('列出 RULE-DRAWER-TALL-FRONT', /RULE-DRAWER-TALL-FRONT/.test(issuesText));
     ok('列出 RULE-SHELF-SPAN', /RULE-SHELF-SPAN/.test(issuesText));
     ok(
@@ -2598,6 +2601,213 @@ async function waitForApp(url, timeoutMs = 25000) {
       Boolean(restored38) && restored38.count === before38.count
         && restored38.names.join('|') === before38.names.join('|'),
       `还原=${JSON.stringify(restored38)} 之前=${JSON.stringify(before38.names)}`);
+    await sleep(240);
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B39 —— 用户原话："报错看不懂、看不出该怎么改"（master 反馈五件事里的第 4 件）。
+     *
+     * node 侧（verify/fixhint-acceptance）验的是"规则目录是对的"，
+     * 这里验的是**用户在界面上真正看到的那一条**：
+     *   ① 面板里说的是人话：报得出"差多少"、上限定在多少、往哪改
+     *   ② 一键修复是真按钮：**真去点它**（不是调函数），点了 = 一条命令 = 一次撤销，
+     *      错误真的消失，而且改的是语义参数（门扇数），不是偷偷去动几何
+     *   ③ 修法不唯一的那条（门板 780×2160 放不进 2440×1220 板材：改门宽 / 拆块 / 换幅面
+     *      都算数）**不许出现按钮**，只许说"这是你要定的事"
+     */
+    section('B39 报错人话化：面板说人话 · 一键修复是真按钮 · 点了真消错');
+
+    await activateRightTab('问题');
+    // 本节会真的往模型里加一台柜（并改两次参数），先存现场，结束还原。
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      window.__b39Saved = structuredClone(s.bus.getState()); return true})()`);
+
+    const before39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const errs=s.bus.derive().issues.filter(i=>i.severity==='ERROR');
+      const p=s.bus.getState();
+      // names 也要存：还原之后要拿它和"本节开始时"逐项对账，
+      // 只比数量等于没比 —— 少一台柜子和一个不存在的字段长得一模一样（这轮就栽在这）
+      return { ver:s.bus.getVersion(), errs:errs.map(i=>i.code), count:p.cabinets.length,
+        names:p.cabinets.map(c=>c.name) };})()`);
+
+    /**
+     * 造一台"门板太宽"的柜：单格 + 1 扇门 + 柜宽 2200mm → 单扇门 2160mm，
+     * 远超 maxDoorWidth（600mm）。放 (4000,4000) 空地上，避开撞墙与重叠记忆门。
+     *
+     * 柜高老实给 900：记忆规则 mem_004 会把"总高超过 2400"的柜子连创建一起拦下
+     * （这条记忆本来就是用户定的"行业默认单柜上限"），所以这条路径上唯一能真实触发的
+     * 硬错就是"门太宽"，负样本（放不进板材）是同一次派生顺带挂上来的，不用额外造。
+     */
+    const wide39 = await evalJs(`(async()=>{
+      const s=await import('/src/state/store.ts');
+      const { createCabinet, makeUnit } = await import('/src/core/docFactory.ts');
+      const rules=s.RULESET;
+      const proto=s.bus.getState().cabinets[0];
+      const t=rules.materials[proto.params.boardMaterial].thickness;
+      const c=createCabinet({
+        id:'cab_b39', name:'探针宽门柜',
+        roomId:(s.bus.getState().rooms[0]||{id:'r1'}).id,
+        x:4000, y:4000,
+        units:[makeUnit({ id:'unit_b39', kind:'shelves', requestedWidth:2200-2*t, count:1,
+          nickname:'宽门格', rules, depth:600, doors:{count:1} }, new Set(['cab_b39']))],
+        params:{ width:2200, height:900, depth:600, bodyLift:80 },
+        rules,
+      });
+      const r=s.bus.execute({ id:'probe_b39_create', op:'cabinet.create', source:'ui',
+        target:{kind:'project',id:'project'}, changes:[], payload:{cabinet:c} }, 'B39 探针：放一台宽门柜');
+      if (r.error) return { err:r.error };
+      const it=s.bus.derive().issues.find(i=>i.code==='RULE-DOOR-MAX-WIDTH' && i.severity==='ERROR');
+      return { ver:s.bus.getVersion(), msg:it?it.message:null, hint:it?it.fixHint:null,
+        hasFix:it?Boolean(it.autoFix):false, doors:it?it.autoFix?it.autoFix.changes[0].value:null:null,
+        verBefore:s.bus.getVersion() };
+    })()`);
+    ok('探针造出了"门板太宽"这条硬错（没有负样本，后面验的一键修复就是假的）',
+      !wide39.err && Boolean(wide39.msg), JSON.stringify(wide39));
+    ok('这条报错报得出差多少与上限定在多少（不是"参数不合法"）',
+      /2160/.test(wide39.msg || '') && /600/.test(wide39.msg || ''), wide39.msg);
+    ok('这条报错说得出往哪改（门扇数 + 加完每扇多宽）',
+      /门扇数量|门扇/.test(wide39.hint || '') && /扇/.test(wide39.hint || ''), wide39.hint);
+
+    const dom39 = await evalJs(`(()=>{
+      const items=[...document.querySelectorAll('.side-right .issue-item')];
+      const hit=items.find(el=>(el.querySelector('.issue-code')?.textContent||'').includes('RULE-DOOR-MAX-WIDTH'));
+      return hit ? {
+        code:(hit.querySelector('.issue-code')?.textContent||'').trim(),
+        title:(hit.querySelector('.issue-title')?.textContent||'').trim(),
+        msg:(hit.querySelector('.issue-msg')?.textContent||'').trim(),
+        hint:(hit.querySelector('.fix-hint')?.textContent||'').trim(),
+        manual:(hit.querySelector('.fix-manual')?.textContent||'').trim(),
+        fixBtn:(hit.querySelector('.issue-fix')?.textContent||'').trim(),
+      } : null;
+    })()`);
+    ok('问题面板里看得见这条报错，而且顶着的是人话标题（不用去猜 RULE-DOOR-MAX-WIDTH 是什么）',
+      Boolean(dom39) && dom39.title.length > 0 && /门板/.test(dom39.title), JSON.stringify(dom39));
+    ok('面板上这句话就是 node 侧算出来的那句（界面与规则同源，不是另写一套）',
+      Boolean(dom39) && dom39.msg === (wide39.msg || '').trim(), `${dom39 && dom39.msg} vs ${wide39.msg}`);
+    ok('面板上带了「一键修复」按钮（这条修法唯一，给得起按钮）',
+      Boolean(dom39) && dom39.fixBtn.includes('一键修复'), JSON.stringify(dom39));
+    // 柜宽 2200 也会顶到 maxSingleCabinetWidth（WARNING）：这条修法有多种（拆柜 or 降宽），
+    // 面板上出现了就必须**没有按钮**；没出现（被严重度过滤掉）则跳过，不算通过也不算失败。
+    const split39 = await evalJs(`(()=>{const items=[...document.querySelectorAll('.side-right .issue-item')];
+      const hit=items.find(el=>(el.querySelector('.issue-code')?.textContent||'').includes('RULE-CABINET-SPLIT'));
+      return hit?{btn:!!hit.querySelector('.issue-fix'),
+        manual:(hit.querySelector('.fix-manual')?.textContent||'').trim()}:null})()`);
+    ok('修法有多种的那条（柜宽超单柜上限）不给按钮，只说"要你决定"',
+      split39 === null || (split39.btn === false && /设计决定/.test(split39.manual)),
+      JSON.stringify(split39));
+
+    /**
+     * 负样本**不用额外造**：这一台柜一放下就同时挂着两条 ERROR ——
+     *   RULE-DOOR-MAX-WIDTH  门扇太宽                 → 修法唯一，给按钮
+     *   RULE-PANEL-OVER-SHEET 门板 780×2160 放不进 2440×1220 板材 → 修法有多种
+     *     （改门宽 / 拆成两块上不同板 / 换更大幅面板材），属于设计决定，**不给按钮**
+     * 挑它就是因为它和门宽同根：修完门宽，它会跟着一起消 —— 正好验"修复是真的"。
+     * （试过把进深压到 60mm 造第三条，但值域夹紧 100~6000 会把它顶回 100，
+     *   这类"命令成功但值被改了"的路子不适合当负样本，也顺带说明夹紧是有回报的 toast。）
+     */
+    await sleep(420);
+    const sheet39 = await evalJs(`(()=>{
+      const items=[...document.querySelectorAll('.side-right .issue-item')];
+      const hit=items.find(el=>(el.querySelector('.issue-code')?.textContent||'').includes('RULE-PANEL-OVER-SHEET'));
+      return hit?{ btn:!!hit.querySelector('.issue-fix'),
+        manual:(hit.querySelector('.fix-manual')?.textContent||'').trim(),
+        msg:(hit.querySelector('.issue-msg')?.textContent||'').trim() }:null;})()`);
+    ok('修法不唯一的报错也在面板上出现了（门板放不进板材）', Boolean(sheet39), JSON.stringify(sheet39));
+    ok('修法不唯一的报错不给按钮（给了就是"点了没用"的假按钮）',
+      Boolean(sheet39) && sheet39.btn === false, JSON.stringify(sheet39));
+    // 措辞不写死：这条的 manual 说的是"工厂工艺决定"，另一条说的是"设计决定"，
+    // 要的是"把决定权交回给人"，不是某个固定词条
+    ok('不给按钮的那条也把话说全了：是"要你定"，不是一声不吭',
+      Boolean(sheet39) && sheet39.manual.length > 6 && /决定/.test(sheet39.manual),
+      sheet39 && sheet39.manual);
+    ok('不给按钮的那条照样报得出具体尺寸（780×2160 放不进 2440×1220，不是"尺寸异常"）',
+      Boolean(sheet39) && /2160/.test(sheet39.msg) && /2440/.test(sheet39.msg), sheet39 && sheet39.msg);
+
+    /**
+     * 点按钮之前先把现场读下来：撤销本身也会走一次版本 +1，
+     * 所以不能拿"建柜时"的版本去推算"点完之后该是几" —— 那是探针自己的算术，不是产品行为。
+     * 之后一切只跟这一刻对账。
+     */
+    const pre39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const d=s.bus.derive();
+      return { ver:s.bus.getVersion(),
+        errs:d.issues.filter(i=>i.severity==='ERROR').map(i=>i.code),
+        warn:d.issues.filter(i=>i.severity==='WARNING').map(i=>i.code) };})()`);
+    ok('现场里同时挂着"门太宽"与"放不进板材"两条硬错（只有一条，下面验的就不是同一件事）',
+      pre39.errs.includes('RULE-DOOR-MAX-WIDTH') && pre39.errs.includes('RULE-PANEL-OVER-SHEET'),
+      JSON.stringify(pre39.errs));
+
+    const shotFix39 = await shot(path.join(OUT_DIR, 'issue-fixhint-before.png'));
+    ok('修复前的问题面板截图已留档（非空）', shotFix39 > 20000, `${shotFix39} 字节`);
+
+    // 真去点那个按钮（不是调函数）：这一下必须是"一条命令 = 一次撤销"
+    await evalJs(`(()=>{const items=[...document.querySelectorAll('.side-right .issue-item')];
+      const hit=items.find(el=>(el.querySelector('.issue-code')?.textContent||'').includes('RULE-DOOR-MAX-WIDTH'));
+      const b=hit&&hit.querySelector('.issue-fix'); if(b){b.click();return true;} return false;})()`);
+    await sleep(460);
+
+    const after39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const cab=s.bus.getState().cabinets.find(c=>c.id==='cab_b39');
+      const errs=s.bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code);
+      return { ver:s.bus.getVersion(), doors:cab?cab.layout.units[0].doors.count:null,
+        netW:cab?cab.layout.units[0].requestedWidth:null, errs,
+        gone:!errs.includes('RULE-DOOR-MAX-WIDTH') };})()`);
+    ok('点按钮之后版本只 +1（一次修复 = 一条命令，不是摸黑改模型）',
+      after39.ver === pre39.ver + 1, `v${pre39.ver} → v${after39.ver}`);
+    ok('这条硬错真的消失了（点了没反应比不给按钮更糟）', after39.gone, JSON.stringify(after39.errs));
+    ok('改的是语义参数「门扇数」，不是偷偷去动几何（1 扇 → 4 扇把 2160 压到 540 上下）',
+      after39.doors === 4, `门扇数=${after39.doors} 期望净宽=${after39.netW}`);
+    /**
+     * "一次修复不顺手改别的"该怎么问：修完门扇变窄，那条"放不进板材"是**连带**消掉的
+     * （2160 的门放不进 2440 的板，538 的门当然放得进），这不是"顺手改了别的"，是同一件事。
+     * 真正要防的是另外两件事：**冒出新错误**、**动了别处**（别的柜子的报错一条都不许变）。
+     */
+    const fixedAway = pre39.errs.filter((c) => !after39.errs.includes(c));
+    const born39 = after39.errs.filter((c) => !pre39.errs.includes(c));
+    ok('被修的那条连带它同源的那条一起消失了（门窄了，自然放得进板材）',
+      fixedAway.includes('RULE-DOOR-MAX-WIDTH') && fixedAway.includes('RULE-PANEL-OVER-SHEET'),
+      `消失的=${fixedAway.join('|')}`);
+    ok('修复没有凭空冒出新错误（修前 ${pre39.errs.length} 条 → 修后 ${after39.errs.length} 条）',
+      born39.length === 0, `冒出来的=${born39.join('|')}`);
+
+    const shotFix39b = await shot(path.join(OUT_DIR, 'issue-fixhint-after.png'));
+    ok('修复后的面板截图已留档（非空）', shotFix39b > 20000, `${shotFix39b} 字节`);
+
+    // 撤销：一次撤销收掉一步，逐步断言（整段撤销后不对账 = 不知道是哪一步没收回）
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await sleep(380);
+    const undo1 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const d=s.bus.derive();
+      return { back:d.issues.some(i=>i.code==='RULE-DOOR-MAX-WIDTH'),
+        sheet:d.issues.some(i=>i.code==='RULE-PANEL-OVER-SHEET'),
+        doors:(s.bus.getState().cabinets.find(c=>c.id==='cab_b39')||{}).layout?.units[0]?.doors?.count ?? null };})()`);
+    ok('撤销掉「一键修复」这一笔：两条硬错和门扇数一起回来（历史按笔回退，不是整体重置）',
+      undo1.back === true && undo1.sheet === true && undo1.doors === 1, JSON.stringify(undo1));
+
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await sleep(380);
+    const undo39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState();
+      return { hasCab:p.cabinets.some(c=>c.id==='cab_b39'), count:p.cabinets.length,
+        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code) };})()`);
+    ok('再撤销掉"建柜"这一笔：柜子没了、报错回到本节开始之前（历史是线性的，不是整体重置）',
+      undo39.hasCab === false && undo39.count === before39.count
+        && undo39.errs.join('|') === before39.errs.join('|'),
+      JSON.stringify(undo39));
+
+    // 还原现场：本节自己造的柜子与改动不许留给下游
+    const restored39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      if(!window.__b39Saved) return null;
+      s.bus.replaceProject(window.__b39Saved, 'B39 还原现场');
+      const p=s.bus.getState();
+      const d=s.bus.derive();
+      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name),
+        errs:d.issues.filter(i=>i.severity==='ERROR').map(i=>i.code) };})()`);
+    ok('B39 结束后把现场还原了（自己造的柜子与改动不许留给下游）',
+      Boolean(restored39) && restored39.count === before39.count
+        && restored39.names.join('|') === before39.names.join('|')
+        && restored39.errs.join('|') === before39.errs.join('|'),
+      JSON.stringify(restored39));
     await sleep(240);
 
     // ═══════════════════════════════════════════════════════════

@@ -2,6 +2,7 @@ import type { Cabinet, Issue, Project, RuleSet, Vec2 } from '../types.ts';
 import { getCabinetFootprint } from '../geometry/generate.ts';
 import { bboxOf, polyLocalToWorld } from '../geometry/transform.ts';
 import { computeCabinetLayout, doorWidths } from '../geometry/layout.ts';
+import { buildIssue } from './issueCatalog.ts';
 
 /**
  * ════════════════════════════════════════════════════════════════════
@@ -142,13 +143,12 @@ function checkSwing(
   const hingeLocalX = innerLocalX <= W / 2 ? partLeft : partRight;
   const hinge = polyLocalToWorld([{ x: hingeLocalX, y: D }], o, o.rotation)[0]!;
   if (distPointToBBox(hinge, bbOther) <= radius + TOL) {
-    out.push({
-      severity: 'WARNING',
-      code: 'CORNER-DOOR-SWING',
-      target: `${src.id} / ${other.id}`,
-      targetKind: 'cabinet',
-      message: `「${src.name}」内端铰链门（扇宽约 ${Math.round(radius)}mm）打开时会扫到「${other.name}」（L 型转角柜），可能撞门 / 抽面。`,
-      fixHint: '将内端改为无门 / 移门，或缩短该分区门扇宽度，或把相邻柜体内缩避让开门弧',
-    });
+    out.push(
+      buildIssue('CORNER-DOOR-SWING', {
+        target: `${src.id} / ${other.id}`,
+        targetKind: 'cabinet',
+        ctx: { nameSrc: src.name, nameOther: other.name, radius: Math.round(radius) },
+      })
+    );
   }
 }

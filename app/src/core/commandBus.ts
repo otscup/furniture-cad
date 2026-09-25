@@ -195,6 +195,12 @@ const WRITABLE: Record<string, RegExp[]> = {
     /^layout\.backUnits\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
     /^layout\.backUnits\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
   ],
+  /**
+   * 一键修复用的"去门"动作：电器洞口格配了门板（RULE-APPLIANCE-DOOR）时的修复动作。
+   * 单独一个 op 而不是并入 cabinet.layout —— 路径写白名单要的是**精确到字段**，
+   * 把 `layout.units[i].doors` 整个交给通用 op，等于让人能把 doors 写成任意垃圾。
+   */
+  'cabinet.layout.clearDoors': [/^layout\.units\[\d+\]\.doors$/],
   'wall.move': [/^(start|end)\.[xy]$/],
   'wall.update': [/^thickness$/, /^height$/, /^name$/],
   'room.rename': [/^rooms\[\d+\]\.name$/],
@@ -442,6 +448,17 @@ export class CommandBus {
   private gate: Gate | null = null;
 
   constructor(project: Project, rules: RuleSet) {
+    /**
+     * 防呆（踩过一次）：这两个参数写反**照样能编译、照样能跑**，只是把规则集当项目存起来，
+     * 然后在一句"读 .materials 炸了"的地方才露馅 —— 离调用点越远越难查。
+     * 参数顺序对不对，在构造函数里一眼就能看出来，别留给运行期。
+     */
+    if (!project || !Array.isArray((project as unknown as Project).cabinets)) {
+      throw new Error(`CommandBus 的第一个参数应是 Project（要有 cabinets 数组），收到 ${typeof project}`);
+    }
+    if (!project || !rules || typeof rules !== 'object' || typeof (rules as RuleSet).materials !== 'object') {
+      throw new Error(`CommandBus 的第二个参数应是 RuleSet（要有 materials），收到 ${typeof rules}`);
+    }
     this.project = structuredClone(project);
     this.rules = rules;
   }

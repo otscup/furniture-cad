@@ -3,6 +3,7 @@ import { bboxOf } from './transform.ts';
 import { generateCabinet, getCabinetFootprint } from './generate.ts';
 import { buildProjectViews } from './views.ts';
 import { buildProjectBodies } from './bodies3d.ts';
+import { buildIssue } from '../rules/issueCatalog.ts';
 
 const L_WALL = 'A-WALL';
 const L_WALL_TEXT = 'A-TEXT';
@@ -58,14 +59,13 @@ export function generateProject(project: Project, rules: RuleSet): ProjectGeomet
       plan.push(...g.plan);
       issues.push(...g.issues);
     } catch (e) {
-      issues.push({
-        severity: 'ERROR',
-        code: 'GEN-CABINET-FAILED',
-        target: cab.id,
-        targetKind: 'cabinet',
-        message: `「${cab.name}」几何生成失败：${(e as Error).message}`,
-        fixHint: '检查材质 ID 是否存在于规则集、参数是否为合法数值',
-      });
+      issues.push(
+        buildIssue('GEN-CABINET-FAILED', {
+          target: cab.id,
+          targetKind: 'cabinet',
+          ctx: { cabName: cab.name, reason: (e as Error).message },
+        })
+      );
     }
   }
 
@@ -95,6 +95,13 @@ function overlap(a: BBox, b: BBox): boolean {
   return a.min.x < b.max.x && a.max.x > b.min.x && a.min.y < b.max.y && a.max.y > b.min.y;
 }
 
+/** 重叠面积（mm²）：给报错用具体数，用户才知道要挪多少 */
+function overlapArea(a: BBox, b: BBox): number {
+  const w = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+  const h = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+  return w > 0 && h > 0 ? Math.round(w * h) : 0;
+}
+
 /**
  * 干涉 / 撞墙的唯一判据。
  *
@@ -115,14 +122,13 @@ export function detectCollisions(project: Project): Issue[] {
   for (let i = 0; i < boxes.length; i++) {
     for (let j = i + 1; j < boxes.length; j++) {
       if (overlap(boxes[i].bbox, boxes[j].bbox)) {
-        out.push({
-          severity: 'ERROR',
-          code: 'RULE-CABINET-OVERLAP',
-          target: `${boxes[i].id} / ${boxes[j].id}`,
-          targetKind: 'cabinet',
-          message: `「${boxes[i].name}」与「${boxes[j].name}」在平面上发生重叠，存在柜体碰撞。`,
-          fixHint: '移动其中一个柜体，或缩短柜体宽度',
-        });
+        out.push(
+          buildIssue('RULE-CABINET-OVERLAP', {
+            target: `${boxes[i].id} / ${boxes[j].id}`,
+            targetKind: 'cabinet',
+            ctx: { nameA: boxes[i].name, nameB: boxes[j].name, area: overlapArea(boxes[i].bbox, boxes[j].bbox) },
+          })
+        );
       }
     }
   }
@@ -134,14 +140,23 @@ export function detectCollisions(project: Project): Issue[] {
       const wb = bboxOf(wpoly);
       for (const b of boxes) {
         if (overlap(b.bbox, wb)) {
-          out.push({
-            severity: 'ERROR',
-            code: 'RULE-CABINET-IN-WALL',
-            target: b.id,
-            targetKind: 'cabinet',
-            message: `「${b.name}」与墙体「${w.name}」发生干涉（墙厚 ${w.thickness}mm）。`,
-            fixHint: '将柜体贴合到墙面外侧，或调整墙位',
-          });
+          out.push(
+            buildIssue('RULE-CABINET-IN-WALL', {
+              target: b.id,
+              targetKind: 'cabinet',
+              ctx: {
+                cabName: b.name,
+                wallName: w.name,
+                thickness: w.thickness,
+                pen: Math.round(
+                  Math.min(Math.max(b.bbox.max.x - wb.min.x, wb.max.x - b.bbox.min.x), Math.max(b.bbox.max.y - wb.min.y, wb.max.y - b.bbox.min.y))
+                ),
+                need: Math.round(
+                  Math.max(b.bbox.max.x - wb.min.x, wb.max.x - b.bbox.min.x, b.bbox.max.y - wb.min.y, wb.max.y - b.bbox.min.y)
+                ),
+              },
+            })
+          );
         }
       }
     }

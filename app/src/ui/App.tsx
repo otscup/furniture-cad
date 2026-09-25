@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, lazy, Suspense } from 'react';
-import type { Vec2 } from '../core/types.ts';
+import type { Issue, Vec2 } from '../core/types.ts';
 import type { Command, ExecResult } from '../core/commandBus.ts';
 import * as CMD from '../core/commands.ts';
 import { bus, useBusVersion, RULESET } from '../state/store.ts';
@@ -39,6 +39,7 @@ import { loadDraft, saveDraft, clearDraft, fmtSavedAt } from '../state/draftStor
 import type { PickLine } from '../core/geometry/pickLines.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
+import { newCommandId } from '../core/ids.ts';
 import type { Toast, ToastKind, Tool } from './types.ts';
 
 /**
@@ -204,6 +205,38 @@ export function App() {
   const run = useCallback(
     (cmd: Command): boolean => afterExec(cmd, bus.execute(cmd, { commitLabel: cmd.label })),
     [afterExec]
+  );
+
+  /**
+   * 一键修复：把报错自带的修复计划还原成一条命令走总线。
+   *
+   * 走总线而不是直接改模型，是为了让修复和手动编辑**同权同位**：
+   * 同样是一次撤销、同样过记忆闸门、同样记进审计。
+   * 修复后的副作用通过 toast 如实交代（"抽屉会浅 40mm"这类）。
+   */
+  const applyFix = useCallback(
+    (i: Issue): boolean => {
+      const plan = i.autoFix;
+      if (!plan) {
+        toast('warn', '这条只能你来定：没有唯一的修法，系统不替你选。');
+        return false;
+      }
+      const cmd: Command = {
+        ...plan,
+        id: newCommandId(plan.op),
+        source: 'ui',
+      } as Command;
+      const r = bus.execute(cmd, { commitLabel: cmd.label });
+      if (!r.ok) {
+        toast('error', `没能自动修：${r.error ?? '这个改动被总线拒绝了'}`);
+        setLastMsg(r.error ?? '没能自动修');
+        return false;
+      }
+      toast('info', `${plan.label} —— ${plan.note}`);
+      setLastMsg(plan.label);
+      return true;
+    },
+    [bus, toast, setLastMsg]
   );
 
   // ── 撤销 / 重做 ──
@@ -984,7 +1017,9 @@ export function App() {
           {rightTab === 'props' ? (
             <PropertiesPanel bus={bus} version={version} selection={selection} setSelection={setSelection} onToast={toast} />
           ) : null}
-          {rightTab === 'issues' ? <IssuesPanel bus={bus} version={version} setSelection={setSelection} /> : null}
+          {rightTab === 'issues' ? (
+            <IssuesPanel bus={bus} version={version} setSelection={setSelection} applyFix={applyFix} />
+          ) : null}
           {rightTab === 'history' ? <HistoryPanel bus={bus} version={version} /> : null}
           {rightTab === 'layers' ? (
             <LayersPanel

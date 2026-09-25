@@ -11,6 +11,7 @@ import type {
   Vec2,
 } from '../types.ts';
 import { equalSpacing, round1 } from '../allocate.ts';
+import { buildIssue } from '../rules/issueCatalog.ts';
 import { localToWorld, polyLocalToWorld, rectPts } from './transform.ts';
 import {
   backPanelSplit,
@@ -89,13 +90,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   if (DB) {
     push({ id: `P_${cabId}_MID`, role: 'MiddlePanel', nameZh: '共用中板（双面）', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: bodyH, grain: 'length', edge: edge(null, null, null, null), edgeLabel: '不封边（藏于柜内）', layer: layerOf(t) });
     push({ id: `P_${cabId}_KICKB`, role: 'KickBoardBack', nameZh: '踢脚板-后', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
-    issues.push({
-      severity: 'INFO',
-      code: 'DOUBLE-NO-BACKPANEL',
-      target: cabId,
-      targetKind: 'cabinet',
-      message: `双面柜不设背板：前后两排背靠背，共用 ${t}mm 中板（排深 ${DB.backRowDepth} + 中板 ${DB.midT} + ${DB.frontRowDepth} = 总深 ${p.depth}mm）。params.backPanel 的槽位参数不参与本柜派生。`,
-    });
+    issues.push(buildIssue('DOUBLE-NO-BACKPANEL', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, boardT: t, backRowDepth: DB.backRowDepth, midT: DB.midT, frontRowDepth: DB.frontRowDepth, depth: p.depth } }));
   }
 
   const unitCount = cab.layout.units.length;
@@ -115,26 +110,12 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     }
   });
   if (drifted.length > 0) {
-    issues.push({
-      severity: 'INFO',
-      code: 'ALLOC-FIT-TOTAL',
-      target: cabId,
-      targetKind: 'cabinet',
-      message: `总宽 ${p.width}mm 固定，扣除两侧板 ${t}×2 与立板 ${t}×${unitCount - 1} 后可用净宽 ${netTotal}mm，按期望比例重新分配：${drifted.join('；')}。这是「总宽优先」策略的必然结果，不是错误。`,
-      fixHint: '如需严格满足净宽，请把 layout.widthMode 改为 fit_units（总宽将随之变化）',
-    });
+    issues.push(buildIssue('ALLOC-FIT-TOTAL', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, width: p.width, netTotal, drift: drifted.join('；') } }));
   }
 
   // 诚实优先：未实现的东西必须在界面上说出来，而不是悄悄忽略
   if (cab.layout.widthMode === 'fit_units') {
-    issues.push({
-      severity: 'INFO',
-      code: 'LAYOUT-MODE-NOT-IMPLEMENTED',
-      target: cabId,
-      targetKind: 'cabinet',
-      message: 'layout.widthMode = fit_units 尚未实现：当前生成器一律按「总宽优先」分配净宽，params.width 仍是唯一权威。',
-      fixHint: 'Phase 2 将实现"按净宽反算总宽"（需先解决与 params.width 的权威冲突）。在此之前请使用 fit_total。',
-    });
+    issues.push(buildIssue('LAYOUT-MODE-NOT-IMPLEMENTED', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, width: p.width } }));
   }
 
   // ───────── 3. 背板（超幅面自动拆块，两个方向都要拆）─────────
@@ -157,18 +138,12 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     // 只说 nW×nH 等于把最后一步心算留给车间（拆块方案里选好的取向不该在这里丢失）
     const maxCol = Math.max(...backSplit.colW);
     const maxRow = Math.max(...backSplit.rowH);
+    // 带上 "A/B" 这个标签：工人开料时说的是"按 A 面放"，只给一句解释他要再翻译一遍
     const orientZh =
       backSplit.orientation === 'A'
-        ? `块宽对短板边（≤${sheetS}）、块高对长板边（≤${sheetL}）`
-        : `块宽对长板边（≤${sheetL}）、块高对短板边（≤${sheetS}）`;
-    issues.push({
-      severity: 'WARNING',
-      code: 'RULE-BACKPANEL-SPLIT',
-      target: cabId,
-      targetKind: 'cabinet',
-      message: `背板 ${Math.round(backW)}×${Math.round(backH)}mm 超出板材最大幅面 ${sheetL}×${sheetS}，已按 ${nW} 列 × ${nH} 行拆为 ${backPieces} 块。摆放取向 ${backSplit.orientation}：${orientZh}；单块最大 ${Math.round(maxCol)}×${Math.round(maxRow)}mm。`,
-      fixHint: '确认拼接方向与压条方案；或改用 5mm 背板条（条状背板不受幅面限制）',
-    });
+        ? `摆放取向 A：块宽对短板边（≤${sheetS}）、块高对长板边（≤${sheetL}）`
+        : `摆放取向 B：块宽对长板边（≤${sheetL}）、块高对短板边（≤${sheetS}）`;
+    issues.push(buildIssue('RULE-BACKPANEL-SPLIT', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, bw: Math.round(backW), bh: Math.round(backH), sheetL, sheetS, cols: nW, rows: nH, pieces: backPieces, maxCol: Math.round(maxCol), maxRow: Math.round(maxRow), orientZh } }));
   }
 
   const colW = backSplit.colW;
@@ -232,7 +207,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
         buildAppliance(u.id, u, netW, rowShelfDepth);
         // 电器格带门 = 洞口与门板打架 —— 如实报 ERROR 并不产出矛盾板件，不静默画一个怪门
         if (u.doors) {
-          issues.push({ severity: 'ERROR', code: 'RULE-APPLIANCE-DOOR', target: `${cabId}.${u.id}`, targetKind: 'unit', message: `电器格「${u.nickname ?? u.id}」带了门板，但洞口（${u.appliance.openingWidth}×${u.appliance.openingHeight}）与门板在同一张脸上互相冲突。`, fixHint: '去掉门（机器露前脸是常规做法），或把这个分区改成普通层板格' });
+          issues.push(buildIssue('RULE-APPLIANCE-DOOR', { target: `${cabId}.${u.id}`, targetKind: 'unit', ctx: { cabId, cab, unitIndex: i, unitName: u.nickname ?? u.id, unitId: u.id, applianceName: u.appliance.name } }));
         }
       }
       if (u.drawers) buildDrawerBank(u.id, u, netW, netH);
@@ -304,7 +279,20 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
      */
     const mId = dr.material && rules.materials[dr.material] ? dr.material : p.boardMaterial;
     if (mId !== dr.material) {
-      issues.push({ severity: 'WARNING', code: 'RULE-DOOR-MATERIAL', target: `${cabId}.${uid}`, targetKind: 'unit', message: `门板材质「${dr.material}」不在材质库，已回退「${p.boardMaterial}」`, fixHint: '改用规则集里存在的材质 ID' });
+      issues.push(
+        buildIssue('RULE-DOOR-MATERIAL', {
+          target: `${cabId}.${uid}`,
+          targetKind: 'unit',
+          ctx: {
+            unitName: unit.nickname ?? uid,
+            unitId: uid,
+            doorMaterial: dr.material,
+            fallback: p.boardMaterial,
+            // 说清"材质库里现在有什么"，比只说"找不到"有用
+            candidates: Object.keys(rules.materials),
+          },
+        })
+      );
     }
     const mDef = rules.materials[mId]!;
     if (mDef.kind === 'glass') {

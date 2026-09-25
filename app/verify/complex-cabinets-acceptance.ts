@@ -319,7 +319,17 @@ ok('开料清单里没有"洗衣机"板件（机器不走开料机）', lg.panel
   const nIssues = validateCabinet(narrowCab, ng, rules);
   const fitW = nIssues.find((i) => i.code === 'RULE-APPLIANCE-FIT-W');
   ok('洞口宽 > 分区净宽 → ERROR（模板 600 净宽装不下 650 洞口）', !!fitW && fitW.severity === 'ERROR', JSON.stringify(nIssues.map((i) => i.code)));
-  ok('错误说清了差多少、怎么改（人话，不是"参数不合法"）', !!fitW && /大 \d+mm|期望净宽|换小一号/.test(fitW.message + (fitW.fixHint ?? '')), fitW ? `${fitW.message} / ${fitW.fixHint}` : '无');
+  /**
+   * 「人话化」的验收口径：报错必须同时给得出**差多少**（不是"参数不合法"）
+   * 和**怎么改**（具体到数或具体字段名）。
+   *   ① 差多少：message 里有"还宽 29mm"这种带单位的差值
+   *   ② 怎么办：fixHint 里有具体目标值（加宽到 686mm 以上）
+   */
+  ok(
+    '错误说清了差多少、怎么改（人话，不是"参数不合法"）',
+    !!fitW && /还宽|超|大\s*\d+mm/.test(fitW.message) && /\d+mm/.test(fitW.fixHint ?? ''),
+    fitW ? `${fitW.message} / ${fitW.fixHint}` : '无'
+  );
 }
 
 // ═══════════════════════════════ E AI 端到端 ═══════════════════════════════

@@ -158,6 +158,70 @@ sudo -n /usr/local/bin/docker exec $C sh -c 'cd /app/dist/assets; for k in 首�
 
 本机（192.168.2.2）直接访问 `http://192.168.2.2:8787/` 应为 200。
 
+## 五、AI 部署后的实测（2026-09-25，含一条**错误结论的更正**）
+
+### 5.1 ⚠ `AI_API_KEY=123456` 不是占位符 —— 我上轮判错了
+
+上一轮我把 6 位 key 当成落没落盘的占位符，据此推断"AI 请求会 403"。**这是错的。**
+`gpt-load` 是本地网关：6 位口令只用于**网关自身的授权**，转发到上游时并不需要它。
+容器内实测 `HTTP=200`，1 秒返回。**别拿长度去判断一个 key 是不是占位符** ——
+网关型密钥的长度和规范 API key 完全不在一个量级。
+
+### 5.2 在宿主机上 `curl http://gpt-load:3002` 得到 `000`，是**假故障**
+
+`gpt-load` 这个主机名**只在 docker 网络内可解析**（实测容器里 `getent hosts gpt-load`
+→ `172.25.0.3`）。在 NAS 宿主机上 curl 它必然解析失败，报 `000` ——
+这个 `000` 测的是"我的 DNS 里有没有这个名字"，不是"服务通不通"。
+**诊断 AI 连通性必须在容器内做。**（容器里既没有 `wget` 也没有 `curl`，
+node 镜像只有 node，所以直接用 `node` 发起请求，顺便复用 `/app/shared/aiContract.mjs`
+里的真实提示词，比裸 curl 更接近真实运行路径。）
+
+### 5.3 偶发 504 是供应商抖动，不是提示词变长
+
+同一句、同一模型连跑：
+
+| 组 | max_tokens | 结果 |
+|---|---|---|
+| A | 4096（契约默认） | 200，19.4s，正文 476 字符，`finish=stop` |
+| B | 1024 | 200，11.2s，正文 **0 字符**，`finish=length` |
+| C | 4096（换一句极简） | 200，66.1s，`finish=stop` |
+
+- B 组正文为空正是契约注释里"**必须显式给足 max_tokens**"那段的现场印证：
+  服务商默认预算被推理过程吃掉，正文就没了。
+- 504 出现在路由**随机换免费供应商**的时候（实测同一批请求分别落到
+  `nex-agi/nex-n2.5-mini`、`cohere/north-mini-code`、`liquid/lfm-2.5-2.6b`、
+  `nvidia/nemotron-3-ultra-550b-a55b`）。**不要把偶发 504 归因于本次改动的提示词长度。**
+
+### 5.4 部署后端到端验证（这条才是"真的修好了"的证据）
+
+用部署目录里**最新的** `aiContract.mjs` + 线上真实模型跑用户那句原话
+（"新增一个 L 形新橱柜，长2200，台面宽750，高1000，另外一边长1200。"），
+`validatePlan` 通过，模型产出：
+
+```
+cabinet.create  target={"cabinetName":"横臂"}  params={"width":2200,"height":1000,"depth":750,"rotation":0}
+cabinet.create  target={"cabinetName":"竖臂"}  params={"width":1200,"height":1000,"depth":750,"rotation":90}
+```
+
+两个 `cabinet.create`、各自带 `rotation` —— 正是修复要的效果。
+（注意：**落位是猜的**（`atX:0,atY:0`），四个数是准的。两段式预览就是为"位置猜错、
+一眼能看见"准备的，不必在 AI 这一步跟它纠结坐标。）
+
+### 5.5 给容器送文件：别用 `docker cp /tmp/...`
+
+Windows 本地的 `/tmp` 和 NAS 的 `/tmp` **不是同一个目录**。`docker cp /tmp/f.sh 容器:/tmp/f.sh`
+会因为源不存在而失败，但 `cp_exit=` 有时看着像成功。可靠做法是走 stdin：
+
+```bash
+ssh ... 'sudo -n /usr/local/bin/docker exec -i C sh -c "cat > /tmp/f.js"' < ./f.js
+```
+
+### 5.6 遗留体验问题（未改，待定）
+
+`AI_TIMEOUT_MS` 未配置 → 服务端默认 **120 秒**。上游 504 时用户要盯着转两分钟才看到失败。
+想改就把 `AI_TIMEOUT_MS=60000` 写进 `data/.env`（改 .env 不影响镜像，
+改完 `docker compose up -d` 即可），代价是慢模型会被更早判死。
+
 ## 六、边界
 
 - 部署目录是**根目录布局**（`build: .`、`./data:/app/data`），不是 `app/` 子目录 ——

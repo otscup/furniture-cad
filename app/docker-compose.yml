@@ -16,14 +16,12 @@
 #    不要把地址写成 NAS 的局域网 IP（192.168.2.x）：容器内访问宿主机 LAN IP
 #    的发布端口在群晖上不通；走 docker 网桥网关 172.17.0.1 也只是时灵时不灵。
 #    **正解：两个容器进同一张 Docker 网络，按容器名互访（http://容器名:端口）。**
-#    做法：把下面 networks 段落里的 external 网络改成目标网的真实名字
-#    （docker network ls 查），再 `docker compose up -d` 重建即可。
+#    做法：在**本机专用**的 docker-compose.override.yml 里声明 networks 并
+#    把服务挂上去（override 只在这台机器上用，不进仓库）。
+#    注意：本文件里**不要**留一个空的 `networks:` 键 —— YAML 里它解析成 null，
+#    一旦 override 声明了 networks，合并就会报 "networks must be a mapping"。
+#    这个坑真的踩过：空键 + 本机的 override = 构建第一步就被拒。
 # ══════════════════════════════════════════════════════════════════════
-networks:
-  # 示例：与同机的 AI 网关容器共享网络后，AI_BASE_URL 可填 http://gpt-load:3002/v1
-  # gpt-load_default:
-  #   external: true
-
 services:
   furniture-cad:
     build: .

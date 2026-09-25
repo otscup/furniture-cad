@@ -30,7 +30,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, createReadStream, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync, createReadStream, mkdtempSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -394,6 +394,8 @@ async function handleApi(req, res, pathname) {
       memoryFile: existsSync(MEM_PATH),
       authMode: auth.mode,
       accountCount: auth.data.accounts.length,
+      /** 数据目录可写性。写不进去时登录照样 200，这里必须能被机器查见 */
+      dataWritable: DATA_WRITABLE,
       time: new Date().toISOString(),
     });
   }
@@ -1299,6 +1301,32 @@ const server = createServer((req, res) => {
   serveStatic(req, res, pathname);
 });
 
+/**
+ * 数据目录能不能写 —— 启动时实测一次，不靠猜。
+ *
+ * 这件事曾真的咬过人：一次部署之后 `data/` 被换成了 root 属主、mode 551，
+ * 容器里跑的是 uid 1000 的 node，**从此一个字节都写不进去**。而登录照样返回
+ * 200 —— 因为改动只存在于内存里。表面一切正常，实际上账号库、审计、用量
+ * 从那次部署起就没再更新过；排查时"审计里没有失败记录"反而被当成"没输错过"，
+ * 差点把方向带跑。
+ *
+ * 所以这里做两件事：
+ *   1. 启动时往数据目录写一个探针文件，成功再删掉；
+ *   2. 结果同时报进 /api/health（Fields 断言能查），界面上也能看见。
+ * 写不进去就要**照实说**，不能让"登录成功"变成一个骗人的动作。
+ */
+function probeWritable() {
+  try {
+    const f = join(dirname(ACCOUNTS_PATH), '.write-probe');
+    writeFileSync(f, 'x', 'utf8');
+    unlinkSync(f);
+    return true;
+  } catch {
+    return false;
+  }
+}
+const DATA_WRITABLE = probeWritable();
+
 server.listen(PORT, HOST, () => {
   const env = readEnv();
   console.log('家具 CAD 本地服务');
@@ -1310,6 +1338,13 @@ server.listen(PORT, HOST, () => {
   console.log(`  账号库    ${ACCOUNTS_PATH}`);
   console.log(`  审计日志  ${AUDIT_PATH}`);
   console.log(`  账号模式  ${auth.mode}${auth.enabled ? `（${auth.data.accounts.length} 个账号）` : '  ← 还没有账号，全部接口免登录'}`);
+  console.log(
+    DATA_WRITABLE
+      ? `  数据目录  可写 —— 账号/审计/用量都能落盘`
+      : `  数据目录  ⚠ 写不进去！${dirname(ACCOUNTS_PATH)} 对 uid ${process.getuid?.() ?? '运行用户'} 不可写。\n` +
+          `            现在登录仍会返回成功，但**改动只存在于内存，重启就没了**。\n` +
+          `            修法：chown -R <运行用户>:<组> ${dirname(ACCOUNTS_PATH)} —— 常见于部署时把 data/ 换成了 root 属主。`
+  );
   console.log(`  静态产物  ${existsSync(DIST) ? DIST : '（还没有 dist，开发时走 vite）'}`);
   console.log('');
   console.log('  接口：GET /api/health · GET|PUT /api/settings · GET /api/models · POST /api/models/refresh');

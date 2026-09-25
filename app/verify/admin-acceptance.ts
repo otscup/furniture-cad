@@ -216,6 +216,61 @@ section('5. 权限边界：重置口令需要 canManage（HTTP 层实测）');
     srv.kill('SIGKILL');
   }
   rmSync(httpDir, { recursive: true, force: true });
+
+  // ── 反面：数据目录写不进去时，健康检查必须**照实说出来** ──
+  //
+  // 这不是假设。真出过一次：一次部署之后 data/ 变成 root 属主、mode 551，
+  // 容器里跑的是 uid 1000 的 node，从此一个字节都写不进去 —— 而登录照样返回
+  // 200，改动只存在于内存里。更糟的是排查时"审计里没有失败记录"被当成了
+  // "没输错过密码"，差点把方向彻底带跑。
+  // 所以这里造一个只读目录，看服务敢不敢承认。
+  /**
+   * 造"写不进去"的办法：把 accounts 路径指到一个**普通文件的子路径**下面。
+   * 不用 chmod —— Windows 不按 POSIX 权限位挡写，chmod 500 照样写成功，
+   * 那种负样本在 Windows 上永远得到"可写"，验的是空气。
+   * 而"路径的某一层是文件"在任何系统上都会 ENOTDIR， Deterministic。
+   */
+  const roDir = mkdtempSync(join(tmpdir(), 'furnicad-ro-'));
+  const blocker = join(roDir, 'not-a-dir');
+  writeFileSync(blocker, 'I am a file');
+  const roAccounts = join(blocker, 'sub', 'accounts.json');
+  const roAudit = join(blocker, 'sub', 'audit.jsonl');
+
+  // 上面那台服务已经被 kill 了，这里另起一台，专门指着只读目录
+  const roPort = PORT + 1;
+  const roSrv = spawn(process.execPath, ['server/server.mjs'], {
+    cwd: join(import.meta.dirname, '..'),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      PORT: String(roPort),
+      APP_ENV_PATH: join(roDir, 'empty.env'),
+      APP_ACCOUNTS_PATH: roAccounts,
+      APP_AUDIT_PATH: roAudit,
+      APP_MEM_PATH: join(roDir, 'corrections.jsonl'),
+    },
+  });
+  try {
+    let roUp = false;
+    for (let i = 0; i < 60 && !roUp; i++) {
+      try { roUp = (await fetch(`http://127.0.0.1:${roPort}/api/health`)).ok; } catch { await new Promise((r) => setTimeout(r, 200)); }
+    }
+    const roHealth = await (await fetch(`http://127.0.0.1:${roPort}/api/health`)).json().catch(() => ({}));
+    ok('只读目录那台服务也起来了（说明它不是靠"起不来"蒙对的）', roUp === true);
+    ok('数据目录不可写时，/api/health 如实报 dataWritable=false（不许假装一切正常）',
+      roHealth.dataWritable === false, JSON.stringify(roHealth).slice(0, 200));
+
+    // 光报 false 还不够 —— 登录仍应可用（那正是它危险的地方：动作"成功"了但留不下痕迹）
+    const roLogin = await (await fetch(`http://127.0.0.1:${roPort}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'nobody', password: 'whatever-x1' }),
+    })).json().catch(() => ({}));
+    ok('不可写时登录接口照常应答（危险之处：看上去一切正常）', typeof roLogin === 'object', JSON.stringify(roLogin).slice(0, 120));
+  } finally {
+    roSrv.kill('SIGKILL');
+  }
+
+  rmSync(roDir, { recursive: true, force: true });
 }
 
 // ══════════════════════════════════════════════════════════════════════

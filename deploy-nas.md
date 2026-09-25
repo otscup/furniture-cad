@@ -70,6 +70,31 @@ sudo -n /usr/local/bin/docker compose up -d
 `validating …: networks must be a mapping`，构建第一步就被拒。
 已在 `app/docker-compose.yml` 里删掉该键并写明原因；**新增 override 兼容性时不要再留空键**。
 
+## 四之一、⚠ 部署后必须先查 `data/` 能不能写
+
+**这个坑真踩过，而且踩得很隐蔽。** 一次部署之后 `data/` 变成了 root 属主、mode 551，
+容器里跑的是 uid 1000 的 node，**从此一个字节都写不进去**。症状却是"一切正常"：
+登录返回 200、界面照用，但账号库、审计、用量从那次部署起就再没更新过。
+更糟的是排查时"审计里没有失败记录"被当成"没输错过密码"，差点把方向彻底带跑。
+
+部署完先验一条：
+
+```bash
+curl -s http://127.0.0.1:8787/api/health | grep dataWritable   # 必须是 true
+```
+
+启动日志里对应那行是「数据目录  可写 —— 账号/审计/用量都能落盘」。
+
+修法（让一个 root 容器代劳，sudo 只放行 docker）：
+
+```bash
+sudo -n /usr/local/bin/docker run --rm -u 0 -v /volume1/docker/furniture-cad:/srv alpine \
+  sh -c 'chown -R 1000:1000 /srv/data && chmod -R u+rwX /srv/data'
+```
+
+根因是推包时被 root 属主目录那一步换掉了属主 —— 见第二节的容器清理。
+**每次部署后都查一次**，别等它悄悄坏掉。
+
 ## 四之二、忘记口令的逃生门（离线重置）
 
 只有 owner 一个账号时，**忘了口令 = 永久锁死**：自助注册已关、没有邮箱找回、
@@ -81,18 +106,19 @@ sudo -n /usr/local/bin/docker compose up -d
 ```bash
 sudo -n /usr/local/bin/docker compose down
 cd /volume1/docker/furniture-cad
-sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine sh -c \
-  "cp /srv/data/accounts.json /srv/data/accounts.json.bak"   # 先备份
+
+# 用**项目自己的镜像**跑（alpine 里没有 node）
+IMG=furniture-cad-furniture-cad:latest
 
 # 先看有哪些账号（只读）
-sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine \
-  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json APP_AUDIT_PATH=/srv/data/audit.jsonl \
-  node /srv/server/account-reset.mjs --list"
+sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv $IMG \
+  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json \
+  APP_AUDIT_PATH=/srv/data/audit.jsonl node /srv/server/account-reset.mjs --list"
 
 # 重置
-sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine \
-  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json APP_AUDIT_PATH=/srv/data/audit.jsonl \
-  node /srv/server/account-reset.mjs --user admin --password '新口令'"
+sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv $IMG \
+  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json \
+  APP_AUDIT_PATH=/srv/data/audit.jsonl node /srv/server/account-reset.mjs --user admin --password '新口令'"
 
 sudo -n /usr/local/bin/docker compose up -d
 ```
@@ -100,6 +126,23 @@ sudo -n /usr/local/bin/docker compose up -d
 它会：先备份 → 换 scrypt 哈希 → 踢掉全部会话 → 清空失败计数/锁定 → 写审计。
 弱口令（少于 8 位、纯数字、常见弱口令表）一律拒绝，不会把系统设回一个弱口令。
 本机等价于 `npm run account:reset -- --user admin --password '新口令'`（同样要先停服务）。
+
+重置后验一遍（别只看"脚本说成功了"）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"新口令"}' | head -c 120   # 应有 token
+```
+
+**注意跑之前先修 `data/` 的属主**（见上一节）—— 目录不可写时脚本会在"先备份"
+那一步直接 EACCES 退出，逃生门自己先卡住，那是最不该发生的事。
+
+## 四之三、脚本在容器里跑要注意的两件事
+
+- **用项目镜像**，不要 alpine —— `sh: node: not found`。
+- **别用 `docker run -v $PWD:/srv alpine` 去动 `data/`**：默认用户是 uid 1000(node)，
+  而 `data/` 常常是 root 属主，读写都会 EACCES。要改属主就 `-u 0`，
+  要改文件内容就用项目镜像（它本来就是以 node 身份在读写这同一批文件）。
 
 ## 五、验收（三条 + 两条"是不是新代码"）
 

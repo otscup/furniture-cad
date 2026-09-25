@@ -4794,6 +4794,180 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     const shot40 = await shot(path.join(OUT_DIR, 'app-toolbar-home-logout.png'));
     ok('顶栏截图已留档（首页入口 + 未登录态）', shot40 > 20000, `${shot40} 字节`);
+
+    /**
+     * B41 —— master 的原话："为什么我之前保存的密码用不了"。
+     *
+     * 查下来根因不是口令被改坏，而是**静默失败**：改口令失败后代码只是 setErr()，
+     * 而那个红条渲染在面板**上面第一个 Section** 里 —— 用户填表的视线在下面的
+     * 「修改我的口令」，于是"保存"毫无反应，线上审计 changePassword = 0 条，
+     * 服务端压根没收到过请求。成功时反而看得见（会被踢下线），失败才是无声的。
+     *
+     * 所以这条断言**必须把判定限定在那一节的节点内部**：
+     * 只查"面板里有没有红字"的话，修复前也是绿的 —— 那正是"看着绿的假验收"。
+     */
+    section('B41 修改口令：失败必须就地在段内报错（不许静默）');
+    await send('Page.navigate', { url: APP_URL });
+    await sleep(2400);
+
+    const boot41 = await evalJs(`(async()=>{
+      const K='furniture-cad.auth.token';
+      if(sessionStorage.getItem(K)) return {already:true};
+      const pw='Cad-Str0ng-Pw-2026!x';
+      const post=async(n,b)=>{const r=await fetch('/api/auth/'+n,{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+        return {s:r.status,b:await r.json().catch(()=>({}))};};
+      const rg=await post('register',{username:'owner',password:pw});
+      let tk=rg.b&&rg.b.token;
+      if(!tk){const lg=await post('login',{username:'owner',password:pw}); tk=lg.b&&lg.b.token;}
+      if(!tk) return {fail:true, body:rg.b};
+      sessionStorage.setItem(K,tk);
+      return {logged:true};
+    })()`);
+    ok('B41 自带前置：重新登录（B40 结尾已退出）', boot41.already === true || boot41.logged === true, JSON.stringify(boot41));
+    if (boot41.logged === true) {
+      await send('Page.navigate', { url: APP_URL });
+      await sleep(2600);
+    }
+
+    await activateRightTab('账号');
+    await sleep(420);
+
+    // 「修改我的口令」是 defaultOpen=false，先点开它（折叠着的话根本不存在于 DOM）。
+    // 点完必须**等一帧再读**：同一次求值里同步去读 DOM，React 还没重渲染，
+    // 读到的一定是"没打开"—— 那是探针写错，不是产品没开。
+    const hasBody41 = async () =>
+      (await evalJs(`(()=>{
+        const s=[...document.querySelectorAll('.side-right .sec')]
+          .find(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');});
+        if(!s) return 'no-section';
+        return s.querySelector('.sec-body') ? 'open' : 'closed';
+      })()`)) === 'open';
+
+    const toggled41 = await evalJs(`(()=>{
+      const s=[...document.querySelectorAll('.side-right .sec')]
+        .find(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');});
+      if(!s) return 'no-section';
+      const t=s.querySelector('.sec-toggle');
+      if(!t) return 'no-toggle';
+      t.click(); return 'clicked';
+    })()`);
+    await sleep(420);
+    ok('「修改我的口令」这一节能被打开', toggled41 === 'clicked' && (await hasBody41()) === true, `${toggled41}`);
+
+    // 拿当前口令故意填错：这是最常踩的一种"保存没生效"
+    const exp41 = await evalJs(`(()=>{
+      const secs=[...document.querySelectorAll('.side-right .sec')];
+      const s=secs.find(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');});
+      if(!s) return {err:'no-section'};
+      const body=s.querySelector('.sec-body');
+      const inputs=[...(body?body.querySelectorAll('input[type=password]'):[])];
+      if(inputs.length<2) return {err:'inputs='+inputs.length};
+      const setV=(el,v)=>{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+        d.set.call(el,v); el.dispatchEvent(new Event('input',{bubbles:true}));};
+      setV(inputs[0],'我不是原来的口令-wrong');
+      setV(inputs[1],'Nw8^Kd2#vRz!6b');
+      const btn=[...(body.querySelectorAll('.tb-btn')||[])].find(b=>b.textContent.includes('修改口令'));
+      if(!btn) return {err:'no-btn'};
+      btn.click();
+      return {ok:true, n:inputs.length};
+    })()`);
+    await sleep(1300);
+
+    const inSec41 = await evalJs(`(async()=>{
+      const secs=[...document.querySelectorAll('.side-right .sec')];
+      const s=secs.find(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');});
+      const body=s?s.querySelector('.sec-body'):null;
+      // 只有 **本段内部** 的文本算数 —— 面板顶部的红条不算
+      const localErr = body && body.querySelector('.alert-error');
+      const txt = body? body.textContent.replace(/\\s+/g,' ').trim() : '';
+      // /api/auth/me 不是公开路径，必须带上的那个 token 从 sessionStorage 取 ——
+      // 裸 fetch 一定 401，那测的是"请求有没有头发"，不是"登录还在不在"
+      const tk=(()=>{try{return sessionStorage.getItem('furniture-cad.auth.token')}catch(e){return null}})();
+      const me=await fetch('/api/auth/me', tk?{headers:{Authorization:'Bearer '+tk}}:{});
+      return {
+        localErr: Boolean(localErr),
+        localErrText: localErr? localErr.textContent.replace(/\\s+/g,' ').trim() : '',
+        mentionsNoEffect: /没有改动/.test(txt),
+        inputCleared: (()=>{const i=[...(body?body.querySelectorAll('input[type=password]'):[])];
+          return i.length>=1 && i[0].value==='';})(),
+        meStatus: me.status,
+        panelHasErr: /当前口令不正确/.test(document.querySelector('.side-right').textContent),
+      };
+    })()`);
+
+    ok('填错当前口令后，「修改我的口令」段内出现错误提示（不是只在面板顶部）',
+      inSec41.localErr === true, JSON.stringify(inSec41));
+    ok('段内错误说的是人话（服务端原话在，且明确"没有改动"）',
+      /当前口令不正确/.test(inSec41.localErrText) && inSec41.mentionsNoEffect === true,
+      inSec41.localErrText.slice(0, 160));
+    ok('失败后仍然登录着（失败不该把人踢下线）', inSec41.meStatus === 200, JSON.stringify(inSec41));
+    ok('出错后清空「当前口令」输入框（否则用户会以为改成功了）', inSec41.inputCleared === true, JSON.stringify(inSec41));
+
+    const shot41 = await shot(path.join(OUT_DIR, 'app-change-pw-inplace-error.png'));
+    ok('修改口令失败已留档', shot41 > 20000, `${shot41} 字节`);
+
+    // 正路径：段内要能看见成功，并且被踢下线后拿新口令重新登录
+    const ok41 = await evalJs(`(async()=>{
+      const secs=[...document.querySelectorAll('.side-right .sec')];
+      const s=secs.find(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');});
+      const body=s&&s.querySelector('.sec-body');
+      const inputs=[...(body?body.querySelectorAll('input[type=password]'):[])];
+      if(inputs.length<2) return {err:'inputs'};
+      const setV=(el,v)=>{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+        d.set.call(el,v); el.dispatchEvent(new Event('input',{bubbles:true}));};
+      // B18 建的那个 owner 的口令，是这套验收环境里唯一已知可用的
+      setV(inputs[0],'Cad-Str0ng-Pw-2026!x');
+      setV(inputs[1],'Nw8^Kd2#vRz!6b');
+      const btn=[...(body.querySelectorAll('.tb-btn')||[])].find(b=>b.textContent.includes('修改口令'));
+      if(!btn) return {err:'btn'};
+      btn.click();
+      return {clicked:true};
+    })()`);
+    ok('用正确当前口令点「修改口令」', ok41.clicked === true, JSON.stringify(ok41));
+    await sleep(1100);
+
+    /**
+     * 成功后**不能**断言"这一节里出现已修改提示"。
+     * 改完即踢下线 → `props.token` 变 null → 整段被 `props.token ? … : null` 卸载，
+     * 段内提示随组件一起消失。去测一个结构上永远不会出现的东西，等于写了一条假绿。
+     * 真正要验的是：人被踢下线了，且这条结果**有地方说** —— 提示走的是 toast。
+     */
+    const after41 = await evalJs(`(()=>({
+      token: (()=>{try{return sessionStorage.getItem('furniture-cad.auth.token')}catch(e){return null}})(),
+      secGone: ![...document.querySelectorAll('.side-right .sec')]
+        .some(x=>{const h=x.querySelector('.sec-head');return h&&h.textContent.includes('修改我的口令');}),
+      toast: (()=>{const t=[...document.querySelectorAll('.toasts .toast')]
+        .map(e=>e.textContent.replace(/\\s+/g,' ').trim()).join(' | '); return t;})(),
+    }))()`);
+    ok('改成功后被踢下线（口令变更必须让旧凭据立刻失效）', !after41.token, JSON.stringify(after41));
+    ok('改密码成功后，这一节就地收掉（已退出，留着是骗人）', after41.secGone === true, JSON.stringify(after41));
+    ok('改成功的结论有人告诉用户（toast，不是静默踢下线）',
+      /口令已修改/.test(after41.toast), after41.toast.slice(0, 200));
+
+    const relogin41 = await evalJs(`(async()=>{
+      const r=await fetch('/api/auth/login',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:'owner',password:'Nw8^Kd2#vRz!6b'})});
+      const b=await r.json().catch(()=>({}));
+      if(b&&b.token) sessionStorage.setItem('furniture-cad.auth.token', b.token);
+      return {s:r.status, got:Boolean(b&&b.token)};
+    })()`);
+    ok('新口令真的能登录（改生效了，不是改了个寂寞）', relogin41.got === true, JSON.stringify(relogin41));
+
+    // 收尾把口令改回去：这节之后若再有人按旧口令登录，不该被它拖累
+    const revert41 = await evalJs(`(async()=>{
+      const r=await fetch('/api/auth/login',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:'owner',password:'Nw8^Kd2#vRz!6b'})});
+      const b=await r.json().catch(()=>({}));
+      if(!(b&&b.token)) return {got:false, s:r.status};
+      const up=await fetch('/api/auth/password',{method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+b.token},
+        body:JSON.stringify({currentPassword:'Nw8^Kd2#vRz!6b', newPassword:'Cad-Str0ng-Pw-2026!x'})});
+      return {got:up.status===200, u:up.status};
+    })()`);
+    ok('收尾：把 owner 口令改回验收环境的原值', revert41.got === true, JSON.stringify(revert41));
     /**
      * console error 的判定要分两类。
      *

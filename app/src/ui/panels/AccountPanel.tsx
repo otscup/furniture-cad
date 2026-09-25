@@ -89,6 +89,18 @@ export function AccountPanel(props: {
   const [regPass, setRegPass] = useState('');
   const [codeSent, setCodeSent] = useState<{ expiresInMin: number; sendMode: string } | null>(null);
 
+  /**
+   * 「修改我的口令」这一段的反馈**必须就地显示**。
+   *
+   * 坑：早先这段代码失败后只是 `setErr(...)`，而面板里那个红条渲染在
+   * **上面第一个 Section（账号与安全）** —— 用户滚到下面填表时视线根本不在那儿，
+   * 于是"保存"看起来毫无反应，实际是口令压根没改成功（服务端零请求、审计零记录）。
+   * 成功时用户会被踢下线，反馈才勉强可见；失败则彻底静默 —— 这是最坏的一种失败。
+   * 所以这一段自带一份状态，好了坏了都写在按钮上面。
+   */
+  const [pwMsg, setPwMsg] = useState('');
+  const [pwErr, setPwErr] = useState('');
+
   const say = useCallback((s: string) => setMsg(s), []);
 
   const refresh = useCallback(async () => {
@@ -231,16 +243,20 @@ export function AccountPanel(props: {
    */
 
   const doChangePassword = useCallback(async () => {
-    setErr('');
+    setPwErr('');
+    setPwMsg('');
     const r = await api('/api/auth/password', { method: 'POST', token: props.token, body: { currentPassword: curP, newPassword: newP } });
     if (!r.ok) {
-      setErr(r.error ?? '修改失败');
+      // 就地报错，并且把"当前口令"清空 —— 否则用户会以为改成功了，然后拿新口令去登录
+      setPwErr(r.error ?? '修改失败');
+      setCurP('');
       return;
     }
     setCurP('');
     setNewP('');
     props.setToken(null);
     saveToken(null);
+    setPwMsg('口令已修改，所有会话已失效，请重新登录');
     say('口令已修改，所有会话已失效，请重新登录');
     props.onToast?.('ok', '口令已修改，请重新登录');
     await refresh();
@@ -411,6 +427,8 @@ export function AccountPanel(props: {
           <Row label="新口令">
             <input className="input" type="password" value={newP} onChange={(e) => setNewP(e.target.value)} autoComplete="new-password" />
           </Row>
+          {pwErr ? <div className="alert alert-error">{pwErr}<br />口令没有改动，请照上面提示重来。</div> : null}
+          {pwMsg ? <div className="alert alert-info">{pwMsg}</div> : null}
           <button type="button" className="tb-btn" disabled={!curP || !newP} onClick={() => void doChangePassword()}>
             修改口令
           </button>

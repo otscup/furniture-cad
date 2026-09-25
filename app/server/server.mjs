@@ -552,7 +552,19 @@ async function handleApi(req, res, pathname) {
       const r = auth.setStatus(id, body.status, actor);
       if (!r.ok) return json(res, 400, { ok: false, error: r.error });
     }
+    /**
+     * 重置口令同样要 canManage。
+     *
+     * 这条不能只靠 resetPassword 内部自觉：`actor` 只用来写审计，不代表这次请求
+     * 有权限动别人。缺了这层，任何一条普通账号（哪怕 role=viewer）只要带着 token
+     * 就能 `PATCH /api/account/account {id:"<owner>", newPassword:"…"}` 接管整个系统。
+     * role/status 那两个分支有 setRole/setStatus 内部兜底，resetPassword 没有 ——
+     * 所以兜底只能加在这里。
+     */
     if (body.newPassword !== undefined) {
+      if (!gate.account || !ROLES[gate.account.role]?.canManage) {
+        return json(res, 403, { ok: false, error: '只有所有者/管理员能重置别人的口令', code: 'FORBIDDEN' });
+      }
       const r = auth.resetPassword(id, body.newPassword, actor);
       if (!r.ok) return json(res, 400, { ok: false, error: r.error });
     }

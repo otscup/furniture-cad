@@ -70,6 +70,37 @@ sudo -n /usr/local/bin/docker compose up -d
 `validating …: networks must be a mapping`，构建第一步就被拒。
 已在 `app/docker-compose.yml` 里删掉该键并写明原因；**新增 override 兼容性时不要再留空键**。
 
+## 四之二、忘记口令的逃生门（离线重置）
+
+只有 owner 一个账号时，**忘了口令 = 永久锁死**：自助注册已关、没有邮箱找回、
+能重置口令的只有能登录的人，而能登录的人正好忘了口令。
+
+`app/server/account-reset.mjs` 就是为此存在的。**先停服务再跑**，
+它绕过 HTTP 直接改账号库文件：
+
+```bash
+sudo -n /usr/local/bin/docker compose down
+cd /volume1/docker/furniture-cad
+sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine sh -c \
+  "cp /srv/data/accounts.json /srv/data/accounts.json.bak"   # 先备份
+
+# 先看有哪些账号（只读）
+sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine \
+  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json APP_AUDIT_PATH=/srv/data/audit.jsonl \
+  node /srv/server/account-reset.mjs --list"
+
+# 重置
+sudo -n /usr/local/bin/docker run --rm -v $PWD:/srv alpine \
+  sh -c "cd /srv && APP_ACCOUNTS_PATH=/srv/data/accounts.json APP_AUDIT_PATH=/srv/data/audit.jsonl \
+  node /srv/server/account-reset.mjs --user admin --password '新口令'"
+
+sudo -n /usr/local/bin/docker compose up -d
+```
+
+它会：先备份 → 换 scrypt 哈希 → 踢掉全部会话 → 清空失败计数/锁定 → 写审计。
+弱口令（少于 8 位、纯数字、常见弱口令表）一律拒绝，不会把系统设回一个弱口令。
+本机等价于 `npm run account:reset -- --user admin --password '新口令'`（同样要先停服务）。
+
 ## 五、验收（三条 + 两条"是不是新代码"）
 
 ```bash

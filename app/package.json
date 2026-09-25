@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "server": "node server/server.mjs",
+    "account:reset": "node server/account-reset.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",

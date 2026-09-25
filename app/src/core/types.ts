@@ -83,11 +83,35 @@ export interface DrawerSpec {
   boxHeightDeduct: number;
 }
 
+/**
+ * 嵌入式电器格（洗衣机柜等）—— "预留洞口 + 上下分体"的语义表达。
+ *
+ * 为什么洞口尺寸是**洞**而不是机器：木工下单收到的是"这里留 650×850×600 的洞"，
+ * 不是"这里放一台某型号洗衣机"。机器尺寸 + 安装余量在用户嘴里合成一个数，
+ * 语义层直接收这个合成结果（openingWidth/Height/Depth），生成器只做
+ * "洞口 ≤ 分区净空"的校验，不替用户猜余量。
+ */
+export interface ApplianceSpec {
+  /** 电器名（洗衣机 / 烘干机 / 嵌入式烤箱…），进甲购件清单与图面标注 */
+  name: string;
+  /** 洞口净空：宽（X）/ 高（Z，从柜内底到过梁板下表面）/ 深（Y，从前脸往里） */
+  openingWidth: number;
+  openingHeight: number;
+  openingDepth: number;
+  /**
+   * 洞口上方的抽屉数（上下分体的"上"）。0 = 洞口以上是开放空腔。
+   * 派生：过梁板（洞口顶板）+ 上排抽屉全套，占用的净高 = 内空高 - 洞口高 - 板厚。
+   */
+  topDrawers: number;
+}
+
 export interface UnitSpec {
   id: string;
-  kind: 'drawerBank' | 'hanging' | 'shelves' | 'open';
+  kind: 'drawerBank' | 'hanging' | 'shelves' | 'open' | 'appliance';
   requestedWidth: number;
   nickname?: string;
+  /** 仅 kind='appliance'：洞口与上下分体定义（缺省值由 docFactory.makeUnit 显式补齐） */
+  appliance?: ApplianceSpec;
   drawers?: DrawerSpec;
   shelves?: {
     count: number;
@@ -138,9 +162,21 @@ export interface UnitSpec {
 }
 
 export interface CabinetLayout {
-  type: 'row';
+  /**
+   * 'row' = 单面柜（分区左右并排，唯一的背板在背面）；
+   * 'double' = 双面柜（岛台）：正面 + 背面两排分区背靠背，中间一块共用中板，
+   * **没有背板**（中板就是两排共用的"背"）。
+   */
+  type: 'row' | 'double';
   widthMode: 'fit_total' | 'fit_units';
   units: UnitSpec[];
+  /**
+   * 仅 type='double'：背面分区（从左到右，朝 -Y）。
+   * row 柜带 backUnits 是自相矛盾的模型 —— 校验器报 ERROR，不静默忽略。
+   * 排深的语义固定为**前后对半**（中板居中）：不留"前深后浅"的自由度，
+   * 真要偏置的岛台是另一档柜型，等真实需求出现再加字段。
+   */
+  backUnits?: UnitSpec[];
 }
 
 export interface Cabinet {
@@ -339,6 +375,26 @@ export interface CabinetDerived {
   nets: number[];
   unitX0: number[];
   shelfDepth: number;
+  /**
+   * 双面柜（type='double'）的派生骨架增量。row 柜为 undefined。
+   * 前排占用 Y ∈ [midY0+midT, D]（前脸朝 +Y），后排占 Y ∈ [0, midY0]。
+   */
+  double?: {
+    /** 前排箱体深（从前脸到中板前表面） */
+    frontRowDepth: number;
+    /** 后排箱体深（从中板后表面到柜背） */
+    backRowDepth: number;
+    /** 中板厚（= boardT） */
+    midT: number;
+    /** 中板前表面所在的 Y（= backRowDepth） */
+    midY0: number;
+    /** 后排净宽分配与起点（与前排同算法，独立分配） */
+    backNets: number[];
+    backUnitX0: number[];
+    backNetTotal: number;
+    /** 后排层板深（后排箱体深 - shelfFrontClearance，无槽） */
+    backShelfDepth: number;
+  };
 }
 
 export interface ProjectGeometry {

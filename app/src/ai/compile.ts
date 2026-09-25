@@ -142,10 +142,20 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number })
         rodHeight: it.rodHeight === undefined ? undefined : Number(it.rodHeight),
         doors: doorIntentOf(it.doorCount),
         takenIds: taken,
+        appliance:
+          kind === 'appliance'
+            ? {
+                name: it.applianceName === undefined ? undefined : String(it.applianceName),
+                openingWidth: it.openingWidth === undefined ? undefined : Number(it.openingWidth),
+                openingHeight: it.openingHeight === undefined ? undefined : Number(it.openingHeight),
+                openingDepth: it.openingDepth === undefined ? undefined : Number(it.openingDepth),
+                topDrawers: it.topDrawers === undefined ? undefined : Number(it.topDrawers),
+              }
+            : undefined,
       });
     } catch (e) {
       // makeUnit 对未知 kind 抛错 —— 转成"哪一格说错了"的人话，别让整份计划挂在一个字段名上
-      return `units 第 ${i + 1} 项的分区类型「${kind}」本系统不认识（可用：drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区）`;
+      return `units 第 ${i + 1} 项的分区类型「${kind}」本系统不认识（可用：drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区 / appliance 电器格）`;
     }
     taken.add(unit.id);
     out.push(unit);
@@ -413,7 +423,11 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         // count 在 hanging 语义下没有意义，静默忽略会让人以为生效了
         return { ok: false, error: '挂衣区请用 rodHeight 指定挂衣杆高度，不要用 count（count 只用于抽屉区/层板区）' };
       }
-      const taken = cab.layout.units.map((u) => u.id);
+      if (kind === 'appliance' && p.doorCount !== undefined && Number(p.doorCount) !== 0) {
+        return { ok: false, error: '电器格的洞口和门在同一张脸上互相冲突 —— 不要给电器格装门（机器露前脸是常规做法）' };
+      }
+      const taken = new Set(cab.layout.units.map((u) => u.id));
+      if (cab.layout.backUnits) for (const u of cab.layout.backUnits) taken.add(u.id);
       const unit = makeUnit({
         id: nextId('unit', taken),
         kind,
@@ -424,6 +438,16 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         count: p.count === undefined ? undefined : Number(p.count),
         rodHeight: p.rodHeight === undefined ? undefined : Number(p.rodHeight),
         doors: doorIntentOf(p.doorCount),
+        appliance:
+          kind === 'appliance'
+            ? {
+                name: p.applianceName === undefined ? undefined : String(p.applianceName),
+                openingWidth: p.openingWidth === undefined ? undefined : Number(p.openingWidth),
+                openingHeight: p.openingHeight === undefined ? undefined : Number(p.openingHeight),
+                openingDepth: p.openingDepth === undefined ? undefined : Number(p.openingDepth),
+                topDrawers: p.topDrawers === undefined ? undefined : Number(p.topDrawers),
+              }
+            : undefined,
       });
       return { ok: true, command: CMD.addUnit(cab.id, cab.name, unit, src), summary: `「${cab.name}」新增分区 ${unit.nickname ?? unit.id}` };
     }
@@ -483,6 +507,15 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         if (typeof built === 'string') return { ok: false, error: built };
         units = built;
       }
+      // 背面分区（岛台）：给了就建双面柜。排深 = (总深 - 板厚) / 2，与派生骨架同口径。
+      let backUnits: UnitSpec[] | undefined;
+      if (p.backUnits !== undefined) {
+        const boardT = rules.materials[base.boardMaterial]?.thickness ?? 18;
+        const rowDepth = Math.floor((depth - boardT) / 2);
+        const built = unitsFromIntents(p.backUnits, { rules, depth: rowDepth });
+        if (typeof built === 'string') return { ok: false, error: built.replace('units 第', 'backUnits（背面分区）第') };
+        backUnits = built;
+      }
 
       const cab = buildCabinet({
         name,
@@ -492,6 +525,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         rules,
         params: { width, height, depth },
         units,
+        backUnits,
         takenIds: project.cabinets.map((c) => c.id),
       });
 

@@ -104,6 +104,12 @@ export const UNIT_INTENT_ITEM = {
   rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm' },
   doorCount: { type: 'number', min: 0, max: 6 },
   nickname: { type: 'string', max: MAX_STRING },
+  // ── 电器格（洗衣机柜等）："预留洞口 + 上下分体" ──
+  applianceName: { type: 'string', max: 20 },
+  openingWidth: { type: 'number', min: 200, max: 2000, unit: 'mm' },
+  openingHeight: { type: 'number', min: 200, max: 3000, unit: 'mm' },
+  openingDepth: { type: 'number', min: 200, max: 1200, unit: 'mm' },
+  topDrawers: { type: 'number', min: 0, max: 6 },
 };
 
 export const UNIT_INTENT_DOC = {
@@ -216,15 +222,20 @@ export const ACTIONS = {
     label: '新增一个分区',
     target: 'cabinet',
     params: {
-      kind: { type: 'enum', from: 'units.kind', desc: 'drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区' },
+      kind: { type: 'enum', from: 'units.kind', desc: 'drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区 / appliance 电器格（洗衣机位）' },
       requestedWidth: { type: 'number', min: 100, max: 4000, unit: 'mm', desc: '请求净宽' },
       nickname: { type: 'string', max: MAX_STRING, optional: true },
       count: { type: 'number', min: 1, max: 12, desc: '该分区的抽屉数 / 层板数（按 kind 解释）' },
       rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', desc: '仅 hanging：挂衣杆离柜内底高度' },
       doorCount: { type: 'number', min: 0, max: 6, desc: '要不要门、几扇：0 = 开放格，2 = 对开门。不给就是不做门' },
+      applianceName: { type: 'string', max: 20, desc: '仅 appliance：电器名（洗衣机/烘干机…）' },
+      openingWidth: { type: 'number', min: 200, max: 2000, unit: 'mm', desc: '仅 appliance：洞口净空宽（机器尺寸+安装余量）' },
+      openingHeight: { type: 'number', min: 200, max: 3000, unit: 'mm', desc: '仅 appliance：洞口净空高' },
+      openingDepth: { type: 'number', min: 200, max: 1200, unit: 'mm', desc: '仅 appliance：洞口净空深' },
+      topDrawers: { type: 'number', min: 0, max: 6, desc: '仅 appliance：洞口上面的抽屉数（上下分体），0 = 开放' },
     },
     required: ['kind', 'requestedWidth'],
-    detail: '新增分区会改变柜体总宽分配。kind=shelves/drawerBank 时 count 表示层板/抽屉数量；kind=hanging 时给 rodHeight。想要"带门的格子"要显式给 doorCount，否则建出来是开放格。',
+    detail: '新增分区会改变柜体总宽分配。kind=shelves/drawerBank 时 count 表示层板/抽屉数量；kind=hanging 时给 rodHeight；kind=appliance 时给洞口三尺寸 + topDrawers。想要"带门的格子"要显式给 doorCount，否则建出来是开放格。',
   },
   'cabinet.removeUnit': {
     label: '删除一个分区',
@@ -261,11 +272,14 @@ export const ACTIONS = {
       atX: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 X（省略 = 按房间内已有柜体自动排开）' },
       atY: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 Y' },
       units: UNIT_INTENT_DOC,
+      backUnits: { ...UNIT_INTENT_DOC, desc: '背面分区（从左到右）。给了就建**双面柜（岛台）**：前后两排背靠背、共用中板、没有背板。岛台/吧台这类两面临走的柜子才用' },
     },
     required: ['name'],
     detail:
       '未给尺寸时用规则集默认值。' +
       '**描述内部结构就给 units**（从左到右一列）：每项给 kind + width + 按需给 count(抽屉/层板数) / rodHeight(挂衣区) / doorCount(门扇数，0=开放格)。' +
+      '**洗衣机柜/嵌入式电器用 kind:"appliance"**：给 openingWidth / openingHeight / openingDepth（要留的洞口净空 = 机器尺寸 + 安装余量）和 topDrawers（洞口上面的抽屉数，0 = 洞口以上开放）。' +
+      '**岛台给 backUnits**（背面分区，结构同 units），不给 backUnits 就是普通单面柜。' +
       'width 是**期望值**，总和不必等于柜宽 —— 系统按比例摊到总宽上，不要自己去做加法。' +
       '没给 units 时才会用默认三分区：不要先 create 再 removeUnit 去拆它。',
   },
@@ -520,6 +534,7 @@ function same(a, b) {
  */
 export function unitIntentsSemanticError(units) {
   if (!Array.isArray(units)) return null;
+  const APPLIANCE_FIELDS = ['applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
   for (let i = 0; i < units.length; i++) {
     const u = units[i];
     if (!isPlainObject(u)) continue; // 结构问题由 checkParam 管，这里只看语义
@@ -532,6 +547,16 @@ export function unitIntentsSemanticError(units) {
     }
     if (u.kind === 'open' && u.count !== undefined) {
       return `${nth} 给了 count，但空区（open）什么都不放 —— 想要几块层板请用 shelves 并给 count`;
+    }
+    if (u.kind === 'appliance' && u.count !== undefined) {
+      return `${nth} 给了 count，但电器格没有"层板数/抽屉数"这个概念 —— 洞口上面的抽屉数请用 topDrawers，洞口尺寸用 openingWidth / openingHeight / openingDepth`;
+    }
+    const gotApplianceField = APPLIANCE_FIELDS.some((k) => u[k] !== undefined);
+    if (u.kind !== 'appliance' && gotApplianceField) {
+      return `${nth} 给了洞口参数（${APPLIANCE_FIELDS.filter((k) => u[k] !== undefined).join('、')}），但只有电器格（kind: "appliance"）预留洞口 —— 洗衣机柜、嵌入式烤箱这类才用得上`;
+    }
+    if (u.kind === 'appliance' && u.doorCount !== undefined && u.doorCount !== 0) {
+      return `${nth} 给了 doorCount，但电器格的洞口和门在同一张脸上互相冲突 —— 机器露前脸是常规做法，不要给电器格装门`;
     }
   }
   return null;
@@ -548,8 +573,27 @@ function crossValidate(actionName, params) {
     if (v < r.min || v > r.max) return `${key} = ${v} 超出允许区间 ${r.min}~${r.max}`;
     return null;
   }
-  if (actionName === 'cabinet.create' && Array.isArray(params.units)) {
-    return unitIntentsSemanticError(params.units);
+  if (actionName === 'cabinet.create') {
+    if (Array.isArray(params.units)) {
+      const bad = unitIntentsSemanticError(params.units);
+      if (bad) return bad;
+    }
+    if (Array.isArray(params.backUnits)) {
+      const bad = unitIntentsSemanticError(params.backUnits);
+      if (bad) return bad.replace('units 第', 'backUnits（背面分区）第');
+    }
+    return null;
+  }
+  if (actionName === 'cabinet.addUnit') {
+    const APPLIANCE_ONLY = ['applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
+    const got = APPLIANCE_ONLY.filter((k) => params[k] !== undefined);
+    if (got.length > 0 && params.kind !== 'appliance') {
+      return `给了洞口参数（${got.join('、')}），但 kind 是 "${params.kind}" —— 只有电器格（kind: "appliance"）预留洞口`;
+    }
+    if (params.kind === 'appliance' && params.doorCount !== undefined && params.doorCount !== 0) {
+      return '电器格的洞口和门在同一张脸上互相冲突 —— 不要给电器格装门（机器露前脸是常规做法）';
+    }
+    return null;
   }
   return null;
 }
@@ -566,7 +610,7 @@ function enumFromSource(from, ctx) {
     case 'rules.materials.back':
       return ctx.backMaterials ?? [];
     case 'units.kind':
-      return ['drawerBank', 'hanging', 'shelves', 'open'];
+      return ['drawerBank', 'hanging', 'shelves', 'open', 'appliance'];
     default:
       return [];
   }

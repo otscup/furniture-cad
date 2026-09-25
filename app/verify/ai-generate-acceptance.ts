@@ -150,7 +150,12 @@ const badDoor = validate([
 ok('A9 门扇数超上限 → 拒', badDoor.ok === false, JSON.stringify(badDoor.rejected));
 
 ok('A10 每一项字段都登记在册（不许出现没有校验的字段）',
-  Object.keys(UNIT_INTENT_ITEM).every((k) => ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'nickname'].includes(k)),
+  (() => {
+    // 电器格五字段加入后清单变长 —— 断言的意图不变：字段清单封闭，且每个都有类型声明
+    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
+    const keys = Object.keys(UNIT_INTENT_ITEM);
+    return keys.every((k) => KNOWN.includes(k)) && keys.every((k) => UNIT_INTENT_ITEM[k] && typeof UNIT_INTENT_ITEM[k].type === 'string');
+  })(),
   Object.keys(UNIT_INTENT_ITEM).join(','));
 
 const addUnitDoor = validate([

@@ -1,4 +1,5 @@
 import type {
+  ApplianceSpec,
   Cabinet,
   CabinetParams,
   DrawerSpec,
@@ -9,7 +10,7 @@ import type {
   Wall,
 } from './types.ts';
 import { nextId } from './ids.ts';
-import { findCabinetTemplate, resolveTemplateUnitWidths } from './templates.ts';
+import { findCabinetTemplate, resolveTemplateUnitWidths, resolveTemplateUnitWidthList } from './templates.ts';
 
 /**
  * 文档工厂 —— 所有"新对象"的唯一构造点。
@@ -107,6 +108,8 @@ export function createCabinet(opts: {
   rotation?: number;
   params?: Partial<CabinetParams>;
   units?: UnitSpec[];
+  /** 双面柜（岛台）的背面分区。给出即建 type='double'；row 柜不传 */
+  backUnits?: UnitSpec[];
   rules: RuleSet;
   takenIds?: Iterable<string>;
 }): Cabinet {
@@ -117,13 +120,31 @@ export function createCabinet(opts: {
     backPanel: { ...base.backPanel, ...(opts.params?.backPanel ?? {}) },
   };
   const units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules);
+  /**
+   * 背面分区的 id 兜底：板件 id 是 `P_{cab}_{unit.id}_…` 拼出来的，
+   * 前后排撞 id = 两块不同的板共用一条清单记录（生产下错料）。
+   * 与 nextId 的 takenIds 铁条目同源：批量造对象先建 takenIds Set。
+   */
+  let backUnits: UnitSpec[] | undefined;
+  if (opts.backUnits && opts.backUnits.length > 0) {
+    const taken = new Set<string>(units.map((u) => u.id));
+    backUnits = opts.backUnits.map((u) => {
+      if (!taken.has(u.id)) {
+        taken.add(u.id);
+        return u;
+      }
+      const fixed = { ...u, id: nextId('unit', taken) };
+      taken.add(fixed.id);
+      return fixed;
+    });
+  }
   return {
     id: opts.id ?? nextId('cab', opts.takenIds ?? []),
     name: opts.name,
     roomId: opts.roomId,
     placement: { x: Math.round(opts.x), y: Math.round(opts.y), rotation: opts.rotation ?? 0 },
     params,
-    layout: { type: 'row', widthMode: 'fit_total', units },
+    layout: { type: backUnits ? 'double' : 'row', widthMode: 'fit_total', units, ...(backUnits ? { backUnits } : {}) },
   };
 }
 
@@ -163,8 +184,33 @@ export function createCabinetFromTemplate(opts: {
             rodHeight: u.rodHeight,
             tilt: u.tilt,
             doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
+            appliance: u.appliance,
           })
         );
+  // 双面模板：背面分区跟着构造，id 从前排之后接着排（takenIds 累积，撞 id 是清单事故）
+  let backUnits: UnitSpec[] | undefined;
+  if (tpl.backUnits && tpl.backUnits.length > 0) {
+    const backWidths = resolveTemplateUnitWidthList(tpl.backUnits, tpl.params.width);
+    const taken = new Set(units.map((u) => u.id));
+    backUnits = tpl.backUnits.map((u, i) => {
+      const unit = makeUnit({
+        id: nextId('unit', taken),
+        kind: u.kind,
+        requestedWidth: backWidths[i]!,
+        nickname: u.nickname,
+        rules: opts.rules,
+        // 双面柜每排箱体深 = (总深 - 板厚) / 2（中板居中，与 layout.ts 派生一致）
+        depth: Math.floor((tpl.params.depth - (opts.rules.materials[defaultCabinetParams(opts.rules).boardMaterial]?.thickness ?? 18)) / 2),
+        count: u.count,
+        rodHeight: u.rodHeight,
+        tilt: u.tilt,
+        doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
+        appliance: u.appliance,
+      });
+      taken.add(unit.id);
+      return unit;
+    });
+  }
   // 模板外形参数覆盖默认值；bodyLift 只有显式给了才覆盖（undefined 不许抹掉默认 80）
   const tplParams: Partial<CabinetParams> = {
     width: tpl.params.width,
@@ -183,6 +229,7 @@ export function createCabinetFromTemplate(opts: {
     takenIds: opts.takenIds,
     params: { ...tplParams, ...opts.params },
     units,
+    backUnits,
   });
 }
 
@@ -227,6 +274,17 @@ export function makeUnit(opts: {
     /** 门板材质 ID（引用 RuleSet.materials）；缺省 = 规则集默认门板材质 */
     material?: string;
   };
+  /**
+   * 仅 kind='appliance'：洞口与上下分体。**缺省值在这里显式补齐**
+   * （洗衣机 650×850×600 洞 + 上面两抽），不留"字段缺失 = 状态不明"。
+   */
+  appliance?: {
+    name?: string;
+    openingWidth?: number;
+    openingHeight?: number;
+    openingDepth?: number;
+    topDrawers?: number;
+  };
 }): UnitSpec {
   const id = opts.id ?? nextId('unit', opts.takenIds ?? []);
   const base = { id, kind: opts.kind, requestedWidth: Math.round(opts.requestedWidth) };
@@ -254,6 +312,25 @@ export function makeUnit(opts: {
         shelves: { count: 1, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       };
       break;
+    case 'appliance': {
+      const a = opts.appliance ?? {};
+      const openingDepth = Math.round(a.openingDepth ?? Math.min(opts.depth ?? 600, 600));
+      const spec: ApplianceSpec = {
+        name: (a.name ?? '洗衣机').slice(0, 20),
+        openingWidth: clampInt(a.openingWidth ?? 650, 200, 2000),
+        openingHeight: clampInt(a.openingHeight ?? 850, 200, 3000),
+        openingDepth,
+        topDrawers: clampInt(a.topDrawers ?? 2, 0, 6),
+      };
+      unit = { ...base, nickname, appliance: spec };
+      // 上下分体的"上"：洞口上面一排抽屉 —— 抽屉子规格直接挂在同分区上，
+      // 生成器按"洞口以上净高"派生它们，清单/视图/恒等式同源。
+      if (spec.topDrawers > 0) {
+        const d = defaultDrawerSpec(opts.rules, opts.depth ?? 600);
+        unit.drawers = { ...d, count: spec.topDrawers };
+      }
+      break;
+    }
     case 'open':
       // 空区：什么都不带。是合法状态，不是"忘了填"
       unit = { ...base, nickname };
@@ -288,6 +365,8 @@ export function defaultNickname(kind: UnitSpec['kind']): string {  switch (kind)
       return '挂衣';
     case 'shelves':
       return '层板';
+    case 'appliance':
+      return '电器格';
     case 'open':
       return '空区';
     default:

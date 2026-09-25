@@ -14,6 +14,70 @@ export function computeCabinetLayout(cab: Cabinet, rules: RuleSet): CabinetDeriv
   const bodyH = p.height - p.bodyLift;
   const innerW = p.width - 2 * boardT;
   const innerH = bodyH - 2 * boardT;
+
+  /**
+   * 双面柜（岛台）：backUnits 存在才按双面派生。
+   * type='double' 但 backUnits 缺失 = 自相矛盾的模型 —— 这里**不猜**，
+   * 按 row 派生让柜体保持可画，由校验器报 ERROR 说清差在哪。
+   */
+  const isDouble = cab.layout.type === 'double' && Array.isArray(cab.layout.backUnits) && cab.layout.backUnits.length > 0;
+
+  if (isDouble) {
+    // 排深：总深扣掉中板后前后对半；D-t 为奇数时前排（前脸）多 1mm，
+    // 保证 frontRowDepth + midT + backRowDepth === depth 严格成立。
+    const rest = p.depth - boardT;
+    const backRowDepth = Math.floor(rest / 2);
+    const frontRowDepth = rest - backRowDepth;
+    const midY0 = backRowDepth;
+
+    const backUnits = cab.layout.backUnits!;
+    const m = backUnits.length;
+    const backNetTotal = innerW - (m - 1) * boardT;
+    const backNets = allocateWidths(backNetTotal, backUnits.map((u) => u.requestedWidth));
+
+    const backUnitX0: number[] = [];
+    let bx = boardT;
+    for (let i = 0; i < m; i++) {
+      backUnitX0.push(bx);
+      bx += backNets[i];
+      if (i < m - 1) bx += boardT;
+    }
+
+    const n = cab.layout.units.length;
+    const netTotal = innerW - (n - 1) * boardT;
+    const nets = allocateWidths(netTotal, cab.layout.units.map((u) => u.requestedWidth));
+    const unitX0: number[] = [];
+    let x = boardT;
+    for (let i = 0; i < n; i++) {
+      unitX0.push(x);
+      x += nets[i];
+      if (i < n - 1) x += boardT;
+    }
+
+    return {
+      boardT,
+      backT,
+      bodyH,
+      innerW,
+      innerH,
+      netTotal,
+      nets,
+      unitX0,
+      // 双面柜没有背板槽：层板/过梁板直接贴到前脸让位为止（后排对称）
+      shelfDepth: frontRowDepth - p.shelfFrontClearance,
+      double: {
+        frontRowDepth,
+        backRowDepth,
+        midT: boardT,
+        midY0,
+        backNets,
+        backUnitX0,
+        backNetTotal,
+        backShelfDepth: backRowDepth - p.shelfFrontClearance,
+      },
+    };
+  }
+
   const n = cab.layout.units.length;
   const netTotal = innerW - (n - 1) * boardT;
   const nets = allocateWidths(netTotal, cab.layout.units.map((u) => u.requestedWidth));

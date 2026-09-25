@@ -179,12 +179,21 @@ const WRITABLE: Record<string, RegExp[]> = {
    */
   'cabinet.moveBatch': [/^cabinets\[\d+\]\.placement\.(x|y)$/],
   'cabinet.layout': [
+    /^layout\.type$/,
     /^layout\.widthMode$/,
     /^layout\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
     /^layout\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
     /^layout\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
     /^layout\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
+    /^layout\.units\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
+    // 双面柜（岛台）的背面排 —— 与前排同一套旋钮，同一条白名单管两排
+    /^layout\.backUnits\[\d+\]\.(requestedWidth|nickname|kind)$/,
+    /^layout\.backUnits\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
+    /^layout\.backUnits\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
+    /^layout\.backUnits\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
+    /^layout\.backUnits\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
+    /^layout\.backUnits\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
   ],
   'wall.move': [/^(start|end)\.[xy]$/],
   'wall.update': [/^thickness$/, /^height$/, /^name$/],
@@ -236,7 +245,7 @@ export function getByPath(root: unknown, path: string): unknown {
  * 只放**可选 authored 字段**：它们在类型上是 `?:`，首次赋值是正常业务操作。
  * 其余一律拒绝创建 —— 这是"派生字段永不写入模型"的最后一道物理防线。
  */
-const OPTIONAL_AUTHORED = new Set(['nickname']);
+const OPTIONAL_AUTHORED = new Set(['nickname', 'type', 'backUnits', 'appliance', 'ledStrip', 'tilt', 'hingeSide', 'material']);
 
 function setByPath(root: unknown, path: string, value: unknown): void {
   const toks = parsePath(path);
@@ -390,6 +399,8 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       const expect = forward ? se.from : se.to;
       if (cur.length === expect.length && cur.every((id, i) => id === expect[i])) {
         cab.layout.units.reverse();
+        // 双面柜：背面排跟着镜像 —— 只翻前排不翻后排，"镜像"就是假的
+        if (Array.isArray(cab.layout.backUnits)) cab.layout.backUnits.reverse();
       }
       return;
     }

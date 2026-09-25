@@ -92,8 +92,16 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
   // 顶板 / 底板（长 innerW，夹在两块侧板之间）
   push('top', `${cab.id}_TOP`, '顶板', t, p.width - t, 0, p.depth, zTop - t, zTop, mat);
   push('bottom', `${cab.id}_BOT`, '底板', t, p.width - t, 0, p.depth, zBot, zBot + t, mat);
-  // 背板（贴背面，全内宽全箱高）
-  push('back', `${cab.id}_BACK`, '背板', t, p.width - t, 0, L.backT, zBot, zTop, p.backPanel.material);
+  // 背板（贴背面，全内宽全箱高）；双面柜没有背板 —— 中板 + 后踢脚替代
+  const DB = L.double;
+  if (DB) {
+    push('back', `${cab.id}_MID`, '共用中板（双面）', t, p.width - t, DB.midY0, DB.midY0 + DB.midT, zBot, zTop, mat);
+    if (p.bodyLift > 0) {
+      push('plinth', `${cab.id}_KICKB`, '踢脚板-后', t, p.width - t, 0, t, 0, p.bodyLift, mat);
+    }
+  } else {
+    push('back', `${cab.id}_BACK`, '背板', t, p.width - t, 0, L.backT, zBot, zTop, p.backPanel.material);
+  }
   // 踢脚板（前脸底部，贴前边）
   if (p.bodyLift > 0) {
     push('plinth', `${cab.id}_KICK`, '踢脚板', t, p.width - t, p.depth - t, p.depth, 0, p.bodyLift, mat);
@@ -102,61 +110,110 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
   // 分区间中立板（全 innerH）
   for (let i = 0; i < cab.layout.units.length - 1; i++) {
     const x0 = L.unitX0[i] + L.nets[i];
-    push('divider', `${cab.id}_DIV${i + 1}`, `中立板${i + 1}`, x0, x0 + t, 0, p.depth, zBot + t, zTop - t, mat);
+    push('divider', `${cab.id}_DIV${i + 1}`, `中立板${i + 1}`, x0, x0 + t, DB ? DB.midY0 + DB.midT : 0, p.depth, zBot + t, zTop - t, mat);
+  }
+  if (DB) {
+    cab.layout.backUnits!.forEach((_: UnitSpec, i: number) => {
+      const x0 = DB.backUnitX0[i] + DB.backNets[i];
+      push('divider', `${cab.id}_BDIV${i + 1}`, `中立板-后${i + 1}`, x0, x0 + t, 0, DB.midY0, zBot + t, zTop - t, mat);
+    });
   }
 
-  // 各分区：层板 / 门 / 抽屉面 / 挂衣杆
-  cab.layout.units.forEach((u: UnitSpec, i: number) => {
-    const x0 = L.unitX0[i];
-    const netW = L.nets[i];
-    const innerBottom = zBot + t; // 柜内底（底板上表面）
+  /** 一排分区的 3D 表达：层板/门/抽的 Y 区间由"这排的脸在哪"决定 */
+  const drawRow = (
+    units: UnitSpec[],
+    netsRow: number[],
+    x0s: number[],
+    shelfY0: number,
+    shelfY1: number,
+    /** 门/抽面占据的 Y 区间（前排 = [depth, depth+t]，后排 = [-t, 0]） */
+    faceY0: number,
+    faceY1: number,
+    /** 这排里电器格洞口之上的 Z 起点偏移（非电器格恒 0） */
+    side: 'front' | 'back'
+  ): void => {
+    units.forEach((u: UnitSpec, i: number) => {
+      const x0 = x0s[i];
+      const netW = netsRow[i];
+      const innerBottom = zBot + t; // 柜内底（底板上表面）
+      const netH = u.kind === 'appliance' && u.appliance ? L.innerH - u.appliance.openingHeight - t : L.innerH;
+      const zOffset = u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0;
 
-    if (u.shelves && u.shelves.count > 0) {
-      const sw = netW - 2 * u.shelves.gapPerSide;
-      const sx0 = x0 + u.shelves.gapPerSide;
-      equalSpacing(L.innerH, u.shelves.count).forEach((pos, k) => {
-        // pos = 距柜内底的层板位置（与 Panel 清单同一 equalSpacing）
-        push('shelf', `${cab.id}_${u.id}_SH${k + 1}`, `层板-${k + 1}`,
-          sx0, sx0 + sw, L.backT, L.backT + L.shelfDepth,
-          innerBottom + pos - t / 2, innerBottom + pos + t / 2, mat);
-      });
-    }
+      if (u.shelves && u.shelves.count > 0) {
+        const sw = netW - 2 * u.shelves.gapPerSide;
+        const sx0 = x0 + u.shelves.gapPerSide;
+        equalSpacing(L.innerH, u.shelves.count).forEach((pos, k) => {
+          // pos = 距柜内底的层板位置（与 Panel 清单同一 equalSpacing）
+          push('shelf', `${cab.id}_${u.id}_SH${k + 1}`, `层板-${k + 1}`,
+            sx0, sx0 + sw, shelfY0, shelfY1,
+            innerBottom + pos - t / 2, innerBottom + pos + t / 2, mat);
+        });
+      }
 
-    if (u.doors) {
-      const dr = u.doors;
-      const widths = doorWidths(u, netW, rules);
-      const doorH = L.innerH - 2 * dr.gapOuter;
-      let dx = x0 + dr.gapOuter;
-      widths.forEach((w, k) => {
-        push('door', `${cab.id}_${u.id}_DOOR${k + 1}`, `门板-${k + 1}`,
-          dx, dx + w, p.depth, p.depth + t, // 门贴前脸外
-          zBot + t + dr.gapOuter, zBot + t + dr.gapOuter + doorH, mat);
-        dx += w + dr.gapMid;
-      });
-    }
+      if (u.doors) {
+        const dr = u.doors;
+        const widths = doorWidths(u, netW, rules);
+        const doorH = L.innerH - 2 * dr.gapOuter;
+        let dx = x0 + dr.gapOuter;
+        widths.forEach((w, k) => {
+          push('door', `${cab.id}_${u.id}_DOOR${k + 1}`, `门板-${k + 1}`,
+            dx, dx + w, faceY0, faceY1,
+            zBot + t + dr.gapOuter, zBot + t + dr.gapOuter + doorH, mat);
+          dx += w + dr.gapMid;
+        });
+      }
 
-    if (u.drawers) {
-      const d = u.drawers;
-      const cellH = drawerCellHeights(u, L.innerH, rules);
-      let z = innerBottom;
-      cellH.forEach((ch, k) => {
-        push('drawer', `${cab.id}_${u.id}_DF${k + 1}`, `抽屉面板-${k + 1}`,
-          x0 + d.gap, x0 + netW - d.gap, p.depth, p.depth + t,
-          z + d.gap, z + ch - d.gap, mat);
-        z += ch;
-      });
-    }
+      if (u.drawers) {
+        const d = u.drawers;
+        const cellH = drawerCellHeights(u, netH, rules);
+        let z = innerBottom + zOffset;
+        cellH.forEach((ch, k) => {
+          push('drawer', `${cab.id}_${u.id}_DF${k + 1}`, `抽屉面板-${k + 1}`,
+            x0 + d.gap, x0 + netW - d.gap, faceY0, faceY1,
+            z + d.gap, z + ch - d.gap, mat);
+          z += ch;
+        });
+      }
 
-    if (u.rod && u.rod.count > 0) {
-      // 挂衣杆用细长盒表达（圆柱渲染留给后续，视觉可辨即可）：
-      // 沿柜宽横向、进深居中、离柜内底 rodHeight
-      const rz = innerBottom + u.rod.heightFromBottom;
-      const yMid = L.backT + L.shelfDepth / 2; // 进深方向居中（在层板深度带内）
-      push('rod', `${cab.id}_${u.id}_ROD`, '挂衣杆',
-        x0 + 30, x0 + netW - 30, yMid - 15, yMid + 15,
-        rz - 15, rz + 15, mat);
-    }
-  });
+      if (u.kind === 'appliance' && u.appliance) {
+        // 电器本体：半透明感的"洞口占位盒"（甲购件，视觉上与柜体板区分）
+        const a = u.appliance;
+        const ow = Math.min(a.openingWidth, netW);
+        const ax0 = x0 + (netW - ow) / 2;
+        const od = Math.min(a.openingDepth, side === 'front' ? p.depth - t : DB ? DB.backRowDepth : p.depth - t);
+        const ay0 = side === 'front' ? p.depth - od : 0;
+        push('rod', `${cab.id}_${u.id}_APP`, `${a.name}（甲购）`,
+          ax0, ax0 + ow, ay0, ay0 + od,
+          innerBottom, innerBottom + Math.min(a.openingHeight, L.innerH), 'APPLIANCE_PLACEHOLDER');
+      }
+
+      if (u.rod && u.rod.count > 0) {
+        // 挂衣杆用细长盒表达（圆柱渲染留给后续，视觉可辨即可）：
+        // 沿柜宽横向、进深居中、离柜内底 rodHeight
+        const rz = innerBottom + u.rod.heightFromBottom;
+        const yMid = (shelfY0 + shelfY1) / 2;
+        push('rod', `${cab.id}_${u.id}_ROD`, '挂衣杆',
+          x0 + 30, x0 + netW - 30, yMid - 15, yMid + 15,
+          rz - 15, rz + 15, mat);
+      }
+    });
+  };
+
+  // 前排：层板贴中板前表面（双面柜）或背板前表面（单面柜）
+  drawRow(
+    cab.layout.units,
+    L.nets,
+    L.unitX0,
+    DB ? DB.midY0 + DB.midT : L.backT,
+    DB ? DB.midY0 + DB.midT + L.shelfDepth : L.backT + L.shelfDepth,
+    p.depth,
+    p.depth + t,
+    'front'
+  );
+  if (DB) {
+    // 后排：脸在 y=0 侧（朝 -Y），门贴 y ∈ [-t, 0]
+    drawRow(cab.layout.backUnits!, DB.backNets, DB.backUnitX0, DB.midY0 - DB.backShelfDepth, DB.midY0, -t, 0, 'back');
+  }
 
   return out;
 }

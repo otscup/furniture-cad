@@ -41,13 +41,40 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
   const chainW = t + L.nets.reduce((a, b) => a + b, 0) + (L.nets.length - 1) * t + t;
   assertEq('宽度链', chainW, p.width, 't + Σ净宽 + (n-1)t + t = width');
 
+  // 双面柜：后排有自己的宽度链；且 type 与 backUnits 必须互相配套（自相矛盾的模型不静默画）
+  const DB = L.double;
+  const hasBack = Array.isArray(cab.layout.backUnits) && cab.layout.backUnits.length > 0;
+  if (cab.layout.type === 'double' && !DB) {
+    err('RULE-DOUBLE-NO-BACK', cab.id, 'cabinet', 'layout.type = double 但没有背面分区（backUnits）—— 双面柜必须有背面排。', '给 layout.backUnits 至少一个分区，或把 type 改回 row');
+  }
+  if (cab.layout.type !== 'double' && hasBack) {
+    err('RULE-ROW-WITH-BACK', cab.id, 'cabinet', '单面柜（type=row）带了背面分区 backUnits —— 两者互相矛盾。', '把 layout.type 改为 double，或删掉 backUnits');
+  }
+  if (DB) {
+    const chainB = t + DB.backNets.reduce((a, b) => a + b, 0) + (DB.backNets.length - 1) * t + t;
+    assertEq('宽度链（背面排）', chainB, p.width, 't + Σ后排净宽 + (m-1)t + t = width');
+    assertEq(
+      '排深 + 中板 + 前排深 = 总深',
+      DB.backRowDepth + DB.midT + DB.frontRowDepth,
+      p.depth,
+      'backRowDepth + midT + frontRowDepth = depth'
+    );
+    assertEq('中板厚 = 板厚', DB.midT, t, '中板就是柜体板');
+  }
+
   // 背板：用「面积守恒」而不是「第一块宽度等于公式值」做断言。
   // 理由：背板会按幅面拆成 n 列 × m 行，此时单块的尺寸不再等于整板公式值，
   //       但【拆块后的面积总和】必须与整板面积严格相等 —— 这是拆块逻辑的正确性核心，
   //       而且是普适的（无论怎么拆、拆几块）。
   const backPieces = geom.panels.filter((x) => x.role === 'BackPanel');
   const expectBack = backPanelSize(cab, L);
-  if (backPieces.length === 0) {
+  if (DB) {
+    // 双面柜没有背板 —— 但共用中板必须真的在清单里，否则就是派生漏了
+    const mid = geom.panels.filter((x) => x.role === 'MiddlePanel');
+    if (mid.length === 0) {
+      err('MISSING-MIDDLE-PANEL', cab.id, 'cabinet', '双面柜缺少共用中板板件 —— 派生管线漏了它。', '不要手动改，这是程序缺陷');
+    }
+  } else if (backPieces.length === 0) {
     err('MISSING-BACKPANEL', cab.id, 'cabinet', '缺少背板板件。');
   } else {
     const totalArea = backPieces.reduce((a, x) => a + x.length * x.width, 0);
@@ -71,9 +98,17 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     }
   }
 
-  cab.layout.units.forEach((u, i) => {
-    const netW = L.nets[i];
-    const netH = L.innerH;
+  /** 两排分区一起校验（双面柜的背面排与前排同一套恒等式，只差净宽表） */
+  const rows: Array<{ units: typeof cab.layout.units; netsRow: number[]; label: string }> = [
+    { units: cab.layout.units, netsRow: L.nets, label: '' },
+    ...(DB ? [{ units: cab.layout.backUnits!, netsRow: DB.backNets, label: '（背面排）' }] : []),
+  ];
+
+  for (const { units, netsRow, label } of rows) {
+    units.forEach((u, i) => {
+      const netW = netsRow[i];
+      // 电器格：洞口上面的抽屉只拥有"内空高 − 洞口高 − 过梁板"这段净高
+      const netH = u.kind === 'appliance' && u.appliance ? L.innerH - u.appliance.openingHeight - t : L.innerH;
 
     if (u.doors) {
       const doors = geom.panels.filter((x) => x.group === u.id && x.role === 'DoorPanel');
@@ -117,11 +152,27 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     }
 
     if (u.shelves && u.shelves.count > 0) {
-      if (L.shelfDepth <= 0) {
-        err('RULE-SHELF-DEPTH', `${cab.id}.${u.id}`, 'unit', `按背板槽位置与前沿让位计算，层板深度为 ${L.shelfDepth}mm，无法生成。`, '检查背板槽位置或增大柜深');
+      const sd = label === '（背面排）' && DB ? DB.backShelfDepth : L.shelfDepth;
+      if (sd <= 0) {
+        err('RULE-SHELF-DEPTH', `${cab.id}.${u.id}`, 'unit', `按前沿让位计算，层板深度为 ${sd}mm，无法生成。`, '检查背板槽位置或增大柜深');
+      }
+    }
+    // 电器格：洞口必须真的装得下（洞口 ≤ 分区净宽；洞口高 + 过梁板 ≤ 内空高；洞口深 ≤ 排深）
+    if (u.kind === 'appliance' && u.appliance) {
+      const a = u.appliance;
+      if (a.openingWidth > netW) {
+        err('RULE-APPLIANCE-FIT-W', `${cab.id}.${u.id}`, 'unit', `「${u.nickname ?? u.id}」的洞口宽 ${a.openingWidth}mm 比分区净宽 ${netW}mm 大 ${a.openingWidth - netW}mm —— 机器放不进去。`, `把这个分区的期望净宽加到 ≥ ${a.openingWidth + 2 * t}mm，或换小一号的 ${a.name}`);
+      }
+      if (a.openingHeight + t > L.innerH) {
+        err('RULE-APPLIANCE-FIT-H', `${cab.id}.${u.id}`, 'unit', `「${u.nickname ?? u.id}」的洞口高 ${a.openingHeight}mm 加过梁板 ${t}mm 超过柜内净高 ${L.innerH}mm。`, `把柜体加高到 ≥ ${a.openingHeight + 2 * t + p.bodyLift}mm，或减小洞口高（${a.name} 尺寸 + 安装余量）`);
+      }
+      const rowDepth = DB && label === '（背面排）' ? DB.backRowDepth : DB ? DB.frontRowDepth : p.depth;
+      if (a.openingDepth > rowDepth) {
+        warn('RULE-APPLIANCE-FIT-D', `${cab.id}.${u.id}`, 'unit', `「${u.nickname ?? u.id}」的洞口深 ${a.openingDepth}mm 超过排深 ${rowDepth}mm —— ${a.name}会凸出柜面。`, `加深柜体到 ≥ ${a.openingDepth + t}mm，或确认凸出是可接受的（如实告知客户）`);
       }
     }
   });
+  }
 
   const seen = new Set<string>();
   for (const x of geom.panels) {
@@ -160,9 +211,10 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     warn('RULE-CABINET-SPLIT-WIDTH', cab.id, 'cabinet', `柜体宽 ${p.width}mm 超过单柜建议上限 ${rules.limits.maxSingleCabinetWidth}mm。`, '考虑左右分柜');
   }
 
-  cab.layout.units.forEach((u, i) => {
-    const netW = L.nets[i];
-    const netH = L.innerH;
+  for (const { units, netsRow } of rows) {
+    units.forEach((u, i) => {
+      const netW = netsRow[i];
+      const netH = u.kind === 'appliance' && u.appliance ? L.innerH - u.appliance.openingHeight - t : L.innerH;
     if (u.shelves && u.shelves.count > 0 && netW > rules.limits.maxShelfSpan) {
       warn('RULE-SHELF-SPAN', `${cab.id}.${u.id}`, 'unit', `${u.nickname ?? u.id} 层板跨度 ${netW}mm 超过建议上限 ${rules.limits.maxShelfSpan}mm。`, '增加中立板，或加厚层板至 25mm');
     }
@@ -186,12 +238,16 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
         warn('RULE-DRAWER-TALL-FRONT', `${cab.id}.${u.id}`, 'unit', `抽屉面板最高 ${maxFront}mm，超出单抽常用高度（≤400mm）。`, '增加抽屉数量，或改为「抽屉 + 上翻门」组合');
       }
     }
-  });
+    });
+  }
 
   // ───────── C. 单柜自检：layout 重算必须与传入的 layout 一致（防止缓存过期）─────────
   const recomputed = computeCabinetLayout(cab, rules);
   if (JSON.stringify(recomputed.nets) !== JSON.stringify(L.nets)) {
     err('LAYOUT-CACHE-STALE', cab.id, 'cabinet', '几何缓存与当前模型不一致（净宽分配对不上），说明缓存失效逻辑有 bug。', '不要手动改，这是程序缺陷');
+  }
+  if (JSON.stringify(recomputed.double?.backNets ?? null) !== JSON.stringify(L.double?.backNets ?? null)) {
+    err('LAYOUT-CACHE-STALE', cab.id, 'cabinet', '几何缓存与当前模型不一致（背面排净宽对不上），说明缓存失效逻辑有 bug。', '不要手动改，这是程序缺陷');
   }
 
   return out;

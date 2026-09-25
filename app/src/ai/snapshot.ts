@@ -85,8 +85,11 @@ export interface AiCabinetView {
     backPanelMaterial: string;
   };
   layout: {
+    type: 'row' | 'double';
     widthMode: 'fit_total' | 'fit_units';
     units: AiUnitView[];
+    /** 仅 type='double'：背面分区（岛台的背面排） */
+    backUnits: AiUnitView[] | null;
   };
 }
 
@@ -101,6 +104,8 @@ export interface AiUnitView {
   shelves: { count: number } | null;
   doors: { count: number; gapOuter: number; gapMid: number } | null;
   rod: { count: number; heightFromBottom: number } | null;
+  /** 仅 kind='appliance'：洞口与上下分体（null = 不是电器格） */
+  appliance: { name: string; openingWidth: number; openingHeight: number; openingDepth: number; topDrawers: number } | null;
 }
 
 export const CONTRACT_VERSION_FOR_SNAPSHOT = '1.0.0';
@@ -172,8 +177,10 @@ function cabinetView(cab: Cabinet, i: number): AiCabinetView {
       backPanelMaterial: cab.params.backPanel.material,
     },
     layout: {
+      type: cab.layout.type,
       widthMode: cab.layout.widthMode,
       units: cab.layout.units.map((u, j) => unitView(u, j)),
+      backUnits: cab.layout.backUnits ? cab.layout.backUnits.map((u, j) => unitView(u, j)) : null,
     },
   };
 }
@@ -190,6 +197,15 @@ function unitView(u: UnitSpec, j: number): AiUnitView {
     shelves: u.shelves ? { count: u.shelves.count } : null,
     doors: u.doors ? { count: u.doors.count, gapOuter: u.doors.gapOuter, gapMid: u.doors.gapMid } : null,
     rod: u.rod ? { count: u.rod.count, heightFromBottom: mm(u.rod.heightFromBottom) } : null,
+    appliance: u.appliance
+      ? {
+          name: u.appliance.name,
+          openingWidth: mm(u.appliance.openingWidth),
+          openingHeight: mm(u.appliance.openingHeight),
+          openingDepth: mm(u.appliance.openingDepth),
+          topDrawers: u.appliance.topDrawers,
+        }
+      : null,
   };
 }
 

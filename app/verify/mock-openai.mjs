@@ -41,6 +41,46 @@ export function mockPlan(ask, snap) {
     };
   }
   /**
+   * 「洗衣机柜」—— B38 验的是**复杂柜型**经 AI 全链落地：
+   * kind:'appliance'（洞口三尺寸 + topDrawers）必须是契约内说得出的话，
+   * 而不是"AI 说不出来、只能建完手动改"。
+   *
+   * ⚠️ 必须排在「生成一个」分支**前面**：B38 的用户原话是
+   * "帮我生成一个洗衣机柜…"，两个关键词同时命中，
+   * 分支顺序写反了就会被上面的普通建柜分支截胡（第一版就踩了）。
+   */
+  if (ask.includes('洗衣机')) {
+    return {
+      reply: '洗衣机柜搭好了：左侧留 650×850 的洗衣机洞口（上面三只抽屉），右侧一组对开门层板柜。',
+      actions: [
+        {
+          action: 'cabinet.create',
+          target: { roomName: snap?.rooms?.[0]?.name ?? '主卧' },
+          params: {
+            name: 'AI洗衣机柜',
+            width: 1400,
+            height: 2100,
+            depth: 620,
+            units: [
+              {
+                kind: 'appliance',
+                width: 700,
+                applianceName: '洗衣机',
+                openingWidth: 650,
+                openingHeight: 850,
+                openingDepth: 600,
+                topDrawers: 3,
+                nickname: '洗衣机位',
+              },
+              { kind: 'shelves', width: 700, count: 4, doorCount: 2, nickname: '侧柜' },
+            ],
+          },
+          reason: '用户要洗衣机柜：洞口 + 上下分体 + 侧柜',
+        },
+      ],
+    };
+  }
+  /**
    * 「按描述生成柜体」—— 用户一句话说出内部结构，模型应当**一次**搭出来。
    *
    * 为什么 mock 要专门回这一条：B37 验的是"AI 能不能照描述建柜"这条**成功路径**。

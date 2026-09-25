@@ -2477,6 +2477,131 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ═══════════════════════════════════════════════════════════
     /**
+     * B38 —— 「洗衣机柜」这条**复杂柜型**经 AI 全链在真界面落地。
+     *
+     * 餐边柜 / 岛台的派生正确性已由 node 侧验收（complex-cabinets-acceptance）
+     * 覆盖；浏览器里专挑洗衣机柜验，因为它最刁：
+     * kind:'appliance'（洞口三尺寸 + 上面抽屉）必须是 AI 契约里**说得出的话**
+     * ——否则就是"AI 建不出来、用户还得手动改"，那句"照描述生成"就名存实亡。
+     *
+     * 三条硬断言（与 B37 同构，但每一层都换了内容）：
+     *   ① 落地的语义就是描述里那个（洞口 650×850×600、上面 3 只抽屉、电器格不带门）
+     *   ② 派生分流正确：洗衣机本体进**甲购件**（不走开料机），过梁板进**开料**
+     *   ③ 一次生成 = 一条命令 = 一次撤销
+     */
+    section('B38 AI 生成复杂柜型（洗衣机柜）：一句话 → 电器格语义 → 甲购件分流');
+
+    await activateRightTab('AI');
+    await sleep(360);
+
+    // 同 B37 的教训：本节会真的往模型里加一台柜，先存现场，结束还原。
+    // （下游 B21 / B30 的落位断言依赖"房间还剩多少空位"，留赃物会把人家挤挂。）
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      window.__b38Saved = structuredClone(s.bus.getState()); return true})()`);
+
+    const before38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState();
+      return { ver:s.bus.getVersion(), count:p.cabinets.length,
+        names:p.cabinets.map(c=>c.name), errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length };})()`);
+
+    ok('能在输入框里写出一段电器格描述（洞口三尺寸 + 上面抽屉，契约外的旧词汇说不出这句话）',
+      (await setElValue('.side-right .ai-input', '帮我生成一个洗衣机柜：左边留 650 宽 850 高的洗衣机洞口，上面做三只抽屉，右边一组对开门层板柜')) === true);
+    ok('点「生成编辑计划」', (await clickPanelBtn('生成编辑计划', 20000)) === true);
+
+    const shown38 = await waitFor(`!!document.querySelector('.side-right .plan-step')`, 25000);
+    ok('出现干跑预览（走真 HTTP：界面 → 本地服务 → mock 服务商 → 回来）', shown38 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
+
+    const plan38 = await evalJs(`(()=>{
+      const steps=[...document.querySelectorAll('.side-right .plan-step')];
+      return {
+        count:steps.length,
+        bad:steps.filter(s=>s.classList.contains('plan-step-bad')).length,
+        actions:steps.map(s=>((s.querySelector('.plan-head .mono')?.textContent)||'').trim()),
+      };
+    })()`);
+
+    ok('AI 给出的是"建一个柜"这条动作（复杂柜型也走 cabinet.create，不是散补丁）',
+      plan38.actions.some((a) => /cabinet\.create/.test(a)), JSON.stringify(plan38.actions));
+    ok('预览里没有失败卡（电器格意图被契约完整接住了）', plan38.bad === 0, `坏卡 ${plan38.bad} 张`);
+    ok('预览阶段模型没动：柜体数量不变', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before38.count,
+      `${before38.count} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)}`);
+
+    const shotPreview38 = await shot(path.join(OUT_DIR, 'ai-laundry-preview.png'));
+    ok('干跑预览截图已留档（非空）', shotPreview38 > 20000, `${shotPreview38} 字节`);
+
+    ok('点「应用」', (await clickPanelBtn('应用全部', 1400)) === true);
+    await sleep(420);
+
+    const after38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState();
+      const c=p.cabinets.find(x=>x.name==='AI洗衣机柜');
+      const apUnit = c ? c.layout.units.find(u=>u.kind==='appliance') : null;
+      const g = c ? s.bus.derive().geom.cabinets[c.id] : null;
+      return {
+        ver:s.bus.getVersion(), count:p.cabinets.length,
+        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length,
+        cab: c ? { id:c.id, units:c.layout.units.map(u=>({id:u.id, kind:u.kind, nick:u.nickname,
+          drawers:u.drawers?.count ?? null, doors:u.doors?.count ?? null})) } : null,
+        ap: apUnit ? { name:apUnit.appliance?.name, w:apUnit.appliance?.openingWidth,
+          h:apUnit.appliance?.openingHeight, d:apUnit.appliance?.openingDepth,
+          top:apUnit.appliance?.topDrawers, wUnit:apUnit.width } : null,
+        purchased: g ? g.purchased.map(x=>x.nameZh) : null,
+        panelWasher: g ? g.panels.filter(x=>x.nameZh && x.nameZh.includes('洗衣机')).map(x=>x.nameZh) : null,
+      };})()`);
+
+    ok('真的多出一台柜（一次生成 = 一条命令 = 版本 +1）',
+      after38.count === before38.count + 1 && after38.ver === before38.ver + 1, JSON.stringify({ c: `${before38.count}→${after38.count}`, v: `${before38.ver}→${after38.ver}` }));
+    ok('两个分区都在：电器格 + 侧柜（不是只建了个空壳）',
+      Boolean(after38.cab) && after38.cab.units.length === 2
+        && after38.cab.units.map((u) => u.kind).join(',') === 'appliance,shelves',
+      JSON.stringify(after38.cab?.units));
+    ok('洞口三尺寸原样落地 650×850×600（这是安装师傅要的数，一个都不能漂）',
+      after38.ap?.w === 650 && after38.ap?.h === 850 && after38.ap?.d === 600, JSON.stringify(after38.ap));
+    ok('"上面三只抽屉"真的变成 3 只（topDrawers 挂在抽屉字段上，不是装样子）',
+      after38.ap?.top === 3 && after38.cab?.units[0]?.drawers === 3,
+      JSON.stringify({ top: after38.ap?.top, drawers: after38.cab?.units[0]?.drawers }));
+    ok('电器格不带门（带门就是 RULE-APPLIANCE-DOOR 的硬错，AI 也不许犯）',
+      after38.cab?.units[0]?.doors === null, String(after38.cab?.units[0]?.doors));
+    ok('"右边一组对开门"真的做了 2 扇门', after38.cab?.units[1]?.doors === 2, String(after38.cab?.units[1]?.doors));
+    ok('分区 id 各不相同（板件撞 id = 清单少一块 = 生产下错料）',
+      new Set((after38.cab?.units ?? []).map((u) => u.id)).size === 2, JSON.stringify((after38.cab?.units ?? []).map((u) => u.id)));
+    ok('洗衣机本体进了甲购件清单（机器不走开料机，这是清单分流的红线）',
+      Array.isArray(after38.purchased) && after38.purchased.some((n) => n.includes('洗衣机')), JSON.stringify(after38.purchased));
+    ok('开料清单里没有"洗衣机"板件（派生没有把甲购件混进开料）',
+      Array.isArray(after38.panelWasher) && after38.panelWasher.length === 0, JSON.stringify(after38.panelWasher));
+    ok('应用后没有新增硬错（洞口 650 装得下 700 净宽，宽度和洞口尺寸不冲突）',
+      after38.errs === before38.errs, `ERROR ${before38.errs} → ${after38.errs}`);
+
+    // 撤销：一次生成必须一次收得回来
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await sleep(320);
+    const undo38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`);
+    ok('一次撤销就把这台柜收回去', undo38 === before38.count, `${after38.count} → ${undo38}`);
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.redo();return true})()`);
+    await sleep(320);
+    ok('重做又能回来（历史是线性的）',
+      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before38.count + 1);
+
+    // 切到四视图拍一张：洗衣机柜（虚线洞口 + 甲购件标注）在图上真的画出来了
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
+    await sleep(1100);
+    const shotApplied38 = await shot(path.join(OUT_DIR, 'ai-laundry-applied.png'));
+    ok('应用后截图已留档（非空）', shotApplied38 > 20000, `${shotApplied38} 字节`);
+
+    // 还原现场：本节自己造的柜子不许留给下游
+    const restored38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      if (!window.__b38Saved) return null;
+      s.bus.replaceProject(window.__b38Saved, 'B38 还原现场');
+      const p=s.bus.getState();
+      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name) };})()`);
+    ok('B38 结束后把现场还原了（自己造的柜子不许留给下游占地方）',
+      Boolean(restored38) && restored38.count === before38.count
+        && restored38.names.join('|') === before38.names.join('|'),
+      `还原=${JSON.stringify(restored38)} 之前=${JSON.stringify(before38.names)}`);
+    await sleep(240);
+
+    // ═══════════════════════════════════════════════════════════
+    /**
      * B18 —— 用户原话："以后用于商用可能涉及到订阅模式…增加账号管理等功能，
      * 以及账号使用、ai 模型调用管理等功能。但是得保证账号安全问题。"
      *

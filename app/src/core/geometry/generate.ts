@@ -65,6 +65,8 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const innerW = L.innerW;
   const innerH = L.innerH;
   const layerOf = (th: number): string => `PANEL_${th}`;
+  /** 双面柜（岛台）派生骨架：undefined = 单面柜 */
+  const DB = L.double;
 
   const push = (pn: Omit<Panel, 'qty'> & { qty?: number }): void => {
     panels.push({ qty: 1, ...pn });
@@ -82,6 +84,19 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   push({ id: `P_${cabId}_TOP`, role: 'TopPanel', nameZh: '顶板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
   push({ id: `P_${cabId}_BOT`, role: 'BottomPanel', nameZh: '底板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
   push({ id: `P_${cabId}_KICK`, role: 'KickBoard', nameZh: '踢脚板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+
+  // ── 双面柜（岛台）增件：共用中板 + 后踢脚，且**没有背板**（中板就是两排共用的"背"）──
+  if (DB) {
+    push({ id: `P_${cabId}_MID`, role: 'MiddlePanel', nameZh: '共用中板（双面）', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: bodyH, grain: 'length', edge: edge(null, null, null, null), edgeLabel: '不封边（藏于柜内）', layer: layerOf(t) });
+    push({ id: `P_${cabId}_KICKB`, role: 'KickBoardBack', nameZh: '踢脚板-后', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+    issues.push({
+      severity: 'INFO',
+      code: 'DOUBLE-NO-BACKPANEL',
+      target: cabId,
+      targetKind: 'cabinet',
+      message: `双面柜不设背板：前后两排背靠背，共用 ${t}mm 中板（排深 ${DB.backRowDepth} + 中板 ${DB.midT} + ${DB.frontRowDepth} = 总深 ${p.depth}mm）。params.backPanel 的槽位参数不参与本柜派生。`,
+    });
+  }
 
   const unitCount = cab.layout.units.length;
   for (let i = 0; i < unitCount - 1; i++) {
@@ -123,6 +138,8 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   }
 
   // ───────── 3. 背板（超幅面自动拆块，两个方向都要拆）─────────
+  // 双面柜没有背板（共用中板替代）—— 整段跳过，不做"拆出 0 块"的假计算。
+  if (!DB) {
   /**
    * 拆分方案来自 layout.ts 的 backPanelSplit —— 与分解图（assembly.ts）共用同一份。
    * 这里不再自己算 nW/nH：那正是"清单 6 块、图上 4 块"这类不一致的温床。
@@ -178,20 +195,57 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       });
     }
   }
+  } // end if (!DB) —— 双面柜没有背板段
 
   // ───────── 4. 各分区 ─────────
   const shelfDepth = L.shelfDepth;
 
-  cab.layout.units.forEach((u, i) => {
-    const netW = nets[i];
-    const netH = innerH;
-    if (u.drawers) buildDrawerBank(u.id, u, netW, netH);
-    if (u.shelves && u.shelves.count > 0) buildShelves(u.id, u.shelves, netW, netH, shelfDepth);
-    if (u.rod && u.rod.count > 0) {
-      hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${u.rod.heightFromBottom}mm`, belongsTo: `${cabId}.${u.id}` });
-    }
-    if (u.doors) buildDoors(u.id, u, netW, netH);
-  });
+  /**
+   * 分区净高的口径：电器格（appliance）的洞口占掉下部 openingHeight + 一块过梁板，
+   * 洞口上面的抽屉只拥有**剩余**净高 —— 恒等式与图面都必须用这个口径。
+   */
+  const unitNetH = (u: Cabinet['layout']['units'][number]): number =>
+    u.kind === 'appliance' && u.appliance ? innerH - u.appliance.openingHeight - t : innerH;
+
+  /** 电器格的结构与清单派生：过梁板（洞口顶）+ 甲购件（机器本身不走开料机） */
+  function buildAppliance(uid: string, unit: Cabinet['layout']['units'][number], netW: number, rowShelfDepth: number): void {
+    const a = unit.appliance!;
+    // 过梁板：洞口的顶，跨整个分区净宽（洞口窄于净宽时两侧余量条同板连带）
+    push({ id: `P_${cabId}_${uid}_APLT`, role: 'ApertureLintel', nameZh: '洞口过梁板', belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: netW, width: rowShelfDepth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${a.openingHeight}mm（洞口顶）`, layer: layerOf(t) });
+    purchased.push({
+      id: `PC_${cabId}_${uid}_APP`,
+      nameZh: `${a.name}（甲购 · 嵌入式电器）`,
+      kind: 'appliance',
+      material: '-',
+      spec: `预留洞口 ${a.openingWidth}(宽)×${a.openingHeight}(高)×${a.openingDepth}(深)mm —— 洞口尺寸为机器尺寸 + 安装余量，安装前现场复核`,
+      qty: 1,
+      belongsTo: `${cabId}.${uid}`,
+    });
+  }
+
+  /** 一排分区的派生（前排 / 后排共用 —— 同一套 build 函数，只差净宽表与层板深） */
+  function buildRow(units: Cabinet['layout']['units'], netsRow: number[], rowShelfDepth: number): void {
+    units.forEach((u, i) => {
+      const netW = netsRow[i];
+      const netH = unitNetH(u);
+      if (u.kind === 'appliance' && u.appliance) {
+        buildAppliance(u.id, u, netW, rowShelfDepth);
+        // 电器格带门 = 洞口与门板打架 —— 如实报 ERROR 并不产出矛盾板件，不静默画一个怪门
+        if (u.doors) {
+          issues.push({ severity: 'ERROR', code: 'RULE-APPLIANCE-DOOR', target: `${cabId}.${u.id}`, targetKind: 'unit', message: `电器格「${u.nickname ?? u.id}」带了门板，但洞口（${u.appliance.openingWidth}×${u.appliance.openingHeight}）与门板在同一张脸上互相冲突。`, fixHint: '去掉门（机器露前脸是常规做法），或把这个分区改成普通层板格' });
+        }
+      }
+      if (u.drawers) buildDrawerBank(u.id, u, netW, netH);
+      if (u.shelves && u.shelves.count > 0) buildShelves(u.id, u.shelves, netW, netH, rowShelfDepth);
+      if (u.rod && u.rod.count > 0) {
+        hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${u.rod.heightFromBottom}mm`, belongsTo: `${cabId}.${u.id}` });
+      }
+      if (u.doors && u.kind !== 'appliance') buildDoors(u.id, u, netW, netH);
+    });
+  }
+
+  buildRow(cab.layout.units, nets, shelfDepth);
+  if (DB) buildRow(cab.layout.backUnits!, DB.backNets, DB.backShelfDepth);
 
   function buildDrawerBank(uid: string, unit: Cabinet['layout']['units'][number], netW: number, netH: number): void {
     const d = unit.drawers!;
@@ -291,40 +345,64 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   plan.push({ k: 'fill', pts: toWorld(rectPts(0, 0, W, D)), layer: L_PLAN, alpha: 0.12 });
   plan.push({ k: 'poly', pts: toWorld(rectPts(0, 0, W, D)), closed: true, layer: L_PLAN, lw: 2 });
 
-  // 结构板（侧板/立板）在平面上是横跨进深的线
-  const structLines: Array<[number, number]> = [
-    [0, t],
-    [W - t, W],
+  // 结构板（侧板/立板）在平面上是横跨进深的线；双面柜的立板各自只跨本排箱体
+  const structLines: Array<[number, number, number, number]> = [
+    [0, t, 0, D],
+    [W - t, W, 0, D],
   ];
   for (let i = 0; i < unitCount - 1; i++) {
     const dx = unitX0[i] + nets[i];
-    structLines.push([dx, dx + t]);
+    structLines.push([dx, dx + t, DB ? DB.midY0 + DB.midT : 0, D]);
   }
-  for (const [a, b] of structLines) {
-    const xc = (a + b) / 2;
-    plan.push({ k: 'poly', pts: toWorld([{ x: xc, y: 0 }, { x: xc, y: D }]), closed: false, layer: L_STRUCT, lw: 1.6 });
+  if (DB) {
+    cab.layout.backUnits!.forEach((_, i) => {
+      const dx = DB.backUnitX0[i] + DB.backNets[i];
+      structLines.push([dx, dx + t, 0, DB.midY0]);
+    });
+    // 中板：两条横线（厚度方向），跨全宽
+    plan.push({ k: 'poly', pts: toWorld([{ x: t, y: DB.midY0 }, { x: W - t, y: DB.midY0 }]), closed: false, layer: L_STRUCT, lw: 1.6 });
+    plan.push({ k: 'poly', pts: toWorld([{ x: t, y: DB.midY0 + DB.midT }, { x: W - t, y: DB.midY0 + DB.midT }]), closed: false, layer: L_STRUCT, lw: 1.6 });
+  }
+  for (const [xa, xb, ya, yb] of structLines) {
+    plan.push({ k: 'poly', pts: toWorld([{ x: (xa + xb) / 2, y: ya }, { x: (xa + xb) / 2, y: yb }]), closed: false, layer: L_STRUCT, lw: 1.6 });
   }
 
-  // 门板 / 抽屉面板：贴前脸的一条线
-  cab.layout.units.forEach((u, i) => {
-    if (!u.doors && !u.drawers) return;
-    const x0 = unitX0[i];
-    const x1 = x0 + nets[i];
-    const yFront = D - t;
-    plan.push({ k: 'poly', pts: toWorld([{ x: x0, y: yFront }, { x: x1, y: yFront }]), closed: false, layer: L_FRONT, lw: 2.4 });
-    if (u.doors && u.doors.count > 1) {
-      for (let k = 1; k < u.doors.count; k++) {
-        const xk = x0 + (nets[i] * k) / u.doors.count;
-        plan.push({ k: 'poly', pts: toWorld([{ x: xk, y: yFront }, { x: xk, y: D }]), closed: false, layer: L_FRONT, lw: 1 });
+  // 门板 / 抽屉面板：贴前脸的一条线（双面柜的背面脸在 y = t 侧，对称地画）
+  const drawFaceLines = (units: Cabinet['layout']['units'], netsRow: number[], x0s: number[], yFront: number, towardFront: boolean): void => {
+    units.forEach((u, i) => {
+      if (!u.doors && !u.drawers && u.kind !== 'appliance') return;
+      const x0 = x0s[i];
+      const x1 = x0 + netsRow[i];
+      plan.push({ k: 'poly', pts: toWorld([{ x: x0, y: yFront }, { x: x1, y: yFront }]), closed: false, layer: L_FRONT, lw: 2.4 });
+      if (u.doors && u.doors.count > 1) {
+        for (let k = 1; k < u.doors.count; k++) {
+          const xk = x0 + (netsRow[i] * k) / u.doors.count;
+          plan.push({ k: 'poly', pts: toWorld([{ x: xk, y: yFront }, { x: xk, y: towardFront ? D : 0 }]), closed: false, layer: L_FRONT, lw: 1 });
+        }
       }
-    }
-    if (u.drawers && u.drawers.count > 1) {
-      for (let k = 1; k < u.drawers.count; k++) {
-        const yk = D - (D * k) / u.drawers.count;
-        plan.push({ k: 'poly', pts: toWorld([{ x: x0, y: yk }, { x: x1, y: yk }]), closed: false, layer: L_FRONT, lw: 0.8 });
+      if (u.drawers && u.drawers.count > 1) {
+        // 分格线与原版同口径：横跨整柜进深（平面图上表达"这一列是 N 格抽屉"）
+        for (let k = 1; k < u.drawers.count; k++) {
+          const yk = towardFront ? D - (D * k) / u.drawers.count : (D * k) / u.drawers.count;
+          plan.push({ k: 'poly', pts: toWorld([{ x: x0, y: yk }, { x: x1, y: yk }]), closed: false, layer: L_FRONT, lw: 0.8 });
+        }
       }
-    }
-  });
+      if (u.kind === 'appliance' && u.appliance) {
+        // 电器外框：洞口宽居中于净宽、深按洞口深贴脸，虚线表达"此处留空放机器"
+        const a = u.appliance;
+        const ow = Math.min(a.openingWidth, netsRow[i]);
+        const od = Math.min(a.openingDepth, towardFront ? D - yFront : yFront);
+        const ox0 = x0 + (netsRow[i] - ow) / 2;
+        const ox1 = ox0 + ow;
+        const oy0 = towardFront ? D - od : od;
+        const oy1 = towardFront ? D : 0;
+        plan.push({ k: 'poly', pts: toWorld([{ x: ox0, y: oy0 }, { x: ox1, y: oy0 }, { x: ox1, y: oy1 }, { x: ox0, y: oy1 }]), closed: true, layer: L_HW, lw: 1.2, dash: [90, 50] });
+        plan.push({ k: 'text', p: localToWorld({ x: (ox0 + ox1) / 2, y: (oy0 + oy1) / 2 }, origin, rotation), text: a.name, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+      }
+    });
+  };
+  drawFaceLines(cab.layout.units, nets, unitX0, D - t, true);
+  if (DB) drawFaceLines(cab.layout.backUnits!, DB.backNets, DB.backUnitX0, t, false);
 
   // 平面标注：柜体宽 + 深（贴在柜体外侧）
   const dimY = -180;
@@ -351,6 +429,15 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   cab.layout.units.forEach((u, i) => {
     const x0 = unitX0[i];
     const netW = nets[i];
+    // 电器格：洞口占掉下部，上部的抽屉/层板从过梁板之上开始；洞口本身画虚线框
+    const apZ0 = u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0;
+    if (u.kind === 'appliance' && u.appliance) {
+      const a = u.appliance;
+      const ow = Math.min(a.openingWidth, netW);
+      const ax0 = x0 + (netW - ow) / 2;
+      elevation.push({ k: 'poly', pts: rectPts(ax0, innerBottomY, ow, Math.min(a.openingHeight, innerH)), closed: true, layer: L_HW, lw: 1.2, dash: [90, 50] });
+      elevation.push({ k: 'text', p: { x: x0 + netW / 2, y: innerBottomY + Math.min(a.openingHeight, innerH) / 2 }, text: `${a.name} ${a.openingWidth}×${a.openingHeight}`, size: 80, layer: L_TEXT, align: 'c' });
+    }
     if (u.shelves && u.shelves.count > 0) {
       const tilt = u.shelves.tilt ?? 0;
       const shift = tilt > 0 ? Math.round(netW * Math.tan((tilt * Math.PI) / 180)) : 0;
@@ -370,8 +457,9 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       });
     }
     if (u.drawers) {
-      const cellH = drawerCellHeights(u, innerH, rules);
-      let y = innerBottomY + u.drawers.gap;
+      const netH = innerH - apZ0;
+      const cellH = drawerCellHeights(u, netH, rules);
+      let y = innerBottomY + apZ0 + u.drawers.gap;
       for (let k = 0; k < cellH.length; k++) {
         elevation.push({ k: 'poly', pts: rectPts(x0 + u.drawers.gap, y, netW - 2 * u.drawers.gap, cellH[k] - 2 * u.drawers.gap), closed: true, layer: L_FRONT, lw: 1.4 });
         y += cellH[k] + u.drawers.gap;

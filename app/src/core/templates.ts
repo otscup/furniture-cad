@@ -28,6 +28,14 @@ export interface TemplateUnit {
   doors?: { count: number; hingeSide?: 'left' | 'right' } | null;
   /** 斜层板倾角（度，仅 shelves 分区；酒柜展示架常用 10~15）。缺省 = 0 平层板 */
   tilt?: number;
+  /** 仅 kind='appliance'：洞口与上下分体（缺省值由 makeUnit 补齐） */
+  appliance?: {
+    name?: string;
+    openingWidth?: number;
+    openingHeight?: number;
+    openingDepth?: number;
+    topDrawers?: number;
+  };
   nickname?: string;
 }
 
@@ -45,6 +53,13 @@ export interface CabinetTemplate {
   };
   /** 分区骨架。空数组 = 走 defaultUnits（默认三分区），保持旧行为 */
   units: TemplateUnit[];
+  /**
+   * 'double' = 双面柜（岛台）：units 是前排，backUnits 是背面排。
+   * 缺省 'row'。给了 backUnits 但 layoutType 不是 double 同样按 double 建校验报错 —— 不允许模板自相矛盾。
+   */
+  layoutType?: 'row' | 'double';
+  /** 仅 layoutType='double'：背面分区骨架（从左到右） */
+  backUnits?: TemplateUnit[];
 }
 
 export const CABINET_TEMPLATES: CabinetTemplate[] = [
@@ -87,6 +102,49 @@ export const CABINET_TEMPLATES: CabinetTemplate[] = [
     params: { width: 600, height: 2000, depth: 350 },
     units: [{ kind: 'shelves', width: { ratio: 1 }, count: 6, tilt: 12, nickname: '斜层板' }],
   },
+  {
+    id: 'sideboard',
+    name: '餐边柜',
+    hint: '餐边柜 900 高 · 左双抽 + 中开放格（灯带）+ 右对开门',
+    params: { width: 1600, height: 900, depth: 420, bodyLift: 60 },
+    units: [
+      { kind: 'drawerBank', width: { ratio: 0.27 }, count: 2, nickname: '左抽' },
+      { kind: 'shelves', width: { ratio: 0.28 }, count: 1, nickname: '开放格' },
+      { kind: 'shelves', width: { ratio: 0.45 }, count: 1, doors: { count: 2 }, nickname: '右柜' },
+    ],
+  },
+  {
+    id: 'island',
+    name: '岛台',
+    hint: '双面岛台 · 前（抽+两组对开门）后（三组对开门）背靠背 · 共用中板',
+    params: { width: 2000, height: 900, depth: 900, bodyLift: 100 },
+    layoutType: 'double',
+    units: [
+      { kind: 'drawerBank', width: { ratio: 0.3 }, count: 2, nickname: '前抽' },
+      { kind: 'shelves', width: { ratio: 0.35 }, count: 1, doors: { count: 2 }, nickname: '前柜左' },
+      { kind: 'shelves', width: { ratio: 0.35 }, count: 1, doors: { count: 2 }, nickname: '前柜右' },
+    ],
+    backUnits: [
+      { kind: 'shelves', width: { ratio: 1 / 3 }, count: 2, doors: { count: 2 }, nickname: '后柜左' },
+      { kind: 'shelves', width: { ratio: 1 / 3 }, count: 2, doors: { count: 2 }, nickname: '后柜中' },
+      { kind: 'shelves', width: { ratio: 1 / 3 }, count: 2, doors: { count: 2 }, nickname: '后柜右' },
+    ],
+  },
+  {
+    id: 'laundry',
+    name: '洗衣机柜',
+    hint: '洗衣机位（洞口 650×850 + 上面三抽）+ 右侧对开门层板格',
+    params: { width: 1400, height: 2100, depth: 620, bodyLift: 80 },
+    units: [
+      {
+        kind: 'appliance',
+        width: { ratio: 0.5 },
+        appliance: { name: '洗衣机', openingWidth: 650, openingHeight: 850, openingDepth: 600, topDrawers: 3 },
+        nickname: '洗衣机位',
+      },
+      { kind: 'shelves', width: { ratio: 0.5 }, count: 4, doors: { count: 2 }, nickname: '侧柜' },
+    ],
+  },
 ];
 
 /** 找模板；找不到抛带可用清单的错（AI 通道也能读懂） */
@@ -100,8 +158,12 @@ export function findCabinetTemplate(id: string): CabinetTemplate {
 
 /** 把模板的宽度声明解析成名义宽度：固定值原样，比例按柜宽取整，最后一个吃余量 */
 export function resolveTemplateUnitWidths(tpl: CabinetTemplate): number[] {
-  const total = tpl.params.width;
-  const raw = tpl.units.map((u) => (typeof u.width === 'number' ? u.width : Math.round(total * u.width.ratio)));
+  return resolveTemplateUnitWidthList(tpl.units, tpl.params.width);
+}
+
+/** 同上，但作用于任意一组分区声明（双面柜的背面排复用同一套解析） */
+export function resolveTemplateUnitWidthList(units: TemplateUnit[], total: number): number[] {
+  const raw = units.map((u) => (typeof u.width === 'number' ? u.width : Math.round(total * u.width.ratio)));
   if (raw.length === 0) return [];
   const sumOthers = raw.slice(0, -1).reduce((a, b) => a + b, 0);
   raw[raw.length - 1] = total - sumOthers;

@@ -147,6 +147,19 @@
 - **隔离靠结构不靠纪律**：所有数据访问函数的第一个参数是 `ctx: {tenantId, userId}`，**没有 ctx 就查不出数据**（同 `isWritablePath` 的思路）
 - **CorrectionType 只用 5 类**（`preference` / `reference` / `cad_calculation` / `production_rule` / `unknown`）：`type` 决定去哪个通道，**分类必须互斥且可断言**；`unknown` 必须是默认值
 
+## AI 契约的坑（血泪）
+
+- **提示词只枚举动作 ≠ 告诉模型怎么用它们**。用户说"L 形橱柜"，AI 回"我只能创建单个
+  柜体，无法直接生成 L 形"——那是模型自己说的（全仓库 grep 无匹配）。它看到清单里
+  没有 `cabinet.createLShape`，就没注意到正上方有 `cabinet.rotate`。组合用法必须
+  单独成段写进提示词（`COMPOSITION_GUIDE`）。
+- **"严格"不等于"严格地拒绝人"**。原规则"做不到就别产生动作""有歧义就先问"，被模型
+  放大成先反问再说。改成可判定序列：直接做 / 组合做 / 真做不到。用户**给了数字**就
+  按口径建、在 reply 里说明，预览里让他纠偏。
+- **`cabinet.create` 必须有 `rotation`**。否则第二条臂只能"先 0° 建再 rotate"，中间态
+  撞墙被严格模式当场拒掉（"嵌进了墙体 1390mm"）——转角柜在动作层面真的拼不出来。
+  旋转角是**落位意图**不是几何，板件仍由生成器推导。
+
 ## 业务约定
 
 - 柜体分区宽有歧义 → `layout.widthMode`: `fit_total`（总宽硬约束，默认）| `fit_units`（净宽硬约束），差异必须报 INFO 显式告知

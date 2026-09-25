@@ -517,11 +517,16 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         backUnits = built;
       }
 
+      // 落位朝向：AI 建转角柜的第二条臂时靠它一次建到位。
+      // 少了这一步就只能"先 0° 建、再 rotate"，而中间态常常撞墙 —— 严格模式下
+      // 那条 create 会被当场拒掉，转角柜就永远建不出来（见契约里 rotation 参数的注释）。
+      const rotation = p.rotation === undefined ? 0 : Number(p.rotation);
       const cab = buildCabinet({
         name,
         roomId: room.id,
         x: place.x,
         y: place.y,
+        rotation,
         rules,
         params: { width, height, depth },
         units,

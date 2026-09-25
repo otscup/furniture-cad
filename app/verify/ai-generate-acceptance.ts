@@ -4,8 +4,9 @@ import { dirname, join } from 'node:path';
 
 import type { Cabinet, RuleSet, UnitSpec } from '../src/core/types.ts';
 import { CommandBus } from '../src/core/commandBus.ts';
-import { sampleProject } from '../src/core/docFactory.ts';
+import { emptyProject, rectRoom, sampleProject } from '../src/core/docFactory.ts';
 import { computeCabinetLayout } from '../src/core/geometry/layout.ts';
+import { buildCabinetBodies } from '../src/core/geometry/bodies3d.ts';
 import { compileAction, type AiAction } from '../src/ai/compile.ts';
 import { dryRunPlan, commitPlan } from '../src/ai/planRunner.ts';
 import { ACTIONS, UNIT_INTENT_ITEM, buildSystemPrompt, validatePlan } from '../shared/aiContract.mjs';
@@ -334,6 +335,121 @@ ok('E1 提示词里出现了 units 参数的写法', /units: 数组/.test(prompt
 ok('E2 提示词里出现了 doorCount（模型才知道"说得出来"）', /doorCount/.test(prompt));
 ok('E3 提示词明确"不要先 create 再 removeUnit 拆默认分区"（否则模型会去绕远路）', /removeUnit/.test(prompt));
 ok('E4 契约里声明了 units 这个动作参数', Boolean((ACTIONS as Record<string, { params?: Record<string, unknown> }>)['cabinet.create']?.params?.units));
+
+// ══════════ G 形体组合：L 形橱柜真的建得出来 ══════════
+// 用户原话：「L 新橱柜，长2200，台面宽750，高1000，另外一边长1200」
+// 他当时拿到的回答是"需要两个柜体配合，但目前我只能创建单个柜体，无法直接生成
+// L 形结构。请问你希望把这两个柜体分别放到哪个房间里？"。
+//
+// 那段话不是代码里的固定文案（全仓库 grep 无匹配），是模型自己说出口的。而契约里
+// **本来就能拼出 L 形** —— 只是有两处没人说清楚，于是在动作层面真的拼不出来：
+//   ① 提示词只把动作一个个列出来，从没说过它们**能组合**；模型于是按"清单里没有
+//      L 形这个动作"推断出"系统做不到"。它甚至没注意到正上方就有 cabinet.rotate。
+//   ② cabinet.create 不带 rotation，第二条臂只能"先以 0° 建、再转"。中间态是没转
+//      的那个朝向，位置多半当场撞墙，被严格模式整条拒掉（实测："嵌进了墙体 1390mm"）
+//      —— 那条报错看上去就像"系统不支持转角"。
+// 两条一起修，下面这组断言把它们钉死。
+
+section('G 形体组合：L 形橱柜真的建得出来');
+
+const kitchen = emptyProject({ name: '厨房', ruleSetId: rules.id });
+kitchen.rooms.push(rectRoom({ name: '厨房', x: 0, y: 0, w: 4200, h: 3600, thickness: 120, height: 2700 }));
+const kitchenBus = new CommandBus(kitchen, rules);
+
+/** 两臂共用的角点：一条向左上长、一条向上长 —— 这就是那个 L */
+const PIVOT = { atX: 3330, atY: 2730 };
+
+const lRaw = [
+  { action: 'cabinet.create', target: { roomName: '厨房' }, params: { name: 'L橱柜-长边', width: 2200, height: 1000, depth: 750, ...PIVOT, rotation: 180 }, reason: '长边 2200 沿墙' },
+  { action: 'cabinet.create', target: { roomName: '厨房' }, params: { name: 'L橱柜-短边', width: 1200, height: 1000, depth: 750, ...PIVOT, rotation: 270 }, reason: '短边 1200，转成第二条臂' },
+] as unknown as AiAction[];
+const lValid = validatePlan({ reply: '', actions: lRaw }, ctx);
+ok('G1 用户那四个数（2200/750/1000/1200）能通过契约校验 —— 不再是"无法生成"',
+  lValid.ok && lValid.actions.length === 2, lValid.error ?? '(0 条动作)');
+
+const lRun = dryRunPlan({ bus: kitchenBus, actions: lValid.actions });
+const badSteps = lRun.steps.filter((s) => !s.ok).map((s) => s.error).join(' / ');
+ok('G2 每一步都过编译（没有一步被严格模式拒掉）',
+  lRun.steps.length === 2 && lRun.steps.every((s) => s.ok), badSteps || '(竟然一步没跑)');
+ok('G3 干跑没有新引入 ERROR（落位没撞墙、两臂没重叠）', lRun.blockingErrors === 0, String(lRun.blockingErrors));
+
+const arms = lRun.draft.cabinets.filter((c) => c.name.startsWith('L橱柜'));
+const longArm = arms.find((c) => c.name === 'L橱柜-长边');
+const shortArm = arms.find((c) => c.name === 'L橱柜-短边');
+ok('G4 两个柜体都建出来了', arms.length === 2, `实到 ${arms.length} 个`);
+ok('G5 尺寸就是用户说的那四个数，一个不丢也不自作主张',
+  Boolean(longArm?.params.width === 2200 && longArm?.params.height === 1000 && longArm?.params.depth === 750 &&
+           shortArm?.params.width === 1200 && shortArm?.params.height === 1000 && shortArm?.params.depth === 750),
+  JSON.stringify(arms.map((a) => [a.params.width, a.params.height, a.params.depth])));
+
+/**
+ * 世界 AABB。
+ *
+ * 坑：`Box3D` 里的 `sx / sy` 是**局部**尺寸，世界 AABB 必须把局部四角按 rot 转出去再取包络。
+ * 直接拿 `cx ± sx / 2` 会在转过 90° 的柜子上量出完全错误的盒子 —— 我第一次就是这么量错
+ * 的，量出"短边伸到 x=4653、穿墙 570mm"，差点据此去改一个并不存在的 bug。
+ */
+function worldAABB(cab: Cabinet): { minX: number; maxX: number; minY: number; maxY: number } {
+  const boxes = buildCabinetBodies(cab, rules);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const b of boxes) {
+    const r = (b.rot * Math.PI) / 180;
+    for (const [dx, dy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]] as const) {
+      const lx = (b.sx / 2) * dx;
+      const ly = (b.sy / 2) * dy;
+      const wx = b.cx + lx * Math.cos(r) - ly * Math.sin(r);
+      const wy = b.cy + lx * Math.sin(r) + ly * Math.cos(r);
+      minX = Math.min(minX, wx); maxX = Math.max(maxX, wx);
+      minY = Math.min(minY, wy); maxY = Math.max(maxY, wy);
+    }
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+const A = longArm ? worldAABB(longArm) : null;
+const B = shortArm ? worldAABB(shortArm) : null;
+ok('G6 两条臂互相垂直（差 90°）',
+  Boolean(longArm && shortArm) && Math.abs((Math.abs(longArm!.placement.rotation - shortArm!.placement.rotation) % 180) - 90) < 1e-6,
+  longArm && shortArm ? `${longArm.placement.rotation}° vs ${shortArm.placement.rotation}°` : '');
+ok('G7 两条臂共用角点（世界 AABB 贴着，中间没有缝）',
+  Boolean(A && B) && (Math.abs(A!.maxX - B!.minX) < 1 || Math.abs(A!.maxY - B!.minY) < 1) &&
+  Math.min(Math.abs(A!.maxX - B!.minX), Math.abs(A!.maxY - B!.minY)) < 1,
+  A && B ? `A x[${A.minX.toFixed(0)}~${A.maxX.toFixed(0)}] y[${A.minY.toFixed(0)}~${A.maxY.toFixed(0)}] / B x[${B.minX.toFixed(0)}~${B.maxX.toFixed(0)}] y[${B.minY.toFixed(0)}~${B.maxY.toFixed(0)}]` : '');
+ok('G8 两条臂不重叠 —— 这是 L 形，不是两条平行的柜',
+  Boolean(A && B) && (Math.min(A!.maxX, B!.maxX) - Math.max(A!.minX, B!.minX) <= 0.5 || Math.min(A!.maxY, B!.maxY) - Math.max(A!.minY, B!.minY) <= 0.5),
+  A && B ? `x 重叠 ${(Math.min(A.maxX, B.maxX) - Math.max(A.minX, B.minX)).toFixed(0)} / y 重叠 ${(Math.min(A.maxY, B.maxY) - Math.max(A.minY, B.minY)).toFixed(0)}` : '');
+
+/**
+ * 负样本自证：把 rotation 撤掉，退回 AI 当初走的「先建、再转」那条老路。
+ *
+ * 这不是为了凑一条负例好看 —— 它证明 `rotation` 这个新参数是**承重**的：
+ * 没有它，L 形在严格模式下真的拼不出来，"系统不支持转角"曾经是代码里
+ * 真实存在的缺口，而不只是模型说错话。有了这条，将来谁把 rotation 删了，
+ * 测试会告诉他这个洞有多深。
+ */
+const naiveRaw = [
+  { action: 'cabinet.create', target: { roomName: '厨房' }, params: { name: '旧路-短边', width: 1200, height: 1000, depth: 750, ...PIVOT }, reason: '' },
+  { action: 'cabinet.rotate', target: { cabinetName: '旧路-短边' }, params: { deg: 270 }, reason: '' },
+] as unknown as AiAction[];
+const naiveValid = validatePlan({ reply: '', actions: naiveRaw }, ctx);
+const naiveRun = dryRunPlan({ bus: new CommandBus(kitchen, rules), actions: naiveValid.actions });
+ok('G9 负样本：退回"先建再转"，create 那一步会被撞墙拒掉（证明 rotation 是承重的）',
+  naiveRun.steps[0]?.ok === false && /墙体/.test(naiveRun.steps[0]?.error ?? ''),
+  naiveRun.steps[0]?.error ?? '(这条老路居然走得通，那 rotation 就没必要存在了)');
+ok('G10 负样本：被拒的那一步没有留下任何后果（该柜体不存在）',
+  naiveRun.draft.cabinets.some((c) => c.name === '旧路-短边') === false);
+
+// ── 提示词：模型必须看得见这些规矩 ──
+ok('G11 提示词写明"L 形用多个柜体拼出来"（不写这句模型就会自我否定）',
+  /L 形/.test(prompt) && /用多个柜体拼出来/.test(prompt));
+ok('G12 提示词要求第二条臂在 create 里直接给 rotation，而不是建完再转',
+  /第二条一定要在 cabinet.create 里就给 rotation/.test(prompt));
+ok('G13 提示词不许再把"做不到"当挡箭牌（旧文案：做不到就不要产生动作）',
+  !/做不到[^\n]*不要产生动作/.test(prompt));
+ok('G14 提示词不许因为"有歧义"就整体反问（旧文案会这么干）',
+  !/有歧义[^\n]*问清楚/.test(prompt));
+ok('G15 提示词不许反问"放到哪个房间"', /永远不要反问用户/.test(prompt));
+ok('G16 cabinet.create 的清单里出现了 rotation', /rotation: 枚举\{0\|90\|180\|270\}/.test(prompt));
 
 console.log('\n' + '='.repeat(64));
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);

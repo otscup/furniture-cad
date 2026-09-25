@@ -95,7 +95,14 @@ function overlap(a: BBox, b: BBox): boolean {
   return a.min.x < b.max.x && a.max.x > b.min.x && a.min.y < b.max.y && a.max.y > b.min.y;
 }
 
-function detectCollisions(project: Project): Issue[] {
+/**
+ * 干涉 / 撞墙的唯一判据。
+ *
+ * 导出它是为了让"挑落位"的地方（candidateSpots 只是候选生成，
+ * 判断放不放得下必须由这里说了算）能复用同一份答案。
+ * 谁要是再去写一遍 AABB，就等于制造了第二份真相源。
+ */
+export function detectCollisions(project: Project): Issue[] {
   const out: Issue[] = [];
   const boxes: Array<{ id: string; name: string; bbox: BBox }> = [];
 

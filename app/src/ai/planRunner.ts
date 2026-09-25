@@ -117,7 +117,14 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
       command: compiled.command,
       label: compiled.command.label ?? compiled.summary,
       ok: r.ok,
-      error: r.error ?? '被拒绝（总线没有给出原因，这本身是个缺陷）',
+      /**
+       * error 只能在**失败**时出现。
+       * 这里原本写成 `r.error ?? '被拒绝（…）'`，于是**成功的步骤也被塞了一句"被拒绝"** ——
+       * 界面恰好只看 !ok 的步骤，才没把这个笑话摆到用户面前。
+       * 这种"字段自带假信息"比没有信息更危险：谁哪天改成直接渲染 error，
+       * 用户会看到每一步都被拒绝。
+       */
+      error: r.ok ? undefined : (r.error ?? '被拒绝（总线没有给出原因，这本身是个缺陷）'),
       diff: r.diff,
       newIssues: r.newIssues,
       resolvedIssues: r.resolvedIssues,

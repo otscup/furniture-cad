@@ -76,6 +76,43 @@ export const UNIT_PARAM_RANGES = {
  * `atLeastOne` —— 至少要出现其中一个参数（例如 resize 至少给一个尺寸）
  * `detail` —— 会写进 prompt 的补充说明，用来减少模型的猜测
  */
+/**
+ * ── 分区意图：让 AI 有本事"照一句话描述搭出一个柜子" ──
+ *
+ * 为什么必须有这个口子：
+ *   `cabinet.create` 缺省生成 2:4:2 的三分区柜。用户说"左边三个抽屉、右边
+ *   两组对开门"时，AI 只能**先建后拆** —— removeUnit 掉那三个默认分区
+ *   （破坏性动作，还得写理由），再逐个 addUnit。一次上限 12 条动作根本不够，
+ *   而"先按默认建出来再拆掉"这种绕路，本质上是逼模型去猜系统的内部默认值。
+ *
+ * 为什么它不违反「几何永不来自 AI」：
+ *   每一项只有 kind（类型）/ width（期望宽 mm）/ count（数量）/ rodHeight /
+ *   doorCount / nickname —— **全是语义意图**，没有坐标、没有板件清单、没有图元。
+ *   真正的板件由 makeUnit + 参数化生成器推导，与既有柜型模板走**同一个构造点**。
+ *
+ * 为什么 width 是"期望值"而不是必须加总等于柜宽：
+ *   layout.widthMode = fit_total 下柜宽是硬约束，分区净宽按比例摊
+ *   （见 core/allocate.ts 的 allocateWidths，它连取整余量都按小数部分补齐，
+ *   保证 Σ 精确）。让 AI 去做加法没有任何好处，只会制造"差 1mm"的机会。
+ */
+export const UNIT_INTENT_MAX = 8;
+
+export const UNIT_INTENT_ITEM = {
+  kind: { type: 'enum', from: 'units.kind' },
+  width: { type: 'number', min: 50, max: 4000, unit: 'mm' },
+  count: { type: 'number', min: 1, max: 12 },
+  rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm' },
+  doorCount: { type: 'number', min: 0, max: 6 },
+  nickname: { type: 'string', max: MAX_STRING },
+};
+
+export const UNIT_INTENT_DOC = {
+  type: 'unitIntents',
+  item: UNIT_INTENT_ITEM,
+  max: UNIT_INTENT_MAX,
+  desc: `柜体内部结构（从左到右），最多 ${UNIT_INTENT_MAX} 个分区。省略 = 用系统默认三分区`,
+};
+
 export const ACTIONS = {
   // ───────── 柜体：外形 ─────────
   'cabinet.resize': {
@@ -184,9 +221,10 @@ export const ACTIONS = {
       nickname: { type: 'string', max: MAX_STRING, optional: true },
       count: { type: 'number', min: 1, max: 12, desc: '该分区的抽屉数 / 层板数（按 kind 解释）' },
       rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', desc: '仅 hanging：挂衣杆离柜内底高度' },
+      doorCount: { type: 'number', min: 0, max: 6, desc: '要不要门、几扇：0 = 开放格，2 = 对开门。不给就是不做门' },
     },
     required: ['kind', 'requestedWidth'],
-    detail: '新增分区会改变柜体总宽分配。kind=shelves/drawerBank 时 count 表示层板/抽屉数量；kind=hanging 时给 rodHeight。',
+    detail: '新增分区会改变柜体总宽分配。kind=shelves/drawerBank 时 count 表示层板/抽屉数量；kind=hanging 时给 rodHeight。想要"带门的格子"要显式给 doorCount，否则建出来是开放格。',
   },
   'cabinet.removeUnit': {
     label: '删除一个分区',
@@ -222,9 +260,14 @@ export const ACTIONS = {
       depth: { type: 'number', min: 200, max: 1200, unit: 'mm' },
       atX: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 X（省略 = 按房间内已有柜体自动排开）' },
       atY: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 Y' },
+      units: UNIT_INTENT_DOC,
     },
     required: ['name'],
-    detail: '未给尺寸时用规则集默认值。分区由 defaultUnits 自动生成（2:4:2 三分区）。',
+    detail:
+      '未给尺寸时用规则集默认值。' +
+      '**描述内部结构就给 units**（从左到右一列）：每项给 kind + width + 按需给 count(抽屉/层板数) / rodHeight(挂衣区) / doorCount(门扇数，0=开放格)。' +
+      'width 是**期望值**，总和不必等于柜宽 —— 系统按比例摊到总宽上，不要自己去做加法。' +
+      '没给 units 时才会用默认三分区：不要先 create 再 removeUnit 去拆它。',
   },
   'cabinet.duplicate': {
     label: '复制一个柜体',
@@ -421,6 +464,29 @@ function checkParam(actionName, key, p, v, ctx) {
       if (finite(v) || (typeof v === 'string' && v.trim() && v.length <= MAX_STRING)) return null;
       return `${where} 必须是数字序号（1 起）或房间名`;
     }
+    case 'unitIntents': {
+      if (!Array.isArray(v)) return `${where} 必须是一个数组（每个分区一项，从左到右）`;
+      if (v.length === 0) return `${where} 是空数组 —— 那就等于没说，删掉这个参数走默认分区`;
+      if (p.max !== undefined && v.length > p.max) {
+        return `${where} 给了 ${v.length} 个分区，最多 ${p.max} 个 —— 描述得太碎了，请把相邻的同类型格子合并`;
+      }
+      const item = p.item ?? {};
+      for (let i = 0; i < v.length; i++) {
+        const it = v[i];
+        if (!isPlainObject(it)) return `${where} 第 ${i + 1} 项必须是一个对象`;
+        for (const k of Object.keys(it)) {
+          if (!(k in item)) {
+            return `${where} 第 ${i + 1} 项里的 "${k}" 不是本系统认识的字段（只能用 ${Object.keys(item).join(' / ')}）`;
+          }
+        }
+        for (const [k, sub] of Object.entries(item)) {
+          if (it[k] === undefined) continue;
+          const bad = checkParam(`${actionName}.units[${i + 1}]`, k, sub, it[k], ctx);
+          if (bad) return bad;
+        }
+      }
+      return null;
+    }
     default:
       return `${where} 的类型 "${p.type}" 未实现校验 —— 契约里不许出现没人校验的参数类型`;
   }
@@ -440,6 +506,37 @@ function same(a, b) {
  *
  * @returns 错误文案，或 null（通过）
  */
+/**
+ * 分区意图的**语义互斥**判定。
+ *
+ * 为什么要抽成一个导出函数，被【校验器】和【编译器】两处调用：
+ *   校验器跑在服务端（AI 输出进门的地方），编译器跑在前端（planRunner 会
+ *   直接编译已经"假定合规"的动作）。只在一边拦，另一条路就是敞的 ——
+ *   实测过：`dryRunPlan` 拿到 `{kind:'hanging', count:2}` 时，
+ *   因为没人做这一层，坏分区真的建出来了。
+ *   同一条规矩只许有一份实现，不然迟早有一边失守。
+ *
+ * @returns 错误文案，或 null（通过）
+ */
+export function unitIntentsSemanticError(units) {
+  if (!Array.isArray(units)) return null;
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (!isPlainObject(u)) continue; // 结构问题由 checkParam 管，这里只看语义
+    const nth = `units 第 ${i + 1} 个分区（${u.kind ?? '?'}）`;
+    if (u.kind === 'hanging' && u.count !== undefined) {
+      return `${nth} 给了 count，但挂衣区没有"数量"这个概念 —— 挂衣杆高度请用 rodHeight（离柜内底）`;
+    }
+    if (u.kind !== 'hanging' && u.rodHeight !== undefined) {
+      return `${nth} 给了 rodHeight，但 ${u.kind} 区没有挂衣杆 —— rodHeight 只有挂衣区用得上`;
+    }
+    if (u.kind === 'open' && u.count !== undefined) {
+      return `${nth} 给了 count，但空区（open）什么都不放 —— 想要几块层板请用 shelves 并给 count`;
+    }
+  }
+  return null;
+}
+
 function crossValidate(actionName, params) {
   if (actionName === 'cabinet.setUnitParam') {
     const key = params.param;
@@ -450,6 +547,9 @@ function crossValidate(actionName, params) {
     if (r.integer && Math.abs(v - Math.round(v)) > 1e-9) return `${key} 必须是整数（收到 ${v}）`;
     if (v < r.min || v > r.max) return `${key} = ${v} 超出允许区间 ${r.min}~${r.max}`;
     return null;
+  }
+  if (actionName === 'cabinet.create' && Array.isArray(params.units)) {
+    return unitIntentsSemanticError(params.units);
   }
   return null;
 }
@@ -577,6 +677,10 @@ function describeParam(k, p, spec) {
       return `${k}: 分区引用（1 起序号或昵称）${opt}`;
     case 'roomRef':
       return `${k}: 房间引用（1 起序号或房间名）${opt}`;
+    case 'unitIntents': {
+      const fields = Object.entries(p.item ?? {}).map(([ik, ip]) => `${ik}${describeParam(ik, ip, {}).replace(/^[^:]*: /, '(') + ')'}`);
+      return `${k}: 数组，最多 ${p.max} 项，从左到右，每项含 ${fields.join('，')}${opt}${p.desc ? ` ${p.desc}` : ''}`;
+    }
     default:
       return `${k}: ${p.type}`;
   }

@@ -2360,6 +2360,123 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ═══════════════════════════════════════════════════════════
     /**
+     * B37 —— 「AI 照描述生成柜体」在**真界面**上跑通一遍。
+     *
+     * 用户原话："目前ai功能太少，只能修改长宽高等一些基础参数……能不能利用AI更具描述生成"。
+     *
+     * node 侧已经证明"意图 → 分区"的映射和恒等式，但用户真正要的是
+     * **在界面上说一句话就得到一个柜子**。这条链路（输入 → mock 服务商 →
+     * 契约 → 干跑 → 点应用 → 对象树/四视图里真的多出一台柜）只在浏览器里存在。
+     *
+     * 关键断言不是"多了一个柜"，而是三条：
+     *   ① 建出来的内部结构**就是描述里说的那个**（三个分区、抽屉数、门扇数）
+     *   ② 落位是系统替它挑的，且**不撞墙**（不许"放进去再说"）
+     *   ③ 一次生成 = 一条命令 = 一次撤销（不是散落一堆改动收不回来）
+     */
+    section('B37 AI 照描述生成柜体：一句话 → 真界面 → 真的多出一台柜');
+
+    await activateRightTab('AI');
+    await sleep(360);
+
+    // 先存现场。这一节会真的往模型里加一台柜，而下游 B21 / B30 的落位断言
+    // 依赖"房间还剩多少空位" —— 不还原就会把人家挤到没地方放（第一轮就踩了，
+    // B30 于是报"两个柜体重叠"，看起来像模板放置有 bug，其实是这里留了赃物）。
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      window.__b37Saved = structuredClone(s.bus.getState()); return true})()`);
+
+    const before37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState();
+      return { ver:s.bus.getVersion(), count:p.cabinets.length,
+        names:p.cabinets.map(c=>c.name), errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length };})()`);
+
+    ok('能在输入框里写出一段结构描述（不是"把宽改成 1800"这种单参数指令）',
+      (await setElValue('.side-right .ai-input', '帮我生成一个餐边柜：左边三只抽屉，中间两块层板带一组对开门，右边留开放格')) === true);
+    ok('点「生成编辑计划」', (await clickPanelBtn('生成编辑计划', 20000)) === true);
+
+    const shown37 = await waitFor(`!!document.querySelector('.side-right .plan-step')`, 25000);
+    ok('出现干跑预览（走真 HTTP：界面 → 本地服务 → mock 服务商 → 回来）', shown37 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
+
+    const plan37 = await evalJs(`(()=>{
+      const steps=[...document.querySelectorAll('.side-right .plan-step')];
+      return {
+        count:steps.length,
+        bad:steps.filter(s=>s.classList.contains('plan-step-bad')).length,
+        actions:steps.map(s=>((s.querySelector('.plan-head .mono')?.textContent)||'').trim()),
+        labels:steps.map(s=>((s.querySelector('.plan-label')?.textContent)||'').trim()),
+        diffs:steps.map(s=>[...s.querySelectorAll('.diff-list li')].map(li=>li.textContent.replace(/\\s+/g,' ').trim())),
+      };
+    })()`);
+
+    ok('AI 给出的是"建一个柜"这条动作，而不是一串改尺寸的补丁',
+      plan37.actions.some((a) => /cabinet\.create/.test(a)), JSON.stringify(plan37.actions));
+    ok('预览里没有失败卡（描述被完整理解了）', plan37.bad === 0, `坏卡 ${plan37.bad} 张`);
+    ok('预览阶段模型没动：柜体数量不变', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before37.count,
+      `${before37.count} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)}`);
+
+    // 留一张"干跑预览"的图：这是用户点"应用"之前看到的唯一依据，值得被看见
+    const shotPreview37 = await shot(path.join(OUT_DIR, 'ai-generate-preview.png'));
+    ok('干跑预览截图已留档（非空）', shotPreview37 > 20000, `${shotPreview37} 字节`);
+
+    ok('点「应用」', (await clickPanelBtn('应用全部', 1400)) === true);
+    await sleep(420);
+
+    const after37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const p=s.bus.getState();
+      const c=p.cabinets.find(x=>x.name==='AI生成柜');
+      return {
+        ver:s.bus.getVersion(), count:p.cabinets.length,
+        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length,
+        cab: c ? { name:c.name, w:c.params.width, h:c.params.height, d:c.params.depth,
+          place:JSON.stringify(c.placement),
+          units:c.layout.units.map(u=>({id:u.id, kind:u.kind, nick:u.nickname,
+            drawers:u.drawers?.count ?? null, shelves:u.shelves?.count ?? null, doors:u.doors?.count ?? null})) } : null,
+      };})()`);
+
+    ok('真的多出一台柜（一次生成 = 一条命令 = 版本 +1）',
+      after37.count === before37.count + 1 && after37.ver === before37.ver + 1, JSON.stringify({ c: `${before37.count}→${after37.count}`, v: `${before37.ver}→${after37.ver}` }));
+    ok('描述里的三个分区一个不少（左抽 / 中门格 / 右开放）',
+      Boolean(after37.cab) && after37.cab.units.length === 3
+        && after37.cab.units.map((u) => u.kind).join(',') === 'drawerBank,shelves,open',
+      JSON.stringify(after37.cab?.units));
+    ok('"三只抽屉"真的变成 3 只', after37.cab?.units[0]?.drawers === 3, String(after37.cab?.units[0]?.drawers));
+    ok('"带一组对开门"真的做了 2 扇门', after37.cab?.units[1]?.doors === 2, String(after37.cab?.units[1]?.doors));
+    ok('"右边开放格"就是不带门（不是忘了做）', after37.cab?.units[2]?.doors === null, String(after37.cab?.units[2]?.doors));
+    ok('分区 id 各不相同（否则板件撞 id → 清单少一块 → 生产下错料）',
+      new Set((after37.cab?.units ?? []).map((u) => u.id)).size === 3, JSON.stringify((after37.cab?.units ?? []).map((u) => u.id)));
+    ok('落位是系统挑的且没撞墙（不是"放进去再报一条干涉"）',
+      after37.errs === before37.errs, `ERROR ${before37.errs} → ${after37.errs}`);
+    ok('应用后没有新增硬错', after37.errs === 0, String(after37.errs));
+
+    // 撤销：一次生成必须一次收得回来
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await sleep(320);
+    const undo37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`);
+    ok('一次撤销就把这台柜收回去（生成不是散落一堆改不回来的改动）', undo37 === before37.count, `${after37.count} → ${undo37}`);
+    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.redo();return true})()`);
+    await sleep(320);
+    ok('重做又能回来（历史是线性的，不是一次性操作）',
+      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before37.count + 1);
+
+    // 切到四视图拍一张：新柜在图上真的画出来了（不是只在对象树里多一行）
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
+    await sleep(1100);
+    const shotApplied37 = await shot(path.join(OUT_DIR, 'ai-generate-applied.png'));
+    ok('应用后截图已留档（非空）', shotApplied37 > 20000, `${shotApplied37} 字节`);
+
+    // 还原现场：本节自己造的柜子不许留给下游
+    const restored37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      if (!window.__b37Saved) return null;
+      s.bus.replaceProject(window.__b37Saved, 'B37 还原现场');
+      const p=s.bus.getState();
+      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name) };})()`);
+    ok('B37 结束后把现场还原了（自己造的柜子不许留给下游占地方）',
+      Boolean(restored37) && restored37.count === before37.count
+        && restored37.names.join('|') === before37.names.join('|'),
+      `还原=${JSON.stringify(restored37)} 之前=${JSON.stringify(before37.names)}`);
+    await sleep(240);
+
+    // ═══════════════════════════════════════════════════════════
+    /**
      * B18 —— 用户原话："以后用于商用可能涉及到订阅模式…增加账号管理等功能，
      * 以及账号使用、ai 模型调用管理等功能。但是得保证账号安全问题。"
      *

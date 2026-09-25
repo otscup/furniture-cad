@@ -3,8 +3,11 @@ import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import * as CMD from '../core/commands.ts';
 import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '../core/docFactory.ts';
 import { nextId } from '../core/ids.ts';
-import { unitParamRange } from '../../shared/aiContract.mjs';
+import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
+import { detectCollisions } from '../core/geometry/project.ts';
+import { candidateSpots } from '../core/snapPlace.ts';
+import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -59,6 +62,96 @@ export type CompileResult =
   | { ok: false; error: string };
 
 const mm = (v: number): number => Math.round(Number(v));
+
+/**
+ * 「要不要门、几扇」的意图 → makeUnit 需要的 doors 形状。
+ *
+ * doorCount 缺省（undefined）= **没说**，建出来是不带门的开放格；
+ * 0 是明确说"不要门"，结果同样是开放格 —— 两者结果一致但语义不同，
+ * 这里统一成"不挂 doors"，因为 makeUnit 里"没有 doors"就是开放格的合法表达。
+ */
+function doorIntentOf(doorCount: unknown): { count: number } | undefined {
+  if (doorCount === undefined || doorCount === null) return undefined;
+  const n = Math.round(Number(doorCount));
+  return n > 0 ? { count: n } : undefined;
+}
+
+/**
+ * 替新柜挑一个放得下的落位。
+ *
+ * ── 判据不许自己写 ──
+ *   "放不放得下"只有一个答案，那就是**干涉校验器**（project.detectCollisions）。
+ *   这里的 probe 只是把候选柜体塞进一份临时 Project 里去问它，
+ *   谁要是在这里再写一遍 AABB，就等于种下第二份真相源 ——
+ *   两边迟早会算出不一样的结论，而那正是本项目最怕的一类事故。
+ *
+ * ── 为什么只在 PLACEMENT_BLOCKING_CODES 上否决 ──
+ *   与 variants.ts 的 placeVariant 同一个道理：柜体本身的结构问题
+ *   （比如板件超幅面）跟"放哪儿"无关，拿它否决落位会导致
+ *   **所有落点都被否掉**，最后退化成"随便放进去再说"。
+ */
+function pickFreeSpot(project: Project, cab: Cabinet): { x: number; y: number; rotation: number } | null {
+  const spots = candidateSpots(project, cab.roomId, cab.params.width);
+  for (const s of spots) {
+    const trial: Cabinet = { ...cab, placement: { x: s.x, y: s.y, rotation: s.rotation } };
+    const draft: Project = { ...project, cabinets: [...project.cabinets, trial] };
+    const bad = detectCollisions(draft).filter(
+      (i) => i.severity === 'ERROR' && PLACEMENT_BLOCKING_CODES.has(i.code) && i.target.split(' / ').includes(trial.id)
+    );
+    if (bad.length === 0) return { x: s.x, y: s.y, rotation: s.rotation };
+  }
+  return null;
+}
+
+/**
+ * 分区意图数组 → UnitSpec[]。
+ *
+ * ── 为什么 width 直接拿来当 requestedWidth，不按柜宽做归一化 ──
+ *   layout.widthMode = fit_total 下柜宽是**硬约束**，分区净宽由
+ *   allocateWidths 按比例摊（它连取整余量都按小数部分补齐，Σ 精确）。
+ *   让 AI 给的宽之和必须等于柜宽，既没有收益，又制造了大量"差 1mm"的机会。
+ *
+ * ── takenIds 必须逐个累积（这条是血泪，不是洁癖）──
+ *   不累积时每个分区都拿到 unit_001，而板件 id 是 `…_unit_00N_SH1` 拼出来的，
+ *   多个分区同名会让**不同板件撞成同一个 id**：校验器报 DUP-PANEL-ID，
+ *   更糟的是列表里两块不同的板会静默共用一条记录 —— 到了生产就是下错料。
+ */
+function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number }): UnitSpec[] | string {
+  if (!Array.isArray(raw)) return 'units 必须是一个数组';
+  if (raw.length === 0) return 'units 是空数组 —— 想用默认分区就不要给这个参数';
+  // 语义互斥这一层**不由编译器自己重写**，而是调用契约里同一份实现。
+  // 只靠服务端拦是不够的：dryRunPlan 会直接编译"假定已合规"的动作，
+  // 那样的话"{kind:'hanging', count:2}"这种坏分区能被真的建出来。
+  const semantic = unitIntentsSemanticError(raw);
+  if (semantic) return semantic;
+  const taken = new Set<string>();
+  const out: UnitSpec[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const it = (raw[i] ?? {}) as Record<string, unknown>;
+    const kind = String(it.kind ?? '') as UnitSpec['kind'];
+    if (!kind) return `units 第 ${i + 1} 项缺 kind（分区类型）`;
+    let unit: UnitSpec;
+    try {
+      unit = makeUnit({
+        kind,
+        requestedWidth: mm(Number(it.width ?? 0)),
+        nickname: it.nickname === undefined ? undefined : String(it.nickname),
+        rules: opts.rules,
+        depth: opts.depth,
+        count: it.count === undefined ? undefined : Number(it.count),
+        rodHeight: it.rodHeight === undefined ? undefined : Number(it.rodHeight),
+        doors: doorIntentOf(it.doorCount),
+        takenIds: taken,
+      });
+    } catch (e) {
+      // makeUnit 对未知 kind 抛错 —— 转成"哪一格说错了"的人话，别让整份计划挂在一个字段名上
+      return `units 第 ${i + 1} 项的分区类型「${kind}」本系统不认识（可用：drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区）`;
+    }
+    taken.add(unit.id);
+    out.push(unit);
+  }
+  return out;
+}
 
 /**
  * 解析"是哪个柜体"。
@@ -330,6 +423,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         depth: cab.params.depth,
         count: p.count === undefined ? undefined : Number(p.count),
         rodHeight: p.rodHeight === undefined ? undefined : Number(p.rodHeight),
+        doors: doorIntentOf(p.doorCount),
       });
       return { ok: true, command: CMD.addUnit(cab.id, cab.name, unit, src), summary: `「${cab.name}」新增分区 ${unit.nickname ?? unit.id}` };
     }
@@ -377,19 +471,48 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         place.x = same.reduce((m, c) => Math.max(m, c.placement.x + c.params.width), 0);
         place.y = same.length ? same[0].placement.y : 0;
       }
+      const width = p.width === undefined ? base.width : mm(Number(p.width));
+      const height = p.height === undefined ? base.height : mm(Number(p.height));
+      const depth = p.depth === undefined ? base.depth : mm(Number(p.depth));
+
+      // ── 分区意图：AI 说"左边三个抽屉、右边两组对开门"时就落在这里 ──
+      // 省略 units 才走默认三分区；给了就必须**完全按它说的建**，不许偷偷补默认分区。
+      let units: UnitSpec[] | undefined;
+      if (p.units !== undefined) {
+        const built = unitsFromIntents(p.units, { rules, depth });
+        if (typeof built === 'string') return { ok: false, error: built };
+        units = built;
+      }
+
       const cab = buildCabinet({
         name,
         roomId: room.id,
         x: place.x,
         y: place.y,
         rules,
-        params: {
-          width: p.width === undefined ? base.width : mm(Number(p.width)),
-          height: p.height === undefined ? base.height : mm(Number(p.height)),
-          depth: p.depth === undefined ? base.depth : mm(Number(p.depth)),
-        },
+        params: { width, height, depth },
+        units,
         takenIds: project.cabinets.map((c) => c.id),
       });
+
+      // 没给落位时，替它在房间里找一个**放得下**的位置。
+      // 这一步看似是"体贴"，其实是必需的：AI 只是描述了柜子长什么样，
+      // 落位是系统替它定的 —— 系统把柜子塞进墙里再报一条干涉 ERROR，
+      // 用户会以为是 AI 理解错了，实际是我们自己挑错了地方。
+      if (p.atX === undefined || p.atY === undefined) {
+        const spot = pickFreeSpot(project, cab);
+        if (spot !== null) {
+          cab.placement = { x: spot.x, y: spot.y, rotation: spot.rotation };
+        } else {
+          return {
+            ok: false,
+            error:
+              `房间「${project.rooms.find((r) => r.id === room.id)?.name ?? room.id}」里找不到放得下「${name}」（宽 ${width}mm）的位置：贴墙的落位会撞墙或与已有柜体重叠。` +
+              '请把柜宽改小一点，或显式给 atX / atY 指定落位。',
+          };
+        }
+      }
+
       return { ok: true, command: CMD.createCabinet(cab, src), summary: `新建柜体「${name}」` };
     }
 

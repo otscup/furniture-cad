@@ -4690,6 +4690,110 @@ async function waitForApp(url, timeoutMs = 25000) {
     const finalShot = await shot(path.join(OUT_DIR, 'app-phase3-final.png'));
     ok(`阶段收尾截图已保存（${(finalShot / 1024).toFixed(0)}KB）`, finalShot > 30000, `${finalShot} bytes`);
     ok('跑完账号与样式审计之后，仍然零页面异常', pageErrors.length === 0, pageErrors.join('\n      '));
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B40 —— master 反馈五件事里的第 5 件：UI 遗留（退出登录 / 首页入口）。
+     *
+     * 这两条当时**根本不存在**：介绍页（/home.html）能进工作台，但工作台没有任何
+     * 路回介绍页；退出登录只藏在「账号」面板里，而免登录模式下那个面板干脆不出。
+     * 所以这里先验"入口真的在顶栏够得着"，再真去点那个按钮 ——
+     * 只断言按钮存在、不看点了以后会话有没有真的失效，等于给一个假出口。
+     */
+    section('B40 UI 遗留：顶栏能回介绍页 · 退出登录是真出口');
+
+    const home40 = await evalJs(`(()=>{
+      const as=[...document.querySelectorAll('.toolbar a')];
+      const hit=as.find(el=>(el.textContent||'').includes('首页'));
+      return hit?{ text:(hit.textContent||'').trim(), href:hit.getAttribute('href'),
+        target:hit.getAttribute('target'), rel:hit.getAttribute('rel'),
+        deco:getComputedStyle(hit).textDecorationLine,
+        box:(()=>{const r=hit.getBoundingClientRect();return {w:Math.round(r.width),h:Math.round(r.height)}})() }:null;})()`);
+    ok('顶栏看得见「首页」入口（原来只有介绍页能进工作台，反过来没有路）',
+      Boolean(home40), JSON.stringify(home40));
+    ok('它真指向介绍页，而且新标签页打开 —— 同标签页等于用介绍页顶掉未存盘的设计',
+      Boolean(home40) && home40.href === '/home.html' && home40.target === '_blank' && /noopener/.test(home40.rel || ''),
+      JSON.stringify(home40));
+    ok('链接长成按钮的样子（没有下划线、也没缩成 0 宽）',
+      Boolean(home40) && home40.deco === 'none' && home40.box.w > 20 && home40.box.h > 12,
+      JSON.stringify(home40 && home40.box));
+
+    /**
+     * 前置自检：**这一节不许靠上一节留下的会话**。
+     * 曾经 B18 建的那个 owner 会话是全靠 B18 点的建号按钮才有的 ——
+     * 于是"顶栏有退出按钮"这条只能在大跑里绿，单独跑 B40 就 null。
+     * 没有会话就自己建一个并登录；界面只在挂载时读一次 sessionStorage，
+     * 所以塞完 token 必须重新导航，否则它永远读不到。
+     */
+    /**
+     * 两步走，且每一步都**留痕**：
+     *   ① 自助注册（只在一个账号都没有时放行，见 server.mjs 的 REGISTER_CLOSED）——
+     *      注册成功那一步**直接就带着 token**，不必再登一次；
+     *   ② 已经有账号时（大跑里 B18 建的那个 owner）注册会被 403 挡住，
+     *      那就用 B18 那副凭据直接登录。
+     * 第一版只发了 register 就丢掉状态码，等于"以为建成了"；再加上
+     * 端口被一台旧服务占着（那台跑的是旧构建，注册接口根本不存在），
+     * 于是这一步静默失败、后面三条全变 null —— ** failures 没有一条说到真原因**。
+     * 所以这回每一步都把 status 带回来，失败时看一眼就明白。
+     */
+    const boot40 = await evalJs(`(async()=>{
+      const K='furniture-cad.auth.token';
+      if(sessionStorage.getItem(K)) return {already:true};
+      const pw='Cad-Str0ng-Pw-2026!x';
+      const post=async(name,b)=>{
+        const r=await fetch('/api/auth/'+name,{method:'POST',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+        return {s:r.status, b:await r.json().catch(()=>({}))};
+      };
+      const trace=[];
+      const rg=await post('register',{username:'owner',password:pw});
+      trace.push('register:'+rg.s);
+      let tk = rg.b && rg.b.token;
+      if(!tk){
+        const lg=await post('login',{username:'owner',password:pw});
+        trace.push('login-owner:'+lg.s);
+        tk = lg.b && lg.b.token;
+      }
+      if(!tk) return {fail:true, trace, body: rg.b};
+      sessionStorage.setItem(K,tk);
+      return {logged:true, via:trace.join(' → ')};
+    })()`);
+    ok('B40 自带前置：要么本来就有会话，要么现建/现登一个 owner（不靠上一节留的现场）',
+      boot40.already === true || boot40.logged === true, JSON.stringify(boot40));
+    if (boot40.logged === true) {
+      await send('Page.navigate', { url: APP_URL });
+      await sleep(2600);
+    }
+
+    const logged40 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')];
+      const hit=b.find(el=>(el.textContent||'').includes('退出登录'));
+      return hit?{ shown:hit.offsetParent!==null, token:(()=>{try{return sessionStorage.getItem('furniture-cad.auth.token')}catch(e){return null}})() }:null;})()`);
+    ok('登录状态下顶栏出现「退出登录」（免登录时没有可退的东西，给它按钮是骗人）',
+      Boolean(logged40) && logged40.shown === true, JSON.stringify(logged40));
+    ok('此刻确实带着会话（没有会话就验不了"退出"这件事）',
+      Boolean(logged40) && !!logged40.token, JSON.stringify(logged40));
+
+    // 真去点顶栏那个按钮
+    const clicked40 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')];
+      const hit=b.find(el=>(el.textContent||'').includes('退出登录'));
+      if(!hit) return false; hit.click(); return true;})()`);
+    await sleep(700);
+    const after40 = await evalJs(`(async()=>{
+      const r=await fetch('/api/auth/me');
+      const b=[...document.querySelectorAll('.toolbar .tb-btn')];
+      const as=[...document.querySelectorAll('.toolbar a')];
+      return { gone:!b.some(el=>(el.textContent||'').includes('退出登录')),
+        meStatus:r.status,
+        token:(()=>{try{return sessionStorage.getItem('furniture-cad.auth.token')}catch(e){return null}})(),
+        homeStill:as.some(el=>(el.textContent||'').includes('首页')) };})()`);
+    ok('顶栏那个「退出登录」点得动', clicked40 === true);
+    ok('点了之后会话真的没了（不是只把按钮藏起来）',
+      after40.meStatus === 401 && !after40.token, JSON.stringify(after40));
+    ok('顶栏的退出按钮跟着消失（状态与界面一致）', after40.gone === true, JSON.stringify(after40));
+    ok('退出之后首页入口还在（退出不该把其它入口一起带走）', after40.homeStill === true, JSON.stringify(after40));
+
+    const shot40 = await shot(path.join(OUT_DIR, 'app-toolbar-home-logout.png'));
+    ok('顶栏截图已留档（首页入口 + 未登录态）', shot40 > 20000, `${shot40} 字节`);
     /**
      * console error 的判定要分两类。
      *

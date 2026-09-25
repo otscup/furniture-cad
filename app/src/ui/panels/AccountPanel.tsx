@@ -48,7 +48,13 @@ interface AuditEntry {
   [k: string]: unknown;
 }
 
-export function AccountPanel(props: { token: string | null; setToken: (t: string | null) => void; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
+export function AccountPanel(props: {
+  token: string | null;
+  setToken: (t: string | null) => void;
+  onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void;
+  /** 统一的登出入口（见 App.tsx 的 doLogout） */
+  onLogout: () => void;
+}): ReactNode {
   const [online, setOnline] = useState<'checking' | 'online' | 'offline'>('checking');
   const [mode, setMode] = useState<'local-open' | 'accounts' | null>(null);
   /** 管理员是否开放了邮箱自助注册（/api/auth/mode 的 signupOpen；local-open 时天然可注册） */
@@ -219,14 +225,10 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
     }
   }, [p, props, refresh, u]);
 
-  const doLogout = useCallback(async () => {
-    await api('/api/auth/logout', { method: 'POST', token: props.token });
-    props.setToken(null);
-    saveToken(null);
-    setMe(null);
-    say('已退出登录');
-    await refresh();
-  }, [props, refresh]);
+  /**
+   * 登出由 App 统一处理（`props.onLogout`）—— 顶栏那个按钮走的是同一份实现。
+   * 这里保留按钮只是为了让"退出登录"在账号页里也够得着，不再各写一遍。
+   */
 
   const doChangePassword = useCallback(async () => {
     setErr('');
@@ -314,7 +316,7 @@ export function AccountPanel(props: { token: string | null; setToken: (t: string
             <Row label="权限" derived>
               {permissions?.canManage ? '可管理账号' : '不可管理账号'} · {permissions?.canDesign ? '可改模型' : '只读'}
             </Row>
-            <button type="button" className="tb-btn" onClick={() => void doLogout()}>
+            <button type="button" className="tb-btn" onClick={() => props.onLogout()}>
               退出登录
             </button>
           </>

@@ -42,6 +42,9 @@ export function Toolbar(props: {
   hasSelection: boolean;
   canDuplicate: boolean;
   canDelete: boolean;
+  /** 有会话才显示「退出登录」——免登录模式下没有可退的东西，给个按钮是骗人 */
+  loggedIn: boolean;
+  onLogout: () => void;
 }): ReactNode {
   const t = props.snap;
   const toggle = (patch: Partial<SnapSettings>): void => props.setSnap({ ...t, ...patch });
@@ -174,6 +177,27 @@ export function Toolbar(props: {
       </div>
 
       <div className="tb-spacer" />
+
+      {props.loggedIn ? (
+        <div className="tb-group">
+          <button type="button" className="tb-btn" title="退出登录（会话只在本标签页，关掉浏览器即失效）" onClick={props.onLogout}>
+            ⏻ 退出登录
+          </button>
+        </div>
+      ) : null}
+
+      {/* 介绍页：新标签页打开。同标签页等于把当前这张未存盘的设计顶掉 —— 那不是入口，是删除 */}
+      <a
+        className="tb-btn"
+        href="/home.html"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="产品介绍页（新开标签页，当前设计不会丢）"
+      >
+        ⌂ 首页
+      </a>
+
+      <div className="tb-sep" />
 
       <div className="tb-group tb-notice" title="MVP 阶段只输出 DXF">
         MVP：仅 DXF

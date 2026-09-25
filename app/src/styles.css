@@ -110,6 +110,8 @@ kbd {
   cursor: pointer;
   white-space: nowrap;
 }
+/* 顶栏里的链接也长成按钮的样子（首页入口）——少一条这条，链接会带下划线并吞掉 flex 居中 */
+a.tb-btn { text-decoration: none; }
 .tb-btn:hover:not(:disabled) { background: var(--accent-soft); border-color: #bfdbfe; color: var(--accent); }
 .tb-select {
   font-family: inherit;

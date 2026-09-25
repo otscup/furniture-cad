@@ -197,6 +197,29 @@ const stop = () => {
 };
 process.on('exit', stop);
 
+/**
+ * 开跑前先确认端口没人占。
+ *
+ * 踩过一次，代价是**整次验收都在跑假**：上次跑留下的一台旧服务先占住了
+ * 本地服务端口，这次新起的进程直接 EADDRINUSE 退出，而 `waitUp()` 探到的
+ * 200 是**那台旧服务**回的 —— 于是探针一路打在旧构建上，
+ * 得到的"通过"与这次改动毫无关系，页面上却显示全绿。
+ * 这比断言写错更危险：写错的断言会红，跑在错的服务上不会。
+ *
+ * vite 那边有 `--strictPort`，占位会直接报错；本地服务没有这道保险。
+ */
+const assertPortFree = async (port, who) => {
+  if (await ping(`http://127.0.0.1:${port}/api/health`)) {
+    console.error(
+      `\nERR: ${who} 端口 ${port} 已经被占住 —— 十有八九是上次跑残留的旧服务。` +
+        `\n     它跑的是**旧代码**，这一轮验收会打在它身上，结论全是假的。` +
+        `\n     先把它收掉（Windows：netstat -ano | findstr :${port}，再 taskkill //PID <pid> //F），再重跑。\n`
+    );
+    process.exit(1);
+  }
+};
+await assertPortFree(API_PORT, '本地服务');
+
 // ── 1. 本地 Node 服务（管理后台的后端）──
 const api = spawnProc('server', ['server/server.mjs'], {
   ...process.env,
@@ -231,6 +254,21 @@ if (!(await waitUp(base, 30000))) {
 console.log(`vite    : ${base} 就绪`);
 
 // ── 3. 探针 ──
+/**
+ * 探针开始前，先确认**这一轮自己拉起的那台服务还活着**。
+ *
+ * 上面那道端口检查挡的是"别人占着"，这道挡的是"自己这台半路死了"：
+ * 服务崩了而端口还没被回收时，`waitUp` 照样探到 200（旧连接仍在 TIME_WAIT
+ * 或内核还没释放），接着整轮验收打在一台死服务上。
+ * 活着的判据用 `exitCode`/`signalCode` —— 不用 ping，ping 只会让人更放心。
+ */
+if (api.exitCode !== null || api.signalCode !== null) {
+  console.error(`\nERR: 本地服务在验收开始前就已经退出（exit=${api.exitCode} signal=${api.signalCode}）：`);
+  console.error(api._log.slice(-1500));
+  stop();
+  process.exit(1);
+}
+
 const probe = spawn(process.execPath, ['verify/browser-probe.cjs'], {
   stdio: 'inherit',
   env: {

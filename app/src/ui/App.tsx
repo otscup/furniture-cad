@@ -34,7 +34,7 @@ import { AIPanel } from './panels/AIPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
-import { loadToken, saveToken } from '../ai/aiClient.ts';
+import { api, loadToken, saveToken } from '../ai/aiClient.ts';
 import { loadDraft, saveDraft, clearDraft, fmtSavedAt } from '../state/draftStore.ts';
 import type { PickLine } from '../core/geometry/pickLines.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
@@ -96,6 +96,24 @@ export function App() {
     setTokenRaw(t);
     saveToken(t);
   }, []);
+
+  /**
+   * 退出登录只有这一份实现（顶栏按钮与账号面板那个共用）。
+   * 曾经 AccountPanel 里也写了一遍，结果顶栏再加一个按钮就意味着两处逻辑
+   * 要同步改 —— 而"改了一处、忘了另一处"是不会报错的。
+   */
+  const doLogout = useCallback(() => {
+    void (async () => {
+      if (token) {
+        const r = await api('/api/auth/logout', { method: 'POST', token });
+        // 服务端拒绝也要退出来：本地会话清掉以后，剩下的只有服务端那条记录，
+        // 让用户卡在一个"本地已登出、界面还当已登录"的状态更糟
+        if (!r.ok) toast('warn', `服务端未确认登出（${r.error ?? r.status}），本地会话已清除`);
+      }
+      setToken(null);
+      toast('ok', '已退出登录');
+    })();
+  }, [token, setToken]);
 
   // ── 本地草稿 ──
   const [savedAt, setSavedAt] = useState<string | null>(null);
@@ -920,6 +938,8 @@ export function App() {
         hasSelection={selection.length > 0}
         canDuplicate={selectedCabs().length > 0}
         canDelete={selection.length > 0}
+        loggedIn={Boolean(token)}
+        onLogout={doLogout}
       />
 
       <div className="body">
@@ -1052,7 +1072,7 @@ export function App() {
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} selection={selection} onToast={toast} /> : null}
-          {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} /> : null}
+          {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} onLogout={doLogout} /> : null}
         </aside>
       </div>
 

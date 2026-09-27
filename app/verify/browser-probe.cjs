@@ -3400,9 +3400,27 @@ async function waitForApp(url, timeoutMs = 25000) {
     const errToastBeforeRoom = await text('.toast-error');
     const vBeforeRoom = await statusVersion();
 
-    const clickedNewRoom = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='+ 房间');if(!b)return false;b.click();return true})()`);
-    ok('工具栏上点得到「+ 房间」', clickedNewRoom === true);
+    /**
+     * 2026-09-28：「+ 房间」不再当场造一个房间出来，而是打开**独立的「新建房间」页**
+     * （用户原话：添加房间应该是单独的一页添加，而不是和现有房间在一个页面并排）。
+     * 所以这里要走完整两步：点工具栏 → 在新建页点「创建房间」。
+     * 只点第一步就断言"房间数 +1"会变成一条**永远失败**的断言，那不是我们要的。
+     */
+    const newRoomViaPage = () =>
+      evalJs(`(async()=>{
+        const tb=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='+ 房间');
+        if(!tb) return 'no-toolbar-btn';
+        tb.click();
+        await new Promise(r=>setTimeout(r,320));
+        const btn=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');
+        if(!btn) return 'no-create-btn';
+        if(btn.disabled) return 'create-disabled';
+        btn.click();
+        return 'ok';
+      })()`);
+
+    const clickedNewRoom = await newRoomViaPage();
+    ok('工具栏「+ 房间」→ 打开新建房间页 → 点「创建房间」这条走得通', clickedNewRoom === 'ok', String(clickedNewRoom));
     await sleep(520);
 
     const roomErrToast = await text('.toast-error');
@@ -3423,8 +3441,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     );
 
     // 连续建第二个：只建得出一个也是缺陷（id 撞车就是这种表现）
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='+ 房间');if(b)b.click();return !!b})()`);
+    await newRoomViaPage();
     await sleep(520);
     ok(
       '能连续建第二个新房间（不是只能建一个）',
@@ -3435,6 +3452,71 @@ async function waitForApp(url, timeoutMs = 25000) {
       '两个新房间都没有触发结构性失败',
       !/结构性命令失败/.test(await text('.toast-error')),
       await text('.toast-error')
+    );
+
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * B22b —— 「新建房间」是**独立一页**，不是在列表里凭空并排多一张卡片。
+     *
+     * 用户原话：「添加房间是增加一个单独页面添加，而不是和现有房间在一个页面并排」。
+     * 旧行为：点「+ 房间」就地 append 一个默认房间，名字没填、尺寸没定，
+     *        跟已有房间混在一起，房间一多根本分不清哪个是新加的。
+     *
+     * 这组断言钉死三件事：① 点了之后进的是表单页；② **这一刻房间数没有变**
+     * （"点了不该立刻多一个"才是用户要的）；③ 填了重名时创建按钮不可用。
+     */
+    section('B22b 新建房间是独立一页（点了不立刻多一个，重名不能建）');
+
+    const roomsBefore22b = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
+      .find(x=>x.textContent.trim()==='+ 房间');if(b)b.click();return !!b})()`);
+    await sleep(420);
+    ok(
+      '点「+ 房间」进的是「新建房间」表单页（能看见创建按钮）',
+      await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].some(x=>x.textContent.trim()==='创建房间')`),
+      await text('.side-right')
+    );
+    ok(
+      '★ 这一刻房间数没变 —— 不再"点了就并排多一个"（用户要的就是这个）',
+      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBefore22b,
+      `${roomsBefore22b} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)}`
+    );
+    // 重名 → 创建按钮必须禁用（不给"点了才知道错"的机会）
+    await evalJs(`(async()=>{
+      const inp=[...document.querySelectorAll('.side-right input.input')][0];
+      const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+      const names=(await import('/src/state/store.ts')).bus.getState().rooms.map(r=>r.name);
+      setter.call(inp, names[0]);
+      inp.dispatchEvent(new Event('input',{bubbles:true}));
+      return true;
+    })()`);
+    await sleep(360);
+    ok(
+      '房间名重名时「创建房间」不可用，且界面上写明原因',
+      (await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间')?.disabled === true`)) === true &&
+        /已经有一个房间叫/.test(await text('.side-right')),
+      await text('.side-right')
+    );
+    // 改回一个不重名的名字 → 能建，且回到列表页
+    await evalJs(`(async()=>{
+      const inp=[...document.querySelectorAll('.side-right input.input')][0];
+      const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+      setter.call(inp, '验收新增房间');
+      inp.dispatchEvent(new Event('input',{bubbles:true}));
+      return true;
+    })()`);
+    await sleep(300);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');if(b&&!b.disabled)b.click();return !!b})()`);
+    await sleep(520);
+    ok(
+      '填好确认后才真的建出来（房间数 +1）',
+      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBefore22b + 1,
+      `${roomsBefore22b} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)}`
+    );
+    ok(
+      '建完回到房间列表页（不是停在表单页上）',
+      (await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].some(x=>x.textContent.trim()==='创建房间')`)) === false,
+      await text('.side-right')
     );
 
     // ═══════════════════════════════════════════════════════════
@@ -3671,7 +3753,10 @@ async function waitForApp(url, timeoutMs = 25000) {
     const roomsBeforeCtx = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`);
     await mouseRightClick(cabCenter25().x, cabCenter25().y);
     await sleep(320);
+    // 「新建房间」现在只打开独立的新建页（不再当场造），所以要再点一下「创建房间」
     await evalJs(`(()=>{const b=[...document.querySelectorAll('.ctx-menu .ctx-item')].find(x=>x.textContent.trim()==='新建房间');if(b)b.click();return !!b})()`);
+    await sleep(360);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');if(b&&!b.disabled)b.click();return !!b})()`);
     await sleep(520);
     ok('菜单项能真的执行：「新建房间」后版本 +1', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx} → v${await statusVersion()}`);
     ok('菜单项执行后菜单收掉', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);

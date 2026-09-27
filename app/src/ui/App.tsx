@@ -3,7 +3,7 @@ import type { Issue, Vec2 } from '../core/types.ts';
 import type { Command, ExecResult } from '../core/commandBus.ts';
 import * as CMD from '../core/commands.ts';
 import { bus, useBusVersion, RULESET } from '../state/store.ts';
-import { createWall as makeWall, createCabinetFromTemplate, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, rectRoom, sampleProject } from '../core/docFactory.ts';
+import { createWall as makeWall, createCabinetFromTemplate, DEFAULT_WALL_THICKNESS, DEFAULT_WALL_HEIGHT, sampleProject } from '../core/docFactory.ts';
 import { CABINET_TEMPLATES } from '../core/templates.ts';
 import { placeAgainstNearestWall } from '../core/snapPlace.ts';
 import { DEFAULT_SNAP } from '../viewport/snapping.ts';
@@ -81,6 +81,8 @@ export function App() {
   const [hiddenLayers, setHiddenLayers] = useState<Set<string>>(() => defaultHiddenLayers());
   const [pendingMove, setPendingMove] = useState<{ base: Vec2 | null } | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>('props');
+  /** 房间页的两种状态：列表 / 新建表单。放在这里是因为面板按需挂载，卸载会丢 state */
+  const [roomsView, setRoomsView] = useState<'list' | 'new'>('list');
   const [leftTab, setLeftTab] = useState<'tree' | 'layers'>('tree');
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [fitSignal, setFitSignal] = useState(0);
@@ -384,34 +386,23 @@ export function App() {
     [run, toast]
   );
 
+  /**
+   * 「+ 房间」**不再当场造一个房间出来**。
+   *
+   * 旧做法：点一下就在列表里并排多出一张默认卡片 —— 名字没填、尺寸没定，
+   * 跟已有房间混在一起，房间一多根本分不清哪个是新加的。
+   * 现在：切到房间页并打开**独立的「新建房间」表单页**，填好确认后才真的建。
+   */
   const onNewRoom = useCallback(() => {
-    const project = bus.getState();
-    const n = project.rooms.length;
-    /**
-     * 房间 id 与墙 id 都必须避开**全项目**已用的，不能只按"第几个房间"编。
-     * 少了这一行，第二个房间拿到的还是 `room_001`（已存在）→
-     * planStructural 直接返回 null → 界面上只剩一句"结构性命令失败：room.create"，
-     * 用户点「+ 房间」永远建不出第二个房间。
-     */
-    const takenIds = new Set<string>();
-    for (const r of project.rooms) {
-      takenIds.add(r.id);
-      for (const w of r.walls) takenIds.add(w.id);
-    }
-    const room = rectRoom({
-      name: `房间${n + 1}`,
-      x: n * 3600,
-      y: 0,
-      w: 3200,
-      h: 2600,
-      takenIds,
-    });
-    if (run(CMD.createRoomCommand(room))) {
-      setTool('select');
-      setFitSignal((v) => v + 1);
-      setRightTab('rooms');
-    }
-  }, [run]);
+    setRightTab('rooms');
+    setRoomsView('new');
+  }, []);
+
+  /** 房间真被创建出来之后：收起工具、重新取景 */
+  const onRoomCreated = useCallback(() => {
+    setTool('select');
+    setFitSignal((v) => v + 1);
+  }, []);
 
   /** 聚焦某个房间：切到平面图并把视口缩放到该房间包围盒 */
   const focusRoomById = useCallback((id: string) => {
@@ -1067,7 +1058,16 @@ export function App() {
             <ViewsPanel bus={bus} version={version} mode={mode} setMode={setMode} explode={explode} setExplode={setExplode} />
           ) : null}
           {rightTab === 'rooms' ? (
-            <RoomsPanel bus={bus} version={version} run={run} onToast={toast} onFocusRoom={focusRoomById} />
+            <RoomsPanel
+              bus={bus}
+              version={version}
+              run={run}
+              onToast={toast}
+              onFocusRoom={focusRoomById}
+              view={roomsView}
+              onViewChange={setRoomsView}
+              onCreated={onRoomCreated}
+            />
           ) : null}
           {rightTab === 'variant' ? (
             <VariantPanel

@@ -698,15 +698,58 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
                 onChange={(e) => setSettings({ ...settings, temperature: Number(e.target.value) || 0 })}
               />
             </Row>
-            <Row label="输出上限" hint="推理模型会先把预算花在思考上 —— 值太小，正文会是空的（而接口仍返回成功）">
-              <input
-                className="input"
-                type="number"
-                min={64}
-                step={512}
-                value={String(settings.maxTokens)}
-                onChange={(e) => setSettings({ ...settings, maxTokens: Number(e.target.value) || 0 })}
-              />
+            <Row
+              label="输出上限"
+              hint="单次回复的最大 token 数，合法区间 1–65536。不能设到百万级（那是上下文/总量概念，不是这里的 max_tokens）。推理模型会先把预算花在思考上，值太小正文是空的；但值太大（如 64K）模型会写很久而超时 —— 建议 8K/16K。"
+            >
+              <div className="token-presets">
+                {[4096, 8192, 16384, 32768, 65536].map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    className={`tb-btn ${settings.maxTokens === v ? 'active' : ''}`}
+                    onClick={() => setSettings({ ...settings, maxTokens: v })}
+                  >
+                    {v / 1024}K
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className={`tb-btn ${
+                    settings.maxTokens !== 4096 &&
+                    settings.maxTokens !== 8192 &&
+                    settings.maxTokens !== 16384 &&
+                    settings.maxTokens !== 32768 &&
+                    settings.maxTokens !== 65536
+                      ? 'active'
+                      : ''
+                  }`}
+                  onClick={() => setSettings({ ...settings, maxTokens: 16384 })}
+                >
+                  自定义
+                </button>
+                {settings.maxTokens !== 4096 &&
+                settings.maxTokens !== 8192 &&
+                settings.maxTokens !== 16384 &&
+                settings.maxTokens !== 32768 &&
+                settings.maxTokens !== 65536 ? (
+                  <input
+                    className="input token-custom"
+                    type="number"
+                    min={1}
+                    max={65536}
+                    step={512}
+                    value={String(settings.maxTokens)}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        maxTokens: Math.max(1, Math.min(65536, Math.round(Number(e.target.value) || 0))),
+                      })
+                    }
+                  />
+                ) : null}
+              </div>
+              <span className="muted">当前：{settings.maxTokens} token（{Math.round(settings.maxTokens / 1024)}K）</span>
             </Row>
 
             <div className="btn-row">

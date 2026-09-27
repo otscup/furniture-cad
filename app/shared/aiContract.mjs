@@ -853,6 +853,66 @@ export function buildUserMessage(text, snapshot, history = []) {
  */
 export const DEFAULT_MAX_TOKENS = 4096;
 
+/**
+ * "无限制"意图的安全上限。
+ *
+ * LLM 接口没有真·无限，`max_tokens` 必须是有限数且 ≤ 模型输出上限。
+ * 服务商对 `max_tokens` 都有硬上限（实测 gpt-load 网关返回 `should be in [1, 65536]`）。
+ * 这里把上限固定为 65536，所有解析结果都夹到 `[1, 65536]`，
+ * 这样无论用户在 .env / 管理后台写什么，都不会再触发 400。
+ */
+export const MAX_OUTPUT_TOKENS_CAP = 65536;
+
+/**
+ * "无限制"意图应该落到的**可用**上限（而不是硬上限 65536）。
+ *
+ * ── 为什么不是 65536 ──
+ *   65536 是服务商的合法上限，但在这个超时预算下**跑不完**：
+ *   实测 4096 的规划请求要 19–66 秒，按这个速率 65536 需要好几分钟，
+ *   必然超过 `AI_TIMEOUT_MS` → 用户看到的就变成"调用超时"。
+ *   把"无限"映射到 65536 等于制造超时，所以这里取一个
+ *   "足够装下推理 + 计划 JSON、又能在超时内跑完"的值。
+ */
+export const PRACTICAL_MAX_TOKENS = 16384;
+
+/**
+ * 把 .env / 后台里的 `AI_MAX_TOKENS` 解析成**必然合法**的输出上限。
+ *
+ * ── 为什么必须夹到 [1, 65536] ──
+ *   服务商对 `max_tokens` 有硬上限（本环境实测为 65536）。用户常写
+ *   `AI_MAX_TOKENS=100m`（以为 m=百万），或留空、写"无限"、打错，
+ *   这些若原样发过去会变成 NaN / 超大值 → HTTP 400。
+ *   这里统一夹到合法区间，永不再 400：
+ *     · 完全没设 → `fallback`（默认 4096，保持旧行为）
+ *     · 写了 `无限 / unlimited / inf / 0` 或非法值 → `PRACTICAL_MAX_TOKENS`(16384)，
+ *       即"能跑完的最大实用值"而非硬上限（硬上限会导致超时，见该常量的说明）
+ *     · 支持 `k` / `m` 后缀：`8k`=8192、`1m`=clamp 到 65536
+ *     · 写了具体正数 → 夹到 [1, 65536] 后生效（用户显式自选档位，后果自负）
+ *
+ * ── 重要概念 ──
+ *   `max_tokens` 是**单次回复**的输出上限，服务商上限通常就是几万（这里是 65536）。
+ *   "百万 token"是**上下文窗口 / 总用量**的概念，不是这个字段能表达的，
+ *   所以即便用户写 `100m` 也只会被夹到 65536，而不是真的 1 亿。
+ */
+export function resolveMaxTokens(raw, fallback = DEFAULT_MAX_TOKENS) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  let s = String(raw).trim().toLowerCase();
+  let mult = 1;
+  if (s.endsWith('k')) {
+    mult = 1024;
+    s = s.slice(0, -1);
+  } else if (s.endsWith('m')) {
+    mult = 1_000_000;
+    s = s.slice(0, -1);
+  }
+  if (s === '0' || s === 'inf' || s === 'infinity' || s === 'unlimited' || s === '无限' || s === '不限制') {
+    return PRACTICAL_MAX_TOKENS;
+  }
+  const n = Number(s) * mult;
+  if (!Number.isFinite(n) || n <= 0) return PRACTICAL_MAX_TOKENS;
+  return Math.min(MAX_OUTPUT_TOKENS_CAP, Math.max(1, Math.round(n)));
+}
+
 export function buildChatRequest(model, text, snapshot, opts = {}) {
   return {
     model,

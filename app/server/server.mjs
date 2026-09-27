@@ -40,7 +40,7 @@ import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
-import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS } from '../shared/aiContract.mjs';
+import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS, resolveMaxTokens } from '../shared/aiContract.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..');
@@ -266,7 +266,7 @@ function currentSettings() {
     apiKeySet: Boolean(env.AI_API_KEY),
     temperature: Number(env.AI_TEMPERATURE ?? 0.2),
     /** 输出预算。推理模型上这个值直接决定"有没有正文" —— 所以它必须可见、可改 */
-    maxTokens: Number(env.AI_MAX_TOKENS ?? DEFAULT_MAX_TOKENS),
+    maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
     timeoutMs: Number(env.AI_TIMEOUT_MS ?? 60000),
     providers: Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, models: v.models }])),
     envPath: ENV_PATH,
@@ -876,7 +876,7 @@ async function handleApi(req, res, pathname) {
          * 留空交给服务商默认值时，一个"上限偏小"的网关就能让对话整整返回空正文，
          * 而界面上只会显示"AI 没有回答"。见 aiContract 里 DEFAULT_MAX_TOKENS 的说明。
          */
-        max_tokens: typeof body.maxTokens === 'number' ? body.maxTokens : Number(env.AI_MAX_TOKENS ?? DEFAULT_MAX_TOKENS),
+        max_tokens: typeof body.maxTokens === 'number' && body.maxTokens > 0 ? body.maxTokens : resolveMaxTokens(env.AI_MAX_TOKENS),
       };
       if (body.json) payload.response_format = { type: 'json_object' };
       const r = await fetchWithTimeout(
@@ -913,7 +913,7 @@ async function handleApi(req, res, pathname) {
         emptyReason: content.trim()
           ? undefined
           : finish === 'length'
-            ? `模型把 ${usage?.completion_tokens ?? '?'} 个输出 token 用完了还没开始写正文（推理模型的典型形态）。把 .env 里的 AI_MAX_TOKENS 调大就会好转。`
+            ? `模型把 ${usage?.completion_tokens ?? '?'} 个输出 token 用完了还没开始写正文（推理模型的典型形态）。把 AI_MAX_TOKENS 调大就会好转（合法区间 1–65536，管理后台有 4K/8K/16K/32K/64K 预设）。`
             : reasoning
               ? '模型只产出了思考过程，没有产出正文。'
               : '模型返回了空的正文。',
@@ -979,6 +979,10 @@ async function handleApi(req, res, pathname) {
       const payload = buildChatRequest(model, text, body.snapshot, {
         history: Array.isArray(body.history) ? body.history : [],
         temperature: Number(env.AI_TEMPERATURE ?? 0.1),
+        // 关键点：规划请求必须尊重 .env 里的 AI_MAX_TOKENS。
+        // 早先这里没传 maxTokens，buildChatRequest 永远落到 DEFAULT(4096)，
+        // 导致推理模型把预算吃光在思考上、正文为空 —— "调到无限也不管用"的真凶。
+        maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
       });
       const r = await fetchWithTimeout(
         `${baseUrl}/chat/completions`,
@@ -999,7 +1003,7 @@ async function handleApi(req, res, pathname) {
         return json(res, 200, { ok: false, error: '服务商返回的不是 JSON', raw: raw.slice(0, 400), ms });
       }
       const choice = data?.choices?.[0] ?? {};
-      const content = choice?.message?.content ?? '';
+      let content = choice?.message?.content ?? '';
       /**
        * `reasoning_content` 是 R1 一系推理模型的"思考过程"字段（DeepSeek / 多数网关都透传）。
        * 它**不是**模型的回答，但它是"为什么等了 18 秒""为什么正文是空的"的唯一线索，
@@ -1027,12 +1031,44 @@ async function handleApi(req, res, pathname) {
        * 早先两种情况都落到 `extractJson` 的"模型返回了空内容"上，
        * 用户拿到这句话完全无从下手 —— 真相是"把 AI_MAX_TOKENS 调大就能用"。
        */
+      /**
+       * ── 正文为空：先试着从"思考过程"里把计划救出来，再谈报错 ──
+       *
+       * 推理模型（R1 一系）的典型形态：整个输出预算都花在 `reasoning_content` 上，
+       * 一个字的 `content` 都没写就被截断（finish_reason=length）。
+       * 而**计划往往已经写在思考里了**。
+       *
+       * 早先这里直接报错让用户"把 max_tokens 调大"，于是 4096→8192→65536 一路加，
+       * 加到超时、加回 8192 还是空 —— 因为预算永远追不上模型的思考长度，
+       * 调数字是治标，而且会引入超时。正确顺序是：
+       *   ① 先从思考里抠 JSON（抠出来照样走 extractJson + validatePlan，不是"尽力理解"）
+       *   ② 抠不出来再如实报错，并且**不再建议盲目调大预算**
+       *
+       * 救援出来的内容仍然要过完整的契约校验，不合法的照样被拒 —— 这与
+       * "AI 输出是第一次进入系统的不受信任内容，边界必须在这儿拦"是一致的。
+       */
+      let salvagedFromReasoning = false;
+      if (!String(content).trim() && reasoning.trim()) {
+        const salv = extractJson(reasoning);
+        if (salv.ok) {
+          content = reasoning;
+          salvagedFromReasoning = true;
+          auth.audit({
+            actor,
+            action: 'ai.plan',
+            result: 'salvaged',
+            model: data?.model ?? model,
+            note: 'empty_content_salvaged_from_reasoning',
+          });
+        }
+      }
+
       if (!String(content).trim()) {
         const comp = usage?.completion_tokens;
         const reas = usage?.reasoning_tokens;
         const why =
           finish === 'length'
-            ? `模型的输出预算用完了却没产出正文（输出 ${comp ?? '?'} token${reas ? `，其中推理 ${reas}` : ''}）—— 推理模型很容易这样：思考过程先把预算吃光了。把 .env 里的 AI_MAX_TOKENS 调大，或换一个非推理模型。`
+            ? `模型把 ${comp ?? '?'} 个输出 token 全花在思考上、一个字正文都没写出来${reas ? `（其中推理 ${reas}）` : ''}，并且思考里也没抠出可解析的计划。**不建议靠调大 AI_MAX_TOKENS 解决**：预算永远追不上模型的思考长度，调大了又会变成"调用超时"。最可靠的办法是**在管理后台换一个非推理模型**（或换一个不随机路由的服务商）；其次是把需求说得更短、减少需要推理的步骤。`
             : reasoning
               ? `模型只产出了"思考过程"（${reasoning.length} 字）而没有产出正文 —— 它可能把计划写在思考里了，或者中途被截断。`
               : '模型返回的正文是空的。';
@@ -1107,6 +1143,12 @@ async function handleApi(req, res, pathname) {
         actions: plan.actions,
         rejected: plan.rejected,
         contractVersion: '1.0.0',
+        /**
+         * 这份计划是**从模型的思考过程里救出来的**（正文为空时的兜底）。
+         * 必须如实告诉前端 —— 它是"模型边想边写下的草稿"，可信度低于正式正文，
+         * 界面应当提示用户重点复核，而不是和普通结果一个待遇。
+         */
+        salvagedFromReasoning,
         model: data?.model ?? model,
         usage,
         ms,

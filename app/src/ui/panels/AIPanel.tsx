@@ -5,8 +5,17 @@ import { ACTION_NAMES, ACTIONS } from '../../../shared/aiContract.mjs';
 import { requestChat, requestPlan, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
+import {
+  addDraftRound,
+  draftSnapshot,
+  finalizeDraft,
+  startDraft,
+  undoLastRound,
+  type DraftSession,
+} from '../../ai/draftSession.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
+import { DraftPreview } from './DraftPreview.tsx';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -92,7 +101,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * 谁在跑。同一个模型通道，**同时只允许一个请求**：
    * 并发发两个不但会让用量账目混乱，还会让用户分不清哪个回答对应哪句话。
    */
-  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan'>('');
+  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft'>('');
   const busy = busyKind !== '';
   /** 已等待秒数 —— 见文件头"为什么有一个计时器" */
   const [waited, setWaited] = useState(0);
@@ -120,6 +129,17 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   const [meta, setMeta] = useState<{ model?: string; tokens?: number; reasoningTokens?: number; ms?: number } | null>(null);
   const [err, setErr] = useState('');
   const [lastApply, setLastApply] = useState('');
+
+  /**
+   * 草案会话 —— 「先聊出方案，定稿才落地」那张桌子。
+   *
+   * 它和下面的 `run`（一次性计划）是两条路：
+   *   · `run`  一句话 → 一份计划 → 应用。改第二句要重新走一遍。
+   *   · 草案   每一句都叠在上一句的**结果**上，AI 看得见自己上一轮建出来的东西。
+   * 之所以保留两条而不是把 run 删掉：run 那条路已被验收脚本与浏览器探针覆盖，
+   * 而草案是"持续修改"的新入口。两条路共用同一套干跑/提交器，不会分叉。
+   */
+  const [draft, setDraft] = useState<DraftSession | null>(null);
 
   const snapshot: AiSnapshot = useMemo(() => buildSnapshot(bus.getState(), bus.getRules()), [bus, version]);
   const bytes = useMemo(() => snapshotBytes(snapshot), [snapshot]);
@@ -156,6 +176,17 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       setLastApply('');
       return null;
     });
+  }, [version]);
+
+  /**
+   * 真模型一被改动，草案的落点同样失效 —— 必须作废。
+   *
+   * 不作废的话会发生一件很难解释的事：用户在主界面手动拖了一下柜子，
+   * 再回来点"定稿"，草案里那批命令是**对着旧模型编译**的，
+   * 它们会落到一个已经不存在的状态上。宁可让人重聊，也不能悄悄写错。
+   */
+  useEffect(() => {
+    setDraft((cur) => (cur && cur.baseVersion !== version ? null : cur));
   }, [version]);
 
   // ── 对话 ──
@@ -241,6 +272,77 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     setErr('');
     setLastApply('');
   }, []);
+
+  // ── 草案 ──
+
+  /**
+   * 向草案追加一轮。
+   *
+   * 关键在 `draftSnapshot(draft ?? startDraft(bus), …)`：
+   * **发给 AI 的是草案当前的样子**，不是真项目。少了这一句，第二轮的
+   * "把刚才那个柜子加宽"就没有任何着落 —— AI 看不见自己上一轮建的东西。
+   */
+  const generateDraft = useCallback(async () => {
+    const q = text.trim();
+    if (!q || busy) return;
+    setBusyKind('draft');
+    setErr('');
+    try {
+      const session = draft ?? startDraft(bus);
+      const snap = draftSnapshot(session, bus.getRules());
+      const history = session.rounds.flatMap((r) => [
+        { role: 'user' as const, text: r.text },
+        { role: 'assistant' as const, text: r.reply },
+      ]);
+      const r = await requestPlan({ text: q, snapshot: snap, history, token: props.token });
+      setMeta({ model: r.model, tokens: r.usage?.total_tokens, reasoningTokens: r.usage?.reasoning_tokens, ms: r.ms });
+      if (!r.ok) {
+        setErr(r.error ?? '草案生成失败');
+        props.onToast?.('error', r.error ?? '草案生成失败');
+        return;
+      }
+      if (r.actions.length === 0) {
+        props.onToast?.('info', 'AI 认为这一句不需要改动草案（它只回了一句话）');
+        return;
+      }
+      const next = addDraftRound(session, {
+        text: q,
+        reply: r.reply,
+        actions: r.actions,
+        rejected: r.rejected,
+        rules: bus.getRules(),
+        gate: compiledRules().gate,
+        selection: props.selection,
+      });
+      setDraft(next);
+      setText('');
+      const last = next.rounds[next.rounds.length - 1];
+      if (!last.merged) {
+        props.onToast?.('warn', '这一轮没有被并入草案 —— 看草案卡片里的失败原因');
+      }
+    } finally {
+      setBusyKind('');
+    }
+  }, [bus, busy, draft, props, text]);
+
+  const finalize = useCallback(() => {
+    if (!draft) return;
+    const r = finalizeDraft(draft, bus);
+    if (!r.ok) {
+      props.onToast?.('error', r.error);
+      return;
+    }
+    setDraft(null);
+    const msg = `已定稿：写入 ${r.applied} 条${r.skipped > 0 ? `（跳过 ${r.skipped} 条）` : ''} · 模型里还有 ${r.blockingErrors} 条 ERROR`;
+    props.onToast?.(r.blockingErrors > 0 ? 'warn' : 'ok', msg);
+  }, [bus, draft, props]);
+
+  const undoDraft = useCallback(() => {
+    if (!draft) return;
+    setDraft(undoLastRound(draft, { rules: bus.getRules(), gate: compiledRules().gate, selection: props.selection }));
+  }, [bus, draft, props]);
+
+  const discardDraft = useCallback(() => setDraft(null), []);
 
   /**
    * 被契约拒掉的动作 —— 一个 JSX 片段，**成功路径和失败路径都要渲染它**。
@@ -373,6 +475,15 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           >
             {busyKind === 'plan' ? `规划中… ${waited}s` : '生成编辑计划'}
           </button>
+          <button
+            type="button"
+            className="tb-btn primary ai-btn-draft"
+            disabled={busy || !text.trim()}
+            onClick={() => void generateDraft()}
+            title="把这一句叠到草案上：AI 看得见之前几轮的结果，可以一句一句改到满意，最后再定稿。"
+          >
+            {busyKind === 'draft' ? `改草案中… ${waited}s` : draft ? '继续改草案' : '生成草案'}
+          </button>
           <button type="button" className="tb-btn" disabled={busy || chat.length === 0} onClick={clearChat}>
             清空对话
           </button>
@@ -404,6 +515,87 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           </Row>
         ) : null}
       </Section>
+
+      {/* ═══════════════ 草案：持续修改，定稿才写入 ═══════════════ */}
+      {draft ? (
+        <Section
+          title={`草案（${draft.rounds.length} 轮 · ${draft.steps.length} 步待定稿）`}
+          defaultOpen
+        >
+          <p className="note">
+            下面是<b>草案当前的样子</b>：每一句都会叠在上一句的结果上，AI 也看得见。
+            在下面点<b>「定稿并生成可编辑稿件」</b>之前，<b>真模型一个字节都没动</b>。
+          </p>
+
+          <DraftPreview project={draft.project} rules={bus.getRules()} />
+
+          <div className="btn-row">
+            <button
+              type="button"
+              className="tb-btn primary ai-btn-finalize"
+              disabled={busy || draft.steps.length === 0}
+              onClick={finalize}
+            >
+              定稿并生成可编辑稿件
+            </button>
+            <button type="button" className="tb-btn" disabled={busy || draft.rounds.length === 0} onClick={undoDraft}>
+              撤回上一轮
+            </button>
+            <button type="button" className="tb-btn" disabled={busy} onClick={discardDraft}>
+              放弃草案
+            </button>
+          </div>
+          {draft.steps.length === 0 ? (
+            <div className="hint-line">草案里还没有能提交的步骤 —— 前面几轮要么失败了，要么 AI 只回了话。</div>
+          ) : null}
+
+          <div className="draft-rounds">
+            {draft.rounds.map((r) => (
+              <div key={r.index} className={`draft-round ${r.merged ? '' : 'draft-round-bad'}`}>
+                <div className="draft-round-head">
+                  <Pill kind={r.merged ? 'ok' : 'WARNING'}>{r.merged ? `第 ${r.index} 轮 · 已并入` : `第 ${r.index} 轮 · 未并入`}</Pill>
+                  <span className="draft-round-text">{r.text}</span>
+                </div>
+                {r.reply ? <div className="draft-round-reply">{r.reply}</div> : null}
+                <div className="draft-round-steps">
+                  {r.run.steps.length === 0 ? (
+                    <span className="muted-sm">AI 这一轮没有给出动作</span>
+                  ) : (
+                    r.run.steps.map((s, i) => (
+                      <div key={i} className={`draft-step ${s.ok ? '' : 'draft-step-bad'}`}>
+                        <Text mono>{s.action.action}</Text>{' '}
+                        <span className="muted-sm">{s.ok ? s.label : s.error}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+                {r.rejected.length > 0 ? (
+                  <div className="alert alert-warn">
+                    {r.rejected.length} 条动作被契约拒绝：
+                    <ul>
+                      {r.rejected.map((x, i) => (
+                        <li key={i}>
+                          <Text mono>第 {x.index + 1} 条 · {x.code}</Text> {x.error}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {r.run.impact.length > 0 ? (
+                  <details className="draft-impact">
+                    <summary>这一轮的影响面（{r.run.impact.length} 处）</summary>
+                    <ul className="diff-list">
+                      {r.run.impact.map((t, i) => (
+                        <li key={i}>{t}</li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </Section>
+      ) : null}
 
       {/* ═══════════════ 计划：失败 / 说明 / 干跑预览 ═══════════════ */}
       {err ? (

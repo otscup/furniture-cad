@@ -894,3 +894,37 @@ select.input { height: 24px; padding: 0 4px; }
 .ctx-item kbd { font-size: 10px; color: var(--text-3, #999); }
 .ctx-danger { color: var(--danger, #c0392b); }
 .ctx-sep { height: 1px; margin: 3px 6px; background: var(--line, #e4e4e4); }
+
+/* ═══════════════════════════════════════════════════════════════
+   草案（AI 对话框里那张"大体结构"图）
+   ═══════════════════════════════════════════════════════════════ */
+
+.draft-preview { border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2); padding: 6px; margin: 6px 0; }
+
+/* 画布容器要能兜住"空的草案"那句话，所以是 relative + 固定高 */
+.draft-canvas-wrap { position: relative; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; background: var(--panel); }
+.draft-canvas { display: block; }
+.draft-canvas-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--muted); }
+
+.draft-summary { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 11px; color: var(--text-2); }
+.draft-err { color: var(--danger); font-weight: 600; }
+
+.draft-cab-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.draft-cab-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 10.5px; color: var(--text-2); border-top: 1px dashed var(--line); padding-top: 2px; }
+.draft-cab-list li b { font-weight: 600; color: var(--text); }
+
+.draft-rounds { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.draft-round { border: 1px solid var(--line); border-left: 3px solid var(--ok); border-radius: 4px; padding: 6px 8px; background: var(--panel); }
+.draft-round-bad { border-left-color: var(--warn); background: var(--warn-soft); }
+.draft-round-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.draft-round-text { font-size: 11.5px; font-weight: 600; color: var(--text); }
+.draft-round-reply { font-size: 11px; line-height: 1.6; color: var(--text-2); margin-top: 3px; white-space: pre-wrap; }
+.draft-round-steps { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.draft-step { font-size: 10.5px; line-height: 1.5; color: var(--text-2); }
+.draft-step-bad { color: var(--danger); }
+.draft-impact { margin-top: 4px; font-size: 10.5px; }
+.draft-impact summary { cursor: pointer; color: var(--text-2); }
+
+/* 草案两个主按钮：颜色跟主按钮一致，避免"哪个才是主操作"看不出来 */
+.ai-btn-draft { border-color: var(--accent); color: var(--accent); }
+.ai-btn-finalize { border-color: var(--accent); color: var(--accent); font-weight: 600; }

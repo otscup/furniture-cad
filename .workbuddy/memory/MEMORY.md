@@ -1,285 +1,75 @@
-# 项目长期记忆
+# 项目长期记忆（已压缩）
 
-## 项目：AI 网页版 CAD + 定制家具生产设计系统
+## 项目
+浏览器端参数化定制家具设计与生产系统。语义模型为真相源，2D/3D/DXF/清单全部同源派生。自然语言入口，可被 MCP 驱动。**主文档**：`docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md`。**git 仓在项目根**（不是 `app/`）。
 
-**目标**：浏览器端参数化定制家具设计与生产数据系统。自然语言为设计入口，参数化模型 + 生产规则引擎为尺寸权威，输出可交付生产的图纸与数据。可被 MCP Client（Claude Code / Codex / Hermes）驱动。
+## 不可违背的设计原则（骨架，逐条都是踩坑换来的）
+1. 真相源=语义参数化模型(JSON)，非几何；2D/3D/DXF/清单同源派生。
+2. 派生数据(Panel/几何/清单)永不写项目文件，`model.json` 只存 authored。
+3. AI 只输出 Command 永不输出几何；不能写 derived、不能删项目、不能改规则集。
+4. 唯一写入口 CommandBus：UI/AI/MCP/脚本同权同位。
+5. 两段式：dry-run(diff+规则)→确认→commit，任何失败不改状态。
+6. 机器硬规则(可判定/可阻断) 与 AI 软建议(不可判定/仅提示) 必须分离。
+7. 顶岗单位全 mm，禁浮点误差进生产尺寸。
+8. 本地优先(local-first)，Phase 0–6 不需 VPS。
+9. 所见即所得：界面读数是"最终会被用到的那个值"（预览===提交）。
+10. 交互结束立即清瞬时状态(追踪线/捕捉标记/预览徽标/读数)。
+11. AI 计划原子：一条被拒→整份一条不执行。
+12. 审计必须与界面说同一件事。
+13. "改一次全体失效"的设计第一时间堵(哈希自描述/规则集版本化/三件套)。
+14. "动没动数据"由用户点的按钮决定→AI 面板两个入口(对话不改模型/生成编辑计划)。
+15. "测试通过"本身可错→判据须是目标真的干成那件事。
+16. 纠错三通道：Gate(拦)/Prompt(教,反例few-shot)/Test(钉,回归断言)。
+17. "是否需模型"与"用哪个模型"是两层→路由抽象要有 `none`(根本不发请求)。
+18. 模型无"线"对象→"改线"须译"改语义部件"；PickLine{part,paramPath}由生成器同产，AI 只收 {cabinetId,part,paramPath} 永不收坐标。
+19. 多方案对比中间产物=候选语义方案(非派生视图)，选定才落地。
+20. 一键修复=承诺→只对修法唯一可判定的规则开放；设计决定只给诚实话术不给假按钮。
+21. "点了错还在"比"没按钮"更糟→一键修复后用真实几何复核。
+22. 报错文案唯一真相源 `issueCatalog.ts` 的 `buildIssue()`；未登记码直接抛错；设计类给数字、程序缺陷类明说"这是程序缺陷"且不给按钮。
 
-**主文档**：`docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md`
+## 技术栈
+React+TS+Vite；2D=Canvas2D 自研(非SVG)；3D=Three.js。后端 Node20+/Fastify(前后端共享类型)。导出=Python+ezdxf(几何TS算好传中立JSON)。DB=SQLite→PostgreSQL。`shared/aiContract.mjs` 是 AI 契约唯一真源(服务/前端编译器/验收三方 import)。不用 opencascade.js。
 
-## 不可违背的设计原则
+## 产品决策（按时间）
+- 先自用后商业化；无工厂标准用行业默认(RuleSet=配置文件)；必须有可点 CAD UI；MVP 只出 DXF 不出 DWG。
+- AI 走 OpenAI 兼容(`POST {baseUrl}/chat/completions` + `response_format:json_object`)→换服务商=填 baseUrl 不改码不重启。
+- 分解图默认关；四视图调好后可开可关(工具栏/视图面板/命令行 EXPLODE)。
+- 账号两模式单向：local-open→accounts(建首账号后全 /api 要 token，删库回不去)。
+- 订阅按自然月 token：free20万/pro500万/team3000万/unlimited(PLANS.models 待拍板)。
+- 账号安全"已实现/未实现"两栏都摆界面；console error 分两类断言(故意4xx单独)。
+- AI 对话通道(/api/ai/chat)只问答不产Command；对话与规划两按钮；历史落 sessionStorage(最近40，多轮回传12)。
+- 局域网模型 `HOST=127.0.0.1` 管入站不管出站，接内网模型不 bind 0.0.0.0。
+- 分层配置 4 层(platform/factory-tenant/project/user)无 team 层；model_suggestions 不进链须标来源；取值带 {key,value,source}。
 
-1. **真相源是语义参数化模型（JSON），不是几何**。2D/3D/DXF/清单全部是派生视图，必须同源派生。
-2. **派生数据（Panel、几何、清单）永不写入项目文件**。`model.json` 只存 authored 字段。
-3. **AI 只输出 Command，永不输出几何**；AI 不能写 derived 字段，不能删项目、不能改规则集。
-4. **唯一写入口 CommandBus**：UI / AI / MCP / 脚本同权同位。
-5. **两段式执行**：dry-run（diff + 规则）→ 确认 → commit。任何失败不改变状态。
-6. **机器硬规则（可判定、可阻断）与 AI 软建议（不可判定、仅提示）必须完全分离**，不能混在同一返回值里。
-7. **顶岗单位**：全部 mm，禁止浮点误差进入生产尺寸。
-8. **本地优先（local-first）**：Phase 0–6 全程不需要 VPS（用户环境无 VPS，仅本地 Windows + WorkBuddy）。
-9. **所见即所得**：界面上给出的读数必须是**最终会被用到的那个值**。捕捉/吸附生效时若仍显示原始指针点，用户会看到 741 而实际落到 700 —— 这是 CAD 里最不能容忍的一类问题。（"预览 === 提交"原则在读数上的延伸）
-10. **交互结束必须清干净瞬时状态**：拖动/夹点松开后，追踪线、捕捉标记、预览徽标、位移读数必须立刻消失，不能残留到下一次鼠标移动。真实 CAD 在命令结束时立即收掉追踪线。
-11. **AI 计划是原子的**：只要有一条动作被拒，**整份一条都不执行**。半执行的意图比不执行更危险，因为它是**静默**的 —— 用户会以为整句话都生效了。（Phase 3）
-12. **审计必须和界面说同一件事**。一个只给别人看、却和现场记录矛盾的账本，价值是负的（会让人以为查过了）。（Phase 3）
-13. **凡是"改一次就全体失效"的设计，必须在第一时间堵掉**。口令哈希自描述、规则集版本化、生产数据三件套 —— 升级类改动必须能**逐条**做。（Phase 3）
-14. **"有没有动到我的数据"必须由用户点下的按钮决定，不能由模型判断决定**。"背板 9mm 够吗"与"把背板改成 9mm"字面差几个字，一个零影响、一个改生产参数。所以 AI 面板是**两个入口**（`对话（不改模型）` / `生成编辑计划`），不是一个输入框。（Phase 3 后段）
-15. **"测试通过"这件事本身也可以是错的**。通过一个什么都没验证的测试，比测试失败更坏 —— 它不产生任何需要排查的现象，却会让你以为自己配好了。凡是"连通性/健康检查"，判据必须是**目标对象真的干成了那件事**，不是"链路没报错"。（Phase 3 后段）
-16. **纠错必须有"教"的通道，不能只有"拦"**。只能"拦"的记忆系统有天花板：它只接得住**可判定**的错，而 AI 犯的错大部分不可判定（指代、量纲、动作选错、臆造数字）。这类错会永远停在 `pending` 且没有任何机制能推它生效 —— 而**唯一能让模型下次不犯的地方是提示词**。所以纠错必须拆三条通道：**Gate（拦）/ Prompt（教，反例 few-shot）/ Test（钉，回归断言）**。（架构评议）
-17. **"是否需要模型"和"用哪个模型"是两层，不能合成一层路由**。把"确定性计算"列为一种 `RouteKind` 是放错层 —— 它压根不经过模型。正确抽象里应有一个 `none`（**根本不发请求**），而不是"用一个便宜模型硬算"。（架构评议）
-18. **模型里没有"线"这个对象，所以"改这条线"必须翻译成"改这个语义部件"**。几何是派生的；给图元加一层 `PickLine`（带 `paramPath`）**必须由生成器同时产出**，不能事后反查 —— 事后反查等于另写一份判定逻辑，会和生成器漂移（`validate.ts:9-11` 的同一条理由）。AI 侧永远只收到 `{cabinetId, part, paramPath}`，**永不收坐标**。（局部编辑设计）
-19. **多方案对比的中间产物是"候选语义方案"，不是"某一张派生视图"**。若中间产物是正面图，则深度信息在图上不存在，后续视图只能靠猜 —— 而那正是投影映射要消灭的问题。界面上看起来一样（都是先看正面图），内部必须保留语义方案为唯一真相源，选定后才落地。（分阶段生成设计）
-20. **给「一键修复」按钮 = 给一份承诺**。只对**修法唯一可判定**的规则开放（加一扇门 / 缩短滑轨 / 加宽电器格）。
-    「移动哪个柜」「加宽哪一格」属于设计决定，只给诚实话术不给假按钮。修法有多种的（门板放不进板材：改门宽 / 拆块 / 换幅面）
-    一律不给按钮，并明说"这是你要定的事"。
-21. **"点了之后错还在"比"压根没这个按钮"更糟**。判据仍是「预览 === 提交」：一键修复后必须用**真实几何复核**
-    （门宽真的压到上限了？），而不是信按钮上写的那句话。曾有两个假按钮：门板太宽只"加一扇"（2200 的门加一扇还是 1100mm）、
-    门板太高改门扇数（门高只由柜高/踢脚决定，与门扇数无关）。
-22. **报错文案的唯一真相源是 `issueCatalog.ts`，`buildIssue()` 是唯一出口** —— 未登记的码直接抛错。
-    于是"新规则忘了写人话"在跑验收时当场炸，"fixHint 100% 覆盖"是结构性保证，不靠人记得写。
-    文案分三档口径：设计类必须给具体数字；**程序缺陷类必须明说"这是程序缺陷"且一律不给按钮**（一键修只会把 bug 盖住）；
-    语义/结构矛盾类（电器洞口本就不该有门）本就报不出 mm，硬要数字是塞水。
+## 硬约束/红线
+DWG 付费/SDK 须先确认授权(ODA 无 Web/SaaS 权)。MCP 白名单不暴露 SQL/路径/shell/规则集。交付带"模型+生成器+规则集版本"三件套。首批生产人工全检。所有 factory 默认值显式覆盖(踩过 dimlfac=100)。
 
-20. **所有 `nextId(...)` 都必须传 `takenIds`** —— 撞 id 在任何一层都不报错，只是静默共用一条记录。**已经第四次踩**：房间 id 撞（建不出第二个房间）、候选分区 id 撞（板件 id 撞车 → 清单两块板变一块）、**AI `unitsFromIntents` 里分区 id 全叫 `unit_001`（板件撞 id → 清单少一块 → 生产下错料）**。凡是"批量造对象"的新代码，第一件事就是建 `takenIds` Set 并累加。
-21. **跑验收前先收掉手动起的 dev server** —— `npm run dev` 占着 5273，`verify:ui` 就起不了自己的服务，探针会连到**真实 .env** 那份，产生假失败。
+## 实测踩坑（高频必看）
+- **AI 密钥勿用长度判占位符**：gpt-load 是本地网关，6位口令只授权网关自身，转发上游不需 key→实测200。
+- **部署诊断在容器内**：gpt-load 仅 docker 网络可解析，宿主机 curl 得000(假故障)；容器无 wget/curl 用 node fetch。
+- **送文件进容器别 docker cp /tmp**：Win/NAS /tmp 不同，静默失败→`ssh ... "docker exec -i C sh -c 'cat > /tmp/f.js'" < f.js`。
+- **openrouter/free 504 是供应商抖动**：随机路由不同免费模型，非提示词变长。
+- **所有 nextId 必传 takenIds**：撞 id 不报错只静默共用记录(房间/板件/AI 分区 id 全 unit_001→清单少板→下错料)。批量造对象第一个动作建 takenIds Set 并累加。
+- **派生量取值唯一来源**：探针从 proto.layout.boardT 取板厚(undefined→NaN→静默过关)，加"拿到了值"前置闸门。
+- **环境代理假失败**：HTTP_PROXY 把局域网地址当外网→fetch/curl 502；服务端与探针 delete 六个代理变量。Node22 fetch 不读代理、Node24 起 NODE_USE_ENV_PROXY=1。
+- **推理模型(R1系)**：回 reasoning_content 非回答；思考吃输出预算(实测89%)；max_tokens 显式下发(DEFAULT 4096)；reasoning_content 必带回；界面显示"已等N秒"；空正文按 finish_reason=length 说明预算用完。
+- **markdown `**` 不进 JSX/toast**：与文档同形，只比文本内容的断言查不出→加文本卫生断言(.side-right 叶子 textContent 不含 **)。
+- **命令构造函数防呆**：`new CommandBus(project,rules)` 参数写反照样跑(把规则当项目存，远处才炸)→构造函数做形状校验。
+- **undo 也是状态变更(版本+1)**：版本不复原；撤销后执行新命令丢重做尾巴(entries.slice(0,pointer+1))。
+- **面板按需挂载→state 卸载**：跨页签留物落 sessionStorage。Section 折叠整块不渲染→主入口勿放默认折叠区，断言先展开再取。
+- **`.panel-scroll` 三属性缺一不可**：flex:1;overflow:auto;min-height:0，否则长内容溢出滚不到。
+- **断言不可信比失败更危险**：失败时先 JSON.stringify 原始值、先假定自己错、去掉什么要有理由、每个视觉缺陷转永久断言、不变量从图元实际坐标推不许读声明 bbox、新增回归断言须临时关修复确认真失败、几何 0/±1 须精确(sin(π)=1.22e-16 旋转180°误判干涉)。
+- **verify:ui 是分钟级链**：不加短超时(命令 SIGINT 让 exit=130 像工程失败)；跑前清手动 dev server(占5273连真.env假失败)；提交前 git checkout 还原 verify/out/*.png。
+- **DXF**：主交付 R2007(原生UTF-8)；R2000 须 encoding='gbk'+$DWGCODEPAGE=ANSI_936(兼容备用)。EZDXF dimstyle dimlfac=100→须设1.0。ACI 7 白底隐形→用CTB/STB。模型空间1:1，打印靠图纸空间。
+- **结构性命令必带 changes:[]**：记忆门读 cmd.changes，漏了 uncaught 崩门；createCabinetFromTemplate 必传 takenIds。
+- **同一能力只许一份实现**：跑验收与出图共用 verify/mock-openai.mjs。
 
-## 技术栈约定（Phase 0 起）
-
-- 前端：React + TypeScript + Vite；2D 用 Canvas 2D 自研渲染器（不用 SVG）；3D 用 Three.js
-- 后端：Node.js 20+ / TypeScript（Fastify 或 Hono），前后端共享同一份 TS 类型定义
-- 导出：Python 微服务 + ezdxf（MIT），几何由 TS 算好传中立 JSON，Python 只做序列化
-- DB：SQLite（单机）→ PostgreSQL（多用户）；模型存 JSON/JSONB
-- MCP：`@modelcontextprotocol/server` v2（2026-07-28 spec，无状态），stdio + Streamable HTTP 双通道
-- **不要用 opencascade.js**（2023-08 起停止维护）
-
-## 已确认的产品决策（2026-09-23）
-
-1. **先自用，效果好再商业化** → MVP 不引入 ODA 付费会员、不做多租户；但架构上禁止"自用捷径"
-2. **无工厂工艺标准，先用行业默认值** → RuleSet 纯配置文件，换工厂 = 换文件
-3. **必须有完整可点鼠标的 CAD 交互 UI + 快捷键** → Phase 1 扩容，规格见主方案 §L
-4. **MVP 只出 DXF，不出 DWG**
-
-## 已确认的产品决策（2026-09-24 · Phase 3）
-
-1. **AI 调用走标准 OpenAI 兼容形态**（`POST {baseUrl}/chat/completions`，带 `response_format: json_object`）→ **换服务商 = 在管理后台填一个 baseUrl，不改代码、不重启**
-2. **分解图（爆炸图）是可选的生产图，默认关闭**；四视图调好后可开可关。三个入口：工具栏 `✦ 分解图` / 视图面板开关 / 命令行 `EXPLODE` · `EXPLODE OFF`
-3. **账号体系两模式，切换单向**：`local-open`（无账号，接口免登录，与加账号之前行为完全一致）→ `accounts`（建第一个账号后所有 `/api` 要求 token，**删掉账号库也回不去**）
-4. **订阅额度按自然月 token 总量**：free 20 万 / pro 500 万 / team 3000 万 / unlimited；另加日调用次数与模型白名单。`PLANS.models` 取值属**定价决策**，待用户拍板
-5. **账号安全"已实现 / 尚未实现"两栏都摆在界面上**（各 7 条）—— "以后再加"必须写在屏幕上，不能只留在脑子里
-6. **console error 分两类断言**：故意触发的 4xx（拒绝类）单独断言，其余一条不放过 —— 把"本该被拒"算成缺陷 = 要求"拒绝的时候别出声"
-
-### 已确认的产品决策（2026-09-24 · Phase 3 后段）
-
-1. **AI 支持对话通道**（`/api/ai/chat`）：只问答、读快照、**不产 Command、不改模型**。对话与规划是两个按钮，判定权在用户手上（见原则 14）
-2. **支持局域网 / 内网模型**：`PROVIDERS.lan` 预设。**`HOST=127.0.0.1` 管入站、不管出站** —— 接内网模型**不需要**、也**不应该** bind `0.0.0.0`（那等于把全部接口连同 API Key 敞开给整个局域网）
-3. **连通性测试的判据是 `spoke`（模型真的回了话），不是 `reachable`（HTTP 通）**；`ok = spoke`。**收到 HTTP 响应本身就说明地址是通的** —— 401 是"鉴权没过"，与"连不上"修法完全不同
-4. **`max_tokens` 必须显式下发**（`DEFAULT_MAX_TOKENS = 4096`），**`reasoning_content` 不许丢** —— 见"实测踩坑"
-5. **长等待必须有反馈**：17~27 秒的等待，按钮要变 `AI 正在思考… 8s`（秒数在走），否则和卡死长得一样
-6. **`verify:lan` 独立成脚本，不进 `verify:all`** —— 它验的是**环境**不是代码，在别人机器上必红，那种红不是信息是噪音
-
-## 硬约束 / 红线
-
-- DWG 相关的任何付费或 SDK 引入，必须先确认授权范围（ODA Commercial 级无 Web/SaaS 使用权）
-- MCP 工具白名单：不暴露 SQL、任意文件路径、shell、规则集修改
-- 生产数据交付必须携带「模型版本 + 生成器版本 + 规则集版本」三件套，可完整复现
-- 首批生产必须人工全检（产品内需明示责任边界）
-- **所有 factory 默认值必须显式覆盖**（踩过 `dimlfac=100` 的坑，见下）
-
-## 实测踩坑（必须遵守，不要重复踩）
-
-- **DXF 中文编码**：ezdxf 默认 cp1252 会把中文写成 `\U+XXXX`。**主交付用 R2007（原生 UTF-8）**；R2000 必须显式 `doc.encoding='gbk'` + `$DWGCODEPAGE=ANSI_936`，且 GBK 版对不认 codepage 的解析器会乱码，只能做兼容备用。
-- **ezdxf `setup=True` 的 `EZDXF` dimstyle 自带 `dimlfac=100`**，复制后标注文字放大 100 倍。必须 `ds.dxf.dimlfac = 1.0`。
-- **ACI 颜色 7** 黑/白随背景反转，白底会隐形。出图颜色策略用 CTB/STB，不能依赖 ACI 7。
-- **模型空间保持 1:1，打印靠图纸空间**（Paper Space + 图框 + 视口比例），绝不缩放模型。
-- **校验器也要有负样本测试**（每条规则 ≥2 正例 + ≥2 反例），否则"0 ERROR"不证明模型正确。
-- **结构性命令（cabinet.create 等）也必须带 `changes: []`**：记忆门 pathForbidden 读 `cmd.changes`，
-  漏了会 uncaught 崩门（已用 `?? []` 兜底，但发命令方仍要守契约）。探针/AI/MCP 裸调 execute 时与真实 UI 的
-  `createCabinet()` 逐字段同构（changes/target/payload/takenIds 一个不能少）。
-- **createCabinetFromTemplate 必传 `takenIds`**，否则默认 id 撞首柜 → planStructural 拒绝（结构性失败）。
-- **undo 也是一次状态变更（版本 +1）**：undo 后断言「对象不残留 + 版本按每步 +1 推进」，别期望版本复原。
-- **浏览器报错栈行号是 esbuild 转换后的**（源行号 ≠ 栈行号，偏移可达 ~120 行）：别按源行号找代码；
-  拿不准就起 vite `curl /src/xxx.ts` 看转换后那一行到底是什么。
-- **示例房间被 2400 衣柜占满、无大柜空位**：测试放柜用 placeAgainstNearestWall（真实路径）或放房间外
-  空地 (4000,4000)；放 (40,40) 会撞墙+重叠，被记忆门正确拒绝。
-- **`.panel-scroll` 三属性缺一不可**：`flex:1; overflow:auto; min-height:0`。`.side-right` 是 flex 列容器且**自身不滚动**，每个右面板必须自带这一层，否则长内容溢出到面板外、永远滚不到（实测让 22 项断言全红，却以为是"面板没渲染"）。
-- **Chrome 支持 CSS 嵌套后，普通 `CSSStyleRule` 也有 `.cssRules`**（空列表，但它是个真值）→ 遍历样式表读选择器时**先读 `selectorText`，再决定要不要递归**；另需收集 `adoptedStyleSheets`。
-- **页面内注释里的反引号会截断外层模板字符串**（在 `evalJs(\`…\`)` 里写 `` ` `` 是最容易踩的一类，报出的错完全不着边际）。注释里的引号一律用行内引号。
-- **撤销后再执行新命令会丢弃重做尾巴**（`entries.slice(0, pointer + 1)`），与所有线性历史编辑器一致。审计"新增了几条"时别按"之前 + N"算。
-- **scrypt 哈希必须自描述**（`scrypt$N=…,r=…,p=…$salt$hash`），且解析器要兼容旧形态。否则参数一升级，"所有人同一个早上登不进来"。
-- **验收脚本自己产生的临时数据必须隔离，且清理不能只挂在正常退出路径上**。验收被 SIGINT/崩溃杀掉时走不到 `process.on('exit')`，垃圾会攒下来（实测攒过 9 个含假 key 的目录）→ 需要启动/收尾时的"清扫旧残留"兜底。
-- **推理模型（R1 一系）的关键性质**：返回的是 `reasoning_content` 而**不是**回答，`content` 可能为空；思考 token **先吃输出预算**（实测占输出 token 的 **89%**，一次简单问答 252 里 224 是思考）；单次往返 **17~27 秒**。三件事必须做：① `max_tokens` **显式下发**（给小了正文永远是空字符串，而 HTTP 仍是 200）② `reasoning_content` 必须带回去（它是"为什么等了 18 秒"的唯一解释）③ 界面上要有"已等 N 秒"。
-- **`fetch` / `curl` 会走环境代理，打局域网地址会拿到假失败**。本机有 `HTTP_PROXY=127.0.0.1:5642`，它把 `192.168.2.2` 当外网域名去解析 → curl 报 502 `upstream connect failed`，而同进程直连是 200。服务端与探针都要主动 `delete process.env[HTTP_PROXY/HTTPS_PROXY/ALL_PROXY…]`。**顺带：把 API Key 交给一个不必要的第三方代理，本身就是不该发生的事**。另注 Node 22 `fetch` 不读代理变量、Node 24 起 `NODE_USE_ENV_PROXY=1` 可打开 —— 一旦有人打开，链路会以极难排查的方式断掉。
-- **markdown 的 `**粗体**` 不许直接写进 JSX / toast**。在源码里它和 markdown 文档长得**一模一样**，任何只比对"文本内容对不对"的断言都不会觉得有问题（内容确实对，只是多了星号）。需要**换一个维度**看渲染结果 —— 加一条文本卫生断言：`.side-right` 下所有叶子节点 `textContent` 不许含 `**`。（实测 4 处：`AIPanel` / `AdminPanel`×2 / `AccountPanel` / `ViewsPanel`）
-- **面板按需挂载 ⇒ 组件 state 会被卸载清掉**（`{rightTab === 'ai' ? <AIPanel/> : null}`）。需要跨页签留住的东西（对话历史）必须落 `sessionStorage`；**选 sessionStorage 不选 localStorage 的理由**：对话是**会话级**工作记录，不是配置。
-- **`Section` 折叠时整块不渲染** ⇒ ① 主入口（输入框）不能放进默认折叠的分区 ② 取值断言必须**先展开再断言**（顺序反了则必然失败，且失败得很像"功能没做"）。
-- **`verify/out/` 里的目录不要无条件创建**：`diagnostics/` 原本每次正常通过都留一个空目录 —— **一个什么都不说明的空目录比没有这个目录更容易让人误解**。改成只在外层 catch 里按需建。
-- **两份系统提示词在两个地方**：规划通道在 `shared/aiContract.mjs` 的 `buildSystemPrompt()`（服务端由契约生成）；对话通道在 `src/ai/aiClient.ts` 的 `CHAT_SYSTEM`（**前端**，服务端只转发 `body.messages`）。**任何"给提示词加料"的改动都要改两处**，否则会出现"一个通道学会了、另一个没学会"。
-- **`buildSystemPrompt()` 由词汇表生成、不手写** —— 这条设计防了"契约加了动作、提示词忘了说"的漂移，也是 lessons 注入能一处生效的基础。
-
-- **`NumField` 是失焦/回车才提交**（否则输入 2400 会在撤销栈里留下 4 条命令）。自动化写值只派 input/change **不会触发 onCommit**，必须再补一次回车。
-- **`text('.toast-ok')` 只读第一条 toast** —— 上一步的提示还没消失就会挡住本次的回执。要读整条 `.toasts`。
-- **新增右侧面板后，B19 的页签清单要跟着长** —— 漏一个面板，它的类名一个都不会被样式审计覆盖。
-- **一条永远为真的断言比一条失败的断言危险得多**：`BUILD(c).autoFix`（真名 `fix`）取到恒 undefined，
-  于是"有几条能一键修"永远是 0、"都没偷偷加按钮"永远绿。→ **过滤类断言必须配反向断言**
-  （"目录里确实有 ≥3 条可修规则"，为 0 就是这条断言已经死了）。
-- **NaN 会让"本该报错"的柜子静默过关**：验收探针从 `proto.layout.boardT` 取板厚，而它是派生量、只在 `geom.layout` 上；
-  undefined 把整柜宽度算成 NaN。→ 派生量的取值必须有唯一来源，并在探针里加"拿到了值"的前置闸门。
-- **`new CommandBus(project, rules)` 参数写反照样能跑**（把规则集当项目存进去，直到某句读 `.materials` 才炸，
-  离调用点很远）→ 构造函数里做形状防呆，参数顺序对不对就该当场看出来。
-- **node 侧与浏览器侧的结论互不外推**：node 的 bus 没装记忆规则，所以 node 侧"能建出 2700 高柜子"
-  不代表浏览器里能 —— `mem_004_max_height_2400` 会**连创建一起拦下**。造记忆门下的负样本别跟记忆硬顶。
-- **值域夹紧（`sanitize`）不是缺陷**：设 60mm 被夹到 100mm 时，`clamped` 提示会由界面 toast 出来 —— 是"如实回报"，
-  不是"静默改数"。探针别把它当失败。
-- **`useEffect([mode])` 会清掉同批提交里刚设的选中** —— 要"切模式后仍选中某对象"，得用 ref 指定（两条路：effect 触发 / 不触发，都要成立）。
-
-## 分层配置的取值优先级（架构评议结论，未实施）
-
-**4 层，不是 6 层。** 层数越多，"这个值是谁定的"越说不清，最后没人敢改任何一层。
-
-```
-1 platform        平台硬规则（代码 + RuleSet 版本化）        不可被下层覆盖
-2 factory/tenant  工厂硬规则（RuleSet 文件，按 tenantId 隔离） 不可被下层覆盖
-3 project         项目设置（键白名单，只覆盖"默认值"）
-4 user            用户偏好（默认值 / 启发式，**不参与校验**）
-```
-
-- **没有独立的 `team` 层** —— 早期"团队 = 一个 tenant"，真有跨工厂集团再拆
-- **`model_suggestions` 不进这条链**：它不是配置是**建议**。放进链里会被上层静默覆盖，用户永远不知道"这个 2400 是模型猜的"。必须**显式标注来源**地呈现
-- **必须带来源溯源**：每次取值同时记 `{key, value, source}`，界面能回答"这个 2300 是谁定的"。**没有溯源的分层配置，三个月后没人敢改任何一层**
-- **隔离靠结构不靠纪律**：所有数据访问函数的第一个参数是 `ctx: {tenantId, userId}`，**没有 ctx 就查不出数据**（同 `isWritablePath` 的思路）
-- **CorrectionType 只用 5 类**（`preference` / `reference` / `cad_calculation` / `production_rule` / `unknown`）：`type` 决定去哪个通道，**分类必须互斥且可断言**；`unknown` 必须是默认值
-
-## AI 契约的坑（血泪）
-
-- **提示词只枚举动作 ≠ 告诉模型怎么用它们**。用户说"L 形橱柜"，AI 回"我只能创建单个
-  柜体，无法直接生成 L 形"——那是模型自己说的（全仓库 grep 无匹配）。它看到清单里
-  没有 `cabinet.createLShape`，就没注意到正上方有 `cabinet.rotate`。组合用法必须
-  单独成段写进提示词（`COMPOSITION_GUIDE`）。
-- **"严格"不等于"严格地拒绝人"**。原规则"做不到就别产生动作""有歧义就先问"，被模型
-  放大成先反问再说。改成可判定序列：直接做 / 组合做 / 真做不到。用户**给了数字**就
-  按口径建、在 reply 里说明，预览里让他纠偏。
-- **`cabinet.create` 必须有 `rotation`**。否则第二条臂只能"先 0° 建再 rotate"，中间态
-  撞墙被严格模式当场拒掉（"嵌进了墙体 1390mm"）——转角柜在动作层面真的拼不出来。
-  旋转角是**落位意图**不是几何，板件仍由生成器推导。
-
-## 业务约定
-
-- 柜体分区宽有歧义 → `layout.widthMode`: `fit_total`（总宽硬约束，默认）| `fit_units`（净宽硬约束），差异必须报 INFO 显式告知
-- 余量归属策略必须写死在规则里（`remainderPolicy`），不允许"每台柜子差 1~2mm"
-- 交互层铁律：**拖动 = 改语义参数字段，严禁改坐标/线条**（映射表见主方案 §L10）
-- **四视图可编辑**（已落地）：图纸视图同样走 `hitPart → PickLine{part,view,edge} → 命令`。所以"改一张其余三张同步"是结构性保证，
-  **不需要也不许做"是否同步"的提示**（那是第二个真相源）。规格层在 `src/viewport/sheetDrag.ts`：
-  可拖 = 外轮廓 max 端（宽/高/深）、踢脚高、分区分界（一条命令两个 change，总宽不变）、门扇中缝；
-  不可拖 = 基准边（min 端，模型锚定在 0..W）、层板线/抽屉分格（由数量派生）—— 都必须**说出理由**，不许静默无反应。
-  取值范围一律读 `shared/aiContract.mjs`，与 AI 能写的值同源同区间。
-- 几何生成器的恒等式断言从 Phase 2 起常驻；DXF 交付前必须过"ezdxf + dxf-parser 双解析器交叉验证"
-
-## 工程与验收约定（Phase 1 起）
-
-- **git 仓在项目根（不是 `app/`）**：`E:/WorkBuddy/2026-09-23-16-08-40/.git`。`.gitignore` 排除 `.env`、账号库与审计日志、`node_modules` / `dist` / `.venv`；`.workbuddy/` 只留 `memory/`
-- **项目文件目前不能存盘** —— 没有保存/加载接口，刷新页面即回到示例项目。git 存的是**代码**，不是设计数据
-- 代码在 `app/`，验收脚本在 `app/verify/`，截图在 `app/verify/out/`
-- `npm run typecheck` / `npm run build`
-- `npm run verify:all` → typecheck + 下面全部串起来跑
-- `npm run verify` → 地基不变量（`verify/bus-acceptance.ts`，105 项）
-- `npm run verify:views` → 四视图投影 + 标注可读性（`verify/views-acceptance.ts`，57 项，含 6+2 负样本）
-- `npm run verify:memory` → 记忆双向测试（`verify/memory-acceptance.ts`，48 项）
-- `npm run verify:assembly` → 分解图与开料清单一一对应 + 开关语义（`verify/assembly-acceptance.ts`，78 项，含 I1–I10 负样本）
-- `npm run verify:ai` → AI 通路三层防线 + 端到端 + 账号与额度（`verify/ai-acceptance.ts`，66 项）
-- `npm run verify:ui` → 起本地服务 + dev server + 真 Chrome/CDP 浏览器验收 + 全部收掉（`verify/run-ui-verify.mjs`，**621 项**）
-- `npm run verify:fixhint` → 报错人话化与一键修复的分档（`verify/fixhint-acceptance.ts`，25 项，已接入 `verify:all`）
-- `npm run verify:lan` → 局域网端点实测（`verify/lan-probe.mjs`，11 项，**不进 `verify:all`**，依赖具体地址与机器）
-- 跑 `verify:ui` 时**别给它加短超时** —— 命令被 SIGINT 打断会让 exit code 变成 130，看起来像工程失败，其实只是被打断
-- 架构边界（禁止腐蚀）：**App 只持视图状态**（模型 100% 归 CommandBus，React 只订阅一个 version 数字）；**视口不写模型、不画几何**（只把指针事件翻译成 Command）；**渲染器只认一个 `Scene{project, geom}`**，遇到未知图元直接忽略（绝不让界面白屏）
-- 拖动预览走 `bus.preview(cmd)`（真实管线跑在试探模型上）→ "预览 === 提交"是结构性保证，不是巧合
-- 文档工厂 `src/core/docFactory.ts` 是所有新对象的唯一构造点（材质/五金从规则集动态选，不硬编码 ID）
-
-### Phase 2 起的新增架构约定
-
-- **命令执行后的收尾只有一份实现**：`App.tsx` 的 `afterExec(cmd, r)`。四条路（鼠标 / 命令行字母 / Command JSON / MCP）全部走它 —— 曾经 JSON 分支自己写了一遍失败处理、漏掉 `noteHit`，导致"记忆拦下 AI 命令不记录"。**某条路少做一步的缺陷必须在结构上不可能。**
-- **四视图同源投影**：`src/core/geometry/views.ts`。四视图共用 `(X,Y,Z)` 分量，只做"取两个分量 + 平移/翻转"，**映射里不重算尺寸** ⇒ 长对正/高平齐/宽相等是结构性保证。要加新视图就往映射表里加，不许单独算尺寸。
-- **文字排版不许手调坐标**：`LabelPlacer`（声明位置 + 确定性贪心避让，让不开就写进假设清单报出来）。字宽用 `estimateTextWidth`（全角 1.0em / 半角 0.62em × 1.06 保守系数）；浏览器侧用渲染器同款 `FONT_STACK` 的 `measureText` 独立复核。
-- **两种 bbox，语义不同，不许混用**：`primPoints`（按锚点 → 视图级 `meta.bbox`，投影不变量依赖它）vs `primVisualExtent`（含字宽字高 → 图幅 bbox，只用于"缩放到图幅"）。混用会让缩放到图幅时文字被裁掉（实测越界 847mm）。
-- **记忆的门挂在 CommandBus 上，不挂在 AI 上**：UI/拖动/AI/MCP/脚本五条路都过它，且不需要 AI 在线。只拦"本次操作新引入的违规"（历史遗留违规不阻塞新操作）。
-- **假记忆防线**：记忆必须带 `status: active|pending|retired`，**检不出来的不许进 active**，宁可报"我记下了但还不会自动拦"。每条 active 记忆必须过"该拦的拦住 + 不该拦的放行"双向测试。
-- **记忆是可执行检查，不是自然语言**：`Correction → compileCorrections() → Gate`。自然语言解析成 check 这一步刻意没做（猜错 = 假记忆），现阶段是"选检查种类 + 填参数"或写进 `seedCorrections.ts`。
-- **API Key 不进浏览器**：服务端 `.env`（明文，本地），HTTP 只回后四位；输入框永远为空，留空 = 不修改。**服务只监听 `127.0.0.1`，绝不 bind `0.0.0.0`。**（**入站监听 ≠ 出站连接** —— 接了局域网模型也一样，不要因此放开监听）
-- **模型清单必须如实标注来源**：`live`（服务商实时返回）/ `builtin`（内置静态清单，会过期）。拉不到就说拉不到，**绝不把内置清单包装成"服务商实时返回"**。
-- **验收数据必须隔离**：`server.mjs` 支持 `APP_ENV_PATH` / `APP_MEM_PATH` 覆盖；`run-ui-verify.mjs` 用系统临时目录 + 假 key + 独立端口（vite 代理目标由 `API_PORT` 决定）。验收不许覆盖 `app/.env` 真 key，也不许改写仓库里的 `memory/corrections.jsonl`。
-- **交互层铁律补充**：`Section` 的 `defaultOpen` 语义是"只要现在有东西要看就自动展开"（用户手动折叠过则不再强行展开）。看不见的日志等于没有日志。
-- **环境约束**：Node 直接跑 `.ts` 是 **strip-only** 模式，**不支持构造器参数属性**（`constructor(private readonly x = 1)` 会当场语法报错），也不支持 enum 等需运行时代码的语法。
-
-### Phase 3 起的新增架构约定
-
-- **AI 契约独占一个纯 JS 文件**（`shared/aiContract.mjs`）：服务（拦 AI 输出）/ 前端编译器（动作→Command）/ 验收（断言一一对应）**三方 import 同一份**，各写一份必漂移。只有纯 ESM JS 能同时被 `.mjs` 服务与 `.ts` 前端用（JSON 不行 —— Node 22 的 `import ... with {type:'json'}` 在本机报 ImportAttributes）。
-- **AI 三层防线**：① 词汇表（有限动作清单，**AI 没有机会输出路径**，不存在 `set(path, value)`）② 校验器（多一个参数键即整条丢掉、数值闭区间、枚举在册）③ CommandBus 的 `isWritablePath`（不认识"AI"，一视同仁）。铁律：几何永不来自 AI；规则集对 AI 只读；不新增"删除项目"类动作；动作名必须与 `compile.ts` **一一对应**。
-- **AI 规划两段式且原子**：干跑走 `bus.preview(cmd)`（真实管线跑在试探模型上），提交执行**同一批 Command 对象**；一条被拒则整份不执行，且必须说出"第几条 / 共几条 / 为什么"。
-- **审计三态**：`ai.plan` 的 result 是 `ok` / `partial` / `rejected`。`plan.ok === true` 只表示"有动作通过了"，**不表示整份会被执行**。
-- **账号体系**：`server/auth.mjs` 的 `AuthStore` 是唯一判定点；角色能力**只读 `ROLES` 一张表**，不许在别处再写 `if (role === ...)`。会话 token 只落 SHA-256，前端存 `sessionStorage` 不存 `localStorage`。账号库损坏 → **拒绝启动，不降级**；登录失败与用户不存在**回同一句话**（防枚举）。
-- **`securityPolicy().notImplemented` 是界面契约**：未实现的安全项由服务端返回、面板照实渲染，不许在界面上硬编码一份"看起来很全"的清单。
-- **mock 服务商是验收必需品**：假 key 打真服务商只能验失败路径，而**成功路径才是功能的全部价值**。mock 只实现 `/chat/completions`、**故意不实现 `/models`**（让"拉取失败必须如实说失败"保持成功语义）。
-- **验收数据必须隔离到临时目录**（`APP_ACCOUNTS_PATH` / `APP_AUDIT_PATH`）：否则每跑一次就往仓库塞一个所有者账号，下次真启动时服务会以为"已经有账号"、关掉注册窗口，而那口令是脚本随手写的 —— **不只是脏，是危险**。
-
-### Phase 3 后段（AI 对话 + 局域网模型）的新增架构约定
-
-- **推理模型的接口契约（写进 `aiContract.mjs`）**：`DEFAULT_MAX_TOKENS = 4096` 显式下发；响应必带 `reasoning` 与 `finishReason`；空正文单独一条诊断分支（按 `finish_reason === 'length'` 说明"预算用完了，把 AI_MAX_TOKENS 调大"），审计加 `result: 'empty'` / `note: budget_exhausted|empty_content`。
-- **连通性接口的返回结构**：`{ reachable, spoke, ok }`，其中 `ok = spoke`。`!r.ok` 时**不能**一律判 `reachable: false` —— 401/403 是"地址通了、鉴权没过"。只有网络层异常（ECONNREFUSED / DNS / 超时）才算不可达。
-- **出站请求主动摘掉环境代理**：`server.mjs` 启动时与 `lan-probe.mjs` 里都 `delete process.env[...]`（六个大小写变体）。
-- **AI 面板两个入口 + 长等待反馈 + 思考折叠 + 每条消息显示 model/token/耗时**；对话历史落 `sessionStorage`（保留最近 40 条，多轮上下文只回传最近 12 条）。
-- **mock 服务商要按通道分流**：规划请求的 user 消息带 `【用户这一句要求】` 标记，对话请求就是用户原话。**通道没分开，mock 就会给出"看起来有回答、其实答错了题"的东西** —— 那种假回答会让"链路通不通"看起来是通的。
-- **mock 要故意慢一点**（`MOCK_DELAY_MS = 800`）：要验的是"等待期间界面有没有如实告诉用户在等"，mock 秒回的话那条断言只能写成"存在即可"——**恒真，等于没验**。
-- **`npm run verify:lan` 与 `verify:all` 分开**：见产品决策 6。
-
-### 验收方法论（血泪）
-
-**"断言不可信"比"断言失败"更危险。** 初次跑浏览器探针 11 项失败**全是探针自己写错**（容器 `textContent` 把相邻元素粘成 `"v01 : 6"` 导致正则读错、`querySelector('.tree-leaf')` 取到墙、期望公式写反），0 项产品缺陷。把断言写诚实之后，才暴露出 5 个真实缺陷。**Phase 2 又重演一轮**：新增的 B14 第一次跑红了 4 项，其中 3 项是断言自己写错（状态栏无选中时根本不渲染「已选」读数、折叠三角 `▸` 被 `textContent` 粘在标题前、修上一条时顺手 strip 空白结果正则又不匹配），1 项是真缺陷（AI 通道漏记 `noteHit`）。**Phase 3 第三次印证**：376 项第一次跑红 22 项，逐条核实后**只有 3 个是真缺陷，19 个是断言自己写错**。**Phase 3 后段第四次印证**：加 B20 与局域网探针后一共失败 4 回，7 项是断言/测试环境自己写错、0 项新缺陷（新缺陷全是在"接真模型"时先暴露的）。
-
-**有一条新的：退出码也可能是"断言自己写错"的一种。** `verify:ui` 报 exit 130 一度被怀疑是工程问题 —— 真相是**我自己的命令超时对整链发了 SIGINT**。`verify:ui` 是分钟级的验收链，**不加短超时、让它自己跑完**。
-
-**还有一条："失败"要顺着往下查，不能只改断言。** B15 两条断言失败（文案不匹配），顺着查下去发现了一个真缺陷（401 被误判成"连不上"）。**先假定自己错 ≠ 改完断言就收工 —— 要把"我为什么会这么写"也问一遍。**
-
-**但"断言读不到东西"有时真的是产品缺陷**：Phase 3 那 3 个真缺陷里有一个（右面板没有滚动容器）表现就是"所有取面板文本的断言读到空字符串"，一个不谨慎的排查会直接得出"面板没渲染"的错误结论。分辨方法：**先看原始值，再看这个原始值是不是一个"不合理但可以解释"的结果** —— 空字符串配"面板明明在屏幕上"就是这个信号。
-
-→ 规则：失败时先把原始值 `JSON.stringify` 出来看，**先假定自己错**；
-→ 规则：**去掉了什么必须有理由** —— "顺手清理一下格式"会把待核对的原始格式一起毁掉；
-→ 规则：**目视发现的每个视觉缺陷都必须转成一条永久断言**（矩形不相交 / 残留元素不存在 / canvas 像素非空白 / 文字包围盒不相交 / 可见范围不越界）；
-→ 规则：文字类问题在大图上肉眼不可判，必须"放大截图 + 逐项 DOM 文本转储 + 用同款字体 `measureText` 量包围盒"三条都做；
-→ 规则：**不变量必须从图元实际坐标推导，不许读对象自己声明的 bbox** —— 声明与内容可以不一致，本轮就是这么让 6 个负样本里 5 个假通过的。
-→ 规则：**每个探针小节必须自成一体，且用完还原现场**。B36 首轮"被墙体规则拦截"其实是跑在上一节导入的工程上；
-改成"复位为干净工程"后又把下游 B30 冲挂了 —— 正确做法是**先存现场 → 复位 → 验完还原**，并断言还原成功。
-→ 规则：**"新增气泡"必须先等气泡清空再判定**。气泡寿命 4.5s：按文本做差集会被同文本旧气泡吃掉；
-改计数又会撞上"旧气泡恰好在观察窗口过期"变成 1→1。两种假失败都真实发生过。
-→ 规则：**Runtime.evaluate 里没有顶层 await**，`await import(...)` 必须包 async IIFE，否则整节探针直接崩。
-→ 规则：**像素换算要按半像素算误差上限**。图幅模式 scale≈0.047，100mm 只有 5px，断言"正好 100mm"必然假失败；
-更有价值的断言是「松手瞬间读数 === 落库值」（所见即所得）。
-→ 工具：browser-probe 支持 `ONLY=<小节关键字>`（只记账该节，动作照旧执行），排单节失败不必每次等几分钟。
+## 部署（NAS 群晖 2026-09-25）
+AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测200)、docker cp /tmp 静默失败用 stdin 法、openrouter/free 504=抖动非提示词、AI_TIMEOUT_MS 默认120s(改 data/.env 加 60000 不重建镜像)。
 
 ## 核心文档
+docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation。spike/ 一键复现 `bash spike/run.sh`。
 
-- `docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md` —— 主方案（PRD/架构/选型/数据模型/AI Command/规则/MCP/文件格式/风险/路线/交互规格）
-- `docs/Phase0-Spike-Report.md` —— Phase 0 实测报告（验收链已跑通 + 4 个真实 bug）
-- `docs/Phase1-Delivery-Report.md` —— Phase 1 交付说明（地基 + 2D 工作台 + 验收证据 + 6 个缺陷复盘 + 诚实清单）
-- `docs/Phase2-Delivery-Report.md` —— Phase 2 交付说明（四视图投影 + AI 记忆/进化 + 管理后台 + 6 个真实缺陷 + 诚实清单）
-- `docs/Phase3-Delivery-Report.md` —— Phase 3 交付说明（OpenAI 兼容 AI 通路 + **AI 对话 + 局域网模型** + 分解图开关 + 账号体系与安全两栏 + **15 个真实缺陷** + 诚实清单）
-- `docs/Architecture-Review-Routing-Correction-Loop.md` —— 架构评议（模型路由 / 确定性后端 / 纠错闭环 / 多租户配置）。**只分析未改代码**。含对用户 long-text 的逐条取舍与 P0/P1/P2 改造清单
-- `docs/Design-Local-Pick-Edit-and-Staged-Generation.md` —— 设计（点选/圈选局部编辑 + 分阶段生成「正面图→选风格→四视图」）。§1–5 只设计未改代码；**§6 是 B 组实现回写**（已落地 + 3 个真缺陷 + 断言自己写错的 4 条）。含现状勘察、两条必须守住的架构判断、A/B 组改造清单与建议顺序
-- `spike/` —— Phase 0 可运行验证工程，`bash spike/run.sh` 一键复现
-11. **"能通过"不等于"验到了"** —— 新增的回归断言必须临时把修复关掉跑一次，确认它**真的会失败**。本轮有断言在关掉修复后照样通过（墙多边形自己带同类浮点残差，两边抵消），等于什么都没断言。
-12. **几何里 0 / ±1 必须精确取值** —— `sin(π)=1.2246e-16`，旋转 180° 的柜体贴墙时足迹会大出 4.5e-13 mm，把"相切"判成"干涉"。这类错误只在 rotation≠0 时出现，而手工测试几乎总是 0°。
-13. **自动落点的判据只能用 CommandBus 干跑** —— 不许另写一份 AABB 判断（第二份真相源必然漂移）。放不下时返回 null 并如实告知，不许退化成"先按 (0,0) 放进去再说"。
-
-## 原则补充（2026-09-25 · AI 按描述生成）
-
-19b. **"AI 太弱"先查契约词汇表，再怪模型。** 本轮根因是 `createCabinet` 本来就收 `units`、模板也有分区意图词汇，
-但 AI 契约没开 → AI 只能走 `create → removeUnit×N → addUnit×N`（破坏性 + 超 12 步上限）。**开契约，不是换模型。**
-新增能力一律做成**纯语义**参数类型（本轮 `unitIntents`：kind/width/count/rodHeight/doorCount/nickname，
-没有坐标、没有板件、没有图元）→ 几何仍由模型派生，AI 依然碰不到几何。
-- **`width` 是期望值，不做加法**：总和不必等于柜宽，摊派交给 `allocateWidths`，恒等式仍精确到 1mm。
-- **语义校验必须编译器与校验器共一份**（`unitIntentsSemanticError`）：`dryRunPlan` 绕过契约校验 = 服务端不是唯一的门。
-- **提示词由词汇表生成** ⇒ 新能力自动进提示词，不存在"契约加了、提示词忘了说"的漂移。
-- **反向语义要给说法**：挂衣区给 count → 告诉他用 rodHeight；层板区给 rodHeight → 拒。不许只回"参数不合法"。
-
-## 工程补充（2026-09-25）
-
-- **提交前先清运行产物**：`verify:ui` 会重写 `verify/out/*.png`（一堆二进制 diff），临时目录被清扫还会留下陈旧的
-  `diagnostics/probe-crash.txt`。提交前 `git checkout --` 还原这些，只留本次真证据（新截图）。
-- **同一能力只许有一份实现**：独立出图脚本缺本地服务端（`/api/ai/plan` 在本地服务里）还要重打 React 选择器 → 删掉，
-  改为在探针小节内部出图；**跑验收与出图共用同一份 mock**（`verify/mock-openai.mjs`），不许两份漂移。
+## 本会话进行中（2026-09-25）
+- **AI 对话框草案功能已完工未提交**：src/ai/draftSession.ts(草案会话：startDraft/addDraftRound/undoLastRound/finalizeDraft，快照取草案非真项目，失败轮整体不并入)、src/ui/panels/DraftPreview.tsx(复用 renderScene 缩略图+结构摘要)、src/ui/panels/AIPanel.tsx(草案Section+生成/定稿/撤回/放弃)、src/styles.css(草案样式)、verify/ai-draft-acceptance.ts(37断言全绿，C快照来自草案/E半截成功不污染两处反退化自证) 已挂 verify:all。typecheck+全 node 验收通过。
+- **下一步：房间独立页**（用户第二大诉求）。现状：四视图(ViewsPanel)不含房间、对象树平铺房间墙无折叠；命令层缺 room.delete/room.resize(仅 room.create/room.rename)。需：①commandBus.ts 加 room.delete(STRUCTURAL_OPS)+room.resize(WRITABLE rooms[\d+].(w|h));②新建 RoomsPanel.tsx(列表/新建/改名/改尺寸/删除，房间多了能分辨);③App.tsx 加 rightTab='rooms' 入口，把"新建房间"从命令行挪到该页;④补验收。

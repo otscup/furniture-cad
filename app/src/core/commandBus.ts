@@ -1,4 +1,4 @@
-import type { Cabinet, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Wall } from './types.ts';
+import type { Cabinet, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
@@ -51,6 +51,9 @@ export interface CommandPayload {
   room?: Room;
   wall?: Wall;
   roomId?: string;
+  /** room.resize 的新尺寸（mm） */
+  w?: number;
+  h?: number;
   /** 允许调用方覆盖名字等 */
   name?: string;
 }
@@ -87,6 +90,12 @@ export type SideEffect =
   | { kind: 'removeUnit'; cabinetId: string; unit: UnitSpec; index: number }
   | { kind: 'insertRoom'; room: Room; index: number }
   | { kind: 'removeRoom'; room: Room; index: number }
+  /**
+   * 调整房间尺寸：矩形/任意多边形房间把每条墙端点相对房间包围盒原点缩放。
+   * 墙的 id/名称/厚度/高度都保留，只动端点坐标。forward 落到新尺寸，reverse 还原。
+   * 必须同时带新/旧端点 —— 房间尺寸没有单字段可表达（来自四面墙 8 个端点），不能走路径回退。
+   */
+  | { kind: 'resizeRoom'; roomId: string; walls: Array<{ id: string; start: Vec2; end: Vec2; prevStart: Vec2; prevEnd: Vec2 }> }
   | { kind: 'insertWall'; roomId: string; wall: Wall; index: number }
   | { kind: 'removeWall'; roomId: string; wall: Wall; index: number }
   /**
@@ -153,6 +162,8 @@ const STRUCTURAL_OPS = new Set([
   'cabinet.layout.removeUnit',
   'cabinet.mirror',
   'room.create',
+  'room.delete',
+  'room.resize',
   'wall.create',
   'wall.delete',
 ]);
@@ -374,6 +385,19 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       }
       return;
     }
+    case 'resizeRoom': {
+      const room = project.rooms.find((r) => r.id === se.roomId);
+      if (!room) return;
+      for (const wl of se.walls) {
+        const wall = room.walls.find((x) => x.id === wl.id);
+        if (!wall) continue;
+        const ns = forward ? wl.start : wl.prevStart;
+        const ne = forward ? wl.end : wl.prevEnd;
+        wall.start = { x: ns.x, y: ns.y };
+        wall.end = { x: ne.x, y: ne.y };
+      }
+      return;
+    }
     case 'insertWall': {
       const room = project.rooms.find((r) => r.id === se.roomId);
       if (!room) return;
@@ -574,6 +598,18 @@ export class CommandBus {
       }
       if (cmd.op === 'room.create' && !cmd.payload?.room) {
         return { ok: false, error: 'room.create 缺少 payload.room' };
+      }
+      /**
+       * room.delete 含柜体时拒绝：删房间会把房间从数组摘掉，但柜体的 roomId 仍指着它
+       * → 悬空柜体（生成器读不到房间 → 尺寸/归属全乱）。与其静默留下孤儿，不如明确拦下，
+       * 让用户先把柜体移走/删掉。这和 cabinet.create「没有房间不能建柜」是同一道防线的两头。
+       */
+      if (cmd.op === 'room.delete') {
+        const rid = cmd.payload?.roomId;
+        const n = this.project.cabinets.filter((c) => c.roomId === rid).length;
+        if (n > 0) {
+          return { ok: false, error: `房间内有 ${n} 个柜体，无法删除（请先移走或删除这些柜体）` };
+        }
       }
     } else if (cmd.changes.length === 0) {
       return { ok: false, error: '命令没有携带任何变更' };
@@ -871,6 +907,57 @@ export class CommandBus {
       return {
         sideEffects: [{ kind: 'insertRoom', room, index }],
         diff: [{ path: '(room.create)', from: null, to: `${room.id} ${room.name}` }],
+      };
+    }
+
+    if (cmd.op === 'room.delete') {
+      const rid = p.roomId;
+      if (!rid) return null;
+      const i = findRoom(draft, rid);
+      if (i < 0) return null;
+      const room = structuredClone(draft.rooms[i]);
+      return {
+        sideEffects: [{ kind: 'removeRoom', room, index: i }],
+        diff: [{ path: '(room.delete)', from: `${room.name}`, to: null }],
+      };
+    }
+
+    if (cmd.op === 'room.resize') {
+      const rid = p.roomId;
+      const w = p.w;
+      const h = p.h;
+      if (!rid || typeof w !== 'number' || typeof h !== 'number' || w <= 0 || h <= 0) return null;
+      const room = draft.rooms.find((r) => r.id === rid);
+      if (!room || room.walls.length === 0) return null;
+      // 房间尺寸来自四面墙端点，先取包围盒原点与边长
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const wll of room.walls) {
+        for (const pt of [wll.start, wll.end]) {
+          if (pt.x < minX) minX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+      }
+      const oldW = maxX - minX;
+      const oldH = maxY - minY;
+      if (!(oldW > 0) || !(oldH > 0)) return null; // 退化的房间（墙共线）没法缩放
+      const sx = w / oldW;
+      const sy = h / oldH;
+      const scale = (pt: Vec2): Vec2 => ({ x: minX + (pt.x - minX) * sx, y: minY + (pt.y - minY) * sy });
+      const walls = room.walls.map((wll) => ({
+        id: wll.id,
+        start: scale(wll.start),
+        end: scale(wll.end),
+        prevStart: { x: wll.start.x, y: wll.start.y },
+        prevEnd: { x: wll.end.x, y: wll.end.y },
+      }));
+      return {
+        sideEffects: [{ kind: 'resizeRoom', roomId: rid, walls }],
+        diff: [{ path: `rooms[${rid}]`, from: `${Math.round(oldW)}×${Math.round(oldH)}`, to: `${Math.round(w)}×${Math.round(h)}` }],
       };
     }
 

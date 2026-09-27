@@ -10,6 +10,7 @@ export type RightTab =
   | 'history'
   | 'layers'
   | 'views'
+  | 'rooms'
   | 'variant'
   | 'export'
   | 'memory'

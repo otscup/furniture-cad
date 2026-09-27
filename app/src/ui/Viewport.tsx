@@ -61,6 +61,8 @@ export interface ViewportProps {
   setCam: Dispatch<SetStateAction<Camera>>;
   fitSignal: number;
   cancelSignal: number;
+  /** 聚焦房间：sig 变化时把视口缩放到该房间包围盒（id 为空表示不聚焦） */
+  focusRoom: { id: string; sig: number };
   /** 'plan' 平面图（可编辑） | 'sheet' 四视图图幅（只读看图） */
   mode: 'plan' | 'sheet';
   /**
@@ -195,6 +197,28 @@ export function Viewport(props: ViewportProps) {
     fitGeom(size.w, size.h);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.fitSignal]);
+
+  // ── 聚焦某个房间：把视口缩放到该房间包围盒（解决"多房间分不清哪个是哪个"） ──
+  useEffect(() => {
+    if (!props.focusRoom.id || props.focusRoom.sig === 0 || size.w < 120) return;
+    const room = bus.getState().rooms.find((r) => r.id === props.focusRoom.id);
+    if (!room || room.walls.length === 0) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const wll of room.walls) {
+      for (const pt of [wll.start, wll.end]) {
+        if (pt.x < minX) minX = pt.x;
+        if (pt.y < minY) minY = pt.y;
+        if (pt.x > maxX) maxX = pt.x;
+        if (pt.y > maxY) maxY = pt.y;
+      }
+    }
+    if (!(maxX > minX) || !(maxY > minY)) return;
+    setCam(() => fitBBox({ min: { x: minX, y: minY }, max: { x: maxX, y: maxY } }, size.w, size.h, 80));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.focusRoom.sig]);
 
   // ── 切换模式（平面 ⇄ 图幅）后重新取景：两种图幅的范围完全不同 ──
   useEffect(() => {

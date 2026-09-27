@@ -31,6 +31,7 @@ import { ViewsPanel } from './panels/ViewsPanel.tsx';
 import { MemoryPanel } from './panels/MemoryPanel.tsx';
 import { AdminPanel } from './panels/AdminPanel.tsx';
 import { AIPanel } from './panels/AIPanel.tsx';
+import { RoomsPanel } from './panels/RoomsPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
@@ -84,6 +85,8 @@ export function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [fitSignal, setFitSignal] = useState(0);
   const [cancelSignal, setCancelSignal] = useState(0);
+  /** 聚焦某个房间：切到平面图并把视口缩放到该房间的包围盒（解决"多个房间分不清哪个是哪个"） */
+  const [focusRoom, setFocusRoom] = useState<{ id: string; sig: number }>({ id: '', sig: 0 });
   const [cmdOpen, setCmdOpen] = useState(false);
   const [lastMsg, setLastMsg] = useState('');
   /**
@@ -406,8 +409,15 @@ export function App() {
     if (run(CMD.createRoomCommand(room))) {
       setTool('select');
       setFitSignal((v) => v + 1);
+      setRightTab('rooms');
     }
   }, [run]);
+
+  /** 聚焦某个房间：切到平面图并把视口缩放到该房间包围盒 */
+  const focusRoomById = useCallback((id: string) => {
+    setMode('plan');
+    setFocusRoom((prev) => ({ id, sig: prev.sig + 1 }));
+  }, [setMode]);
 
   // ── 选中对象操作 ──
   const selectedCabs = useCallback(() => bus.getState().cabinets.filter((c) => selection.includes(c.id)), [selection]);
@@ -866,6 +876,7 @@ export function App() {
 
   const issues = bus.issues();
   const errCount = issues.filter((i) => i.severity === 'ERROR').length;
+  const projectRooms = bus.getState().rooms.length;
 
   // ── 右键菜单项：按「当前选中了什么」算 —— 选中态不同，菜单就不同 ──
   const buildCtxItems = (): CtxItem[] => {
@@ -976,6 +987,7 @@ export function App() {
               setCam={setCam}
               fitSignal={fitSignal}
               cancelSignal={cancelSignal}
+              focusRoom={focusRoom}
               mode={mode}
               explode={explode}
               tool={tool}
@@ -1014,6 +1026,9 @@ export function App() {
             <button type="button" className={rightTab === 'views' ? 'on' : ''} onClick={() => setRightTab('views')}>
               视图
             </button>
+            <button type="button" className={rightTab === 'rooms' ? 'on' : ''} onClick={() => setRightTab('rooms')}>
+              房间{projectRooms > 0 ? <span className="tab-badge">{projectRooms}</span> : null}
+            </button>
             <button type="button" className={rightTab === 'variant' ? 'on' : ''} onClick={() => setRightTab('variant')}>
               方案
             </button>
@@ -1050,6 +1065,9 @@ export function App() {
           ) : null}
           {rightTab === 'views' ? (
             <ViewsPanel bus={bus} version={version} mode={mode} setMode={setMode} explode={explode} setExplode={setExplode} />
+          ) : null}
+          {rightTab === 'rooms' ? (
+            <RoomsPanel bus={bus} version={version} run={run} onToast={toast} onFocusRoom={focusRoomById} />
           ) : null}
           {rightTab === 'variant' ? (
             <VariantPanel

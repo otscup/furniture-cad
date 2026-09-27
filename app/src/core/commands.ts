@@ -262,6 +262,42 @@ export function createRoomCommand(room: Room, source: CommandSource = 'ui'): Com
   };
 }
 
+export function deleteRoomCommand(roomId: string, roomName: string, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('room.delete'),
+    op: 'room.delete',
+    source,
+    target: { kind: 'project', id: 'project' },
+    changes: [],
+    payload: { roomId },
+    label: `删除房间「${roomName}」`,
+  };
+}
+
+export function resizeRoomCommand(roomId: string, w: number, h: number, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('room.resize'),
+    op: 'room.resize',
+    source,
+    target: { kind: 'project', id: 'project' },
+    changes: [],
+    payload: { roomId, w, h },
+    label: `调整房间尺寸 → ${w}×${h}`,
+  };
+}
+
+/** 重命名房间：走 room.rename 路径白名单（rooms[i].name）。index 取当前房间在数组中的位置。 */
+export function renameRoomCommand(roomIndex: number, fromName: string, toName: string, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('room.rename'),
+    op: 'room.rename',
+    source,
+    target: { kind: 'project', id: 'project' },
+    changes: [{ path: `rooms[${roomIndex}].name`, op: 'set', value: toName }],
+    label: `重命名房间「${fromName}」→「${toName}」`,
+  };
+}
+
 // ───────────── 项目 ─────────────
 
 export function renameProject(from: string, to: string, source: CommandSource = 'ui'): Command {

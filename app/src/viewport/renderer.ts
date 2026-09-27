@@ -76,7 +76,7 @@ export interface RenderInput {
   sheetHover?: { pts: Vec2[]; draggable: boolean } | null;
 }
 
-type P2S = (p: Vec2) => Vec2;
+export type P2S = (p: Vec2) => Vec2;
 
 export function renderScene(inp: RenderInput): void {
   const { ctx, vw, vh } = inp;
@@ -285,7 +285,14 @@ function drawPrim(ctx: CanvasRenderingContext2D, p: Prim, to: P2S, scale: number
   }
 }
 
-function drawPrims(ctx: CanvasRenderingContext2D, prims: Prim[], to: P2S, hidden: Set<string>, scale: number): void {
+/**
+ * 画一批图元 —— **唯一**的画法。
+ *
+ * 导出它，是为了让别处（草案缩略图）能复用同一份画法去画**单张立面**，
+ * 而不是另写一套简笔画：两份实现一定会在某次改动后分叉，届时
+ * "小图上看着对、点开大图却是另一回事"，小图就成了骗人的图。
+ */
+export function drawPrims(ctx: CanvasRenderingContext2D, prims: Prim[], to: P2S, hidden: Set<string>, scale: number): void {
   for (const p of prims) {
     if (hidden.has(p.layer)) continue;
     drawPrim(ctx, p, to, scale);

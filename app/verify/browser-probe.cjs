@@ -4968,6 +4968,92 @@ async function waitForApp(url, timeoutMs = 25000) {
       return {got:up.status===200, u:up.status};
     })()`);
     ok('收尾：把 owner 口令改回验收环境的原值', revert41.got === true, JSON.stringify(revert41));
+    section('B42 AI 会话：按房间一对一 · 切页回来不丢 · 草图默认正视图');
+    /**
+     * 自带前置：**重新登录**。
+     *
+     * B41 那节改过 owner 口令（改口令会让服务端把旧会话作废），
+     * 所以到这一步 sessionStorage 里的 token 已经是死的 ——
+     * 不发这一句，下面的 AI 请求一律 401「未登录或会话已过期」，
+     * 而看起来会像是"草案功能坏了"。第一版写这一节时就踩了，
+     * 在去查 AI 通路之前，先确认自己是不是带着一个过期 token 在跑。
+     * 注意：token 只在**挂载时**读一次，所以写完必须重新加载页面才生效。
+     */
+    const boot42 = await evalJs(`(async()=>{
+      const K='furniture-cad.auth.token';
+      const r=await fetch('/api/auth/login',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:'owner',password:'Cad-Str0ng-Pw-2026!x'})});
+      const b=await r.json().catch(()=>({}));
+      if(!(b&&b.token)) return {fail:true, s:r.status};
+      sessionStorage.setItem(K,b.token);
+      return {ok:true};
+    })()`);
+    ok('B42 自带前置：重新登录（B41 改口令已让旧会话失效）', boot42.ok === true, JSON.stringify(boot42));
+    await send('Page.navigate', { url: APP_URL });
+    await sleep(2600);
+    await activateRightTab('AI');
+    await sleep(460);
+
+    const roomInfo42 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+      const rooms=s.bus.getState().rooms;
+      return {count:rooms.length, names:rooms.map(r=>r.name)};})()`);
+    const chipCount42 = await evalJs(`document.querySelectorAll('.side-right .room-chips .chip').length`);
+    /**
+     * 用户原话："能不能做成聊天框类型，每个房间一对一对话"。
+     * 这里验的是"一个房间一格"这件事本身：多了房间就多一格，改 model 不许把格局打乱。
+     */
+    ok(
+      `会话对象按房间分格（${chipCount42} 格 = 全项目 + ${roomInfo42.count} 个房间）`,
+      chipCount42 === roomInfo42.count + 1,
+      JSON.stringify({ chipCount42, rooms: roomInfo42.names })
+    );
+
+    ok('能在输入框里写下这句话', (await setElValue('.side-right .ai-input', '生成一个 1800 宽的餐边柜')) === true);
+    ok('点「改草案」', (await clickPanelBtn('改草案', 1800)) === true);
+    const draftShown42 = await waitFor(`!!document.querySelector('.side-right .draft-preview')`, 25000);
+    ok('草案卡片出来了（这一句话叠到了草案上）', draftShown42 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
+
+    /**
+     * 用户原话："草图应该默认是正面图或者内部图"。
+     * 这是从上一次真实反馈里得到的结论：俯视平面图会被整个房间占满，
+     * 新柜只有两条细边 —— "这一轮到底建成没有"在看不出来，
+     * 于是出现了"AI 把房间的图形复制出来了"这种无法解释的画面。
+     */
+    const viewBtns42 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .draft-view-btn')];
+      return {n:b.length, on:b.filter(x=>x.classList.contains('on')).map(x=>x.textContent.trim())};})()`);
+    ok(
+      '草图默认正视图（不再是一张被房间占满的平面图）',
+      viewBtns42.on.length === 1 && viewBtns42.on[0] === '正视图',
+      JSON.stringify(viewBtns42)
+    );
+    ok('三种看法都能切：正视图 / 内部结构图 / 俯视图', viewBtns42.n === 3, JSON.stringify(viewBtns42));
+
+    const roundMark42 = await evalJs(`(()=>{const m=[...document.querySelectorAll('.side-right .chat-round')]
+      .map(x=>x.textContent.replace(/\\s+/g,' ').trim());return m;})()`);
+    ok(
+      '会话里写明这一轮有没有并进草案（"AI 说了但没动手"必须当场看得见）',
+      roundMark42.length >= 1 && /第 1 轮 · (已并入|未并入)草案/.test(roundMark42[0]),
+      JSON.stringify(roundMark42)
+    );
+
+    // ── 用户原话："为什么切到其它页面再回来就看不到了" ──
+    await activateRightTab('属性');
+    await sleep(420);
+    await activateRightTab('AI');
+    await sleep(560);
+    const back42 = await evalJs(`(()=>{
+      return {
+        draft: !!document.querySelector('.side-right .draft-preview'),
+        chatTurns: document.querySelectorAll('.side-right .chat-msg').length,
+        round: (document.querySelector('.side-right .chat-round')||{}).textContent||'',
+      };})()`);
+    ok('切到别的页签再回来，草案还在（等几十秒的成果不许白等）', back42.draft === true, JSON.stringify(back42));
+    ok('对话历史也还在（连同"这一轮改了什么"的标记）', back42.chatTurns >= 2, JSON.stringify(back42));
+
+    await clickPanelBtn('放弃草案', 460);
+    ok('放弃草案后草图收起（界面不留一个别人以为还在的东西）', (await evalJs(`!!document.querySelector('.side-right .draft-preview')`)) === false);
+
     /**
      * console error 的判定要分两类。
      *

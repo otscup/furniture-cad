@@ -44,6 +44,12 @@ export interface PlanResponse {
   reasoning?: string;
   /** 模型的结束原因。`length` = 输出预算用完了 —— 正文为空时这是最要紧的那个信息 */
   finishReason?: string;
+  /**
+   * 这份计划是**从模型的思考过程里救出来的**（正文为空时的兜底）。
+   * 它是"模型边想边写下的草稿"，可信度低于正式正文 —— 界面必须提示用户重点复核，
+   * 不能和普通结果一个待遇（界面与审计必须说同一件事）。
+   */
+  salvagedFromReasoning?: boolean;
   model?: string;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; reasoning_tokens?: number } | null;
   ms?: number;
@@ -130,6 +136,7 @@ export async function requestPlan(opts: {
     raw: body.raw as string | undefined,
     reasoning: body.reasoning as string | undefined,
     finishReason: body.finishReason as string | undefined,
+    salvagedFromReasoning: body.salvagedFromReasoning === true,
     model: body.model as string | undefined,
     usage: (body.usage as PlanResponse['usage']) ?? null,
     ms: body.ms as number | undefined,
@@ -217,6 +224,14 @@ export async function requestChat(opts: {
   history: ChatTurn[];
   snapshot: AiSnapshot;
   token: string | null;
+  /**
+   * 会话范围说明（"当前只针对房间X"）。
+   *
+   * 放进**系统提示**，不放进用户的话里：用户说的话要原样留在历史里，
+   * 否则回头看历史时会看到一句自己没说过的话 —— 历史被篡改过一次之后，
+   * 它就再也没法用来复盘了。
+   */
+  scope?: string;
 }): Promise<ChatResponse> {
   const empty: ChatTurn = { role: 'assistant', text: '' };
   /** 只回传最近 12 条，防止多轮之后 prompt 无限膨胀 */
@@ -225,7 +240,8 @@ export async function requestChat(opts: {
     .slice(-12)
     .map((m) => ({ role: m.role, content: m.text }));
 
-  const system = `${CHAT_SYSTEM}\n\n当前项目状态（只读，JSON）：\n\`\`\`json\n${JSON.stringify(opts.snapshot)}\n\`\`\``;
+  const scopeLine = opts.scope ? `\n\n${opts.scope}` : '';
+  const system = `${CHAT_SYSTEM}${scopeLine}\n\n当前项目状态（只读，JSON）：\n\`\`\`json\n${JSON.stringify(opts.snapshot)}\n\`\`\``;
 
   let res: Response;
   try {

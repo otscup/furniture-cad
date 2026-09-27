@@ -70,6 +70,7 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 ## 核心文档
 docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation。spike/ 一键复现 `bash spike/run.sh`。
 
-## 本会话进行中（2026-09-25）
-- **AI 对话框草案功能已完工未提交**：src/ai/draftSession.ts(草案会话：startDraft/addDraftRound/undoLastRound/finalizeDraft，快照取草案非真项目，失败轮整体不并入)、src/ui/panels/DraftPreview.tsx(复用 renderScene 缩略图+结构摘要)、src/ui/panels/AIPanel.tsx(草案Section+生成/定稿/撤回/放弃)、src/styles.css(草案样式)、verify/ai-draft-acceptance.ts(37断言全绿，C快照来自草案/E半截成功不污染两处反退化自证) 已挂 verify:all。typecheck+全 node 验收通过。
-- **下一步：房间独立页**（用户第二大诉求）。现状：四视图(ViewsPanel)不含房间、对象树平铺房间墙无折叠；命令层缺 room.delete/room.resize(仅 room.create/room.rename)。需：①commandBus.ts 加 room.delete(STRUCTURAL_OPS)+room.resize(WRITABLE rooms[\d+].(w|h));②新建 RoomsPanel.tsx(列表/新建/改名/改尺寸/删除，房间多了能分辨);③App.tsx 加 rightTab='rooms' 入口，把"新建房间"从命令行挪到该页;④补验收。
+## 本会话进行中（2026-09-25 · 已交付两件）
+- **AI 对话框草案**已提交 `6a91374`：draftSession + DraftPreview + AIPanel 草案段 + 样式 + 37 断言验收。
+- **房间独立管理页**已提交 `1e423c4`：commandBus 加 room.delete/room.resize（含 resizeRoom 副作用 + 含柜体拒删）；RoomsPanel（列表/新建/改名/改尺寸/删除/聚焦）；Viewport focusRoom 取景；28 断言验收。
+- 两个功能 typecheck + 全 node 验收链 + verify:ui 645/645 均通过。本会话两大诉求已闭环。

@@ -1,5 +1,7 @@
-import type { Project, Vec2 } from './types.ts';
-import { projectParamOnSegment } from './geometry/transform.ts';
+import type { Cabinet, Project, Vec2 } from './types.ts';
+import { bboxOf, projectParamOnSegment } from './geometry/transform.ts';
+import { getCabinetFootprint } from './geometry/generate.ts';
+import { detectCollisions, wallPolygon } from './geometry/project.ts';
 
 /**
  * 放置吸附：把"在墙上点一下"翻译成"柜体背靠该墙面且与之平行"。
@@ -162,4 +164,65 @@ export function candidateSpots(project: Project, roomId: string, width: number):
     }
   }
   return out;
+}
+
+/**
+ * 把柜体**沿最小位移方向**推出墙体，推到与墙面相切。
+ *
+ * ── 为什么必须有这个 ──
+ *   AI 给 `atX / atY` 时，它手上没有墙的坐标，只能"照着房间名猜一个角点"。
+ *   实测：房间2 的南墙中心线在 y=0、墙厚 120，模型给的 atY 就是 0 ——
+ *   柜体正好扎进墙里 60mm，记忆门 mem_002 当场拒收，整份计划一条不执行。
+ *   用户看到的就是"AI 说什么都建不出来"，而错的是**我们让 AI 去猜坐标**。
+ *
+ * ── 判据仍然只有一份 ──
+ *   本函数只**提议**位移方向（用 bbox 算出"往哪个方向挪多少才能分开"），
+ *   挪完之后到底算不算干涉，一律交回 `detectCollisions` 复核。
+ *   在这里再写一遍"是否相切"的判定就是第二份真相源，本项目不允许。
+ *
+ * ── 为什么取"最小位移"而不是"沿墙法线" ──
+ *   最小位移 = 对 AI 意图改动最小的那一种改法。它保证"AI 想放哪就尽量还在哪"，
+ *   同时满足"贴墙相切即可，不必退开更多"。多面墙时逐面推，最多推 MAX_PUSH 轮。
+ *
+ * @returns 修正后的落位；推不出来（例如房间本身比柜子小）返回 null
+ */
+export function nudgeOutOfWalls(project: Project, cab: Cabinet): { x: number; y: number } | null {
+  const MAX_PUSH = 8;
+  let x = cab.placement.x;
+  let y = cab.placement.y;
+
+  for (let round = 0; round < MAX_PUSH; round++) {
+    const probe: Cabinet = { ...cab, placement: { ...cab.placement, x, y } };
+    const hit = detectCollisions({ ...project, cabinets: [...project.cabinets.filter((c) => c.id !== cab.id), probe] }).filter(
+      (i) => i.code === 'RULE-CABINET-IN-WALL' && i.target.split(' / ').includes(probe.id)
+    );
+    if (hit.length === 0) return { x: Math.round(x), y: Math.round(y) };
+
+    const cb = bboxOf(getCabinetFootprint(probe));
+    // 在所有"能让它与某面墙分开"的平移里挑绝对值最小的那个 —— 改动最小的修法
+    let best: { dx: number; dy: number; cost: number } | null = null;
+    for (const room of project.rooms) {
+      for (const w of room.walls) {
+        const poly = wallPolygon(w);
+        if (poly.length === 0) continue;
+        const wb = bboxOf(poly);
+        if (!(cb.min.x < wb.max.x && cb.max.x > wb.min.x && cb.min.y < wb.max.y && cb.max.y > wb.min.y)) continue;
+        const cands = [
+          { dx: wb.max.x - cb.min.x, dy: 0 }, // 往 +X 推出墙的右/上边界
+          { dx: wb.min.x - cb.max.x, dy: 0 }, // 往 -X
+          { dx: 0, dy: wb.max.y - cb.min.y }, // 往 +Y
+          { dx: 0, dy: wb.min.y - cb.max.y }, // 往 -Y
+        ];
+        for (const c of cands) {
+          const cost = Math.abs(c.dx) + Math.abs(c.dy);
+          if (cost <= 0) continue;
+          if (!best || cost < best.cost) best = { dx: c.dx, dy: c.dy, cost };
+        }
+      }
+    }
+    if (!best) return null;
+    x += best.dx;
+    y += best.dy;
+  }
+  return null;
 }

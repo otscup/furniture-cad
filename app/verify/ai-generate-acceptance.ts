@@ -422,10 +422,19 @@ ok('G8 两条臂不重叠 —— 这是 L 形，不是两条平行的柜',
 /**
  * 负样本自证：把 rotation 撤掉，退回 AI 当初走的「先建、再转」那条老路。
  *
- * 这不是为了凑一条负例好看 —— 它证明 `rotation` 这个新参数是**承重**的：
- * 没有它，L 形在严格模式下真的拼不出来，"系统不支持转角"曾经是代码里
- * 真实存在的缺口，而不只是模型说错话。有了这条，将来谁把 rotation 删了，
- * 测试会告诉他这个洞有多深。
+ * ── 2026-09-28 这条的判据改过，理由要留下来 ──
+ *   原先断言的是"不带 rotation 的 create 会被撞墙**整条拒掉**"。
+ *   那天之后，AI 猜的落位撞墙不再等于失败：系统会沿最小位移把它**推到与墙面相切**
+ *   （见 core/snapPlace.ts 的 nudgeOutOfWalls —— 用户现场被"未并入草案"卡住，
+ *   根因正是我们让 AI 去猜它根本拿不到的墙坐标）。所以老路现在**建得出来**，
+ *   原判据失效。
+ *
+ *   但 `rotation` 依然承重，只是承重的方式变了，必须换成新的判据：
+ *     不带 rotation → 中间态撞墙 → 被系统**挪开**兜底 → 转完之后
+ *     它已经不在 AI 说的那个角点上 → 两臂拼不出共用角点的 L。
+ *   也就是说：老路能"建成一个柜"，但拼不出用户要的 L。
+ *
+ *   谁以后把 rotation 删了，这两条会告诉他这个洞有多深。
  */
 const naiveRaw = [
   { action: 'cabinet.create', target: { roomName: '厨房' }, params: { name: '旧路-短边', width: 1200, height: 1000, depth: 750, ...PIVOT }, reason: '' },
@@ -433,11 +442,18 @@ const naiveRaw = [
 ] as unknown as AiAction[];
 const naiveValid = validatePlan({ reply: '', actions: naiveRaw }, ctx);
 const naiveRun = dryRunPlan({ bus: new CommandBus(kitchen, rules), actions: naiveValid.actions });
-ok('G9 负样本：退回"先建再转"，create 那一步会被撞墙拒掉（证明 rotation 是承重的）',
-  naiveRun.steps[0]?.ok === false && /墙体/.test(naiveRun.steps[0]?.error ?? ''),
-  naiveRun.steps[0]?.error ?? '(这条老路居然走得通，那 rotation 就没必要存在了)');
-ok('G10 负样本：被拒的那一步没有留下任何后果（该柜体不存在）',
-  naiveRun.draft.cabinets.some((c) => c.name === '旧路-短边') === false);
+
+ok('G9 负样本：不带 rotation 的中间态确实撞墙 —— 系统只能挪位兜底，且把"挪了多少"写进摘要',
+  /自动贴墙修正/.test(naiveRun.steps[0]?.label ?? ''),
+  naiveRun.steps[0]?.label ?? '(中间态没撞墙？那 PIVOT 这个反例就选错了)');
+const naiveCab = naiveRun.draft.cabinets.find((c) => c.name === '旧路-短边');
+ok('G10 负样本：兜底之后落位已经不是 AI 说的角点（x 被挪开了）—— 于是两臂拼不出共用角点的 L',
+  naiveCab !== undefined && naiveCab.placement.x !== PIVOT.atX,
+  JSON.stringify(naiveCab?.placement ?? null));
+ok('G10b 正样本对照：create 里就给 rotation 的两条臂落位**分毫未动**（不需要系统兜底，这才是 L 拼得齐的原因）',
+  Boolean(longArm && shortArm) && longArm!.placement.x === PIVOT.atX && shortArm!.placement.x === PIVOT.atX &&
+    longArm!.placement.y === PIVOT.atY && shortArm!.placement.y === PIVOT.atY,
+  longArm && shortArm ? `${JSON.stringify(longArm.placement)} / ${JSON.stringify(shortArm.placement)}` : '');
 
 // ── 提示词：模型必须看得见这些规矩 ──
 ok('G11 提示词写明"L 形用多个柜体拼出来"（不写这句模型就会自我否定）',

@@ -7,6 +7,8 @@ import { CommandBus } from '../src/core/commandBus.ts';
 import { emptyProject, rectRoom } from '../src/core/docFactory.ts';
 import { dryRunPlan } from '../src/ai/planRunner.ts';
 import type { AiAction } from '../src/ai/compile.ts';
+import { compileCorrections } from '../src/ai/memory.ts';
+import { seedCorrections } from '../src/ai/seedCorrections.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -160,8 +162,76 @@ section('岛台：backUnits 双面柜这条路真通');
   ok('它真的是双面柜（layout.type = double 且背面排有分区）', cab?.layout.type === 'double' && (cab?.layout.backUnits?.length ?? 0) === 2, JSON.stringify({ type: cab?.layout.type, back: cab?.layout.backUnits?.length ?? 0 }));
 }
 
-// ───────────────────────── ④ 反例：自己往墙里塞，必须被拒且说清 ─────────────────────────
-section('反例：显式落位嵌进墙 → strict 拒收，且原因可操作');
+// ───────────────────────── ④ AI 自己给的坐标扎进墙 → 自动贴墙修正 ─────────────────────────
+/**
+ * 这一组是 2026-09-28 用户现场报的那条：
+ *   「第 1 轮 · 未并入草案 · 记忆拦截 mem_002_no_cabinet_in_wall」
+ *
+ * 根因不在 AI，在我们：**提示词要求 AI 给 atX/atY，而 AI 手上没有墙的坐标**，
+ * 它只能照房间名猜角点 —— 房间2 南墙中心线 y=0、墙厚 120，模型给的 atY 就是 0，
+ * 柜体正好扎进墙 60mm，记忆门整份拒收。
+ *
+ * 所以这里钉死两件事：
+ *   · 猜错坐标**不再等于失败**：系统沿最小位移把它推到与墙面相切并照实说明；
+ *   · 但推不出来时（柜子比房间还大）必须**明确报错并给出下一步**，不许静默乱放。
+ */
+section('AI 猜的落位扎进墙 → 自动贴墙修正（而不是整份拒收）');
+
+{
+  const { bus, room2Id } = twoRoomProject();
+  // 真实现场：AI 把房间2 的角点当成 (4200, 0) —— 那正是西墙与南墙的中心线交点
+  const run = dryRunPlan({
+    bus,
+    gate: compileCorrections(seedCorrections()).gate,
+    actions: [
+      {
+        action: 'cabinet.create',
+        target: { roomId: room2Id },
+        params: { name: '横臂', width: 2200, height: 900, depth: 850, atX: 4200, atY: 0 },
+        reason: 'AI 猜的落位',
+      },
+    ],
+  });
+  const cab = run.draft.cabinets.find((c) => c.name === '横臂');
+  ok('不再被 mem_002 拒收 —— 这一轮能真的并进草案', run.okCount === 1 && run.errorCount === 0, JSON.stringify(run.steps.map((s) => s.error ?? s.label)));
+  ok(
+    '修正后的落位确实与墙面相切（校验器里没有 RULE-CABINET-IN-WALL）',
+    run.steps[0].newIssues.filter((i) => i.code === 'RULE-CABINET-IN-WALL').length === 0,
+    JSON.stringify(run.steps[0].newIssues.map((i) => i.code))
+  );
+  ok('改了落位这件事写在摘要里（界面读数 = 最终会被用到的值）', /自动贴墙修正/.test(run.steps[0].label), run.steps[0].label);
+  ok('修正量是最小的（只推到墙面，不是随便挪开）', cab !== undefined && cab.placement.y === 60 && cab.placement.x >= 4260, JSON.stringify(cab?.placement));
+}
+
+// ───────────────────────── ⑤ 反例：推不出来时必须明确报错 ─────────────────────────
+section('反例：柜子比房间还大 → 推不出来就明确报错并给出下一步');
+
+{
+  // 一个 1200×1200 的小房间（净宽约 1080），硬塞一条 1100 宽的柜子并指定角点：
+  // 推到西墙外就撞东墙，推回来又撞西墙 —— 这就该明确报错，而不是静默乱放。
+  const taken = new Set<string>();
+  const p = emptyProject({ ruleSetId: rules.id, name: '推不出来' });
+  p.rooms.push(rectRoom({ name: '小房间', x: 0, y: 0, w: 1200, h: 1200, id: 'room_s', takenIds: taken }));
+  const bus = new CommandBus(p, rules);
+  const run = dryRunPlan({
+    bus,
+    gate: null,
+    actions: [
+      {
+        action: 'cabinet.create',
+        target: { roomId: 'room_s' },
+        params: { name: '放不下的柜', width: 1100, height: 700, depth: 600, atX: 0, atY: 0 },
+        reason: '反例',
+      },
+    ],
+  });
+  ok('推不出来 → 整条拒收（不许静默乱放）', run.errorCount === 1 && run.steps[0].ok === false, JSON.stringify(run.steps[0].label));
+  const msg = run.steps[0].error ?? '';
+  ok('报错点名"嵌进墙"并给出下一步（省略 atX/atY 或调大房间）', /嵌进墙/.test(msg) && /atX/.test(msg) && /房间/.test(msg), msg.slice(0, 300));
+}
+
+// ───────────────────────── ⑥ L 形：朝向必须被尊重（不许并排贴同一面墙）─────────────────────────
+section('L 形：rotation 决定贴哪面墙（两条臂不能并排贴同一面墙）');
 
 {
   const { bus, room2Id } = twoRoomProject();
@@ -169,18 +239,35 @@ section('反例：显式落位嵌进墙 → strict 拒收，且原因可操作')
     bus,
     gate: null,
     actions: [
-      {
-        action: 'cabinet.create',
-        target: { roomId: room2Id },
-        // 房间2 的西墙在 x=4200；这里把柜体横跨墙中心线 —— 必然嵌墙
-        params: { name: '嵌墙柜', width: 1500, height: 700, depth: 850, atX: 3900, atY: 300 },
-        reason: '反例',
-      },
+      { action: 'cabinet.create', target: { roomId: room2Id }, params: { name: '横臂', width: 2200, height: 900, depth: 850 } },
+      { action: 'cabinet.create', target: { roomId: room2Id }, params: { name: '竖臂', width: 1500, height: 700, depth: 850, rotation: 90 } },
     ],
   });
-  ok('引入了 ERROR，于是整条被 strict 拒收', run.errorCount === 1 && run.steps[0].ok === false, JSON.stringify(run.steps[0]));
-  const msg = `${run.steps[0].error ?? ''} ${run.steps[0].newIssues.map((i) => i.message).join(' ')}`;
-  ok('拒收原因点名了"墙体"并给出厚度（不是一句"失败"）', /墙/.test(msg) && /120/.test(msg), msg.slice(0, 300));
+  const a = run.draft.cabinets.find((c) => c.name === '横臂');
+  const b = run.draft.cabinets.find((c) => c.name === '竖臂');
+  ok('两条臂都建成', run.okCount === 2 && !!a && !!b, JSON.stringify(run.steps.map((s) => s.error ?? s.label)));
+  ok(
+    'AI 说的朝向被尊重 —— 竖臂仍然是 90°（以前会被自动落位悄悄改成 0°）',
+    b?.placement.rotation === 90 && a?.placement.rotation === 0,
+    JSON.stringify({ 横臂: a?.placement.rotation, 竖臂: b?.placement.rotation })
+  );
+  const fp = (c: (typeof run.draft.cabinets)[number]) => {
+    const x0 = c.placement.x;
+    const y0 = c.placement.y;
+    const r = c.placement.rotation;
+    // 与 getCabinetFootprint 同口径：rotation=90 时宽落在 Y、深落在 X
+    const along = r === 90 || r === 270;
+    return { minX: along ? x0 - c.params.depth : x0, maxX: along ? x0 : x0 + c.params.width, minY: along ? y0 : y0 - 0, maxY: along ? y0 + c.params.width : y0 + c.params.depth };
+  };
+  const fa = a ? fp(a) : null;
+  const fb = b ? fp(b) : null;
+  const overlapXY = fa && fb ? fa.minX < fb.maxX && fa.maxX > fb.minX && fa.minY < fb.maxY && fa.maxY > fb.minY : true;
+  ok('两条臂不重叠（否则会被 mem_003 拦下，又是"未并入草案"）', overlapXY === false, JSON.stringify({ fa, fb }));
+  ok(
+    '两条臂贴的是**互相垂直**的两面墙（这才是 L，不是一字排开）',
+    a !== undefined && b !== undefined && a.placement.rotation !== b.placement.rotation,
+    JSON.stringify({ 横臂: a?.placement.rotation, 竖臂: b?.placement.rotation })
+  );
 }
 
 console.log(`\n${'─'.repeat(56)}`);

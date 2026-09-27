@@ -115,7 +115,12 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
     steps.push({
       action: displayAction,
       command: compiled.command,
-      label: compiled.command.label ?? compiled.summary,
+      /**
+       * `note` 是编译器替 AI 做过的修正（例如"AI 猜的落位扎进墙，已自动贴墙修正"）。
+       * 必须拼进 label —— 否则界面上显示的是"新建柜体 X"，而实际落到的是另一个坐标，
+       * 那正是"预览不等于提交"，也是本项目最不能接受的一类问题。
+       */
+      label: [compiled.command.label ?? compiled.summary, compiled.note].filter(Boolean).join(' — '),
       ok: r.ok,
       /**
        * error 只能在**失败**时出现。

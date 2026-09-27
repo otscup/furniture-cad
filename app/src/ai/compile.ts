@@ -6,7 +6,7 @@ import { nextId } from '../core/ids.ts';
 import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
-import { candidateSpots } from '../core/snapPlace.ts';
+import { candidateSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
@@ -58,7 +58,8 @@ export interface AiAction {
 }
 
 export type CompileResult =
-  | { ok: true; command: Command; summary: string }
+  /** `note` = 编译器替 AI 做过的修正。它会拼进 PlanStep.label，界面必须看得到 —— "预览 === 提交" */
+  | { ok: true; command: Command; summary: string; note?: string }
   | { ok: false; error: string };
 
 const mm = (v: number): number => Math.round(Number(v));
@@ -90,8 +91,20 @@ function doorIntentOf(doorCount: unknown): { count: number } | undefined {
  *   （比如板件超幅面）跟"放哪儿"无关，拿它否决落位会导致
  *   **所有落点都被否掉**，最后退化成"随便放进去再说"。
  */
-function pickFreeSpot(project: Project, cab: Cabinet): { x: number; y: number; rotation: number } | null {
-  const spots = candidateSpots(project, cab.roomId, cab.params.width);
+function pickFreeSpot(project: Project, cab: Cabinet, preferRotation?: number): { x: number; y: number; rotation: number } | null {
+  let spots = candidateSpots(project, cab.roomId, cab.params.width);
+  /**
+   * AI 说了朝向（rotation）时，落位必须**顺着它说的朝向**去找墙。
+   *
+   * 这条是"L 形能不能真生成出来"的关键：两句描述里的第二条臂给了 rotation:90，
+   * 如果这里不管朝向、直接取第一个放得下的落点，两条臂会并排贴在同一面墙上 ——
+   * 用户要的是拐弯，拿到的是一字排开。把同朝向的候选排到前面，
+   * 横臂落在南墙（0°）、竖臂落在东墙（90°），两臂自然共用角点成 L。
+   */
+  if (preferRotation !== undefined) {
+    const want = ((Math.round(preferRotation) % 360) + 360) % 360;
+    spots = [...spots.filter((s) => s.rotation === want), ...spots.filter((s) => s.rotation !== want)];
+  }
   for (const s of spots) {
     const trial: Cabinet = { ...cab, placement: { x: s.x, y: s.y, rotation: s.rotation } };
     const draft: Project = { ...project, cabinets: [...project.cabinets, trial] };
@@ -487,6 +500,8 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (typeof room === 'string') return { ok: false, error: room };
       const name = String(p.name);
       if (project.cabinets.some((c) => c.name === name)) return { ok: false, error: `已经有一个柜体叫「${name}」，名字要能分辨` };
+      /** 系统替它改了落位时要写在 summary 里 —— "界面读数必须是最终会被用到的那个值" */
+      let note = '';
       const base = defaultCabinetParams(rules);
       const place = { x: mm(Number(p.atX ?? 0)), y: mm(Number(p.atY ?? 0)) };
       if (p.atX === undefined && p.atY === undefined) {
@@ -539,7 +554,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       // 落位是系统替它定的 —— 系统把柜子塞进墙里再报一条干涉 ERROR，
       // 用户会以为是 AI 理解错了，实际是我们自己挑错了地方。
       if (p.atX === undefined || p.atY === undefined) {
-        const spot = pickFreeSpot(project, cab);
+        const spot = pickFreeSpot(project, cab, rotation);
         if (spot !== null) {
           cab.placement = { x: spot.x, y: spot.y, rotation: spot.rotation };
         } else {
@@ -550,9 +565,33 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
               '请把柜宽改小一点，或显式给 atX / atY 指定落位。',
           };
         }
+      } else {
+        /**
+         * AI 显式给了 atX / atY —— 而它手上**没有墙的坐标**，只能照房间名猜角点。
+         * 实测它给的往往正好是墙的中心线（房间2 南墙 y=0、墙厚 120 → 柜体扎进墙 60mm），
+         * 于是记忆门 mem_002 整份拒收，界面上只剩"未并入草案"。
+         *
+         * 这里不再把这份坐标当成圣旨，也不直接报错让用户卡住：
+         * 沿**最小位移**把它推到与墙面相切，并把"改了、改了多少"写进 summary。
+         * 判据仍然是校验器那一份（见 nudgeOutOfWalls 的注释）。
+         */
+        const pushed = nudgeOutOfWalls(project, cab);
+        if (pushed === null) {
+          return {
+            ok: false,
+            error:
+              `「${name}」按 atX=${cab.placement.x} / atY=${cab.placement.y} 放会嵌进墙体，且推不出来（房间可能比柜子还小）。` +
+              '请不要给 atX / atY，让系统自动找落位；或先把房间尺寸调大。',
+          };
+        }
+        if (pushed.x !== cab.placement.x || pushed.y !== cab.placement.y) {
+          const from = `(${cab.placement.x}, ${cab.placement.y})`;
+          cab.placement = { ...cab.placement, x: pushed.x, y: pushed.y };
+          note = `（给的落位 ${from} 会嵌进墙，已自动贴墙修正到 (${pushed.x}, ${pushed.y})）`;
+        }
       }
 
-      return { ok: true, command: CMD.createCabinet(cab, src), summary: `新建柜体「${name}」` };
+      return { ok: true, command: CMD.createCabinet(cab, src), summary: `新建柜体「${name}」${note}`, note: note || undefined };
     }
 
     case 'cabinet.duplicate': {

@@ -14,22 +14,45 @@ export type RemainderPolicy = 'bottom' | 'top' | 'distribute';
  * 本函数按比例把差额摊掉，并把"期望 vs 实际"的差异交给调用方报 INFO。
  */
 export function allocateWidths(total: number, requested: number[]): number[] {
-  const sum = requested.reduce((a, b) => a + b, 0);
-  if (sum <= 0) return requested.map(() => 0);
+  const n = requested.length;
+  if (n === 0) return [];
+  // 总净宽为负/零（柜子比排里分区还窄）：放不下，全 0，交给校验器报"装不下"
+  if (total <= 0) return new Array(n).fill(0);
 
-  const raw = requested.map((r) => (total * r) / sum);
-  const out = raw.map((v) => Math.floor(v));
+  /**
+   * 语义修正（一次真缺陷）：
+   *   旧实现 `if (sum <= 0) return 全 0` —— 当所有分区**都没给宽**（AI 只说
+   *   "岛台带镂空"、省略了背面排宽）时，requested 全是 0，于是背面排净宽全 0，
+   *   宽度链恒等式 `t + Σ后排净宽 + … = width` 左=36、右=2200 直接崩，
+   *   柜体被严格模式拒掉，"AI 建不出岛台"。
+   *   正确语义：**未指定宽（0 / 非有限）应当等分总净宽**，明确指定的才按比例。
+   *   这里把 0 / NaN 当"未指定"处理，不再当"明确要 0 宽"。
+   */
+  const specs = requested.map((r) => (Number.isFinite(Number(r)) && Number(r) > 0 ? Number(r) : 0));
+  const specifiedSum = specs.reduce((a, b) => a + b, 0);
 
-  let remainder = total - out.reduce((a, b) => a + b, 0);
-  // 按小数部分从大到小补 1mm，保证总和精确
-  const order = raw
-    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
-    .sort((a, b) => b.frac - a.frac);
-  let k = 0;
-  while (remainder > 0 && order.length > 0) {
-    out[order[k % order.length].i] += 1;
-    remainder -= 1;
-    k += 1;
+  let out: number[];
+  if (specifiedSum === 0) {
+    // 全部未指定 → 等分（整数化，余量按索引顺序补 1mm，保证 Σ ≡ total）
+    const base = Math.floor(total / n);
+    out = new Array(n).fill(base);
+    let rem = total - base * n;
+    for (let i = 0; rem > 0; i = (i + 1) % n, rem--) out[i] += 1;
+  } else {
+    const raw = specs.map((r) => (total * r) / specifiedSum);
+    out = raw.map((v) => Math.floor(v));
+
+    let remainder = total - out.reduce((a, b) => a + b, 0);
+    // 按小数部分从大到小补 1mm，保证总和精确
+    const order = raw
+      .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+      .sort((a, b) => b.frac - a.frac);
+    let k = 0;
+    while (remainder > 0 && order.length > 0) {
+      out[order[k % order.length].i] += 1;
+      remainder -= 1;
+      k += 1;
+    }
   }
   return out;
 }

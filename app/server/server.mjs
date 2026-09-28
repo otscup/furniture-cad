@@ -41,6 +41,7 @@ import { csvCell } from './csvCell.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
 import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS, resolveMaxTokens } from '../shared/aiContract.mjs';
+import { quotaView } from '../shared/quota.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..');
@@ -524,8 +525,9 @@ async function handleApi(req, res, pathname) {
       plans: Object.entries(PLANS).map(([id, p]) => ({
         id,
         label: p.label,
-        monthlyTokens: p.monthlyTokens,
-        dailyCalls: p.dailyCalls,
+        // 原样下发档位定义，界面据此生成"每档给多少"的说明 —— 不手写第二份
+        tokens: p.tokens,
+        generations: p.generations,
         models: p.models,
       })),
       accounts: auth.list(),
@@ -865,6 +867,22 @@ async function handleApi(req, res, pathname) {
     const model = body.model || env.AI_MODEL || s.model;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
     if (!Array.isArray(body.messages) || body.messages.length === 0) return json(res, 400, { ok: false, error: 'messages 不能为空' });
+    /**
+     * ① 额度 —— 对话**也**要计。
+     *
+     * 以前这条通道既不查额度也不记账：问一句"踢脚线一般多高"同样要花钱（prompt +
+     * completion 都得计费），而账上显示是 0。用量是账单，少记比不显示更糟 ——
+     * 用户照着界面上的数字估"还能用多久"，估出来的是假的。
+     *
+     * 但对话**不算一次"生成"**（generation 不传）：生成次数是给"出图"那件事留的，
+     * 提问不该吃掉它，否则免费档每天那 1 次会被几个常识问题用光。
+     */
+    if (gate.account) {
+      const q = auth.checkQuota(gate.account.id, { generation: false });
+      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code });
+      const m = auth.checkModel(gate.account.id, model);
+      if (!m.ok) return json(res, 403, { ok: false, error: m.error, code: m.code });
+    }
     const t0 = Date.now();
     try {
       const payload = {
@@ -889,13 +907,32 @@ async function handleApi(req, res, pathname) {
         Number(env.AI_TIMEOUT_MS ?? 120000)
       );
       const text = await r.text();
-      if (!r.ok) return json(res, 200, { ok: false, error: `HTTP ${r.status}：${text.slice(0, 400)}` });
-      const data = JSON.parse(text);
+      if (!r.ok) {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: `HTTP ${r.status}` });
+        return json(res, 200, { ok: false, error: `HTTP ${r.status}：${text.slice(0, 400)}` });
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: 'bad_envelope' });
+        return json(res, 200, { ok: false, error: '服务商返回的不是 JSON', raw: text.slice(0, 400), ms: Date.now() - t0 });
+      }
       const choice = data?.choices?.[0] ?? {};
       const content = String(choice?.message?.content ?? '');
       const reasoning = String(choice?.message?.reasoning_content ?? '');
       const finish = choice?.finish_reason;
       const usage = data?.usage ?? null;
+      if (gate.account) {
+        auth.recordUsage(gate.account.id, {
+          model: data?.model ?? model,
+          promptTokens: Number(usage?.prompt_tokens ?? 0),
+          completionTokens: Number(usage?.completion_tokens ?? 0),
+          ok: true,
+          ms: Date.now() - t0,
+          generation: false,
+        });
+      }
       return json(res, 200, {
         ok: true,
         text: content,
@@ -910,10 +947,15 @@ async function handleApi(req, res, pathname) {
          * 正文为空时给一个**可操作的**原因。
          * "AI 没有回答"是零信息量的一句话：用户不知道是该改配置、换模型、还是自己说错了。
          */
+        /**
+         * 口径与 /api/ai/plan 保持一致：**不建议靠调大 AI_MAX_TOKENS 解决**。
+         * 早先两条通道一个说"调大就好转"、一个说"不建议调大"，同一个故障
+         * 在同一个界面上给出两套相反的建议 —— 那比不给建议更糟。
+         */
         emptyReason: content.trim()
           ? undefined
           : finish === 'length'
-            ? `模型把 ${usage?.completion_tokens ?? '?'} 个输出 token 用完了还没开始写正文（推理模型的典型形态）。把 AI_MAX_TOKENS 调大就会好转（合法区间 1–65536，管理后台有 4K/8K/16K/32K/64K 预设）。`
+            ? `模型把 ${usage?.completion_tokens ?? '?'} 个输出 token 全花在思考上、还没开始写正文。调大 AI_MAX_TOKENS 通常只是把"空回答"换成"超时"；更可靠的办法是在管理后台换一个非推理模型。`
             : reasoning
               ? '模型只产出了思考过程，没有产出正文。'
               : '模型返回了空的正文。',
@@ -921,9 +963,16 @@ async function handleApi(req, res, pathname) {
         usage,
         /** 服务端实测耗时（不含浏览器往返）—— 界面要如实显示"这次等了多久" */
         ms: Date.now() - t0,
+        /**
+         * 这一次花完之后还剩多少。带上它的理由很实际：
+         * 界面上的"今日还能生成几次"必须跟着真实消耗走，而每次问 /api/auth/me
+         * 重新拉一次是第二次往返 —— 顺手带回是最省事也最不容易漂的做法。
+         */
+        quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
       });
     } catch (e) {
       const timedOut = e.name === 'AbortError';
+      if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: e.name });
       return json(res, 200, {
         ok: false,
         ms: Date.now() - t0,
@@ -952,10 +1001,10 @@ async function handleApi(req, res, pathname) {
     if (!auth.enabled) {
       // local-open：免登录，不计量。如实回一个标记，让界面能说清"当前没有额度限制"
     }
-    // ① 额度（在**发起调用之前**判定，不是事后统计）
+    // ① 额度（在**发起调用之前**判定，不是事后统计）。规划 = 一次"生成"
     if (gate.account) {
-      const q = auth.checkQuota(gate.account.id);
-      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code });
+      const q = auth.checkQuota(gate.account.id, { generation: true });
+      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code, quota: q.view });
     }
 
     const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
@@ -992,14 +1041,14 @@ async function handleApi(req, res, pathname) {
       const raw = await r.text();
       const ms = Date.now() - t0;
       if (!r.ok) {
-        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: `HTTP ${r.status}` });
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: `HTTP ${r.status}`, generation: true });
         return json(res, 200, { ok: false, error: `服务商返回 HTTP ${r.status}：${raw.slice(0, 400)}`, ms });
       }
       let data;
       try {
         data = JSON.parse(raw);
       } catch {
-        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: 'bad_envelope' });
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: 'bad_envelope', generation: true });
         return json(res, 200, { ok: false, error: '服务商返回的不是 JSON', raw: raw.slice(0, 400), ms });
       }
       const choice = data?.choices?.[0] ?? {};
@@ -1019,6 +1068,7 @@ async function handleApi(req, res, pathname) {
           completionTokens: Number(usage?.completion_tokens ?? 0),
           ok: true,
           ms,
+          generation: true,
         });
       }
 
@@ -1152,10 +1202,11 @@ async function handleApi(req, res, pathname) {
         model: data?.model ?? model,
         usage,
         ms,
+        quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
       });
     } catch (e) {
       const ms = Date.now() - t0;
-      if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: e.name });
+      if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: e.name, generation: true });
       return json(res, 200, { ok: false, error: e.name === 'AbortError' ? '调用超时' : `调用失败：${e.message}`, ms });
     }
   }

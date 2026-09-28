@@ -856,9 +856,9 @@ async function main(): Promise<void> {
     const weak = await post('/api/account/accounts', { username: 'weakuser', password: '123456' }, token);
     ok('H6 弱口令被拒（纯数字/常见弱口令/长度不足）', weak.status === 400 && String(weak.data.error).includes('口令'), String(weak.data.error));
 
-    // 额度：把 owner 降到 free（200k token），再用一次超量调用触发
+    // 额度：账号默认就是 free（每日 100 万 token **且**每日 1 次生成，任一用尽即止）
     await post('/api/account/account', { id: String((reg.data.account as { id?: string }).id), plan: 'free' }, token);
-    // 反复调用把日次数打满（free = 60 次/日）；mock 每次都回 1290 token
+    // H4 那次成功调用已经用掉了今天这 1 次生成 —— 第二次就该被拦
     let quotaHit = 0;
     let lastStatus = 0;
     for (let i = 0; i < 70; i++) {
@@ -870,10 +870,33 @@ async function main(): Promise<void> {
       }
     }
     ok('H7 额度耗尽后被拦（429 且给出可读原因），不是无声继续烧钱', quotaHit > 0 && lastStatus === 429, `第 ${quotaHit} 次触发 429`);
+    const blockedBody = await post('/api/ai/plan', { text: '项目改名', snapshot }, token);
+    ok('H7b 被拦时**说清是哪一条拦的**（生成次数，不是 token）—— "额度用完"没有可操作性',
+      String(blockedBody.data.code ?? '').includes('GENERATIONS') && String(blockedBody.data.error ?? '').includes('生成'),
+      `${blockedBody.data.code} / ${blockedBody.data.error}`);
 
     const usage = await get('/api/usage', token);
-    const used = (usage.data.accounts as Array<{ quota: { used: { totalCalls: number; totalTokens: number } } }>)?.[0]?.quota.used;
-    ok('H8 用量被如实累计（次数与 token 都记）', Boolean(used) && used!.totalCalls > 0 && used!.totalTokens > 0, JSON.stringify(used));
+    const usedRow = (usage.data.accounts as Array<{ quota: { used: { totalCalls: number; totalTokens: number; dayGenerations: number; dayTokens: number } } }>)?.[0]?.quota.used;
+    ok('H8 用量被如实累计（次数与 token 都记）', Boolean(usedRow) && usedRow!.totalCalls > 0 && usedRow!.totalTokens > 0, JSON.stringify(usedRow));
+
+    /**
+     * H13 / H14 —— 对话通道也得记账。
+     *
+     * 以前 /api/ai/chat 既不查额度也不记账：问一句"踢脚线一般多高"同样要花
+     * prompt + completion 的钱，而账上显示是 0。用量是账单，少记比不显示更糟 ——
+     * 用户照着界面上的数字估"还能用多久"，估出来的是假的。
+     *
+     * 但对话**不算一次生成**：生成次数是给"出图"那件事留的，提问不该吃掉它。
+     * 这两条一起，才是"免费用户每天 100 万 token 或 1 次生成"能同时成立的原因。
+     */
+    const genBefore = usedRow?.dayGenerations ?? -1;
+    const tokBefore = usedRow?.dayTokens ?? -1;
+    const chat = await post('/api/ai/chat', { messages: [{ role: 'user', content: '踢脚线一般多高？' }] }, token);
+    ok('H13 对话通道正常返回（未被额度拦住）', chat.status === 200 && chat.data.ok === true, JSON.stringify(chat.data).slice(0, 160));
+    const usage2 = await get('/api/usage', token);
+    const usedRow2 = (usage2.data.accounts as Array<{ quota: { used: { dayTokens: number; dayGenerations: number } } }>)?.[0]?.quota.used;
+    ok('H14 对话消耗的 token 进了账（以前这里永远是 0）', (usedRow2?.dayTokens ?? 0) > tokBefore, `${tokBefore} → ${usedRow2?.dayTokens}`);
+    ok('H15 对话**没有**吃掉生成次数（提问不该算一次生成）', usedRow2?.dayGenerations === genBefore, `${genBefore} → ${usedRow2?.dayGenerations}`);
 
     const audit = await get('/api/security/audit?limit=200', token);
     const entries = (audit.data.entries as Array<{ action?: string; result?: string; actor?: string }>) ?? [];

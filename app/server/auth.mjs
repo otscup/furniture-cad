@@ -37,14 +37,15 @@ export const ROLES = {
   viewer: { label: '只读', rank: 10, canManage: false, canDesign: false, canView: true },
 };
 
-/** 订阅档位 → AI 调用额度。额度按"自然月 token 总量"计，与商用订阅的常见口径一致 */
-export const PLANS = {
-  free: { label: '免费', monthlyTokens: 200_000, dailyCalls: 60, models: [] },
-  pro: { label: '专业', monthlyTokens: 5_000_000, dailyCalls: 1200, models: [] },
-  team: { label: '团队', monthlyTokens: 30_000_000, dailyCalls: 6000, models: [] },
-  unlimited: { label: '不限', monthlyTokens: Number.MAX_SAFE_INTEGER, dailyCalls: Number.MAX_SAFE_INTEGER, models: [] },
-};
-/** models: [] 表示不限制模型；填了就是白名单（"AI 模型调用管理"的落点） */
+/**
+ * 订阅档位 —— 定义在 shared/quota.mjs，这里只是转发。
+ *
+ * 为什么不留在 auth.mjs：额度要在服务端、账号面板、管理后台、AI 面板四处显示，
+ * 而"四处各格式化一次"迟早会显示成四个不同的数。档位表、显示口径、
+ * 已用/剩余的计算全部只有一份（见 shared/quota.mjs 文件头）。
+ */
+import { PLANS, planOf, normalizeUsage, applyUsage, checkQuota as evalQuota, quotaView } from '../shared/quota.mjs';
+export { PLANS };
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 小时
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -201,12 +202,14 @@ export class AuthStore {  /**
       tenantId: a.tenantId,
       createdAt: a.createdAt,
       lastLoginAt: a.lastLoginAt ?? null,
-      quota: {
-        monthlyTokens: PLANS[a.plan]?.monthlyTokens ?? 0,
-        dailyCalls: PLANS[a.plan]?.dailyCalls ?? 0,
-        models: PLANS[a.plan]?.models ?? [],
-        used: a.usage ?? { monthTokens: 0, dayCalls: 0, month: '', day: '', totalTokens: 0, totalCalls: 0 },
-      },
+      /**
+       * 额度**视图**（已用/剩余/百分比/被哪条拦住）。
+       *
+       * 以前这里发的是三个裸数字，界面自己去拼"已用 / 限额"、自己算百分比 ——
+       * 于是同一个额度在账号面板和后台可能是两种说法。现在两边拿的都是这一份，
+       * 界面只负责把它画出来，不做第二次计算。
+       */
+      quota: quotaView(a.plan, a.usage),
       ...extra,
     };
   }
@@ -265,7 +268,7 @@ export class AuthStore {  /**
       sessions: [],
       failedLogins: [],
       lockedUntil: null,
-      usage: { month: '', day: '', monthTokens: 0, dayCalls: 0, totalTokens: 0, totalCalls: 0 },
+      usage: normalizeUsage(null),
     };
     this.data.accounts.push(acc);
     this.#save();
@@ -500,25 +503,23 @@ export class AuthStore {  /**
 
   // ───────────────────────── 额度与用量 ─────────────────────────
 
-  /** 额度检查 —— 在**发起 AI 调用之前**执行，不是事后统计 */
-  checkQuota(id) {
+  /**
+   * 额度检查 —— 在**发起 AI 调用之前**执行，不是事后统计。
+   *
+   * @param opts.generation true = 这次算一次"生成"（计每日生成次数）；
+   *                        对话通道传 false —— 提问不该吃掉生成额度。
+   */
+  checkQuota(id, opts = {}) {
     const a = this.findById(id);
-    if (!a) return { ok: false, error: '账号不存在' };
-    const plan = PLANS[a.plan] ?? PLANS.free;
-    const u = normalizeUsage(a.usage);
-    if (u.monthTokens >= plan.monthlyTokens) {
-      return { ok: false, error: `本月 AI 额度已用完（${u.monthTokens} / ${plan.monthlyTokens} token），请升级订阅档位`, code: 'QUOTA_MONTHLY' };
-    }
-    if (u.dayCalls >= plan.dailyCalls) {
-      return { ok: false, error: `今日调用次数已用完（${u.dayCalls} / ${plan.dailyCalls} 次），请明天再试或升级档位`, code: 'QUOTA_DAILY' };
-    }
-    return { ok: true, plan, used: u };
+    if (!a) return { ok: false, error: '账号不存在', code: 'ACCOUNT_NOT_FOUND' };
+    const r = evalQuota(a.plan, a.usage, { counts: opts.generation === true });
+    return { ok: r.ok, error: r.error, code: r.code, plan: planOf(a.plan), view: r.view, used: r.used };
   }
 
   /** 额度检查之模型白名单 —— 空数组 = 不限制 */
   checkModel(id, model) {
     const a = this.findById(id);
-    const plan = PLANS[a?.plan ?? 'free'] ?? PLANS.free;
+    const plan = planOf(a?.plan ?? 'free');
     if (!plan.models || plan.models.length === 0) return { ok: true };
     return plan.models.includes(model)
       ? { ok: true }
@@ -532,34 +533,14 @@ export class AuthStore {  /**
    * 所以宁可少记也不要编造：缺 token 数时按 0 记，并把 calls 记上，
    * 界面上如实显示"本次未返回用量"。凭空估一个数字会让账单不可信。
    */
-  recordUsage(id, { promptTokens = 0, completionTokens = 0, model = '', ok = true, ms = 0, note = '' }) {
+  recordUsage(id, { promptTokens = 0, completionTokens = 0, model = '', ok = true, ms = 0, note = '', generation = false }) {
     const a = this.findById(id);
     if (!a) return;
-    const u = normalizeUsage(a.usage);
-    u.monthTokens += promptTokens + completionTokens;
-    u.totalTokens += promptTokens + completionTokens;
-    u.dayCalls += 1;
-    u.totalCalls += 1;
+    const u = applyUsage(a.usage, { tokens: promptTokens + completionTokens, generation });
     a.usage = { ...u, lastAt: new Date().toISOString(), lastModel: model, lastMs: ms, lastOk: ok };
     this.#save();
     this.audit({ actor: id, action: 'ai.call', model, ok, ms, promptTokens, completionTokens, note: String(note).slice(0, 120) });
   }
-}
-
-function normalizeUsage(u) {
-  const now = new Date();
-  const month = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-  const day = now.toISOString().slice(0, 10);
-  const base = u ?? {};
-  return {
-    month: month,
-    day: day,
-    // 跨月/跨日归零 —— 在读取处判，不在定时器里判：没有定时器就没有"没跑到"的问题
-    monthTokens: base.month === month ? Number(base.monthTokens ?? 0) : 0,
-    dayCalls: base.day === day ? Number(base.dayCalls ?? 0) : 0,
-    totalTokens: Number(base.totalTokens ?? 0),
-    totalCalls: Number(base.totalCalls ?? 0),
-  };
 }
 
 function sha256(s) {
@@ -607,7 +588,7 @@ export function securityPolicy({ mode, accountsPath, auditPath, host }) {
       '会话 token 只存哈希，支持过期与停用即踢下线',
       '失败登录计数与锁定窗口',
       '角色（owner/admin/designer/viewer）与最小权限判定',
-      'AI 调用额度（月 token / 日次数）与模型白名单',
+      'AI 调用额度（按周期 token + 每日生成次数，任一用尽即止）与模型白名单',
       '邮箱验证码注册：验证码只落哈希、10 分钟过期、限次限频（SMTP / 落盘两种发信模式）',
       '管理操作与 AI 调用全量审计（actor / action / target / ip / 时间）',
       '账号库损坏时**拒绝启动**，不降级为无账号模式',

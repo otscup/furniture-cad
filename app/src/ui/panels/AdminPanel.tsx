@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { fromJsonl, toJsonl } from '../../ai/correctionStore.ts';
 import { applyCorrections, getCorrections } from '../../state/memoryStore.ts';
+import type { QuotaView } from '../../ai/quotaTypes.ts';
+import { QuotaMeter } from '../QuotaMeter.tsx';
 import { Pill, Row, Section, Text } from './common.tsx';
 
 /**
@@ -80,16 +82,13 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
   const [testTo, setTestTo] = useState('');
 
   // ── 用量 / 账号 / 审计（Task #27：把后端已有的数据变成"看得见"的界面）──
-  interface QuotaInfo {
-    monthlyTokens?: number;
-    dailyCalls?: number;
-    used?: { monthTokens?: number; dayCalls?: number; month?: string; totalTokens?: number; totalCalls?: number };
-  }
   interface UsageAccount {
     id: string;
     username: string;
     plan: string;
-    quota?: QuotaInfo;
+    planLabel?: string;
+    /** 服务端下发的额度**视图**（已用/剩余/百分比/被哪条拦住）—— 界面不算第二遍 */
+    quota?: QuotaView;
     lastLoginAt?: string | null;
   }
   interface AcctRow extends UsageAccount {
@@ -473,7 +472,11 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
     }
   }, [authed, say]);
 
-  const fmtNum = (v: number | undefined): string => (typeof v === 'number' ? v.toLocaleString('zh-CN') : '—');
+  /**
+   * 数字格式化**不再**在这里做 —— 用量显示统一由 QuotaMeter 负责，
+   * 口径只有 shared/quota.mjs 一份。管理后台要是自己再写一个 toLocaleString，
+   * 就会出现"后台显示 1,234,567、账号面板显示 123.5 万"，而没人知道哪个是对的。
+   */
   const modelOptions = (() => {
     const base = models?.models ?? [];
     const cur = modelChoice || settings?.model || '';
@@ -533,21 +536,15 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
               <Text>本地开放模式：还没有账号体系，用量统计在创建账号后生效</Text>
             ) : (
               usage.map((a) => {
-                const used = a.quota?.used;
-                const pct = a.quota?.monthlyTokens && a.quota.monthlyTokens > 0 && used?.monthTokens !== undefined
-                  ? Math.min(100, Math.round((used.monthTokens / a.quota.monthlyTokens) * 100))
-                  : null;
+                const q = a.quota;
+                const hot = q ? (q.tokens.pct >= 85 || q.generations.pct >= 85) : false;
                 return (
                   <div key={a.id} className="view-item">
                     <div className="view-item-head">
                       <b>{a.username}</b>
-                      <Pill kind={pct !== null && pct > 85 ? 'WARNING' : 'muted'}>{a.plan}</Pill>
+                      <Pill kind={hot ? 'WARNING' : 'muted'}>{a.planLabel ?? a.plan}</Pill>
                     </div>
-                    <div className="view-item-note">
-                      本月 {fmtNum(used?.monthTokens)} / {fmtNum(a.quota?.monthlyTokens)} token
-                      {pct !== null ? `（${pct}%）` : ''} · 今日调用 {fmtNum(used?.dayCalls)} / {fmtNum(a.quota?.dailyCalls)} · 累计{' '}
-                      {fmtNum(used?.totalTokens)} token
-                    </div>
+                    {q ? <QuotaMeter quota={q} /> : <div className="view-item-note">服务端没有返回额度</div>}
                   </div>
                 );
               })

@@ -167,6 +167,68 @@ export function candidateSpots(project: Project, roomId: string, width: number):
 }
 
 /**
+ * 拼接候选：把新柜的某一个角锚到房间里**已有柜体**的角点，贴着它形成 L 或续接。
+ *
+ * ── 这条是"拼接操作"能不能成立的关键 ──
+ *   没给 atX / atY（让系统自己找落位）时，早先只从「贴墙候选」里挑，
+ *   于是两条互相垂直的臂会各自贴一面墙、中间留一道缝 —— 用户要的是拐弯成 L，
+ *   拿到的是两个互不相连的柜子。这里补上"贴着已有柜体"的候选：
+ *   新柜落位优先与已有的柜体共用角点，两段才真的拼到一起。
+ *
+ * ── 判据仍然只有一份（校验器）──
+ *   生成的候选逐个丢进 `detectCollisions`，撞墙（RULE-CABINET-IN-WALL）
+ *   或撞柜（RULE-CABINET-OVERLAP）一律不要。沿用 `pickFreeSpot` 同款过滤，
+ *   不在这里再写一遍"是否相接"的判定 —— 那是第二份真相源，本项目不允许。
+ *
+ * ── 锚点偏移按 rotation 取 ──
+ *   柜体 footprint 随 rotation 不同：0° 宽沿 +x、深沿 +y；90° 宽沿 +y、深沿 −x；
+ *   其余类推。4 个锚点（左上/右上/左下/右下）相对原点的偏移由此推出，
+ *   把某个锚点放到已有柜体的某个角上，就得到一种拼接摆法。碰撞校验会筛掉
+ *   那些其实压进旧柜里的摆法，只留真正"贴边相接"的。
+ */
+export function joinSpots(project: Project, cab: Cabinet): Spot[] {
+  const room = project.rooms.find((r) => r.id === cab.roomId);
+  if (!room) return [];
+  const others = project.cabinets.filter((c) => c.id !== cab.id && c.roomId === room.id);
+  if (others.length === 0) return [];
+  const W = cab.params.width;
+  const D = cab.params.depth;
+  const rot = ((Math.round(cab.placement.rotation) % 360) + 360) % 360;
+  const anchors: Array<[number, number]> =
+    rot === 0
+      ? [[0, 0], [W, 0], [0, D], [W, D]]
+      : rot === 90
+        ? [[-D, 0], [0, 0], [-D, W], [0, W]]
+        : rot === 180
+          ? [[-W, -D], [0, -D], [-W, 0], [0, 0]]
+          : [[0, -W], [D, -W], [0, 0], [D, 0]];
+  const out: Spot[] = [];
+  for (const c of others) {
+    const cb = bboxOf(getCabinetFootprint(c));
+    const corners: Array<[number, number]> = [
+      [cb.min.x, cb.min.y],
+      [cb.max.x, cb.min.y],
+      [cb.min.x, cb.max.y],
+      [cb.max.x, cb.max.y],
+    ];
+    for (const [px, py] of corners) {
+      for (const [ax, ay] of anchors) {
+        const ox = px - ax;
+        const oy = py - ay;
+        const trial: Cabinet = { ...cab, placement: { x: ox, y: oy, rotation: rot } };
+        const bad = detectCollisions({ ...project, cabinets: [...project.cabinets.filter((x) => x.id !== cab.id), trial] }).filter(
+          (i) =>
+            (i.code === 'RULE-CABINET-IN-WALL' || i.code === 'RULE-CABINET-OVERLAP') &&
+            i.target.split(' / ').includes(trial.id)
+        );
+        if (bad.length === 0) out.push({ x: Math.round(ox), y: Math.round(oy), rotation: rot, wallId: null, wallName: '拼接' });
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * 把柜体**沿最小位移方向**推出墙体，推到与墙面相切。
  *
  * ── 为什么必须有这个 ──

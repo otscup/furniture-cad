@@ -6,7 +6,7 @@ import { nextId } from '../core/ids.ts';
 import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
-import { candidateSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
+import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
@@ -92,20 +92,26 @@ function doorIntentOf(doorCount: unknown): { count: number } | undefined {
  *   **所有落点都被否掉**，最后退化成"随便放进去再说"。
  */
 function pickFreeSpot(project: Project, cab: Cabinet, preferRotation?: number): { x: number; y: number; rotation: number } | null {
+  /**
+   * 拼接候选：把新柜的某一个角锚到房间内已有柜体的角点，贴着它形成 L 或续接。
+   *
+   * 这条是"拼接操作"能不能成立的关键。早先 `pickFreeSpot` 只从「贴墙候选」里挑，
+   * 于是两条互相垂直的臂会各自贴一面墙、中间留一道缝 —— 用户要的是拐弯成 L，
+   * 拿到的是两个互不相连的柜子。没给 atX / atY 时，系统应该替它把两段拼起来：
+   * 新柜落位优先贴着已有的柜体，共用角点。判据仍是校验器那一份（见 joinSpots）。
+   */
+  const join = joinSpots(project, cab);
   let spots = candidateSpots(project, cab.roomId, cab.params.width);
   /**
    * AI 说了朝向（rotation）时，落位必须**顺着它说的朝向**去找墙。
-   *
-   * 这条是"L 形能不能真生成出来"的关键：两句描述里的第二条臂给了 rotation:90，
-   * 如果这里不管朝向、直接取第一个放得下的落点，两条臂会并排贴在同一面墙上 ——
-   * 用户要的是拐弯，拿到的是一字排开。把同朝向的候选排到前面，
-   * 横臂落在南墙（0°）、竖臂落在东墙（90°），两臂自然共用角点成 L。
    */
   if (preferRotation !== undefined) {
     const want = ((Math.round(preferRotation) % 360) + 360) % 360;
     spots = [...spots.filter((s) => s.rotation === want), ...spots.filter((s) => s.rotation !== want)];
   }
-  for (const s of spots) {
+  // 拼接优先：能贴着已有柜体就贴（这才是"拼接"），否则才退到贴墙
+  const ordered = join.length > 0 ? [...join, ...spots] : spots;
+  for (const s of ordered) {
     const trial: Cabinet = { ...cab, placement: { x: s.x, y: s.y, rotation: s.rotation } };
     const draft: Project = { ...project, cabinets: [...project.cabinets, trial] };
     const bad = detectCollisions(draft).filter(

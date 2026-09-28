@@ -1,5 +1,6 @@
 import { validatePlan } from '../../shared/aiContract.mjs';
 import type { AiAction } from './compile.ts';
+import type { QuotaView } from './quotaTypes.ts';
 import { snapshotContext, type AiSnapshot } from './snapshot.ts';
 
 /**
@@ -53,8 +54,13 @@ export interface PlanResponse {
   model?: string;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; reasoning_tokens?: number } | null;
   ms?: number;
-  /** 服务端返回的账号额度信息（local-open 模式下为空） */
-  quota?: unknown;
+  /**
+   * 服务端顺手带回的额度余量（local-open 模式下为空）。
+   * 带上它的理由：界面上的"今日还能生成几次"必须跟着真实消耗走，
+   * 每次调用完再单独拉一次账号信息是多余的一次往返 —— 而多余的一次往返
+   * 迟早会有人忘记发，界面就停在旧数字上。
+   */
+  quota?: QuotaView;
 }
 
 /** 带上登录 token（local-open 模式下没有 token，也就不带） */
@@ -140,7 +146,7 @@ export async function requestPlan(opts: {
     model: body.model as string | undefined,
     usage: (body.usage as PlanResponse['usage']) ?? null,
     ms: body.ms as number | undefined,
-    quota: body.quota,
+    quota: (body.quota as QuotaView | undefined) ?? undefined,
   };
 }
 
@@ -202,6 +208,8 @@ export interface ChatResponse {
   error?: string;
   note?: string;
   turn: ChatTurn;
+  /** 这一问花完之后还剩多少额度（对话也计 token，但不计生成次数） */
+  quota?: QuotaView;
 }
 
 /**
@@ -292,6 +300,7 @@ export async function requestChat(opts: {
       emptyReason: body.emptyReason as string | undefined,
       error: text.trim() ? undefined : error,
     },
+    quota: (body.quota as QuotaView | undefined) ?? undefined,
   };
 }
 
@@ -309,7 +318,7 @@ export interface AuthAccount {
   tenantId: string;
   createdAt: string;
   lastLoginAt: string | null;
-  quota: { monthlyTokens: number; dailyCalls: number; models: string[]; used: Record<string, number | string> };
+  quota: QuotaView;
 }
 
 export async function api<T>(path: string, opts: { method?: string; body?: unknown; token?: string | null } = {}): Promise<{ ok: boolean; error?: string; status: number; data: T }> {

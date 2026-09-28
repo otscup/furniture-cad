@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
 import { ACTION_NAMES, ACTIONS } from '../../../shared/aiContract.mjs';
-import { requestChat, requestPlan, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
+import { api, requestChat, requestPlan, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
+import type { QuotaView } from '../../ai/quotaTypes.ts';
+import { QuotaMeter } from '../QuotaMeter.tsx';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
 import {
@@ -222,6 +224,29 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   /** 存不进去要**说一声** —— 默默不存等于骗人说记住了 */
   const [storeErr, setStoreErr] = useState('');
 
+  /**
+   * 还剩多少额度。
+   *
+   * 为什么摆在 AI 面板里：额度是"这次点下去能不能成"的前提，
+   * 而"点了之后等 30 秒才被告知额度用完"是最没必要的那种等待。
+   * 数字跟着每次调用返回的值更新 —— 不额外拉一次账号信息，
+   * 省一次往返，也避免"界面停在旧数字上"这种两头不一致。
+   */
+  const [quota, setQuota] = useState<QuotaView | null>(null);
+  useEffect(() => {
+    if (!props.token) {
+      setQuota(null);
+      return;
+    }
+    let alive = true;
+    void api<{ account?: { quota?: QuotaView } }>('/api/auth/me', { token: props.token }).then((r) => {
+      if (alive) setQuota(r.data?.account?.quota ?? null);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [props.token]);
+
   const rooms = bus.getState().rooms;
   /** 房间被删掉后 roomId 失效 —— 退回全项目会话，而不是对着空气聊天 */
   const activeRoomId = rooms.some((r) => r.id === roomId) ? roomId : '';
@@ -367,6 +392,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     try {
       const r = await requestChat({ history: next, snapshot, token: props.token, scope: scopePrefix });
       setConvo({ chat: [...next, r.turn] });
+      if (r.quota) setQuota(r.quota);
     } finally {
       setBusyKind('');
     }
@@ -383,6 +409,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     setPlan({ reply: '', rejected: [], rawReply: '', reasoning: '', meta: null, err: '', lastApply: '', run: null });
     try {
       const r = await requestPlan({ text: `${scopePrefix}${q}`, snapshot, token: props.token });
+      if (r.quota) setQuota(r.quota);
       setPlan({
         reply: r.reply,
         rejected: r.rejected,
@@ -445,6 +472,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         { role: 'assistant' as const, text: r.reply },
       ]);
       const r = await requestPlan({ text: `${scopePrefix}${q}`, snapshot: snap, history, token: props.token });
+      if (r.quota) setQuota(r.quota);
       if (!r.ok) {
         setConvo({ chat: [...chat, { role: 'user', text: q }, { role: 'assistant', text: '', error: r.error, draftRound: { round: (draft?.rounds.length ?? 0) + 1, merged: false, actions: [], rejected: r.rejected.length, note: '这一轮没有进入草案' } }] });
         props.onToast?.('error', r.error ?? '草案生成失败');
@@ -652,6 +680,15 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           两条路都会先给你预览，<b>你点确认了才会写进去</b>。
         </p>
 
+        {/*
+          ── 剩余额度就摆在输入框上方 ──
+          额度是"这一句能不能生成"的前提。摆在别处（比如账号页）的后果是：
+          用户打完一句话、等 30 秒、才被告知额度用完 —— 那 30 秒纯粹是白等。
+          local-open（还没建账号）时服务端不给额度，这里就什么都不显示：
+          如实说"当前没有额度限制"比摆一个假的 0/0 好。
+        */}
+        {quota ? <QuotaMeter quota={quota} compact /> : null}
+
         {chat.length > 0 ? (
           <div className="chat-list">
             {chat.map((m, i) => (
@@ -747,18 +784,26 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           <button
             type="button"
             className="tb-btn primary ai-btn-plan"
-            disabled={busy || !text.trim()}
+            disabled={busy || !text.trim() || !!quota?.blockedBy}
             onClick={() => void generatePlan()}
-            title="生成动作清单并干跑预览。在你点「应用」之前不会修改模型。"
+            title={
+              quota?.blockedBy
+                ? `额度已用完，不能生成：${quota.blockReason}`
+                : '生成动作清单并干跑预览。在你点「应用」之前不会修改模型。'
+            }
           >
             {busyKind === 'plan' ? `规划中… ${waited}s` : '生成编辑计划'}
           </button>
           <button
             type="button"
             className="tb-btn primary ai-btn-draft"
-            disabled={busy || !text.trim()}
+            disabled={busy || !text.trim() || !!quota?.blockedBy}
             onClick={() => void generateDraft()}
-            title="把这一句叠到草案上：AI 看得见之前几轮的结果，可以一句一句改到满意，最后再定稿。"
+            title={
+              quota?.blockedBy
+                ? `额度已用完，不能生成：${quota.blockReason}`
+                : '把这一句叠到草案上：AI 看得见之前几轮的结果，可以一句一句改到满意，最后再定稿。'
+            }
           >
             {busyKind === 'draft' ? `改草案中… ${waited}s` : draft ? '继续改草案' : '改草案（多轮）'}
           </button>

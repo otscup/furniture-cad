@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api, loadToken, saveToken, type AuthAccount } from '../../ai/aiClient.ts';
+import type { PlanOption } from '../../ai/quotaTypes.ts';
+import { planOptionLabel, QuotaMeter } from '../QuotaMeter.tsx';
 import { Pill, Row, Section, Text } from './common.tsx';
 
 /**
@@ -65,7 +67,7 @@ export function AccountPanel(props: {
   const [policy, setPolicy] = useState<Policy | null>(null);
   const [accounts, setAccounts] = useState<AuthAccount[]>([]);
   const [roles, setRoles] = useState<Array<{ id: string; label: string }>>([]);
-  const [plans, setPlans] = useState<Array<{ id: string; label: string; monthlyTokens: number; dailyCalls: number }>>([]);
+  const [plans, setPlans] = useState<PlanOption[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
@@ -348,6 +350,19 @@ export function AccountPanel(props: {
         {err ? <div className="alert alert-error">{err}</div> : null}
       </Section>
 
+      {props.token && me ? (
+        <Section title="我的 AI 用量（按标准 token 计）" defaultOpen>
+          <p className="note">
+            token 按<b>万 / 亿</b>显示 —— 「已用 1234567」没人看得懂是多少，「123.5 万」一眼就明白；
+            把鼠标停在数字上能看到精确值，便于和服务商账单核对。
+            <b>生成次数</b>只计「生成编辑计划」「改草案」这类会出结果的调用，
+            <b>对话提问不算</b>（它只花 token）—— 否则问两句常识就把当天的生成额度吃掉了。
+            两条里<b>任意一条</b>用尽即止，界面会写清是哪一条拦的。
+          </p>
+          <QuotaMeter quota={me.quota} />
+        </Section>
+      ) : null}
+
       {(!props.token && mode === 'local-open') || !props.token ? (
         <Section title={mode === 'local-open' ? '建立第一个账号（所有者）' : '登录'} defaultOpen>
           <Row label="用户名">
@@ -456,20 +471,18 @@ export function AccountPanel(props: {
                   ))}
                 </select>
               </Row>
-              <Row label="订阅档位" hint="档位决定 AI 月 token 额度与日调用次数">
+              <Row label="订阅档位" hint="档位决定 AI 的 token 额度（按周期）与每日生成次数，任一用尽即止">
                 <select className="input" value={a.plan} onChange={(e) => void patch(a.id, { plan: e.target.value }, '档位变更')}>
                   {plans.map((pl) => (
                     <option key={pl.id} value={pl.id}>
-                      {pl.label}（{(pl.monthlyTokens / 1000).toFixed(0)}k token / 月 · {pl.dailyCalls} 次 / 日）
+                      {planOptionLabel(pl)}
                     </option>
                   ))}
                 </select>
               </Row>
               <Row label="AI 用量" derived>
-                <Text mono>
-                  本月 {a.quota.used.monthTokens} / {a.quota.monthlyTokens >= Number.MAX_SAFE_INTEGER ? '∞' : a.quota.monthlyTokens} token · 今日{' '}
-                  {a.quota.used.dayCalls} / {a.quota.dailyCalls >= Number.MAX_SAFE_INTEGER ? '∞' : a.quota.dailyCalls} 次 · 累计 {a.quota.used.totalCalls} 次
-                </Text>
+                {/* 与「我的用量」、管理后台共用同一块 —— 三处口径必须一致 */}
+                <QuotaMeter quota={a.quota} />
               </Row>
               <Row label="最近登录" derived>
                 <Text mono>{a.lastLoginAt ? new Date(a.lastLoginAt).toLocaleString() : '从未'}</Text>

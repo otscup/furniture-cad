@@ -1,4 +1,4 @@
-import type { Cabinet, HardwareItem, Panel, RuleSet } from '../types.ts';
+import type { Cabinet, HardwareItem, Panel, RuleSet, UnitSpec } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import {
   backPanelSplit,
@@ -94,6 +94,12 @@ const EXPLODE_PLAN: Record<string, { dir: ExplodeDir; tier: number }> = {
   BottomPanel: { dir: { axis: 'z', sign: -1 }, tier: 0 },
   KickBoard: { dir: { axis: 'z', sign: -1 }, tier: 0 },
   DividerPanel: { dir: { axis: 'y', sign: 1 }, tier: 0 },
+  /**
+   * 行隔板（行与行之间的贯通横隔板）。
+   * 方向与中立板同（往前拉出来）：它是一块横板，只能从前脸那个方向取出来 ——
+   * 往左右拉会和侧板撞、往上/下会和它上下两行的板件混在一条线上。
+   */
+  RowDividerPanel: { dir: { axis: 'y', sign: 1 }, tier: 0 },
   BackPanel: { dir: { axis: 'y', sign: -1 }, tier: 0 },
   ShelfPanel: { dir: { axis: 'y', sign: 1 }, tier: 1 },
   DrawerSide: { dir: { axis: 'y', sign: 1 }, tier: 2 },
@@ -144,12 +150,51 @@ export interface Assembly {
 }
 
 /** 箱体结构板：裁切清单里的 width 取整柜深，而装配进深不含门板厚 —— 这是已知的语义待确认点 */
-const DEPTH_CONFLICT_ROLES = new Set(['LeftSidePanel', 'RightSidePanel', 'TopPanel', 'BottomPanel', 'DividerPanel']);
+const DEPTH_CONFLICT_ROLES = new Set(['LeftSidePanel', 'RightSidePanel', 'TopPanel', 'BottomPanel', 'DividerPanel', 'RowDividerPanel']);
 
-/** 抽面板与门板要在"前脸"平面上分开摆，不能和箱体件混在一起 */
-function unitIndexOf(cab: Cabinet, belongsTo: string): number {
-  const uid = belongsTo.includes('.') ? belongsTo.slice(belongsTo.indexOf('.') + 1) : '';
-  return cab.layout.units.findIndex((u) => u.id === uid);
+/**
+ * 分区定位：分区 id → **它在哪一行**、行内下标，以及该行的几何（净宽 / X 起点 / 内空底 Z / 净高）。
+ *
+ * ── 为什么必须按行定位（而不是像 v0.2 那样在 `layout.units` 里搜）──
+ *   v0.3 起分区有两个坐标：行 + 行内下标。若仍按"整柜一个 units 数组"来搜，
+ *   多行柜里**每一行都会命中第 0 行的几何** —— 分解图上所有抽屉箱、层板、门板
+ *   全部叠到最上面那一行去，件数照样对得上（所以断言查不出来），
+ *   只有人眼看图才会发现"下面那层的板都跑到上面去了"。
+ *   本函数是装配侧唯一的"分区 → 几何"入口，所有落位分支都从这里取数。
+ */
+interface UnitLoc {
+  rowIndex: number;
+  unitIndex: number;
+  unit: UnitSpec;
+  /** 该分区净宽 */
+  netW: number;
+  /** 该分区左边缘 X */
+  x0: number;
+  /** 该行内空底面 Z */
+  z0: number;
+  /** 该行净高 */
+  netH: number;
+  label: string;
+}
+
+function locateUnit(L: CabinetLayoutResult, unitId: string): UnitLoc | null {
+  for (let ri = 0; ri < L.rows.length; ri++) {
+    const r = L.rows[ri]!;
+    const ui = r.units.findIndex((u) => u.id === unitId);
+    if (ui >= 0) {
+      return {
+        rowIndex: ri,
+        unitIndex: ui,
+        unit: r.units[ui]!,
+        netW: r.nets[ui]!,
+        x0: r.unitX0[ui]!,
+        z0: r.z0,
+        netH: r.netH,
+        label: L.rows.length > 1 ? `第${ri + 1}行·第${ui + 1}区` : `第${ui + 1}区`,
+      };
+    }
+  }
+  return null;
 }
 
 /**
@@ -172,8 +217,6 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
   const tb = L.backT;
   const bodyLift = p.bodyLift;
   const innerH = L.innerH;
-  const nets = L.nets;
-  const unitX0 = L.unitX0;
   const bp = p.backPanel;
 
   const bodyD = D - t;
@@ -184,7 +227,6 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
   const shelfY0 = Math.max(bp.grooveSetback + bp.grooveDepth, backY1);
   const shelfY1 = shelfY0 + L.shelfDepth;
   const innerBottomZ = bodyLift + t;
-  const innerTopZ = H - t;
 
   const backSplit = backPanelSplit(cab, L, rules);
   /** 背板每列的起点 X（从左到右） */
@@ -298,11 +340,34 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
    */
   const idIndex = (panel: Panel): number => Math.max(0, Number(/(\d+)$/.exec(panel.id)?.[1] ?? '1') - 1);
 
+  /**
+   * 中立板 / 行隔板的面板 id → 它在哪一行、行内第几块。
+   *
+   * 为什么是"查表"而不是"解析 id 字符串"：
+   *   这两类板件的 id 由 generate.ts 用 `panelTag` 拼出来（`P_cab_R1_DIV2`），
+   *   而 `panelTag` 是派生层保证唯一性的手段（单行 = `''`）。若这里自己写正则去猜
+   *   "id 里第几段是行号"，就出现了**第二处**对同一编码的解释 ——
+   *   一旦 tag 规则变了（比如行号到两位数），两处一起错而不报错。
+   *   直接按生成器的拼法建表，两边结构性地锁死。
+   */
+  const dividerSlots = new Map<string, { rowIndex: number; unitIndex: number }>();
+  const rowDividerSlots = new Map<string, number>();
+  L.rows.forEach((r, ri) => {
+    for (let i = 0; i < r.units.length - 1; i++) {
+      dividerSlots.set(`P_${cab.id}_${r.panelTag}DIV${i + 1}`, { rowIndex: ri, unitIndex: i });
+    }
+  });
+  L.rowDividers.forEach((_, k) => rowDividerSlots.set(`P_${cab.id}_RD${k + 1}`, k));
+
   for (const panel of panels) {
-    const i = unitIndexOf(cab, panel.belongsTo);
-    const unit = i >= 0 ? cab.layout.units[i] : undefined;
-    const netW = i >= 0 ? nets[i] : 0;
-    const x0 = i >= 0 ? unitX0[i] : 0;
+    const uid = panel.belongsTo.includes('.') ? panel.belongsTo.slice(panel.belongsTo.indexOf('.') + 1) : '';
+    const loc = uid ? locateUnit(L, uid) : null;
+    const unit = loc?.unit;
+    const netW = loc?.netW ?? 0;
+    const x0 = loc?.x0 ?? 0;
+    /** 该分区所在行的内空底面 Z 与净高 —— 单行柜 = `innerBottomZ` / `innerH`（与 v0.2 逐位相同） */
+    const rowBaseZ = loc?.z0 ?? innerBottomZ;
+    const rowNetH = loc?.netH ?? innerH;
     const k = idIndex(panel);
     const qty = Math.max(1, panel.qty);
 
@@ -327,9 +392,27 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
         slots.push({ box: { x0: t, x1: W - t, y0: faceY0 - t, y1: faceY0, z0: 0, z1: bodyLift } });
         break;
       case 'DividerPanel': {
-        const j = Math.min(k, unitX0.length - 2);
-        const dx = unitX0[j] + nets[j];
-        slots.push({ box: { x0: dx, x1: dx + t, y0: 0, y1: bodyD, z0: innerBottomZ, z1: innerTopZ } });
+        // 逐行定位：多行柜里上下两行的中立板落在不同 X，且高度只跨本行净高
+        const slot = dividerSlots.get(panel.id);
+        if (!slot) {
+          if (!unplaced.includes(panel.role)) unplaced.push(panel.role);
+          break;
+        }
+        const rr = L.rows[slot.rowIndex]!;
+        const j = Math.min(slot.unitIndex, rr.unitX0.length - 2);
+        const dx = rr.unitX0[j]! + rr.nets[j]!;
+        slots.push({ box: { x0: dx, x1: dx + t, y0: 0, y1: bodyD, z0: rr.z0, z1: rr.z1 } });
+        break;
+      }
+      case 'RowDividerPanel': {
+        // 行隔板：位置直接取自 `L.rowDividers`（同一份派生量，不在这里重算 z）
+        const kk = rowDividerSlots.get(panel.id);
+        if (kk === undefined) {
+          if (!unplaced.includes(panel.role)) unplaced.push(panel.role);
+          break;
+        }
+        const z = L.rowDividers[kk]!;
+        slots.push({ box: { x0: t, x1: W - t, y0: 0, y1: bodyD, z0: z, z1: z + t } });
         break;
       }
       case 'BackPanel': {
@@ -357,35 +440,35 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
         break;
       }
       case 'ShelfPanel': {
-        if (!unit?.shelves || i < 0) {
+        if (!unit?.shelves || !loc) {
           if (!unplaced.includes(panel.role)) unplaced.push(panel.role);
           break;
         }
         const gap = unit.shelves.gapPerSide;
         const sw = netW - 2 * gap;
         const sa = x0 + (netW - sw) / 2;
-        const positions = equalSpacing(innerH, unit.shelves.count);
-        const pos = positions[Math.min(k, positions.length - 1)];
-        slots.push({ box: { x0: sa, x1: sa + sw, y0: shelfY0, y1: shelfY1, z0: innerBottomZ + pos, z1: innerBottomZ + pos + t } });
+        const positions = equalSpacing(rowNetH, unit.shelves.count);
+        const pos = positions[Math.min(k, positions.length - 1)]!;
+        slots.push({ box: { x0: sa, x1: sa + sw, y0: shelfY0, y1: shelfY1, z0: rowBaseZ + pos, z1: rowBaseZ + pos + t } });
         break;
       }
       case 'DoorPanel': {
-        if (!unit?.doors || i < 0) {
+        if (!unit?.doors || !loc) {
           if (!unplaced.includes(panel.role)) unplaced.push(panel.role);
           break;
         }
         const dr = unit.doors;
         const widths = doorWidths(unit, netW, rules);
         let cx = x0 + dr.gapOuter;
-        for (let j = 0; j < k && j < widths.length; j++) cx += widths[j] + dr.gapMid;
+        for (let j = 0; j < k && j < widths.length; j++) cx += widths[j]! + dr.gapMid;
         slots.push({
           box: {
             x0: cx,
-            x1: cx + widths[Math.min(k, widths.length - 1)],
+            x1: cx + widths[Math.min(k, widths.length - 1)]!,
             y0: faceY0,
             y1: faceY1,
-            z0: innerBottomZ + dr.gapOuter,
-            z1: innerBottomZ + dr.gapOuter + (innerH - 2 * dr.gapOuter),
+            z0: rowBaseZ + dr.gapOuter,
+            z1: rowBaseZ + dr.gapOuter + (rowNetH - 2 * dr.gapOuter),
           },
         });
         break;
@@ -394,15 +477,15 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
       case 'DrawerSide':
       case 'DrawerBack':
       case 'DrawerBottom': {
-        if (!unit?.drawers || i < 0) {
+        if (!unit?.drawers || !loc) {
           if (!unplaced.includes(panel.role)) unplaced.push(panel.role);
           break;
         }
         const d = unit.drawers;
-        const cellH = drawerCellHeights(unit, innerH, rules);
-        const cell = cellH[Math.min(k, cellH.length - 1)];
-        let zFront = innerBottomZ + d.gap;
-        for (let j = 0; j < k && j < cellH.length; j++) zFront += cellH[j] + d.gap;
+        const cellH = drawerCellHeights(unit, rowNetH, rules);
+        const cell = cellH[Math.min(k, cellH.length - 1)]!;
+        let zFront = rowBaseZ + d.gap;
+        for (let j = 0; j < k && j < cellH.length; j++) zFront += cellH[j]! + d.gap;
         const frontH = cell - 2 * d.gap;
         const box = drawerBoxParts(d, frontH, netW);
         /** 箱体在 X 向居中于分区（模型未定义横向基准） */

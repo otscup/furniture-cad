@@ -5,6 +5,7 @@ import { validateCabinet } from './rules/validate.ts';
 import { validateCornerInterference } from './rules/corner.ts';
 import { createRoom, defaultCabinetParams, defaultUnits } from './docFactory.ts';
 import { nextId } from './ids.ts';
+import { layoutRows, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 import type { Gate, GateHit } from '../ai/memory.ts';
 import { formatGateError } from '../ai/memory.ts';
 
@@ -54,6 +55,12 @@ export interface CommandPayload {
   /** room.resize 的新尺寸（mm） */
   w?: number;
   h?: number;
+  /**
+   * 结构性分区操作落在**哪一行**（`layout.rows` 行序，0 = 最上面）。
+   * 单行柜缺省 0；多行柜缺省即拒绝 —— 见 planStructural 里的说明：
+   * 猜错行的后果是把分区加到别的楼层，而界面上看起来"成功了"。
+   */
+  rowIndex?: number;
   /** 允许调用方覆盖名字等 */
   name?: string;
 }
@@ -86,8 +93,13 @@ export interface DiffEntry {
 export type SideEffect =
   | { kind: 'insertCabinet'; cab: Cabinet; index: number }
   | { kind: 'removeCabinet'; cab: Cabinet; index: number }
-  | { kind: 'addUnit'; cabinetId: string; unit: UnitSpec; index: number }
-  | { kind: 'removeUnit'; cabinetId: string; unit: UnitSpec; index: number }
+  /**
+   * 分区增删：`basePath` 指明动的是**哪一行**的分区数组
+   * （单行柜 `layout.units` / 多行柜 `layout.rows[j].units`，见 layoutModel.unitPathPrefix）。
+   * 撤销时靠它把分区放回原来那一行 —— 少了它，多行柜的 undo 会插进第一行。
+   */
+  | { kind: 'addUnit'; cabinetId: string; unit: UnitSpec; index: number; basePath: string }
+  | { kind: 'removeUnit'; cabinetId: string; unit: UnitSpec; index: number; basePath: string }
   | { kind: 'insertRoom'; room: Room; index: number }
   | { kind: 'removeRoom'; room: Room; index: number }
   /**
@@ -102,7 +114,7 @@ export type SideEffect =
    * 镜像柜体（MI）：分区序列左右反序。反序的自逆就是自身（reverse 两次还原），
    * 所以 undo/redo 走同一个动作 —— 不需要快照前后两份。
    */
-  | { kind: 'mirrorUnits'; cabinetId: string; from: string[]; to: string[] }
+  | { kind: 'mirrorUnits'; cabinetId: string; from: string[]; to: string[]; basePath: string }
   /**
    * 整项目替换（导入 / 恢复草稿）。它换掉的是【对象引用】而不是某个字段，
    * 所以不能走路径回退，undo/redo 里单独处理 —— 必须同时携带前后两份快照，
@@ -205,13 +217,29 @@ const WRITABLE: Record<string, RegExp[]> = {
     /^layout\.backUnits\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.backUnits\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
     /^layout\.backUnits\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
+    /**
+     * 垂直行（v0.3）：多行柜里分区在 `layout.rows[j].units[k]`。
+     * 字段清单与前排**逐字相同** —— 行只是多了一层容器，分区本身还是同一套旋钮。
+     * `height` 是行唯一的 authored 字段（数字 = 固定净高 / 'fill' = 吃掉剩余内高）；
+     * 行 id 不可改（它同时是派生、清单与拾取线的标识）。
+     * 注意这些路径**只在 rows 已存在时才是合法路径**：单行柜的文件里没有 `rows`，
+     * 写入会因为"不许凭空创建结构"被物理拦下（见 OPTIONAL_AUTHORED）——
+     * 也就是说 P1 不可能把单行柜悄悄变成多行柜，只会被拒绝。
+     */
+    /^layout\.rows\[\d+\]\.height$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
   ],
   /**
    * 一键修复用的"去门"动作：电器洞口格配了门板（RULE-APPLIANCE-DOOR）时的修复动作。
    * 单独一个 op 而不是并入 cabinet.layout —— 路径写白名单要的是**精确到字段**，
    * 把 `layout.units[i].doors` 整个交给通用 op，等于让人能把 doors 写成任意垃圾。
    */
-  'cabinet.layout.clearDoors': [/^layout\.units\[\d+\]\.doors$/],
+  'cabinet.layout.clearDoors': [/^layout\.units\[\d+\]\.doors$/, /^layout\.rows\[\d+\]\.units\[\d+\]\.doors$/],
   'wall.move': [/^(start|end)\.[xy]$/],
   'wall.update': [/^thickness$/, /^height$/, /^name$/],
   'room.rename': [/^rooms\[\d+\]\.name$/],
@@ -345,22 +373,24 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
     case 'addUnit': {
       const cab = project.cabinets.find((c) => c.id === se.cabinetId);
       if (!cab) return;
-      const i = cab.layout.units.findIndex((u) => u.id === se.unit.id);
+      const units = unitsAtPath(cab.layout, se.basePath);
+      const i = units.findIndex((u) => u.id === se.unit.id);
       if (forward) {
-        if (i < 0) cab.layout.units.splice(Math.min(se.index, cab.layout.units.length), 0, structuredClone(se.unit));
+        if (i < 0) units.splice(Math.min(se.index, units.length), 0, structuredClone(se.unit));
       } else if (i >= 0) {
-        cab.layout.units.splice(i, 1);
+        units.splice(i, 1);
       }
       return;
     }
     case 'removeUnit': {
       const cab = project.cabinets.find((c) => c.id === se.cabinetId);
       if (!cab) return;
-      const i = cab.layout.units.findIndex((u) => u.id === se.unit.id);
+      const units = unitsAtPath(cab.layout, se.basePath);
+      const i = units.findIndex((u) => u.id === se.unit.id);
       if (forward) {
-        if (i >= 0) cab.layout.units.splice(i, 1);
+        if (i >= 0) units.splice(i, 1);
       } else if (i < 0) {
-        cab.layout.units.splice(Math.min(se.index, cab.layout.units.length), 0, structuredClone(se.unit));
+        units.splice(Math.min(se.index, units.length), 0, structuredClone(se.unit));
       }
       return;
     }
@@ -425,10 +455,11 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       if (!cab) return;
       // 反序自逆：undo / redo 都执行同一个 reverse（两次 reverse = 还原）。
       // 照抄 se.from 校验一次，防止未来有人在别处动了顺序导致快照失真。
-      const cur = cab.layout.units.map((u) => u.id);
+      const units = unitsAtPath(cab.layout, se.basePath);
+      const cur = units.map((u) => u.id);
       const expect = forward ? se.from : se.to;
       if (cur.length === expect.length && cur.every((id, i) => id === expect[i])) {
-        cab.layout.units.reverse();
+        units.reverse();
         // 双面柜：背面排跟着镜像 —— 只翻前排不翻后排，"镜像"就是假的
         if (Array.isArray(cab.layout.backUnits)) cab.layout.backUnits.reverse();
       }
@@ -817,25 +848,46 @@ export class CommandBus {
   ): { sideEffects: SideEffect[]; diff: DiffEntry[] } | null {
     const p = cmd.payload ?? {};
 
-    if (cmd.op === 'cabinet.create') {
-      const cab = structuredClone(p.cabinet!);
-      // 归一化：补齐可能缺失的默认值（AI 只给核心字段时也能落地）
-      const base = defaultCabinetParams(this.rules);
-      cab.params = { ...base, ...cab.params, backPanel: { ...base.backPanel, ...cab.params?.backPanel } };
-      if (!cab.layout || !cab.layout.units || cab.layout.units.length === 0) {
-        cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules) };
-      }
-      if (!cab.id) cab.id = nextId('cab', draft.cabinets.map((c) => c.id));
-      if (draft.cabinets.some((c) => c.id === cab.id)) return null;
-      const room = draft.rooms.find((r) => r.id === cab.roomId) ?? draft.rooms[0];
-      if (!room) return null; // 没有房间时不能建柜（避免悬空柜体）
-      cab.roomId = room.id;
-      const index = draft.cabinets.length;
-      return {
-        sideEffects: [{ kind: 'insertCabinet', cab, index }],
-        diff: [{ path: '(cabinet.create)', from: null, to: `${cab.id} ${cab.name}` }],
-      };
+  /** 结构性分区操作的目标行：单行柜缺省第 0 行；多行柜必须显式指定（否则拒绝） */
+  const targetRowOf = (cab: Cabinet): { units: UnitSpec[]; basePath: string } | null => {
+    const rows = layoutRows(cab.layout);
+    if (rows.length > 1 && p.rowIndex === undefined) return null;
+    const ri = p.rowIndex ?? 0;
+    const row = rows[ri];
+    if (!row) return null;
+    return { units: row.units, basePath: unitPathPrefix(cab.layout, ri) };
+  };
+
+  if (cmd.op === 'cabinet.create') {
+    const cab = structuredClone(p.cabinet!);
+    // 归一化：补齐可能缺失的默认值（AI 只给核心字段时也能落地）
+    const base = defaultCabinetParams(this.rules);
+    cab.params = { ...base, ...cab.params, backPanel: { ...base.backPanel, ...cab.params?.backPanel } };
+    /**
+     * 没有任何分区时才补默认分区。
+     * ⚠ 判据必须是 `layoutRows()`（canonical）而不是"`units` 存不存在"：
+     * 多行柜按约定**不写 units 镜像**（见 layoutModel.toFileLayout），
+     * 若照旧判 `!cab.layout.units` 就会把整个 rows 结构**覆盖掉**换成单行默认分区 ——
+     * 上层柜体在创建的那一刻被静默删掉，而调用方看到的是"创建成功"。
+     */
+    const rowArr = Array.isArray(cab.layout?.rows) ? cab.layout!.rows! : null;
+    const hasAnyUnits = rowArr && rowArr.length > 0
+      ? true
+      : Array.isArray(cab.layout?.units) && cab.layout.units.length > 0;
+    if (!cab.layout || !hasAnyUnits) {
+      cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules) };
     }
+    if (!cab.id) cab.id = nextId('cab', draft.cabinets.map((c) => c.id));
+    if (draft.cabinets.some((c) => c.id === cab.id)) return null;
+    const room = draft.rooms.find((r) => r.id === cab.roomId) ?? draft.rooms[0];
+    if (!room) return null; // 没有房间时不能建柜（避免悬空柜体）
+    cab.roomId = room.id;
+    const index = draft.cabinets.length;
+    return {
+      sideEffects: [{ kind: 'insertCabinet', cab, index }],
+      diff: [{ path: '(cabinet.create)', from: null, to: `${cab.id} ${cab.name}` }],
+    };
+  }
 
     if (cmd.op === 'cabinet.delete') {
       const id = cmd.target?.id;
@@ -854,17 +906,19 @@ export class CommandBus {
       if (!id) return null;
       const cab = draft.cabinets.find((c) => c.id === id);
       if (!cab) return null;
+      const row = targetRowOf(cab);
+      if (!row) return null; // 多行柜未指定行 → 拒绝，绝不猜（猜错＝把分区加到别的楼层）
       const unit = structuredClone(p.unit!);
-      if (!unit.id) unit.id = nextId('unit', cab.layout.units.map((u) => u.id));
-      if (cab.layout.units.some((u) => u.id === unit.id)) return null;
+      if (!unit.id) unit.id = nextId('unit', row.units.map((u) => u.id));
+      if (row.units.some((u) => u.id === unit.id)) return null;
       if (typeof unit.requestedWidth !== 'number') {
-        const rest = cab.params.width - cab.layout.units.reduce((a, u) => a + u.requestedWidth, 0);
+        const rest = cab.params.width - row.units.reduce((a, u) => a + u.requestedWidth, 0);
         unit.requestedWidth = Math.max(150, Math.round(rest));
       }
-      const index = cab.layout.units.length;
+      const index = row.units.length;
       return {
-        sideEffects: [{ kind: 'addUnit', cabinetId: id, unit, index }],
-        diff: [{ path: `layout.units[${index}]`, from: null, to: unit.id }],
+        sideEffects: [{ kind: 'addUnit', cabinetId: id, unit, index, basePath: row.basePath }],
+        diff: [{ path: `${row.basePath}[${index}]`, from: null, to: unit.id }],
       };
     }
 
@@ -874,13 +928,15 @@ export class CommandBus {
       if (!id) return null;
       const cab = draft.cabinets.find((c) => c.id === id);
       if (!cab) return null;
-      const index = cab.layout.units.findIndex((u) => u.id === unitId);
+      const row = targetRowOf(cab);
+      if (!row) return null;
+      const index = row.units.findIndex((u) => u.id === unitId);
       if (index < 0) return null;
-      if (cab.layout.units.length <= 1) return null; // 至少保留一个分区，否则不是柜子
-      const unit = structuredClone(cab.layout.units[index]);
+      if (row.units.length <= 1) return null; // 至少保留一个分区，否则不是柜子
+      const unit = structuredClone(row.units[index]);
       return {
-        sideEffects: [{ kind: 'removeUnit', cabinetId: id, unit, index }],
-        diff: [{ path: `layout.units[${index}]`, from: unit.id, to: null }],
+        sideEffects: [{ kind: 'removeUnit', cabinetId: id, unit, index, basePath: row.basePath }],
+        diff: [{ path: `${row.basePath}[${index}]`, from: unit.id, to: null }],
       };
     }
 
@@ -889,13 +945,15 @@ export class CommandBus {
       if (!id) return null;
       const cab = draft.cabinets.find((c) => c.id === id);
       if (!cab) return null;
+      const row = targetRowOf(cab);
+      if (!row) return null;
       // 单分区没有"左右"可翻 —— 拒绝，让 UI 给出解释而不是静默成功
-      if (cab.layout.units.length < 2) return null;
-      const from = cab.layout.units.map((u) => u.id);
+      if (row.units.length < 2) return null;
+      const from = row.units.map((u) => u.id);
       const to = from.slice().reverse();
       return {
-        sideEffects: [{ kind: 'mirrorUnits', cabinetId: id, from, to }],
-        diff: [{ path: 'layout.units', from: from.join('|'), to: to.join('|') }],
+        sideEffects: [{ kind: 'mirrorUnits', cabinetId: id, from, to, basePath: row.basePath }],
+        diff: [{ path: row.basePath, from: from.join('|'), to: to.join('|') }],
       };
     }
 

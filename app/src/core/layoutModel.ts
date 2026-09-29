@@ -92,6 +92,47 @@ export function allUnits(layout: CabinetLayout): UnitSpec[] {
   return layoutRows(layout).flatMap((r) => r.units);
 }
 
+/** 单面柜（row）分区的写路径前缀；多行柜时它在 `layout.rows[j].units`。 */
+export const UNITS_PATH = 'layout.units';
+
+/** 双面柜背面排的写路径前缀（与"行"正交）。 */
+export const BACK_UNITS_PATH = 'layout.backUnits';
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  写路径前缀 —— 某个"行"的分区在模型里的路径前缀
+ *
+ *    · 单行柜 ⇒ `layout.units`（与 v0.2 **逐字相同**：旧命令、旧白名单、
+ *      旧断言、旧一键修复路径全部不变）
+ *    · 多行柜 ⇒ `layout.rows[j].units`
+ *
+ *  ── 为什么必须收敛到这一个函数 ──
+ *   写路径是四条线共同的语言：AI 动作、一键修复（Issue.autoFix）、
+ *    拾取线（PickLine.paramPath）、CommandBus 白名单。
+ *    若让各处自己判断"要不要带 rows"，就会出现"AI 说改第 2 行的抽屉、
+ *    实际改到了第 1 行"这类**安静改错对象**的命令 —— 比一条被拒绝的命令危险得多
+ *    （拒绝看得见，改错看不见，最后变成车间下错料）。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+export function unitPathPrefix(layout: CabinetLayout, rowIndex: number): string {
+  return isMultiRow(layout) ? `layout.rows[${rowIndex}].units` : UNITS_PATH;
+}
+
+/**
+ * 反向查询：按写路径前缀取到那一排分区。
+ * 只为**文案**用（"改「柜·抽屉组」净宽"里的那个昵称）—— 写路径本身始终是字符串。
+ * 实现复用 unitPathPrefix 生成候选，因此不可能与写路径口径漂移。
+ */
+export function unitsAtPath(layout: CabinetLayout, basePath: string): UnitSpec[] {
+  if (basePath === BACK_UNITS_PATH) return layout.backUnits ?? [];
+  if (basePath === UNITS_PATH) return layoutRows(layout)[0]!.units;
+  const rows = layoutRows(layout);
+  for (let i = 0; i < rows.length; i++) {
+    if (unitPathPrefix(layout, i) === basePath) return rows[i]!.units;
+  }
+  return [];
+}
+
 /**
  * 写侧：canonical → **文件形状**。
  *

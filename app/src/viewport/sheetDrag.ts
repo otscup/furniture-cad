@@ -23,6 +23,7 @@ import type { CabinetPart, PickLine } from '../core/geometry/pickLines.ts';
 import { PART_ZH } from '../core/geometry/pickLines.ts';
 import * as CMD from '../core/commands.ts';
 import { newCommandId } from '../core/ids.ts';
+import { unitPathPrefix, unitsAtPath } from '../core/layoutModel.ts';
 import { ACTIONS, unitParamRange } from '../../shared/aiContract.mjs';
 
 /** 每 1mm 都算数 —— 生产尺寸禁止浮点（项目铁律第 7 条） */
@@ -153,6 +154,10 @@ export function dragPlanOf(pl: PickLine): DragPlan {
     case 'unit.divider': {
       if (pl.view !== 'front' && pl.view !== 'top') return { ok: false, labelZh: label, reason: '这张图上这条线不代表分区分界' };
       const i = pl.unitIndex;
+      const ri = pl.rowIndex;
+      // 写路径前缀按**这条线所在的行**取：多行柜里上下两行各有自己的"第 i 个分区"，
+      // 少了 rowIndex 就会出现"拖上面那条线、改的是下面那一行"。
+      const base = (c: Cabinet): string => unitPathPrefix(c.layout, ri);
       return {
         ok: true,
         spec: {
@@ -162,13 +167,14 @@ export function dragPlanOf(pl: PickLine): DragPlan {
           sign: 1,
           hintZh: '左右拖 = 改两个分区的比例（总宽不变）',
           ...UNIT_WIDTH_RANGE,
-          read: (c) => c.layout.units[i]?.requestedWidth ?? 0,
-          build: (c, _i, v) => dividerCommand(c, i, v),
+          read: (c) => unitsAtPath(c.layout, unitPathPrefix(c.layout, ri))[i]?.requestedWidth ?? 0,
+          build: (c, _i, v) => dividerCommand(c, i, v, base(c)),
         },
       };
     }
     case 'door.gapMid': {
       const i = pl.unitIndex;
+      const ri = pl.rowIndex;
       return {
         ok: true,
         spec: {
@@ -178,8 +184,9 @@ export function dragPlanOf(pl: PickLine): DragPlan {
           sign: 1,
           hintZh: '左右拖 = 改中缝间隙',
           ...GAP_RANGE,
-          read: (c) => c.layout.units[i]?.doors?.gapMid ?? 0,
-          build: (c, _unitIndex, v) => CMD.setUnitInt(c, i, 'doors.gapMid', mm(v), `门扇中缝 → ${mm(v)}mm`),
+          read: (c) => unitsAtPath(c.layout, unitPathPrefix(c.layout, ri))[i]?.doors?.gapMid ?? 0,
+          build: (c, _unitIndex, v) =>
+            CMD.setUnitInt(c, i, 'doors.gapMid', mm(v), `门扇中缝 → ${mm(v)}mm`, 'ui', unitPathPrefix(c.layout, ri)),
         },
       };
     }
@@ -193,13 +200,17 @@ export function dragPlanOf(pl: PickLine): DragPlan {
 /**
  * 拖动分区分界：左区变宽多少，右区就变窄多少（**总宽不变**）。
  * 一条命令两个 change —— 一次撤销回到原样，不允许出现"一边改了另一边没改"的中间态。
+ *
+ * `basePath` = 这两个分区所在那一行的写路径前缀（单行柜 = `layout.units`，与 v0.2 逐字相同）。
+ * 两个 change 必须落在**同一行**内 —— 跨行改宽在语义上根本不是"挪分界线"。
  */
-function dividerCommand(cab: Cabinet, leftIndex: number, leftWidth: number): Command {
-  const left = cab.layout.units[leftIndex];
-  const right = cab.layout.units[leftIndex + 1];
+function dividerCommand(cab: Cabinet, leftIndex: number, leftWidth: number, basePath: string = unitPathPrefix(cab.layout, 0)): Command {
+  const units = unitsAtPath(cab.layout, basePath);
+  const left = units[leftIndex];
+  const right = units[leftIndex + 1];
   if (!left || !right) {
     // 不该发生（合成表只在相邻分区之间登记）：退回单区改宽，总比崩掉好
-    return CMD.setUnitWidth(cab, leftIndex, mm(leftWidth));
+    return CMD.setUnitWidth(cab, leftIndex, mm(leftWidth), 'ui', basePath);
   }
   const before = left.requestedWidth;
   const delta = before - mm(leftWidth);
@@ -211,8 +222,8 @@ function dividerCommand(cab: Cabinet, leftIndex: number, leftWidth: number): Com
     source: 'ui',
     target: { kind: 'cabinet', id: cab.id },
     changes: [
-      { path: `layout.units[${leftIndex}].requestedWidth`, op: 'set', value: lw, unit: 'mm' },
-      { path: `layout.units[${leftIndex + 1}].requestedWidth`, op: 'set', value: rw, unit: 'mm' },
+      { path: `${basePath}[${leftIndex}].requestedWidth`, op: 'set', value: lw, unit: 'mm' },
+      { path: `${basePath}[${leftIndex + 1}].requestedWidth`, op: 'set', value: rw, unit: 'mm' },
     ],
     label: `「${cab.name}」分区 ${leftIndex + 1}/${leftIndex + 2} 分界 → ${lw} / ${rw}mm`,
   };

@@ -1,8 +1,9 @@
-import type { ReactNode } from 'react';
-import type { Cabinet, CabinetGeometry, Project, ProjectGeometry, RuleSet, UnitSpec, Wall } from '../../core/types.ts';
+import { useEffect, useState, type ReactNode } from 'react';
+import type { Cabinet, CabinetGeometry, Project, ProjectGeometry, RowHeight, RuleSet, UnitSpec, Wall } from '../../core/types.ts';
 import type { Command, CommandBus } from '../../core/commandBus.ts';
 import * as CMD from '../../core/commands.ts';
 import { NumField, Pill, Row, Section, Text, TextField } from './common.tsx';
+import { ROW_HEIGHT_FILL, layoutRows, unitPathPrefix, unitsAtPath } from '../../core/layoutModel.ts';
 import type { ToastKind } from '../types.ts';
 
 /**
@@ -171,6 +172,8 @@ function CabinetProps(props: {
   const { cab, rules, geom } = props;
   const p = cab.params;
   const L = geom?.layout;
+  /** 是否多行柜 —— 只影响“要不要画行头与行高输入”；单行柜输出与 v0.2 逐节点相同 */
+  const multiRow = layoutRows(cab.layout).length > 1;
 
   return (
     <div className="panel-scroll">
@@ -270,28 +273,66 @@ function CabinetProps(props: {
           </select>
         </Row>
 
-        {cab.layout.units.map((u, i) => (
-          <UnitEditor key={u.id} cab={cab} unit={u} index={i} netWidth={L?.nets[i]} onRun={props.onRun} />
-        ))}
+        {/**
+         * 分区按**行**分组（v0.3）。
+         * 单行柜 ⇒ 恰好一行、无行头、basePath = `layout.units`（与 v0.2 完全一致）；
+         * 多行柜 ⇒ 每行一个行高输入 + 该行的分区，所有改动都带**该行的写路径前缀**
+         * （`layout.rows[j].units`）—— 少了它就等于"改上层、动了下层"。
+         */}
+        {layoutRows(cab.layout).map((r, ri) => {
+          const basePath = unitPathPrefix(cab.layout, ri);
+          const rowDerived = L?.rows[ri];
+          const rowUnits = unitsAtPath(cab.layout, basePath);
+          return (
+            <div key={r.id}>
+              {multiRow ? (
+                <>
+                  <div className="prop-row-sub">第 {ri + 1} 行（rows[{ri}]）· {r.height === ROW_HEIGHT_FILL ? '吃掉剩余内高' : '固定高度'}{rowDerived ? ` → 净高 ${rowDerived.netH}mm` : ''}</div>
+                  <Row label={`第 ${ri + 1} 行高度`} hint="数字 = 固定净高（mm）；'fill' = 吃掉剩余内高（多行柜的唯一自由项，且只能落在最后一行）">
+                    <RowHeightField
+                      value={r.height}
+                      onCommit={(v) => props.onRun(CMD.setRowHeight(cab, ri, v))}
+                    />
+                  </Row>
+                </>
+              ) : null}
 
-        <div className="btn-row">
-          <button
-            type="button"
-            className="btn"
-            onClick={() => {
-              const unit: UnitSpec = {
-                id: '',
-                kind: 'shelves',
-                requestedWidth: 450,
-                nickname: '新分区',
-                shelves: { count: 3, mode: 'equal', gapPerSide: 0.5 },
-              };
-              props.onRun(CMD.addUnit(cab.id, cab.name, unit));
-            }}
-          >
-            + 新增分区
-          </button>
-        </div>
+              {rowUnits.map((u, i) => (
+                <UnitEditor
+                  key={u.id}
+                  cab={cab}
+                  unit={u}
+                  index={i}
+                  basePath={basePath}
+                  rowIndex={ri}
+                  rowPrefix={multiRow ? `R${ri + 1} ` : ''}
+                  netWidth={rowDerived?.nets[i]}
+                  onRun={props.onRun}
+                />
+              ))}
+
+              <div className="btn-row">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    const unit: UnitSpec = {
+                      id: '',
+                      kind: 'shelves',
+                      requestedWidth: 450,
+                      nickname: '新分区',
+                      shelves: { count: 3, mode: 'equal', gapPerSide: 0.5 },
+                    };
+                    // 多行柜必须指明加在哪一行（CommandBus 会拒绝缺行信息的多行命令）
+                    props.onRun(CMD.addUnit(cab.id, cab.name, unit, 'ui', multiRow ? ri : undefined));
+                  }}
+                >
+                  {multiRow ? `+ 第 ${ri + 1} 行新增分区` : '+ 新增分区'}
+                </button>
+              </div>
+            </div>
+          );
+        })}
       </Section>
 
       <Section title="派生骨架（🔒 生成器输出，不是输入）">
@@ -404,57 +445,114 @@ function CabinetProps(props: {
   );
 }
 
+/**
+ * 行高输入：数字（净高 mm）或 `fill`（吃掉剩余内高）。
+ *
+ * 为什么是一个输入框而不是“开关 + 数值”两个控件：
+ *   `'fill'` 与数字是**同一个字段的两个取值**。拆成两个控件，界面就会出现
+ *   “勾了还剩一个数”这种模型里根本不存在的中间态，而模型里只能有一个值。
+ */
+function RowHeightField(props: { value: RowHeight; onCommit: (v: RowHeight) => void }): ReactNode {
+  const asText = (v: RowHeight): string => (v === ROW_HEIGHT_FILL ? 'fill' : String(v));
+  const [text, setText] = useState(asText(props.value));
+  useEffect(() => setText(asText(props.value)), [props.value]);
+
+  const commit = (): void => {
+    const t = text.trim().toLowerCase();
+    if (t === 'fill' || t === '剩余') {
+      setText('fill');
+      if (props.value !== ROW_HEIGHT_FILL) props.onCommit(ROW_HEIGHT_FILL);
+      return;
+    }
+    const n = Number(t);
+    if (!Number.isFinite(n)) {
+      setText(asText(props.value));
+      return;
+    }
+    const v = Math.max(1, Math.round(n));
+    setText(String(v));
+    if (v !== props.value) props.onCommit(v);
+  };
+
+  return (
+    <div className="numfield">
+      <input
+        className="input"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            commit();
+            e.currentTarget.blur();
+          } else if (e.key === 'Escape') {
+            setText(asText(props.value));
+            e.currentTarget.blur();
+          }
+        }}
+      />
+      <span className="suffix">{props.value === ROW_HEIGHT_FILL ? '剩余' : 'mm'}</span>
+    </div>
+  );
+}
+
 function UnitEditor(props: {
   cab: Cabinet;
   unit: UnitSpec;
   index: number;
+  /** 该分区所在那一行的写路径前缀（单行 = `layout.units`，多行 = `layout.rows[j].units`） */
+  basePath: string;
+  rowIndex: number;
+  /** 多行柜时的标题前缀（`R1 `）；单行柜为空串 */
+  rowPrefix: string;
   netWidth: number | undefined;
   onRun: Run;
 }): ReactNode {
-  const { cab, unit, index, netWidth } = props;
+  const { cab, unit, index, netWidth, basePath, rowPrefix } = props;
+  const rowUnits = unitsAtPath(cab.layout, basePath);
   return (
-    <Section title={`${index + 1}. ${unit.nickname ?? unit.kind} · 实际净宽 ${netWidth ?? '—'}mm`} defaultOpen={false}>
+    <Section title={`${rowPrefix}${index + 1}. ${unit.nickname ?? unit.kind} · 实际净宽 ${netWidth ?? '—'}mm`} defaultOpen={false}>
       <Row label="昵称">
-        <TextField value={unit.nickname ?? ''} onCommit={(v) => props.onRun(CMD.setUnitString(cab, index, 'nickname', v, '重命名分区'))} />
+        <TextField value={unit.nickname ?? ''} onCommit={(v) => props.onRun(CMD.setUnitString(cab, index, 'nickname', v, '重命名分区', 'ui', basePath))} />
       </Row>
       <Row label="期望净宽" hint="fit_total 策略下这只是「愿望」，实际净宽见标题与只读区">
-        <NumField value={unit.requestedWidth} min={50} max={6000} onCommit={(v) => props.onRun(CMD.setUnitWidth(cab, index, v))} />
+        <NumField value={unit.requestedWidth} min={50} max={6000} onCommit={(v) => props.onRun(CMD.setUnitWidth(cab, index, v, 'ui', basePath))} />
       </Row>
 
       {unit.drawers ? (
         <>
           <Row label="抽屉数">
-            <NumField value={unit.drawers.count} min={0} max={10} suffix="只" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'drawers.count', v, `抽屉数 → ${v}`))} />
+            <NumField value={unit.drawers.count} min={0} max={10} suffix="只" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'drawers.count', v, `抽屉数 → ${v}`, 'ui', basePath))} />
           </Row>
           <Row label="滑轨长度">
-            <NumField value={unit.drawers.runnerLength} min={200} max={600} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'drawers.runnerLength', v, `滑轨长 → ${v}`))} />
+            <NumField value={unit.drawers.runnerLength} min={200} max={600} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'drawers.runnerLength', v, `滑轨长 → ${v}`, 'ui', basePath))} />
           </Row>
         </>
       ) : null}
 
       {unit.shelves ? (
         <Row label="层板数">
-          <NumField value={unit.shelves.count} min={0} max={12} suffix="块" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'shelves.count', v, `层板数 → ${v}`))} />
+          <NumField value={unit.shelves.count} min={0} max={12} suffix="块" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'shelves.count', v, `层板数 → ${v}`, 'ui', basePath))} />
         </Row>
       ) : null}
 
       {unit.doors ? (
         <>
           <Row label="门扇数">
-            <NumField value={unit.doors.count} min={0} max={6} suffix="扇" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.count', v, `门扇数 → ${v}`))} />
+            <NumField value={unit.doors.count} min={0} max={6} suffix="扇" onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.count', v, `门扇数 → ${v}`, 'ui', basePath))} />
           </Row>
           <Row label="中缝">
-            <NumField value={unit.doors.gapMid} min={0} max={20} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.gapMid', v, `门中缝 → ${v}`))} />
+            <NumField value={unit.doors.gapMid} min={0} max={20} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.gapMid', v, `门中缝 → ${v}`, 'ui', basePath))} />
           </Row>
           <Row label="外缝">
-            <NumField value={unit.doors.gapOuter} min={0} max={20} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.gapOuter', v, `门外缝 → ${v}`))} />
+            <NumField value={unit.doors.gapOuter} min={0} max={20} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'doors.gapOuter', v, `门外缝 → ${v}`, 'ui', basePath))} />
           </Row>
         </>
       ) : null}
 
       {unit.rod ? (
         <Row label="挂衣杆高">
-          <NumField value={unit.rod.heightFromBottom} min={0} max={3000} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'rod.heightFromBottom', v, `挂衣杆高 → ${v}`))} />
+          <NumField value={unit.rod.heightFromBottom} min={0} max={3000} onCommit={(v) => props.onRun(CMD.setUnitInt(cab, index, 'rod.heightFromBottom', v, `挂衣杆高 → ${v}`, 'ui', basePath))} />
         </Row>
       ) : null}
 
@@ -462,9 +560,9 @@ function UnitEditor(props: {
         <button
           type="button"
           className="btn btn-danger"
-          disabled={cab.layout.units.length <= 1}
-          title={cab.layout.units.length <= 1 ? '至少保留一个分区' : ''}
-          onClick={() => props.onRun(CMD.removeUnit(cab.id, cab.name, unit.id))}
+          disabled={rowUnits.length <= 1}
+          title={rowUnits.length <= 1 ? '至少保留一个分区' : ''}
+          onClick={() => props.onRun(CMD.removeUnit(cab.id, cab.name, unit.id, 'ui', props.rowIndex))}
         >
           删除该分区
         </button>

@@ -1,6 +1,7 @@
 import type { Cabinet, Issue } from '../types.ts';
 import type { Change, Command } from '../commandBus.ts';
 import { resizeCabinet, setUnitInt, setUnitWidth } from '../commands.ts';
+import { unitPathPrefix } from '../layoutModel.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -75,6 +76,28 @@ const str = (c: IssueCtx, key: string, fallback = ''): string => {
 };
 const cabOf = (c: IssueCtx): Cabinet => c.cab as Cabinet;
 const zh = (nick: string, id: string): string => nick || id;
+
+/**
+ * 这条报错说的分区**在哪一排** —— 一键修复的写路径前缀。
+ *
+ * 校验器会把 `unitBasePath` 放进 ctx（垂直行 = `layout.rows[j].units`，
+ * 背面排 = `layout.backUnits`）；单行柜就是 `layout.units`。
+ * 没带时按 canonical 第一行走（与 v0.2 一致）。
+ *
+ * ── 为什么必须有它 ──
+ *   一键修复是"点了就执行"的按钮。若多行柜的修复命令仍写死 `layout.units[i]`，
+ *   用户在**第 2 行**点"门扇加到 3 扇"，改的却是第 1 行 —— 界面不报错、
+ *   柜子看着变了、车间拿到的是错的板件。比"没有按钮"糟得多。
+ */
+const baseOf = (c: IssueCtx): string => {
+  const b = c['unitBasePath'];
+  if (typeof b === 'string' && b !== '') return b;
+  const cab = c.cab;
+  return cab ? unitPathPrefix(cab.layout, 0) : 'layout.units';
+};
+
+/** 该分区所在行的说明（多行柜才有；单行柜为空串 → 文案与 v0.2 逐字相同） */
+const rowOf = (c: IssueCtx): string => str(c, 'rowLabel');
 
 /**
  * 门扇数：均分之后**最宽那扇**不超过 limit，最少要几扇。
@@ -182,7 +205,7 @@ const RULE_CARDS: Record<string, RuleCard> = {
       `把滑轨缩短到 ${num(c, 'depth')}mm（抽屉会浅 ${Math.max(0, num(c, 'runnerLength') - num(c, 'depth'))}mm），或把柜体加深到 ≥ ${num(c, 'runnerLength')}mm。`,
     fix: (c) =>
       fromCommand(
-        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'drawers.runnerLength', num(c, 'depth'), '抽屉滑轨 → 柜体深度'),
+        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'drawers.runnerLength', num(c, 'depth'), '抽屉滑轨 → 柜体深度', 'ui', baseOf(c)),
         `滑轨已缩短到 ${num(c, 'depth')}mm，抽屉相应变浅 ${Math.max(0, num(c, 'runnerLength') - num(c, 'depth'))}mm。`
       ),
   },
@@ -194,7 +217,7 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `把这格加宽到 ${num(c, 'needW')}mm 以上（= 洞口宽 + 两侧板厚），或换一台窄一点的机器。`,
     fix: (c) =>
       fromCommand(
-        setUnitWidth(cabOf(c), num(c, 'unitIndex'), num(c, 'needW')),
+        setUnitWidth(cabOf(c), num(c, 'unitIndex'), num(c, 'needW'), 'ui', baseOf(c)),
         `该分区期望净宽已加到 ${num(c, 'needW')}mm（总宽固定，其他分区会等比让一点）。`
       ),
   },
@@ -252,7 +275,7 @@ const RULE_CARDS: Record<string, RuleCard> = {
       const n = enoughDoorCount(num(c, 'netW'), num(c, 'limit'), num(c, 'gapOuter'), num(c, 'gapMid'), from);
       const per = Math.ceil(Math.max(0, num(c, 'netW') - 2 * num(c, 'gapOuter') - (n - 1) * num(c, 'gapMid')) / n);
       return fromCommand(
-        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'doors.count', n, `门扇数 ${from} → ${n}`),
+        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'doors.count', n, `门扇数 ${from} → ${n}`, 'ui', baseOf(c)),
         `门扇已加到 ${n} 扇，最宽那扇 ${per}mm；门缝位置会跟着重排。`
       );
     },
@@ -269,6 +292,13 @@ const RULE_CARDS: Record<string, RuleCard> = {
       `「${zh(str(c, 'unitName'), str(c, 'unitId'))}」的门板高 ${num(c, 'doorH')}mm，超过规则允许的上限 ${num(c, 'limit')}mm —— 门板太重，铰链扛不住。`,
     hint: (c) => {
       const over = Math.max(0, num(c, 'doorH') - num(c, 'limit'));
+      /**
+       * 多行柜（上下分层）时，"降柜高"不是唯一的修法 —— 要降的是**这一行**的高度。
+       * 单行柜时这里走下面那条分支，文案与 v0.2 逐字相同。
+       */
+      if (rowOf(c) !== '') {
+        return `把这一行的固定高度减少 ${over}mm 以上（门高随之压到 ≤${num(c, 'limit')}mm；柜体总高不变，让出来的空间归标了 fill 的那一行），或者把这一行的门拆成上下两扇。`;
+      }
       return `把柜体高度从 ${num(c, 'height')}mm 降到 ${num(c, 'height') - over}mm 以内（门高随之压到 ${num(c, 'limit')}mm），或者把踢脚高度从 ${num(c, 'bodyLift')}mm 加到 ${num(c, 'bodyLift') + over}mm（柜子总高不变，门高同样压到 ${num(c, 'limit')}mm）。`;
     },
     manual: '降柜高还是抬踢脚，会让柜子外观不一样，属于设计决定 —— 系统只给得出数字，不替你选。',
@@ -281,7 +311,7 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `在这格里多分一格抽屉（数量 ${num(c, 'count')} → ${num(c, 'count') + 1}，每格约 ${Math.round(num(c, 'netH') / (num(c, 'count') + 1))}mm），或改成「抽屉 + 上翻门」。`,
     fix: (c) =>
       fromCommand(
-        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'drawers.count', num(c, 'count') + 1, `抽屉数 ${num(c, 'count')} → ${num(c, 'count') + 1}`),
+        setUnitInt(cabOf(c), num(c, 'unitIndex'), 'drawers.count', num(c, 'count') + 1, `抽屉数 ${num(c, 'count')} → ${num(c, 'count') + 1}`, 'ui', baseOf(c)),
         `抽屉已多分一格（${num(c, 'count')} → ${num(c, 'count') + 1}），面板高度随之降低。`
       ),
   },
@@ -300,6 +330,64 @@ const RULE_CARDS: Record<string, RuleCard> = {
       `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」是单面柜，却带着背面分区 backUnits —— 两者互相矛盾。`,
     hint: () => '把 layout.type 改成 double（做真双面柜），或把 backUnits 删掉。',
     manual: '改成双面还是删掉背面分区，属于设计决定。',
+  },
+
+  // ═══════════ Rows（v0.3 上下分层）：高度链的错法 ═══════════
+  // 判定全部来自 layout.ts 的 resolveRowHeights（唯一一处），这里只把它翻成人话。
+  'RULE-ROW-FILL-DUP': {
+    title: '有两行都想"吃掉剩余高度"',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」分了 ${num(c, 'rowCount')} 行，其中 ${num(c, 'fillCount')} 行都标成了「吃掉剩余高度」（fill）—— 剩余高度只有一份，两行都吃掉算不出结果。`,
+    hint: (c) =>
+      `只留最后一行标 fill；其余行各给一个固定净高，这些固定高之和必须等于 ${num(c, 'available')}mm（= 柜内净高 − (${num(c, 'rowCount')}−1)×板厚 ${num(c, 'boardT')}mm）。`,
+    manual: '哪几行给固定高、各给多少，属于设计决定 —— 系统只给得出总和。',
+  },
+  'RULE-ROW-FILL-POSITION': {
+    title: '"吃掉剩余"的那一行不在最下面',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」共 ${num(c, 'rowCount')} 行（自上而下编号），标了 fill 的是第 ${num(c, 'fillIndex') + 1} 行 —— 而 fill 必须落在最后一行（最下面那行），否则它上/下方的行没有锚点。`,
+    hint: (c) =>
+      `把 fill 挪到最后一行（第 ${num(c, 'rowCount')} 行），或者给第 ${num(c, 'fillIndex') + 1} 行一个固定净高、把 fill 让给最后一行。`,
+    manual: '让哪一行吃剩余高度，属于设计决定。',
+  },
+  'RULE-ROW-FILL-OVERFLOW': {
+    title: '固定行高之和已经超过可用内高',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」各固定行的净高之和是 ${num(c, 'fixedSum')}mm，而扣掉 ${num(c, 'rowCount')} 行之间那几块行隔板后只剩 ${num(c, 'available')}mm —— 已经超了 ${num(c, 'over')}mm，最后一行的 fill 没有空间可吃。`,
+    hint: (c) =>
+      `把固定行的总高减少 ${num(c, 'over')}mm 以上（总和要 ≤ ${num(c, 'available')}mm），或者把柜体高度加大 ${num(c, 'over')}mm 以上。`,
+    manual: '减哪一行、还是加高柜体，属于设计决定。',
+  },
+  'RULE-ROW-HEIGHT-SUM': {
+    title: '各行高度加起来对不上柜内净高',
+    severity: 'ERROR',
+    message: (c) => {
+      const d = num(c, 'diff');
+      const rel = d >= 0 ? `多 ${d}mm` : `少 ${Math.abs(d)}mm`;
+      return `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」各固定行的净高之和是 ${num(c, 'fixedSum')}mm，而扣掉 ${num(c, 'rowCount')} 行之间的行隔板后可用内高是 ${num(c, 'available')}mm —— 比可用内高${rel}，而且没有一行标 fill 来吸收这个差。`;
+    },
+    hint: (c) =>
+      `把某一行的高度调整 ${Math.abs(num(c, 'diff'))}mm（让总和等于 ${num(c, 'available')}mm），或者把最后一行改成「吃掉剩余高度」（fill），让它自动吸收。`,
+    manual: '调哪一行属于设计决定；改成 fill 则等于把自由量交给最后一行。',
+  },
+  'RULE-ROW-HEIGHT-BAD': {
+    title: '行高不是合法的正整毫米',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」有一行的高度不是正整数毫米（共 ${num(c, 'rowCount')} 行）—— 生产尺寸不允许小数，也不允许 0 或负数。`,
+    hint: () => '把这一行的 height 改成正整数（mm，例如 480），或改成字符串 "fill"（表示吃掉剩余高度）。',
+    manual: '这一行该多高，属于设计决定。',
+  },
+  'RULE-ROW-DOUBLE-UNSUPPORTED': {
+    title: '双面柜暂不支持上下分行',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${zh(str(c, 'cabName'), str(c, 'cabId'))}」是双面柜（前后两排），同时又分了 ${num(c, 'rowCount')} 个上下行 —— 本阶段不支持这个组合：行隔板会与前后共用的中板抢同一段空间，而"两排的行要不要对齐、行隔板要不要穿中板"还没有定义。`,
+    hint: () => '把它拆成两个单面柜，或者先取消上下分行（去掉 layout.rows 里多出来的行）再排岛台。',
+    manual: '这是本阶段明确的能力边界，不是你的设计错 —— 系统不猜一个没人定义过的几何。',
   },
 
   // ─────────────── 设计问题：修法有多种 → 只给建议 ───────────────

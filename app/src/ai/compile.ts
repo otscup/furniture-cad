@@ -5,6 +5,7 @@ import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '.
 import { nextId } from '../core/ids.ts';
 import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
+import { allUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
 import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
@@ -212,6 +213,19 @@ export function resolveCabinet(project: Project, target: AiAction['target']): Ca
  * 这个 +1/−1 的换算只在这里做一次，界面上给用户看的永远是 1 起序号。
  */
 export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined): number | string {
+  /**
+   * ⚠ 多行柜（v0.3）：本阶段 AI 还**不能指定"哪一行"**。
+   *
+   * 这里必须**拒绝**，而不是默认取第 0 行：多行柜的"第 2 分区"在每一行里都存在，
+   * 缺行信息时无法确定对象。猜错一行的后果是**安静改错分区** ——
+   * 拒绝看得见（用户能换个说法），改错看不见（最后变成车间下错料）。
+   * 这与本文件其它地方"宁可报错不许猜"的口径一致。
+   *
+   * 界面上直接改不受影响：界面知道用户点的是哪一行（PickLine 带 rowIndex）。
+   */
+  if (isMultiRow(cab.layout)) {
+    return `柜体「${cab.name}」分了上下 ${layoutRows(cab.layout).length} 行，本阶段 AI 还不能指定是哪一行 —— 请在界面上直接改那一行里的分区`;
+  }
   const units = cab.layout.units;
   if (units.length === 0) return `柜体「${cab.name}」没有任何分区`;
   if (ref === undefined || ref === null) return '没有指明是哪个分区（需要 target.unit：1 起序号或分区昵称）';
@@ -437,6 +451,16 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
     case 'cabinet.addUnit': {
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
+      /**
+       * 多行柜：新分区加到哪一行没有合理缺省（第 0 行是最上面那行，常常不是用户想加的地方）。
+       * AI 契约在本阶段没有"行"这个参数，所以明确拒绝，而不是悄悄加到第 0 行。
+       */
+      if (isMultiRow(cab.layout)) {
+        return {
+          ok: false,
+          error: `柜体「${cab.name}」分了上下 ${layoutRows(cab.layout).length} 行，本阶段 AI 还不能指定新分区加到哪一行 —— 请在界面上直接加`,
+        };
+      }
       const kind = String(p.kind) as UnitSpec['kind'];
       if (kind === 'hanging' && p.rodHeight === undefined && p.count !== undefined) {
         // count 在 hanging 语义下没有意义，静默忽略会让人以为生效了
@@ -445,7 +469,9 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (kind === 'appliance' && p.doorCount !== undefined && Number(p.doorCount) !== 0) {
         return { ok: false, error: '电器格的洞口和门在同一张脸上互相冲突 —— 不要给电器格装门（机器露前脸是常规做法）' };
       }
-      const taken = new Set(cab.layout.units.map((u) => u.id));
+      // 分区 id 的唯一性必须**跨行**成立：板件 id 由 unit.id 拼出（`P_cab_unit_001_SHELF1`），
+      // 两行各有一个 `unit_001` 会让两份板件在清单里合成一条 —— 静默少件。
+      const taken = new Set(allUnits(cab.layout).map((u) => u.id));
       if (cab.layout.backUnits) for (const u of cab.layout.backUnits) taken.add(u.id);
       const unit = makeUnit({
         id: nextId('unit', taken),

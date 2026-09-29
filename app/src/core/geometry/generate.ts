@@ -8,6 +8,7 @@ import type {
   Prim,
   PurchasedItem,
   RuleSet,
+  UnitSpec,
   Vec2,
 } from '../types.ts';
 import { equalSpacing, round1 } from '../allocate.ts';
@@ -64,8 +65,14 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const cabId = cab.id;
   const bodyH = L.bodyH;
   const innerW = L.innerW;
-  const innerH = L.innerH;
   const layerOf = (th: number): string => `PANEL_${th}`;
+  /**
+   * 柜内底面的 Z（底板上表面）—— **唯一**的"距柜内底 Xmm"基准点。
+   * 多行柜里每一行的层板/挂衣杆位置都换算到这个绝对基准上，
+   * 这样板件上的位置数字对车间只有一个读法（不用先问"哪一行的内底"）。
+   * 单行柜下它与 v0.2 使用的 `bodyLift + t` 完全等价 → 文案逐字不变。
+   */
+  const innerBottomZ = p.bodyLift + t;
   /** 双面柜（岛台）派生骨架：undefined = 单面柜 */
   const DB = L.double;
 
@@ -93,21 +100,58 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     issues.push(buildIssue('DOUBLE-NO-BACKPANEL', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, boardT: t, backRowDepth: DB.backRowDepth, midT: DB.midT, frontRowDepth: DB.frontRowDepth, depth: p.depth } }));
   }
 
-  const unitCount = cab.layout.units.length;
-  for (let i = 0; i < unitCount - 1; i++) {
-    push({ id: `P_${cabId}_DIV${i + 1}`, role: 'DividerPanel', nameZh: `中立板${i + 1}`, belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerH, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
-  }
-
-  // ───────── 2. 宽度分配 ─────────
-  const netTotal = L.netTotal;
-  const nets = L.nets;
-  const unitX0 = L.unitX0;
-
-  const drifted: string[] = [];
-  cab.layout.units.forEach((u, i) => {
-    if (nets[i] !== u.requestedWidth) {
-      drifted.push(`${u.nickname ?? u.id} 期望净宽 ${u.requestedWidth} → 实际 ${nets[i]}（${nets[i] - u.requestedWidth >= 0 ? '+' : ''}${nets[i] - u.requestedWidth}mm）`);
+  /**
+   * 中立板与行隔板 —— 两者都来自**行结构**（canonical 的 `L.rows`），
+   * 不是"谁手加的一块板"。这里不认识 rows/units 两种文件形状，也不需要认识。
+   *
+   *   · 中立板：每行内部、行内相邻分区之间的竖板。长度 = **该行净高**
+   *     （不是整柜净高 —— 多行柜里拿整柜净高做中立板，上层中立板会捅穿顶板）。
+   *   · 行隔板：行与行之间那块贯通横隔板，长度 = 内空宽（夹在两块侧板之间）。
+   *
+   * 单行柜：行内 `units.length-1` 块中立板、0 块行隔板 →
+   * id（`P_cab_DIV1`）、长度（innerH）、文案与 v0.2 **逐字相同**。
+   */
+  const multiRowCab = L.rows.length > 1;
+  L.rows.forEach((r, ri) => {
+    const rowSuffix = multiRowCab ? `（第${ri + 1}行）` : '';
+    for (let i = 0; i < r.units.length - 1; i++) {
+      push({ id: `P_${cabId}_${r.panelTag}DIV${i + 1}`, role: 'DividerPanel', nameZh: `中立板${i + 1}${rowSuffix}`, belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: r.netH, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
     }
+  });
+  L.rowDividers.forEach((z, k) => {
+    push({
+      id: `P_${cabId}_RD${k + 1}`,
+      role: 'RowDividerPanel',
+      nameZh: `行隔板${k + 1}`,
+      belongsTo: cabId,
+      group: '箱体',
+      material: p.boardMaterial,
+      thickness: t,
+      length: innerW,
+      width: p.depth,
+      grain: 'length',
+      edge: edge(null, null, E1, null),
+      edgeLabel: `前边 1mm；位置：距柜内底 ${z - innerBottomZ}mm`,
+      layer: layerOf(t),
+    });
+  });
+
+  // ───────── 2. 宽度分配（逐行）─────────
+  // 每行独立分配（见 layout.ts 的 allocateRowWidths）；这里只取用，不重算。
+  const netTotal = L.netTotal;
+
+  /**
+   * 期望净宽与实际净宽的偏差，**逐行**收集。
+   * 单行柜下 drift 文案与 v0.2 逐字相同（不带行号）。
+   */
+  const drifted: string[] = [];
+  L.rows.forEach((r, ri) => {
+    const rowSuffix = L.rows.length > 1 ? `（第${ri + 1}行）` : '';
+    r.units.forEach((u, i) => {
+      if (r.nets[i] !== u.requestedWidth) {
+        drifted.push(`${u.nickname ?? u.id}${rowSuffix} 期望净宽 ${u.requestedWidth} → 实际 ${r.nets[i]}（${r.nets[i]! - u.requestedWidth >= 0 ? '+' : ''}${r.nets[i]! - u.requestedWidth}mm）`);
+      }
+    });
   });
   if (drifted.length > 0) {
     issues.push(buildIssue('ALLOC-FIT-TOTAL', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, width: p.width, netTotal, drift: drifted.join('；') } }));
@@ -178,15 +222,18 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   /**
    * 分区净高的口径：电器格（appliance）的洞口占掉下部 openingHeight + 一块过梁板，
    * 洞口上面的抽屉只拥有**剩余**净高 —— 恒等式与图面都必须用这个口径。
+   *
+   * 净高的上限是**这一行**的净高（`rowNetH`），不是整柜内空高：
+   * 多行柜里拿整柜内空高算某一行的抽屉分格，分格会一路捅到别的行里去。
    */
-  const unitNetH = (u: Cabinet['layout']['units'][number]): number =>
-    u.kind === 'appliance' && u.appliance ? innerH - u.appliance.openingHeight - t : innerH;
+  const unitNetH = (u: UnitSpec, rowNetH: number): number =>
+    u.kind === 'appliance' && u.appliance ? rowNetH - u.appliance.openingHeight - t : rowNetH;
 
   /** 电器格的结构与清单派生：过梁板（洞口顶）+ 甲购件（机器本身不走开料机） */
-  function buildAppliance(uid: string, unit: Cabinet['layout']['units'][number], netW: number, rowShelfDepth: number): void {
+  function buildAppliance(uid: string, unit: UnitSpec, netW: number, rowShelfDepth: number, zOffset: number): void {
     const a = unit.appliance!;
     // 过梁板：洞口的顶，跨整个分区净宽（洞口窄于净宽时两侧余量条同板连带）
-    push({ id: `P_${cabId}_${uid}_APLT`, role: 'ApertureLintel', nameZh: '洞口过梁板', belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: netW, width: rowShelfDepth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${a.openingHeight}mm（洞口顶）`, layer: layerOf(t) });
+    push({ id: `P_${cabId}_${uid}_APLT`, role: 'ApertureLintel', nameZh: '洞口过梁板', belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: netW, width: rowShelfDepth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${zOffset + a.openingHeight}mm（洞口顶）`, layer: layerOf(t) });
     purchased.push({
       id: `PC_${cabId}_${uid}_APP`,
       nameZh: `${a.name}（甲购 · 嵌入式电器）`,
@@ -198,31 +245,41 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     });
   }
 
-  /** 一排分区的派生（前排 / 后排共用 —— 同一套 build 函数，只差净宽表与层板深） */
-  function buildRow(units: Cabinet['layout']['units'], netsRow: number[], rowShelfDepth: number): void {
+  /**
+   * 一排分区的派生。四个调用方共用同一套 build 函数，只差四样：
+   * 净宽表 / 层板深 / **该排净高** / **该排内空底面相对柜内底的偏移**（Z）。
+   *
+   *   ① 垂直各行（`L.rows`）—— 高度与 Z 各不相同；
+   *   ② 双面柜背面排 —— 净高 = 整柜内空高、Z 偏移 = 0。
+   *
+   * 单行柜下偏移恒为 0、净高恒为 innerH → 与 v0.2 的板件与文案逐字相同。
+   */
+  function buildRow(units: UnitSpec[], netsRow: number[], rowShelfDepth: number, rowNetH: number, zOffset: number): void {
     units.forEach((u, i) => {
-      const netW = netsRow[i];
-      const netH = unitNetH(u);
+      const netW = netsRow[i]!;
+      const netH = unitNetH(u, rowNetH);
       if (u.kind === 'appliance' && u.appliance) {
-        buildAppliance(u.id, u, netW, rowShelfDepth);
+        buildAppliance(u.id, u, netW, rowShelfDepth, zOffset);
         // 电器格带门 = 洞口与门板打架 —— 如实报 ERROR 并不产出矛盾板件，不静默画一个怪门
         if (u.doors) {
           issues.push(buildIssue('RULE-APPLIANCE-DOOR', { target: `${cabId}.${u.id}`, targetKind: 'unit', ctx: { cabId, cab, unitIndex: i, unitName: u.nickname ?? u.id, unitId: u.id, applianceName: u.appliance.name } }));
         }
       }
       if (u.drawers) buildDrawerBank(u.id, u, netW, netH);
-      if (u.shelves && u.shelves.count > 0) buildShelves(u.id, u.shelves, netW, netH, rowShelfDepth);
+      if (u.shelves && u.shelves.count > 0) buildShelves(u.id, u.shelves, netW, netH, rowShelfDepth, zOffset);
       if (u.rod && u.rod.count > 0) {
-        hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${u.rod.heightFromBottom}mm`, belongsTo: `${cabId}.${u.id}` });
+        hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${zOffset + u.rod.heightFromBottom}mm`, belongsTo: `${cabId}.${u.id}` });
       }
       if (u.doors && u.kind !== 'appliance') buildDoors(u.id, u, netW, netH);
     });
   }
 
-  buildRow(cab.layout.units, nets, shelfDepth);
-  if (DB) buildRow(cab.layout.backUnits!, DB.backNets, DB.backShelfDepth);
+  // ① 垂直各行（canonical）：每行用**自己的**净宽表、净高与 Z 偏移
+  L.rows.forEach((r) => buildRow(r.units, r.nets, shelfDepth, r.netH, r.z0 - innerBottomZ));
+  // ② 双面柜背面排（与垂直行正交；多行 × 双面由校验器明确报"本阶段不支持"）
+  if (DB) buildRow(cab.layout.backUnits!, DB.backNets, DB.backShelfDepth, L.innerH, 0);
 
-  function buildDrawerBank(uid: string, unit: Cabinet['layout']['units'][number], netW: number, netH: number): void {
+  function buildDrawerBank(uid: string, unit: UnitSpec, netW: number, netH: number): void {
     const d = unit.drawers!;
     const cellH = drawerCellHeights(unit, netH, rules);
     for (let k = 0; k < d.count; k++) {
@@ -238,7 +295,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     hardware.push({ id: `HW_${cabId}_${uid}_RUNNER`, nameZh: '抽屉滑轨', kind: 'runner', qty: d.count, spec: `${rules.hardware[d.runner]?.name ?? d.runner}，L=${d.runnerLength}mm`, belongsTo: `${cabId}.${uid}` });
   }
 
-  function buildShelves(uid: string, s: NonNullable<Cabinet['layout']['units'][number]['shelves']>, netW: number, netH: number, sDepth: number): void {
+  function buildShelves(uid: string, s: NonNullable<UnitSpec['shelves']>, netW: number, netH: number, sDepth: number, zOffset: number): void {
     const shelfW = netW - 2 * s.gapPerSide;
     /**
      * 斜层板（Phase E 图元扩展）：板件真实裁切长 = 水平跨度 / cos(tilt)。
@@ -251,7 +308,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     const realLen = tilt > 0 ? Math.max(1, Math.round(shelfW / cosT)) : shelfW;
     const tiltNote = tilt > 0 ? `；斜 ${tilt}°（裁切长 ${realLen}mm = 水平 ${shelfW}mm ÷ cos${tilt}°）` : '';
     equalSpacing(netH, s.count).forEach((pos, k) => {
-      push({ id: `P_${cabId}_${uid}_SH${k + 1}`, role: 'ShelfPanel', nameZh: tilt > 0 ? `斜层板-${k + 1}` : `层板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: realLen, width: sDepth, grain: 'length', edge: edge(E1, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${pos}mm${tiltNote}`, layer: layerOf(t) });
+      push({ id: `P_${cabId}_${uid}_SH${k + 1}`, role: 'ShelfPanel', nameZh: tilt > 0 ? `斜层板-${k + 1}` : `层板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: realLen, width: sDepth, grain: 'length', edge: edge(E1, null, E1, null), edgeLabel: `前边 1mm；位置：距柜内底 ${zOffset + pos}mm${tiltNote}`, layer: layerOf(t) });
     });
     hardware.push({ id: `HW_${cabId}_${uid}_PIN`, nameZh: '层板托', kind: 'shelfPin', qty: s.count * 4, spec: '每块层板 4 只', belongsTo: `${cabId}.${uid}` });
     if (s.ledStrip && s.ledStrip !== 'none') {
@@ -338,8 +395,16 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     [0, t, 0, D],
     [W - t, W, 0, D],
   ];
-  for (let i = 0; i < unitCount - 1; i++) {
-    const dx = unitX0[i] + nets[i];
+  /**
+   * 中立板的平面位置**逐行取并集**：多行柜里各行的中立板可以落在不同的 X
+   * （上行 2 格、下行 3 格），俯视图上要把它们都画出来 —— 只画第一行会漏掉下行的隔板。
+   * 单行柜：并集就是原来那一串，逐条相同。
+   */
+  const dividerXs = new Set<number>();
+  L.rows.forEach((r) => {
+    for (let i = 0; i < r.units.length - 1; i++) dividerXs.add(r.unitX0[i]! + r.nets[i]!);
+  });
+  for (const dx of dividerXs) {
     structLines.push([dx, dx + t, DB ? DB.midY0 + DB.midT : 0, D]);
   }
   if (DB) {
@@ -356,15 +421,15 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   }
 
   // 门板 / 抽屉面板：贴前脸的一条线（双面柜的背面脸在 y = t 侧，对称地画）
-  const drawFaceLines = (units: Cabinet['layout']['units'], netsRow: number[], x0s: number[], yFront: number, towardFront: boolean): void => {
+  const drawFaceLines = (units: UnitSpec[], netsRow: number[], x0s: number[], yFront: number, towardFront: boolean): void => {
     units.forEach((u, i) => {
       if (!u.doors && !u.drawers && u.kind !== 'appliance') return;
-      const x0 = x0s[i];
-      const x1 = x0 + netsRow[i];
+      const x0 = x0s[i]!;
+      const x1 = x0 + netsRow[i]!;
       plan.push({ k: 'poly', pts: toWorld([{ x: x0, y: yFront }, { x: x1, y: yFront }]), closed: false, layer: L_FRONT, lw: 2.4 });
       if (u.doors && u.doors.count > 1) {
         for (let k = 1; k < u.doors.count; k++) {
-          const xk = x0 + (netsRow[i] * k) / u.doors.count;
+          const xk = x0 + (netsRow[i]! * k) / u.doors.count;
           plan.push({ k: 'poly', pts: toWorld([{ x: xk, y: yFront }, { x: xk, y: towardFront ? D : 0 }]), closed: false, layer: L_FRONT, lw: 1 });
         }
       }
@@ -378,9 +443,9 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       if (u.kind === 'appliance' && u.appliance) {
         // 电器外框：洞口宽居中于净宽、深按洞口深贴脸，虚线表达"此处留空放机器"
         const a = u.appliance;
-        const ow = Math.min(a.openingWidth, netsRow[i]);
+        const ow = Math.min(a.openingWidth, netsRow[i]!);
         const od = Math.min(a.openingDepth, towardFront ? D - yFront : yFront);
-        const ox0 = x0 + (netsRow[i] - ow) / 2;
+        const ox0 = x0 + (netsRow[i]! - ow) / 2;
         const ox1 = ox0 + ow;
         const oy0 = towardFront ? D - od : od;
         const oy1 = towardFront ? D : 0;
@@ -389,7 +454,8 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       }
     });
   };
-  drawFaceLines(cab.layout.units, nets, unitX0, D - t, true);
+  // 各行的前脸线都画在俯视图上（行在垂直方向叠，平面图上重合成同一段 → 逐行画同样正确）
+  L.rows.forEach((r) => drawFaceLines(r.units, r.nets, r.unitX0, D - t, true));
   if (DB) drawFaceLines(cab.layout.backUnits!, DB.backNets, DB.backUnitX0, t, false);
 
   // 平面标注：柜体宽 + 深（贴在柜体外侧）
@@ -404,66 +470,76 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
 
   // ───────── 6. 2D 图元：立面（局部坐标，y 向上）─────────
   const baseY = p.bodyLift;
-  const innerBottomY = baseY + t;
   elevation.push({ k: 'poly', pts: rectPts(0, 0, W, p.height), closed: true, layer: L_PLAN, lw: 1.6 });
   elevation.push({ k: 'poly', pts: rectPts(t, 0, innerW, p.bodyLift), closed: true, layer: L_STRUCT, lw: 1 });
   elevation.push({ k: 'poly', pts: rectPts(0, baseY, t, bodyH), closed: true, layer: L_STRUCT, lw: 1 });
   elevation.push({ k: 'poly', pts: rectPts(W - t, baseY, t, bodyH), closed: true, layer: L_STRUCT, lw: 1 });
   elevation.push({ k: 'poly', pts: rectPts(t, p.height - t, innerW, t), closed: true, layer: L_STRUCT, lw: 1 });
   elevation.push({ k: 'poly', pts: rectPts(t, baseY, innerW, t), closed: true, layer: L_STRUCT, lw: 1 });
-  for (let i = 0; i < unitCount - 1; i++) {
-    elevation.push({ k: 'poly', pts: rectPts(unitX0[i] + nets[i], innerBottomY, t, innerH), closed: true, layer: L_STRUCT, lw: 1 });
-  }
-  cab.layout.units.forEach((u, i) => {
-    const x0 = unitX0[i];
-    const netW = nets[i];
-    // 电器格：洞口占掉下部，上部的抽屉/层板从过梁板之上开始；洞口本身画虚线框
-    const apZ0 = u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0;
-    if (u.kind === 'appliance' && u.appliance) {
-      const a = u.appliance;
-      const ow = Math.min(a.openingWidth, netW);
-      const ax0 = x0 + (netW - ow) / 2;
-      elevation.push({ k: 'poly', pts: rectPts(ax0, innerBottomY, ow, Math.min(a.openingHeight, innerH)), closed: true, layer: L_HW, lw: 1.2, dash: [90, 50] });
-      elevation.push({ k: 'text', p: { x: x0 + netW / 2, y: innerBottomY + Math.min(a.openingHeight, innerH) / 2 }, text: `${a.name} ${a.openingWidth}×${a.openingHeight}`, size: 80, layer: L_TEXT, align: 'c' });
+  // 行隔板（贯通横隔板）：立面上一块横贯内宽的横板；单行柜无此行 → 与 v0.2 逐图元相同
+  L.rowDividers.forEach((z) => {
+    elevation.push({ k: 'poly', pts: rectPts(t, z, innerW, t), closed: true, layer: L_STRUCT, lw: 1 });
+  });
+  // 各行内部的中立板：纵向只跨**本行**净高（不再跨整柜内空高）
+  L.rows.forEach((r) => {
+    for (let i = 0; i < r.units.length - 1; i++) {
+      elevation.push({ k: 'poly', pts: rectPts(r.unitX0[i]! + r.nets[i]!, r.z0, t, r.netH), closed: true, layer: L_STRUCT, lw: 1 });
     }
-    if (u.shelves && u.shelves.count > 0) {
-      const tilt = u.shelves.tilt ?? 0;
-      const shift = tilt > 0 ? Math.round(netW * Math.tan((tilt * Math.PI) / 180)) : 0;
-      equalSpacing(innerH, u.shelves.count).forEach((pos) => {
-        const yb = innerBottomY + pos;
-        // 斜层板：平行四边形（右端下沉 shift），与四视图（views.ts）同源表达
-        const pts =
-          shift > 0
-            ? [
-                { x: x0, y: yb },
-                { x: x0 + netW, y: yb - shift },
-                { x: x0 + netW, y: yb - shift + t },
-                { x: x0, y: yb + t },
-              ]
-            : rectPts(x0, yb, netW, t);
-        elevation.push({ k: 'poly', pts, closed: true, layer: L_STRUCT, lw: 1 });
-      });
-    }
-    if (u.drawers) {
-      const netH = innerH - apZ0;
-      const cellH = drawerCellHeights(u, netH, rules);
-      let y = innerBottomY + apZ0 + u.drawers.gap;
-      for (let k = 0; k < cellH.length; k++) {
-        elevation.push({ k: 'poly', pts: rectPts(x0 + u.drawers.gap, y, netW - 2 * u.drawers.gap, cellH[k] - 2 * u.drawers.gap), closed: true, layer: L_FRONT, lw: 1.4 });
-        y += cellH[k] + u.drawers.gap;
+  });
+  L.rows.forEach((r) => {
+    r.units.forEach((u, i) => {
+      const x0 = r.unitX0[i]!;
+      const netW = r.nets[i]!;
+      const rowZ0 = r.z0;
+      const rowNetH = r.netH;
+      // 电器格：洞口占掉下部，上部的抽屉/层板从过梁板之上开始；洞口本身画虚线框
+      const apZ0 = u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0;
+      if (u.kind === 'appliance' && u.appliance) {
+        const a = u.appliance;
+        const ow = Math.min(a.openingWidth, netW);
+        const ax0 = x0 + (netW - ow) / 2;
+        elevation.push({ k: 'poly', pts: rectPts(ax0, rowZ0, ow, Math.min(a.openingHeight, rowNetH)), closed: true, layer: L_HW, lw: 1.2, dash: [90, 50] });
+        elevation.push({ k: 'text', p: { x: x0 + netW / 2, y: rowZ0 + Math.min(a.openingHeight, rowNetH) / 2 }, text: `${a.name} ${a.openingWidth}×${a.openingHeight}`, size: 80, layer: L_TEXT, align: 'c' });
       }
-    }
-    if (u.doors) {
-      const widths = doorWidths(u, netW, rules);
-      let x = x0 + u.doors.gapOuter;
-      for (const w of widths) {
-        elevation.push({ k: 'poly', pts: rectPts(x, innerBottomY + u.doors.gapOuter, w, innerH - 2 * u.doors.gapOuter), closed: true, layer: L_FRONT, lw: 1.4 });
-        x += w + u.doors.gapMid;
+      if (u.shelves && u.shelves.count > 0) {
+        const tilt = u.shelves.tilt ?? 0;
+        const shift = tilt > 0 ? Math.round(netW * Math.tan((tilt * Math.PI) / 180)) : 0;
+        equalSpacing(rowNetH, u.shelves.count).forEach((pos) => {
+          const yb = rowZ0 + pos;
+          // 斜层板：平行四边形（右端下沉 shift），与四视图（views.ts）同源表达
+          const pts =
+            shift > 0
+              ? [
+                  { x: x0, y: yb },
+                  { x: x0 + netW, y: yb - shift },
+                  { x: x0 + netW, y: yb - shift + t },
+                  { x: x0, y: yb + t },
+                ]
+              : rectPts(x0, yb, netW, t);
+          elevation.push({ k: 'poly', pts, closed: true, layer: L_STRUCT, lw: 1 });
+        });
       }
-    }
-    if (u.rod) {
-      elevation.push({ k: 'poly', pts: [{ x: x0 + 2, y: innerBottomY + u.rod.heightFromBottom }, { x: x0 + netW - 2, y: innerBottomY + u.rod.heightFromBottom }], closed: false, layer: L_HW, lw: 1.4, dash: [40, 20, 6, 20] });
-    }
+      if (u.drawers) {
+        const netH = rowNetH - apZ0;
+        const cellH = drawerCellHeights(u, netH, rules);
+        let y = rowZ0 + apZ0 + u.drawers.gap;
+        for (let k = 0; k < cellH.length; k++) {
+          elevation.push({ k: 'poly', pts: rectPts(x0 + u.drawers.gap, y, netW - 2 * u.drawers.gap, cellH[k]! - 2 * u.drawers.gap), closed: true, layer: L_FRONT, lw: 1.4 });
+          y += cellH[k]! + u.drawers.gap;
+        }
+      }
+      if (u.doors) {
+        const widths = doorWidths(u, netW, rules);
+        let x = x0 + u.doors.gapOuter;
+        for (const w of widths) {
+          elevation.push({ k: 'poly', pts: rectPts(x, rowZ0 + u.doors.gapOuter, w, rowNetH - 2 * u.doors.gapOuter), closed: true, layer: L_FRONT, lw: 1.4 });
+          x += w + u.doors.gapMid;
+        }
+      }
+      if (u.rod) {
+        elevation.push({ k: 'poly', pts: [{ x: x0 + 2, y: rowZ0 + u.rod.heightFromBottom }, { x: x0 + netW - 2, y: rowZ0 + u.rod.heightFromBottom }], closed: false, layer: L_HW, lw: 1.4, dash: [40, 20, 6, 20] });
+      }
+    });
   });
 
   // ───────── 7. 统计 ─────────

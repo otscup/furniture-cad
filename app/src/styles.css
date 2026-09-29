@@ -198,6 +198,16 @@ a.tb-btn { text-decoration: none; }
 .row-value { min-width: 0; display: flex; align-items: center; gap: 4px; }
 .row-derived .row-label { color: var(--muted); }
 .row-derived .row-value { color: var(--text-2); }
+/* 垂直行小节标题（v0.3 多行柜）：把「行高 + 该行分区」和上一行视觉上分开 */
+.prop-row-sub {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: .3px;
+  padding: 7px 0 3px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--line);
+}
 .lock { font-size: 9px; opacity: .6; }
 
 .input {
@@ -308,6 +318,16 @@ a.tb-btn { text-decoration: none; }
 .tree-sub { padding-left: 26px; }
 .tree-leaf-sub { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; color: var(--text-2); padding: 1px 4px; }
 .tree-leaf-sub .tree-name { color: var(--text-2); }
+/* 垂直行标题（v0.3 多行柜）：分区列表按行分组，行头比分区略重一点 */
+.tree-row-head {
+  font-size: 10px;
+  color: var(--muted);
+  letter-spacing: .3px;
+  padding: 3px 4px 1px;
+  border-top: 1px dashed var(--line);
+  margin-top: 2px;
+}
+.tree-row-head:first-child { border-top: none; margin-top: 0; }
 
 .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
 .dot-err { background: var(--danger); }

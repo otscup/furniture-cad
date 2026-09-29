@@ -427,16 +427,105 @@ export interface CabinetGeometry {
   layout: CabinetDerived;
 }
 
+/**
+ * 垂直行的**派生几何**（v0.3）。
+ *
+ * canonical：永远 ≥1 行，与 `layout.rows` 等长同序（自上而下，`[0]` 在最上面）。
+ * 单行柜 = 恰好一行，各字段与 v0.2 的柜级字段**逐值相等** → 旧行为逐位不变。
+ *
+ * ── 为什么"行的 Z 位置"必须由派生层给，而不是让 2D/3D 各自算 ──
+ *   行从下往上堆：底行的内空底面 = 内空底（bodyLift + 板厚），往上每跨一行加
+ *   `行净高 + 行隔板厚`。若正视图、内部图、侧视图、3D 各写一遍这个累加，
+ *   一旦某处漏加一块行隔板，图上就出现"上柜比实际矮 18mm"这类**看不出来的错**，
+ *   而清单仍是照派生给的板件做 —— 图料不一致正是本项目第一条铁律要防的东西。
+ */
+export interface DerivedRow {
+  id: string;
+  /**
+   * 该行结构板件 id 的**唯一性标签**：单行柜 = `''`（于是 id 与 v0.2 逐字相同，
+   * `P_cab_DIV1`），多行柜 = `R1_` / `R2_`…（`P_cab_R1_DIV1`）。
+   *
+   * 为什么在派生层定而不是各生成器各自拼：板件 id 同时出现在清单、分解图、
+   * 拾取线里；三处各拼一次就会出现"清单里叫 A、图上找不到 A"。
+   */
+  panelTag: string;
+  /** authored 高度：数字 = 固定净高，'fill' = 吃掉剩余内高 */
+  height: RowHeight;
+  /** 该行的分区（= authored units 的同一批对象引用，只读；不拷贝） */
+  units: UnitSpec[];
+  /** 该行净高（内空，**不含**行隔板） */
+  netH: number;
+  /** 该行净宽总和 = innerW − (该行分区数−1)×板厚 */
+  netTotal: number;
+  /** 该行各分区净宽（左→右），与 units 等长 */
+  nets: number[];
+  /** 该行各分区左边缘 X（局部坐标，含侧板） */
+  unitX0: number[];
+  /** 该行内空底面 Z（局部立面坐标，自地面起算） */
+  z0: number;
+  /** 该行内空顶面 Z = z0 + netH */
+  z1: number;
+}
+
+/**
+ * 行高链的解算结论 —— **合法性的唯一判定处**。
+ *
+ * 为什么把"判定"和"求解"放在同一个函数里（layout.ts 的 resolveRowHeights）：
+ *   若生成器按一种口径解、校验器按另一种口径判，两边一起错就永远发现不了
+ *   （校验器的铁律：校验"生成器的输出"，而不是"自己另算一遍"）。
+ *   所以这里只把结论带出来，校验器负责把它翻成人话报错。
+ */
+export interface RowHeightCheck {
+  ok: boolean;
+  /**
+   * 不合法时的原因码（ok=true 时缺省）：
+   *   FILL-NOT-LAST = 'fill' 出现在非最后一行；FILL-DUP = 多个 'fill'；
+   *   FILL-OVERFLOW = 固定行高之和已超过可用内高，'fill' 行没有空间；
+   *   SUM-MISMATCH  = 没有 'fill'，各固定行高之和不等于可用内高；
+   *   HEIGHT-BAD    = 某行高度不是正整数（解析层本该拦住，这里是最后一道）
+   */
+  code?: 'FILL-NOT-LAST' | 'FILL-DUP' | 'SUM-MISMATCH' | 'FILL-OVERFLOW' | 'HEIGHT-BAD';
+  /** 行数 */
+  rowCount: number;
+  /** 各固定行高之和（不含 'fill' 行） */
+  fixedSum: number;
+  /** 可用总高 = innerH − (行数−1)×板厚 */
+  available: number;
+  /** 固定行高之和 − 可用总高（正数 = 超了这么多 mm） */
+  diff: number;
+  /** 'fill' 行的索引；−1 = 没有 'fill' 或 'fill' 不止一个 */
+  fillIndex: number;
+  /** 'fill' 出现的次数（>1 即 FILL-DUP） */
+  fillCount: number;
+}
+
 export interface CabinetDerived {
   boardT: number;
   backT: number;
   bodyH: number;
   innerW: number;
   innerH: number;
+  /**
+   * ⚠️ 下列三个字段是**行的兼容视图**（= `rows[0]`，即最上面那一行）。
+   *
+   *   · 单行柜：`rows[0]` 就是整柜 → 与 v0.2 逐值相等，旧行为不变；
+   *   · 多行柜：只有 `rows[0]` 那一行的值 —— **不许拿它代表整柜**。
+   *     需要遍历全部行的地方（生成器/校验器/四视图/3D/拾取线）一律用 `rows`。
+   *     这是 P0 定下的口径：读侧以 canonical 行数组为权威，别处不再判断字段形状。
+   */
   netTotal: number;
   nets: number[];
   unitX0: number[];
   shelfDepth: number;
+  /** 垂直行派生（canonical，永远 ≥1 行，自上而下）。单行柜 = 一行 = 旧行为 */
+  rows: DerivedRow[];
+  /**
+   * 行隔板（贯通横隔板）Z 区间下沿，长度 = rows.length − 1。
+   * 墙板位置**不存** —— 由 `rows[i].z1` 立即得出（同一件事不给两个来源）。
+   */
+  rowDividers: number[];
+  /** 行高链解算结论（合法性判定唯一来源，见 RowHeightCheck） */
+  heightChain: RowHeightCheck;
   /**
    * 双面柜（type='double'）的派生骨架增量。row 柜为 undefined。
    * 前排占用 Y ∈ [midY0+midT, D]（前脸朝 +Y），后排占 Y ∈ [0, midY0]。

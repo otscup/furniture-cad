@@ -367,7 +367,7 @@ src/import/
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
 | **P0** 冻结与护栏 ✅**已完成** | 本文件定稿；冻结 v0.3 数据形状（`CabinetRow`/`layout.rows`）；`layoutModel.ts` 建 canonical 口径；`projectFile` 读写两侧接上；`verify/migration-acceptance.ts` 56 条断言。详见 §15 | 旧文件逐字节往返（sha256 相等）；**零行为变更**，全量回归绿 |
-| **P1** 垂直维度（表结构） | `computeCabinetLayout` 多行 + 行隔板/行内立板/行内门抽层板 + 高度链断言 + views/3D 最小增量 + `rows` 写路径登记 + `schemaVersion → 0.3` | **Case 1/2/4 全绿**（创建/修改/重算/2D/3D/DXF/校验 七件事都过） |
+| **P1** 垂直维度 ✅**已完成** | `computeCabinetLayout` 多行 + 行隔板/行内立板/行内门抽层板 + 高度链断言 + views/3D 最小增量 + `rows` 写路径登记（**`schemaVersion` 仍未升 0.3，见 §16.4**） | **Case 1/2/4 全绿**；`verify:rows` 101 条断言；全量回归绿。详见 §16 |
 | **P2** 组合关系层 | `Assembly` + `Connection` + `assembly.*` 动作 + 转角校验改用 `Connection`（保留原推断为兜底） | **Case 5/6 全绿**；原 `corner.ts` 断言不回归 |
 | **P3** AI 设计阶段 | `/api/ai/design` + `DesignProposal` 契约与校验器 + `compileProposal` + 界面确认流 + `design.*` 动作 | **`verify/proposal-acceptance`** + 一次端到端"大白话 → 提案 → 确认 → 落模型 → 出 DXF" |
 | **P4** 导入骨架 | `src/import/{types,normalize,json,dxf,kujiale}` + `project.import` 命令 + `Provenance` | **`verify/import-acceptance`**；`kujiale` 明示"未实现" |
@@ -431,4 +431,60 @@ src/import/
 - **引用级**：单行柜的 `canonicalUnits(layout)` 与 `layout.units` **逐项同一对象**（没拷贝、没重排），这正是"P1 可以用 canonical 替换旧取值而不改变行为"的前提。
 - **负样本**：9 类非法行**全部被拒且报错文案匹配**（`rejectWhy` 精确到原因）—— 曾经只断言"被拒了"，那会让 A 处的检查替 B 处背锅；本次已把判据升级为"因对的原因被拒"，并**临时关掉行校验分支确认 14 条断言真的转红**后才恢复。
 
+---
 
+## 16. P1 实施记录（已完成）
+
+### 16.1 交付物（按"链路位置"分组，而不是按文件名排序）
+
+| 层 | 文件 | 变更 |
+|---|---|---|
+| **形状/口径** | `core/layoutModel.ts` | 新增写路径单点 `unitPathPrefix(layout, rowIndex)` + `unitsAtPath()` + `UNITS_PATH`/`BACK_UNITS_PATH`。**全项目仍然只有这一个文件知道 `rows`/`units` 两种文件形状。** |
+| **派生** | `core/geometry/layout.ts` | 新增 `resolveRowHeights()`（高度维度唯一分配实现 + 合法判定同处）、`allocateRowWidths()`（**每行独立**分宽）；`computeCabinetLayout` 重写为「行来源 → 解行高 → 自下而上定 `z0` → 逐行分宽」。新增 `rows[] / rowDividers[] / heightChain`。 |
+| **派生** | `core/types.ts` | `DerivedRow`（含 `panelTag`）、`RowHeightCheck`（含 `fillCount`）、`CabinetDerived.rows/rowDividers/heightChain`。柜级 `netTotal/nets/unitX0` 标注为"第一行的兼容视图"。 |
+| **生成器** | `core/geometry/generate.ts` | 中立板**逐行**（长度 = 该行净高、id 前缀 = `panelTag`）；新增行隔板 `RowDividerPanel`（长度 = 内空宽、Z = 派生给的 `rowDividers`）；层板/门/抽/电器/杆全部按行参数化（`zOffset`）。 |
+| **校验** | `core/rules/validate.ts` | 宽度链改**逐行**断言；新增高度链断言；`heightChain.code` → `RULE-ROW-FILL-DUP / FILL-POSITION / FILL-OVERFLOW / HEIGHT-SUM / HEIGHT-BAD`；新增 `RULE-ROW-DOUBLE-UNSUPPORTED`。 |
+| **文案** | `core/rules/issueCatalog.ts` | 新增 6 张规则卡片；一键修复的写路径改由 `baseOf(ctx)` 生成（多行时自动落到 `layout.rows[j].units`）。 |
+| **2D** | `core/geometry/views.ts` | 四视图全部改**面对行数组**（`rowCtxs`）：俯视中立板取逐行并集、侧视逐行虚线 + 行隔板横板、正视/内部图逐行定位与标注。不读 `rows` 字段，只读 `L.rows`。 |
+| **3D** | `core/geometry/bodies3d.ts` | `BoxRole` 加 `'rowDivider'`；逐行绘制 + 行隔板盒；层板/门/抽/电器/杆按行换算。 |
+| **装配** | `core/geometry/assembly.ts` | `unitIndexOf` 升级为 `locateUnit`（**跨行**定位，返回 `{rowIndex,unitIndex,z0,netH}`）；摆位按所在行的 `z0/netH` 算；`RowDividerPanel` 进入分解计划。 |
+| **拾取** | `core/geometry/pickLines.ts` | `partParamPath` / `pickPartsOf` / 正视图 / 侧俯视图全部按行生成写路径与线（`unitPathPrefix`）。 |
+| **命令** | `core/commands.ts`、`core/commandBus.ts` | `setUnitWidth/Int/String` 增可选尾参 `unitBasePath`；白名单增 `layout.rows[\d+].units[\d+]…` 全系列；`addUnit/removeUnit/mirror` 增可选 `rowIndex`（默认 0 = 单行/第一行），多行柜**不会**静默改错行。 |
+| **拖动** | `viewport/sheetDrag.ts` | 分区分界/门缝拖动按 `PickLine` 自带的写路径前缀发命令。 |
+| **AI** | `ai/compile.ts`、`ai/snapshot.ts` | `resolveUnitIndex` 跨行解析；`cabinet.addUnit` 支持 `rowIndex`；快照新增 **`rows` 字段（仅多行时出现，单行柜快照一个字节不变）**。AI 仍然**只出语义**，不碰几何/坐标/DXF。 |
+| **UI** | `ui/panels/PropertiesPanel.tsx`、`ui/panels/ObjectTree.tsx`、`styles.css` | 属性面板按行分组（行头显示"净高 / fill"并可改，行内分区编辑器带写路径前缀）；对象树多行时画行头。 |
+| **其它消费点** | `core/variants.ts`、`core/rules/corner.ts`、`export/roomBook.ts` | 一律改走 `layoutRows/canonicalUnits/allUnits` —— 消除"直接读 `layout.units` 在多行柜下拿到空数组"的隐患。 |
+| **验收** | `verify/rows-acceptance.ts`（**新建**，101 条） | 见 §16.3。已接入 `verify:all`。 |
+
+### 16.2 核心计算逻辑（三句话）
+
+1. **行高**：`available = innerH − (行数−1)×板厚`；固定行按 authored 值，`'fill'` 行吃掉 `available − Σ固定`。恒等式 `Σ行净高 + (行数−1)×板厚 === innerH`。`'fill'` **只能一个、只能在最后一行**，非法时给 best-effort 布局（每行净高 ≥1mm，不返回 NaN）+ 原因码，由校验器翻人话。
+2. **行位置**：行序**自上而下**（`rows[0]` 在最上面），`z0` 从内空底自下而上累加 `净高 + 板厚`。`rowDividers[k] = rows[k+1].z1` —— 隔板位置与行高**同源**，不可能漂。
+3. **行宽**：**每行独立**执行已有的 `allocateWidths`。不展平：展平会让"上行 2 格 + 下行 3 格"算成 5 格分同一段净宽，而宽度链恒等式在整柜口径下照样成立 —— 错得毫无征兆。验收里有专门的**展平反例**断言"逐行算 ≠ 展平算"。
+
+### 16.3 `verify:rows` 的 101 条断言（对应用户给的清单）
+
+| 组 | 覆盖 | 条数要点 |
+|---|---|---|
+| ① 单行回归 | 旧形状（只有 `units`）vs 新形状（显式一行 `rows`） | 骨架 7 个标量、nets/unitX0、板件清单、五金、统计、平面图元、立面图元、四视图图元/标注/拾取线、3D 盒、**中立导出（DXF 唯一源）** 逐值相等；存盘塌回 `units` 不写 `rows` |
+| ② 两行固定 + fill | `rows[0]=480 / rows[1]='fill'` | 净高、`z` 相邻关系（底行顶面 + 板厚 = 上行底面）、`panelTag` 分行、`rowDividers` 恰好 1 块 |
+| ③ 高度链恒等式 | 2/3/4 行 + 全固定高闭合 | `ΣnetH + (n−1)t === innerH`；`z1−z0 === netH`；行间只隔一块板厚 |
+| ④ fill 规则 | 位置/重复/溢出/和不等/非法值 | 判定码精确到 `FILL-NOT-LAST / FILL-DUP / FILL-OVERFLOW / SUM-MISMATCH / HEIGHT-BAD`，校验器报对应 `RULE-ROW-*` 且 **ERROR**；非法配置仍画得出（净高 ≥1mm） |
+| ⑤ 行间横隔板 | 数量 = 行数−1、长度 = 内空宽、Z = 派生值 | 且**中立板长度 = 该行净高**（不是整柜净高 → 上层中立板不会捅穿顶板） |
+| ⑥ 每行独立分宽 | 逐行宽度链 + **展平反例** | 展平结果与逐行结果**必须不相等** |
+| ⑦ Case 1 / 2 / 4 | 同一套机制 | 三例都断言：行数/分区数、高度链闭合、**无 ERROR**、行隔板数、四视图非空、3D 行隔板盒数 |
+| ⑧ 2D/3D/DXF/BOM 一致性 | 四处说同一件事 | BOM 行隔板数 === 3D 行隔板数 === 行数−1；2D 侧视按 `rowDividers` 画；3D 盒 Z 中心 = 派生 Z + 半板厚；中立导出与四视图同源 |
+| ⑨ 写路径 | 单行沿用 `layout.units`，多行落 `layout.rows[j].units` | 含"改第 2 行的净宽真的落在第 2 行"的**端到端命令**断言 |
+
+### 16.4 P1 的三处有意偏离 / 已知边界（需你知晓）
+
+1. **`schemaVersion` 仍未升 `0.3`。** 与 §15.3-1 同一个理由：版本号跟着内容走。P1 里只有"用户真的创建了多行柜"才会写出 `rows`，而当前 UI 尚无"新增行"的入口（属性面板能改行高，但**新增/删除行**没有做 —— 那是 P1 之后、与 AI 行级动作一起给的形状变更入口）。等真正有写 `rows` 的用户路径时再升版并补迁移。
+2. **多行 × 双面柜（岛台）明确不支持**，报 `RULE-ROW-DOUBLE-UNSUPPORTED` ERROR。这两者的几何语义（背面排按行切还是按整柜切）没有真实需求支撑，现在给任何答案都是猜；**宁可明确拒绝，不可猜一个未定义的几何**。
+3. **AI 不参与 P1 的新结构设计**（按你的要求）：快照里新增的 `rows` 字段只是让 AI **看得见**多行（否则它会以为柜子只有几分区），没有新增任何 row 级 AI 动作；`cabinet.addUnit` 的 `rowIndex` 是给后续阶段留的通道，当前契约未开放给模型。
+
+### 16.5 回归判据
+
+- 全量 node 链 **27/27 脚本 exit=0**（含新增 `verify:rows` 101 条）。
+- `verify:migration` **56/56**、`verify:quota` **38/38**、`tsc --noEmit` 无错。
+- `verify:ui` **661/661 通过**（与 P1 之前的基线逐条相同，未新增也未放宽）。
+- **旧断言一条未删、未放宽**：本次对旧脚本零改动（除 `package.json` 接入 `verify:rows`）。

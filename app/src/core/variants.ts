@@ -5,6 +5,7 @@ import { buildCabinetViews } from './geometry/views.ts';
 import { validateCabinet } from './rules/validate.ts';
 import { candidateSpots } from './snapPlace.ts';
 import { nextId } from './ids.ts';
+import { allUnits, canonicalUnits, layoutRows } from './layoutModel.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -138,13 +139,24 @@ function mergeIssues(a: Issue[], b: Issue[]): Issue[] {
 }
 
 function summarize(cab: Cabinet): string {
-  const us = cab.layout.units;
-  const names = us.map((u) => `${u.nickname ?? defaultNickname(u.kind)} ${u.requestedWidth}`).join(' / ');
-  const doors = us
-    .filter((u) => u.doors)
-    .map((u) => `${u.nickname ?? defaultNickname(u.kind)} ${u.doors!.count} 扇`)
+  /**
+   * 走 canonical 读法（`layoutRows` / `allUnits`）：
+   * 多行柜按约定不写 `units` 镜像，直接读 `cab.layout.units` 会拿到 `undefined`
+   * → 在方案对比面板里抛异常（整个面板打不开）。单行柜下这与原来的取法逐位相同。
+   * 多行时把行号带进文案 —— 否则"5 个分区"会被读成"一整排 5 格"。
+   */
+  const rows = layoutRows(cab.layout);
+  const multi = rows.length > 1;
+  const us = allUnits(cab.layout);
+  const tag = (u: UnitSpec, ri: number): string => `${multi ? `R${ri + 1} ` : ''}${u.nickname ?? defaultNickname(u.kind)}`;
+  const names = rows.flatMap((r, ri) => r.units.map((u) => `${tag(u, ri)} ${u.requestedWidth}`)).join(' / ');
+  const doors = rows
+    .flatMap((r, ri) => r.units.map((u) => ({ u, ri })))
+    .filter((x) => x.u.doors)
+    .map((x) => `${tag(x.u, x.ri)} ${x.u.doors!.count} 扇`)
     .join('、');
-  return `${us.length} 个分区：${names}　门：${doors || '无门板'}`;
+  const count = multi ? `${rows.length} 行 ${us.length} 个分区` : `${us.length} 个分区`;
+  return `${count}：${names}　门：${doors || '无门板'}`;
 }
 
 /**
@@ -233,12 +245,12 @@ export function adoptVariant(draft: VariantDraft, project: Project): Cabinet {
   for (const c of project.cabinets) taken.add(c.id);
   for (const r of project.rooms) for (const w of r.walls) taken.add(w.id);
   for (const r of project.rooms) taken.add(r.id);
-  for (const c of project.cabinets) for (const u of c.layout.units) taken.add(u.id);
+  for (const c of project.cabinets) for (const u of allUnits(c.layout)) taken.add(u.id);
 
   const cabId = nextId('cab', taken);
   taken.add(cabId);
 
-  const units = draft.cabinet.layout.units.map((u) => {
+  const units = canonicalUnits(draft.cabinet.layout).map((u) => {
     const uid = nextId('unit', taken);
     taken.add(uid);
     return { ...u, id: uid };

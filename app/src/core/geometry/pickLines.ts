@@ -25,6 +25,7 @@
 import type { Cabinet, Vec2, CabinetDerived, RuleSet } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import { drawerCellHeights } from './layout.ts';
+import { UNITS_PATH, isMultiRow, layoutRows, unitPathPrefix } from '../layoutModel.ts';
 
 /**
  * 语义部件：闭合词汇表，契约与编译器都按这份清单校验
@@ -55,8 +56,16 @@ export const PART_ZH: Record<CabinetPart, string> = {
   'drawer.divider': '抽屉分格线',
 };
 
-/** 每个部件"由哪个参数决定"的映射 —— 编译器用它校验 AI 改的路径与部件一致 */
-export function partParamPath(part: CabinetPart, unitIndex: number): string {
+/**
+ * 每个部件"由哪个参数决定"的映射 —— 编译器用它校验 AI 改的路径与部件一致。
+ *
+ * `basePath` 是**该分区所在那一排**的写路径前缀（见 layoutModel.unitPathPrefix）：
+ *   · 单行柜 ⇒ `layout.units`（与 v0.2 逐字相同）
+ *   · 多行柜 ⇒ `layout.rows[j].units`
+ * 默认值让旧调用（只传两个参数）行为不变；一旦柜体分了行，调用方必须显式传入，
+ * 否则会出现"点的是第 2 行的层板、改的是第 1 行"这种安静改错对象的命令。
+ */
+export function partParamPath(part: CabinetPart, unitIndex: number, basePath: string = UNITS_PATH): string {
   switch (part) {
     case 'outer.width':
       return 'params.width';
@@ -67,13 +76,13 @@ export function partParamPath(part: CabinetPart, unitIndex: number): string {
     case 'bodyLift':
       return 'params.bodyLift';
     case 'unit.divider':
-      return `layout.units[${unitIndex}].requestedWidth`;
+      return `${basePath}[${unitIndex}].requestedWidth`;
     case 'door.gapMid':
-      return `layout.units[${unitIndex}].doors.gapMid`;
+      return `${basePath}[${unitIndex}].doors.gapMid`;
     case 'shelf.line':
-      return `layout.units[${unitIndex}].shelves.count`;
+      return `${basePath}[${unitIndex}].shelves.count`;
     case 'drawer.divider':
-      return `layout.units[${unitIndex}].drawers.count`;
+      return `${basePath}[${unitIndex}].drawers.count`;
   }
 }
 
@@ -82,8 +91,14 @@ export interface PickLine {
   view: PickView;
   cabinetId: string;
   part: CabinetPart;
-  /** 部件落在哪个分区上（外轮廓/踢脚类为 0）—— 界面显示与编译校验都用 */
+  /** 部件落在**该行内**的哪个分区上（外轮廓/踢脚类为 0）—— 界面显示与编译校验都用 */
   unitIndex: number;
+  /**
+   * 该分区属于哪一行（`rows` 的行序，0 = 最上面）。
+   * 单行柜恒为 0 —— 此时 `unitIndex` 就是 `layout.units` 的下标，与 v0.2 一致。
+   * 多行柜里 `{rowIndex, unitIndex}` 才是分区的唯一坐标，**缺一个就会点到别的分区**。
+   */
+  rowIndex: number;
   /** AI 最终改的写路径 */
   paramPath: string;
   labelZh: string;
@@ -108,25 +123,41 @@ export type PickView = 'front' | 'side' | 'top' | 'internal';
  *
  * 注意这里**按部件去重**（不按视图展开）：同一个 'outer.width' 在正视图和俯视图上各有一条线，
  * 但它是同一个语义部件、同一条写路径。多视图是为了让用户在任意视图下都能点到它。
+ *
+ * 多行柜：逐行登记，去重键含 `rowIndex` —— 否则"第 1 行的第 2 分区"和"第 2 行的第 2 分区"
+ * 会被当成同一个部件，AI 说改后者时改到前者（本文件存在的理由就是不让这种事发生）。
  */
-export function pickPartsOf(cab: Cabinet): Array<{ part: CabinetPart; unitIndex: number; paramPath: string; labelZh: string }> {
-  const out: Array<{ part: CabinetPart; unitIndex: number; paramPath: string; labelZh: string }> = [];
+export function pickPartsOf(
+  cab: Cabinet
+): Array<{ part: CabinetPart; unitIndex: number; rowIndex: number; paramPath: string; labelZh: string }> {
+  const out: Array<{ part: CabinetPart; unitIndex: number; rowIndex: number; paramPath: string; labelZh: string }> = [];
   const seen = new Set<string>();
-  const push = (part: CabinetPart, unitIndex: number): void => {
-    const key = `${part}@${unitIndex}`;
+  const multi = isMultiRow(cab.layout);
+  const push = (part: CabinetPart, unitIndex: number, rowIndex: number): void => {
+    const basePath = unitPathPrefix(cab.layout, rowIndex);
+    const key = `${part}@${rowIndex}@${unitIndex}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part] });
+    out.push({
+      part,
+      unitIndex,
+      rowIndex,
+      paramPath: partParamPath(part, unitIndex, basePath),
+      labelZh: multi ? `R${rowIndex + 1} ${PART_ZH[part]}` : PART_ZH[part],
+    });
   };
-  push('outer.width', 0);
-  push('outer.height', 0);
-  push('outer.depth', 0);
-  push('bodyLift', 0);
-  for (let i = 0; i < cab.layout.units.length - 1; i++) push('unit.divider', i);
-  cab.layout.units.forEach((u, i) => {
-    if (u.doors && u.doors.count > 1) push('door.gapMid', i);
-    if (u.shelves && u.shelves.count > 0) push('shelf.line', i);
-    if (u.drawers && u.drawers.count > 1) push('drawer.divider', i);
+  push('outer.width', 0, 0);
+  push('outer.height', 0, 0);
+  push('outer.depth', 0, 0);
+  push('bodyLift', 0, 0);
+  const rows = layoutRows(cab.layout);
+  rows.forEach((r, ri) => {
+    for (let i = 0; i < r.units.length - 1; i++) push('unit.divider', i, ri);
+    r.units.forEach((u, i) => {
+      if (u.doors && u.doors.count > 1) push('door.gapMid', i, ri);
+      if (u.shelves && u.shelves.count > 0) push('shelf.line', i, ri);
+      if (u.drawers && u.drawers.count > 1) push('drawer.divider', i, ri);
+    });
   });
   return out;
 }
@@ -147,19 +178,23 @@ export function buildFrontPickLines(
   mapInt: Mapper
 ): PickLine[] {
   const out: PickLine[] = [];
-  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max'): void => {
-    out.push({ view, cabinetId: cab.id, part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part], pts, edge });
+  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max', rowIndex = 0): void => {
+    const basePath = unitPathPrefix(cab.layout, rowIndex);
+    out.push({
+      view,
+      cabinetId: cab.id,
+      part,
+      unitIndex,
+      rowIndex,
+      paramPath: partParamPath(part, unitIndex, basePath),
+      labelZh: PART_ZH[part],
+      pts,
+      edge,
+    });
   };
   const W = cab.params.width;
   const H = cab.params.height;
   const bodyLift = cab.params.bodyLift;
-  const t = L.boardT;
-  const innerBottomZ = bodyLift + t;
-  const innerTopZ = H - t;
-  const innerH = L.innerH;
-  const nets = L.nets;
-  const unitX0 = L.unitX0;
-  const units = cab.layout.units;
 
   // 外轮廓（正视图）：左右边 = 柜宽，上下边 = 柜高
   add('front', 'outer.width', 0, [mapFront(0, 0), mapFront(0, H)], 'min');
@@ -168,43 +203,59 @@ export function buildFrontPickLines(
   add('front', 'outer.height', 0, [mapFront(0, H), mapFront(W, H)], 'max');
   // 踢脚线：踢脚区的顶边
   add('front', 'bodyLift', 0, [mapFront(0, bodyLift), mapFront(W, bodyLift)], 'max');
-  // 分区中立板的竖线（内空段）
-  for (let i = 0; i < units.length - 1; i++) {
-    const x = unitX0[i] + nets[i];
-    add('front', 'unit.divider', i, [mapFront(x, innerBottomZ), mapFront(x, innerTopZ)]);
-  }
-  // 门扇中缝（正视图上有门的分区）
-  units.forEach((u, i) => {
-    if (!u.doors || u.doors.count <= 1) return;
-    const x0 = unitX0[i];
-    const x1 = x0 + nets[i];
-    const z0 = innerBottomZ + u.doors.gapOuter;
-    const z1 = innerBottomZ + innerH - u.doors.gapOuter;
-    for (let k = 1; k < u.doors.count; k++) {
-      const xk = x0 + ((x1 - x0) * k) / u.doors.count;
-      add('front', 'door.gapMid', i, [mapFront(xk, z0), mapFront(xk, z1)]);
+
+  /**
+   * 行内部件（分区中立板 / 门缝 / 层板线 / 抽屉分格线）——**逐行**登记。
+   *
+   * 三段循环各自的次序与 v0.2 完全一致（单行柜 `L.rows` 恰好一行 ⇒ 数组逐项相同），
+   * 多行柜只是多迭代几次。位置全部取自 `L.rows[j]`（canonical 派生量），
+   * 本模块不判断文件里存的是 `rows` 还是 `units`。
+   */
+  const rows = L.rows;
+
+  // 分区中立板的竖线（内空段，只跨本行净高）
+  rows.forEach((r, ri) => {
+    for (let i = 0; i < r.units.length - 1; i++) {
+      const x = r.unitX0[i]! + r.nets[i]!;
+      add('front', 'unit.divider', i, [mapFront(x, r.z0), mapFront(x, r.z0 + r.netH)], undefined, ri);
     }
   });
+  // 门扇中缝（正视图上有门的分区）
+  rows.forEach((r, ri) => {
+    r.units.forEach((u, i) => {
+      if (!u.doors || u.doors.count <= 1) return;
+      const x0 = r.unitX0[i]!;
+      const x1 = x0 + r.nets[i]!;
+      const z0 = r.z0 + u.doors.gapOuter;
+      const z1 = r.z0 + r.netH - u.doors.gapOuter;
+      for (let k = 1; k < u.doors.count; k++) {
+        const xk = x0 + ((x1 - x0) * k) / u.doors.count;
+        add('front', 'door.gapMid', i, [mapFront(xk, z0), mapFront(xk, z1)], undefined, ri);
+      }
+    });
+  });
   // 层板线 / 抽屉分格线画在内部结构图里（正视图上被门板挡住，点它就是自欺）
-  units.forEach((u, i) => {
-    const x0 = unitX0[i];
-    const x1 = x0 + nets[i];
-    if (u.shelves && u.shelves.count > 0) {
-      for (const pos of equalSpacing(innerH, u.shelves.count)) {
-        const z = innerBottomZ + pos;
-        add('internal', 'shelf.line', i, [mapInt(x0, z), mapInt(x1, z)]);
+  rows.forEach((r, ri) => {
+    r.units.forEach((u, i) => {
+      const x0 = r.unitX0[i]!;
+      const x1 = x0 + r.nets[i]!;
+      if (u.shelves && u.shelves.count > 0) {
+        for (const pos of equalSpacing(r.netH, u.shelves.count)) {
+          const z = r.z0 + pos;
+          add('internal', 'shelf.line', i, [mapInt(x0, z), mapInt(x1, z)], undefined, ri);
+        }
       }
-    }
-    if (u.drawers && u.drawers.count > 1) {
-      // 分格边界 = 上一格的顶面 + 让位缝（与 views.ts 侧视图/内部图画格的方式同一套推进）
-      const cellH = drawerCellHeights(u, innerH, rules);
-      let z = innerBottomZ + u.drawers.gap;
-      for (let k = 0; k < cellH.length - 1; k++) {
-        z += cellH[k];
-        add('internal', 'drawer.divider', i, [mapInt(x0, z), mapInt(x1, z)]);
-        z += u.drawers.gap;
+      if (u.drawers && u.drawers.count > 1) {
+        // 分格边界 = 上一格的顶面 + 让位缝（与 views.ts 侧视图/内部图画格的方式同一套推进）
+        const cellH = drawerCellHeights(u, r.netH, rules);
+        let z = r.z0 + u.drawers.gap;
+        for (let k = 0; k < cellH.length - 1; k++) {
+          z += cellH[k]!;
+          add('internal', 'drawer.divider', i, [mapInt(x0, z), mapInt(x1, z)], undefined, ri);
+          z += u.drawers.gap;
+        }
       }
-    }
+    });
   });
   return out;
 }
@@ -229,16 +280,24 @@ export function buildSideTopPickLines(
   mapTop: Mapper
 ): PickLine[] {
   const out: PickLine[] = [];
-  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max'): void => {
-    out.push({ view, cabinetId: cab.id, part, unitIndex, paramPath: partParamPath(part, unitIndex), labelZh: PART_ZH[part], pts, edge });
+  const add = (view: PickView, part: CabinetPart, unitIndex: number, pts: Vec2[], edge?: 'min' | 'max', rowIndex = 0): void => {
+    const basePath = unitPathPrefix(cab.layout, rowIndex);
+    out.push({
+      view,
+      cabinetId: cab.id,
+      part,
+      unitIndex,
+      rowIndex,
+      paramPath: partParamPath(part, unitIndex, basePath),
+      labelZh: PART_ZH[part],
+      pts,
+      edge,
+    });
   };
   const W = cab.params.width;
   const H = cab.params.height;
   const D = cab.params.depth;
   const bodyLift = cab.params.bodyLift;
-  const units = cab.layout.units;
-  const nets = L.nets;
-  const unitX0 = L.unitX0;
 
   // ── 侧视图框架：横向跨度 = 柜深，纵向跨度 = 柜高 ──
   add('side', 'outer.height', 0, [mapSide(0, H), mapSide(D, H)], 'max');
@@ -255,18 +314,23 @@ export function buildSideTopPickLines(
   add('top', 'outer.depth', 0, [mapTop(0, D), mapTop(W, D)], 'max');
   add('top', 'outer.depth', 0, [mapTop(0, 0), mapTop(W, 0)], 'min');
   // 中立板与门扇缝在俯视图上同样画出来了 —— 横跨进深方向，**横向拖动**改分区比例 / 中缝间隙
-  for (let i = 0; i < units.length - 1; i++) {
-    const x = unitX0[i] + nets[i];
-    add('top', 'unit.divider', i, [mapTop(x, 0), mapTop(x, D)]);
-  }
-  units.forEach((u, i) => {
-    if (!u.doors || u.doors.count <= 1) return;
-    const x0 = unitX0[i];
-    const x1 = x0 + nets[i];
-    for (let k = 1; k < u.doors.count; k++) {
-      const xk = x0 + ((x1 - x0) * k) / u.doors.count;
-      add('top', 'door.gapMid', i, [mapTop(xk, 0), mapTop(xk, D)]);
+  // 逐行登记：多行柜里上下两行的分界线落在不同 X（与 views.ts 俯视图"逐行取并集"同源）
+  L.rows.forEach((r, ri) => {
+    for (let i = 0; i < r.units.length - 1; i++) {
+      const x = r.unitX0[i]! + r.nets[i]!;
+      add('top', 'unit.divider', i, [mapTop(x, 0), mapTop(x, D)], undefined, ri);
     }
+  });
+  L.rows.forEach((r, ri) => {
+    r.units.forEach((u, i) => {
+      if (!u.doors || u.doors.count <= 1) return;
+      const x0 = r.unitX0[i]!;
+      const x1 = x0 + r.nets[i]!;
+      for (let k = 1; k < u.doors.count; k++) {
+        const xk = x0 + ((x1 - x0) * k) / u.doors.count;
+        add('top', 'door.gapMid', i, [mapTop(xk, 0), mapTop(xk, D)], undefined, ri);
+      }
+    });
   });
   return out;
 }

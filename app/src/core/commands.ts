@@ -1,6 +1,7 @@
-import type { Cabinet, Room, UnitSpec, Wall } from './types.ts';
+import type { Cabinet, Room, RowHeight, UnitSpec, Wall } from './types.ts';
 import type { Change, Command, CommandSource } from './commandBus.ts';
 import { newCommandId } from './ids.ts';
+import { ROW_HEIGHT_FILL, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -59,8 +60,14 @@ export function rotateCabinet(cab: Cabinet, deg: number, source: CommandSource =
  * 门扇按等分跟随分区翻转，铰链是五金型号（无左右向）不用动。
  * 单分区柜体没有"左右"可翻 —— 总线拒绝，UI 提示而不是静默成功。
  */
-export function mirrorCabinet(cab: Cabinet, source: CommandSource = 'ui'): Command {
-  return cmd('cabinet.mirror', source, cabTarget(cab.id), [], `镜像「${cab.name}」（分区左右反序）`);
+/**
+ * 镜像柜体：分区左右反序（语义镜像，不是几何镜像）。
+ * `rowIndex` 同 addUnit：多行柜必须指明翻哪一行（缺省会被 CommandBus 拒绝）。
+ */
+export function mirrorCabinet(cab: Cabinet, source: CommandSource = 'ui', rowIndex?: number): Command {
+  const c = cmd('cabinet.mirror', source, cabTarget(cab.id), [], `镜像「${cab.name}」（分区左右反序）`);
+  if (rowIndex !== undefined) c.payload = { rowIndex };
+  return c;
 }
 
 /**
@@ -119,23 +126,45 @@ export function renameCabinet(cab: Cabinet, name: string, source: CommandSource 
 
 // ───────────── 柜体：分区 ─────────────
 
-export function setUnitWidth(cab: Cabinet, index: number, width: number, source: CommandSource = 'ui'): Command {
-  const u = cab.layout.units[index];
+export function setUnitWidth(
+  cab: Cabinet,
+  index: number,
+  width: number,
+  source: CommandSource = 'ui',
+  unitBasePath: string = unitPathPrefix(cab.layout, 0)
+): Command {
+  const u = unitsAtPath(cab.layout, unitBasePath)[index];
   return cmd('cabinet.layout', source, cabTarget(cab.id), [
-    { path: `layout.units[${index}].requestedWidth`, op: 'set', value: Math.round(width), unit: 'mm' },
+    { path: `${unitBasePath}[${index}].requestedWidth`, op: 'set', value: Math.round(width), unit: 'mm' },
   ], `「${cab.name}·${u?.nickname ?? u?.id ?? index}」净宽 → ${Math.round(width)}mm`);
 }
 
-export function setUnitInt(cab: Cabinet, index: number, relPath: string, value: number, label: string, source: CommandSource = 'ui'): Command {
+export function setUnitInt(
+  cab: Cabinet,
+  index: number,
+  relPath: string,
+  value: number,
+  label: string,
+  source: CommandSource = 'ui',
+  unitBasePath: string = unitPathPrefix(cab.layout, 0)
+): Command {
   return cmd('cabinet.layout', source, cabTarget(cab.id), [
-    { path: `layout.units[${index}].${relPath}`, op: 'set', value: Math.round(value) },
+    { path: `${unitBasePath}[${index}].${relPath}`, op: 'set', value: Math.round(value) },
   ], `「${cab.name}」${label}`);
 }
 
 /** 分区上的字符串字段（昵称、kind） */
-export function setUnitString(cab: Cabinet, index: number, relPath: string, value: string, label: string, source: CommandSource = 'ui'): Command {
+export function setUnitString(
+  cab: Cabinet,
+  index: number,
+  relPath: string,
+  value: string,
+  label: string,
+  source: CommandSource = 'ui',
+  unitBasePath: string = unitPathPrefix(cab.layout, 0)
+): Command {
   return cmd('cabinet.layout', source, cabTarget(cab.id), [
-    { path: `layout.units[${index}].${relPath}`, op: 'set', value },
+    { path: `${unitBasePath}[${index}].${relPath}`, op: 'set', value },
   ], `「${cab.name}」${label}`);
 }
 
@@ -145,6 +174,28 @@ export function setWidthMode(cab: Cabinet, mode: 'fit_total' | 'fit_units', sour
   ], `「${cab.name}」总宽策略 → ${mode}`);
 }
 
+// ───────────── 柜体：垂直行（v0.3） ─────────────
+
+/**
+ * 改某一行的**净高** —— v0.3 引入"行"之后新增的**唯一** authored 行字段。
+ *
+ * `height` 只有两个合法形态：
+ *   · 数字 = 该行固定净高（mm）；
+ *   · `'fill'` = 吃掉剩余内高（多行柜的**唯一自由项**，且必须落在最后一行）。
+ * 两者共用同一条写路径，因为它们是同一个字段的两个取值 ——
+ * 如果拆成两条路径，高度链的判定就得在两处各写一遍。
+ *
+ * ⚠ 只对**已有 rows** 的柜体有效：单行柜的文件里根本没有 `rows` 这一层，
+ * 写这条路径会被 CommandBus 的"不许凭空创建结构"拦下（见 setByPath）。
+ * 也就是说"把单行柜变成多行柜"在本阶段**不是一条命令能做出来的事** ——
+ * 那属于结构设计（P2），P1 只保证多行结构一旦存在就被正确地派生。
+ */
+export function setRowHeight(cab: Cabinet, rowIndex: number, height: RowHeight, source: CommandSource = 'ui'): Command {
+  return cmd('cabinet.layout', source, cabTarget(cab.id), [
+    { path: `layout.rows[${rowIndex}].height`, op: 'set', value: height },
+  ], `「${cab.name}」第 ${rowIndex + 1} 行高 → ${height === ROW_HEIGHT_FILL ? '吃掉剩余内高' : `${height}mm`}`);
+}
+
 /** 柜体 params 上的枚举/字符串字段（材质 ID、背板方式…） */
 export function setCabinetParam(cab: Cabinet, relPath: string, value: string, label: string, source: CommandSource = 'ui'): Command {
   return cmd('cabinet.update', source, cabTarget(cab.id), [
@@ -152,26 +203,32 @@ export function setCabinetParam(cab: Cabinet, relPath: string, value: string, la
   ], `「${cab.name}」${label}`);
 }
 
-export function addUnit(cabId: string, cabName: string, unit: UnitSpec, source: CommandSource = 'ui'): Command {
+/**
+ * 新增分区。
+ * `rowIndex` 只在**多行柜**上需要（单行柜不要传，避免给旧命令加无意义的载荷字段）：
+ * 多行柜不传就会被 CommandBus 拒绝 —— 因为"加到哪一行"没有合理缺省，
+ * 猜错的后果是分区加到了别的楼层，而界面上显示的是"新增成功"。
+ */
+export function addUnit(cabId: string, cabName: string, unit: UnitSpec, source: CommandSource = 'ui', rowIndex?: number): Command {
   return {
     id: newCommandId('cabinet.layout.addUnit'),
     op: 'cabinet.layout.addUnit',
     source,
     target: cabTarget(cabId),
     changes: [],
-    payload: { unit },
+    payload: rowIndex === undefined ? { unit } : { unit, rowIndex },
     label: `「${cabName}」新增分区 ${unit.nickname ?? unit.id}`,
   };
 }
 
-export function removeUnit(cabId: string, cabName: string, unitId: string, source: CommandSource = 'ui'): Command {
+export function removeUnit(cabId: string, cabName: string, unitId: string, source: CommandSource = 'ui', rowIndex?: number): Command {
   return {
     id: newCommandId('cabinet.layout.removeUnit'),
     op: 'cabinet.layout.removeUnit',
     source,
     target: cabTarget(cabId),
     changes: [],
-    payload: { unitId },
+    payload: rowIndex === undefined ? { unitId } : { unitId, rowIndex },
     label: `「${cabName}」删除分区 ${unitId}`,
   };
 }

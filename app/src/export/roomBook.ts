@@ -22,6 +22,7 @@ import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/typ
 import { generateProject } from '../core/geometry/project.ts';
 import { buildCabinetViews } from '../core/geometry/views.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
+import { allUnits } from '../core/layoutModel.ts';
 
 // ─────────────────────────── SVG（Y 向上 CAD → Y 向下 SVG）───────────────────────────
 
@@ -144,7 +145,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
   const buildCab = (cab: Cabinet, index: number): RoomBookCabinet => {
     const g = geom.cabinets[cab.id]!;
     const vs = buildCabinetViews(cab, rules);
-    const doorUnit = cab.layout.units.find((u) => u.doors);
+    const doorUnit = allUnits(cab.layout).find((u) => u.doors);
     const doorMatName = doorUnit?.doors?.material ? (rules.materials[doorUnit.doors.material]?.name ?? doorUnit.doors.material) : null;
     return {
       id: cab.id,

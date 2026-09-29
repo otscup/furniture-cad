@@ -1,4 +1,5 @@
 import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
+import { canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -87,7 +88,18 @@ export interface AiCabinetView {
   layout: {
     type: 'row' | 'double';
     widthMode: 'fit_total' | 'fit_units';
+    /**
+     * 单行柜 = 该行的分区；多行柜 = **最上面那一行**（兼容旧读法）。
+     * 多行柜的真实结构在 `rows` 里 —— 两者必须一起看，只看 `units` 会漏掉下面的行。
+     */
     units: AiUnitView[];
+    /**
+     * 垂直行（v0.3）。**单行柜为 null**（快照与 v0.2 逐字节相同，AI 的提示词不受影响）。
+     * 多行柜 = 自下而上？不：`[0]` 是**最上面**那一行（与模型同序），逐行列出高度与分区 ——
+     * 少了这个字段，模型会以为柜体只有 `units` 里那几分区，
+     * 于是"把下面那层的抽屉加到 4 个"这种话它根本没对象可指。
+     */
+    rows: Array<{ index: number; height: number | 'fill'; units: AiUnitView[] }> | null;
     /** 仅 type='double'：背面分区（岛台的背面排） */
     backUnits: AiUnitView[] | null;
   };
@@ -179,7 +191,21 @@ function cabinetView(cab: Cabinet, i: number): AiCabinetView {
     layout: {
       type: cab.layout.type,
       widthMode: cab.layout.widthMode,
-      units: cab.layout.units.map((u, j) => unitView(u, j)),
+      /**
+       * ⚠ 必须走 canonical 读取：多行柜按约定**不写 `units` 镜像**（见 layoutModel.toFileLayout），
+       * 直接读 `cab.layout.units` 会是 `undefined` —— 旧的 `!units` 判断会在这里直接抛异常，
+       * 而快照抛异常等于"整个 AI 面板打不开"。
+       */
+      units: canonicalUnits(cab.layout).map((u, j) => unitView(u, j)),
+      /**
+       * 垂直行：**只在真的多行时出现**（单行柜 = null）。
+       * 于是单行柜的快照逐字节不变（旧断言、旧提示词、旧 token 预算都不动），
+       * 而多行柜的每一行都如实摆出来 —— AI 至少能"看见"自己看不见的东西，
+       * 不会被误导成"这个柜子只有 units 里那几分区"。
+       */
+      rows: isMultiRow(cab.layout)
+        ? layoutRows(cab.layout).map((r, ri) => ({ index: ri + 1, height: r.height, units: r.units.map((u, j) => unitView(u, j)) }))
+        : null,
       backUnits: cab.layout.backUnits ? cab.layout.backUnits.map((u, j) => unitView(u, j)) : null,
     },
   };

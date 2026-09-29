@@ -3,6 +3,7 @@ import { getCabinetFootprint } from '../geometry/generate.ts';
 import { bboxOf, polyLocalToWorld } from '../geometry/transform.ts';
 import { computeCabinetLayout, doorWidths } from '../geometry/layout.ts';
 import { buildIssue } from './issueCatalog.ts';
+import { canonicalUnits } from '../layoutModel.ts';
 
 /**
  * ════════════════════════════════════════════════════════════════════
@@ -131,7 +132,7 @@ function checkSwing(
     }
   }
   if (unitIdx < 0) unitIdx = innerLocalX <= W / 2 ? 0 : nUnits - 1;
-  const u = src.layout.units[unitIdx];
+  const u = canonicalUnits(src.layout)[unitIdx];
   if (!u || !u.doors) return;
   const widths = doorWidths(u, L.nets[unitIdx]!, rules);
   const radius = Math.max(...widths);

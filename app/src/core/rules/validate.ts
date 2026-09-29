@@ -1,5 +1,6 @@
-import type { Cabinet, CabinetGeometry, Issue, RuleSet } from '../types.ts';
+import type { Cabinet, CabinetGeometry, Issue, RuleSet, UnitSpec } from '../types.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights, backPanelSize } from '../geometry/layout.ts';
+import { BACK_UNITS_PATH, isMultiRow, layoutRows, unitPathPrefix } from '../layoutModel.ts';
 import { buildIssue, type IssueCtx } from './issueCatalog.ts';
 
 /**
@@ -36,12 +37,55 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
   assertEq('内空高 + 2×板厚 = 箱体高', L.innerH + 2 * t, L.bodyH, 'innerH + 2t = bodyH');
   assertEq('内空宽 + 2×板厚 = 总宽', L.innerW + 2 * t, p.width, 'innerW + 2t = width');
 
-  const chainW = t + L.nets.reduce((a, b) => a + b, 0) + (L.nets.length - 1) * t + t;
-  assertEq('宽度链', chainW, p.width, 't + Σ净宽 + (n-1)t + t = width');
+  /**
+   * 宽度链 **逐行** 断言：每行独立分配净宽，所以每行都有自己的宽度链。
+   * 单行柜下标签与 v0.2 逐字相同（多行才带"第 N 行"）。
+   */
+  L.rows.forEach((r, i) => {
+    const chainW = t + r.nets.reduce((a, b) => a + b, 0) + (r.nets.length - 1) * t + t;
+    assertEq(L.rows.length > 1 ? `宽度链（第${i + 1}行）` : '宽度链', chainW, p.width, 't + Σ净宽 + (n-1)t + t = width');
+  });
+
+  /**
+   * 高度链：`Σ(行净高) + (行数−1)×板厚 === 内空高`。
+   *
+   * 只在行高配置**合法**时断言 —— 配置本身不合法时那已经是一条设计报错
+   * （RULE-ROW-*），再叠一条"程序自检没过"只会把设计问题说成程序缺陷，
+   * 让用户拿着一条"这是程序缺陷"的报错来找我们。
+   */
+  if (L.heightChain.ok) {
+    const sumH = L.rows.reduce((a, r) => a + r.netH, 0) + Math.max(0, L.rows.length - 1) * t;
+    assertEq('高度链', sumH, L.innerH, 'Σ行净高 + (行数−1)×板厚 = innerH');
+  }
+
+  // ── 行高配置的设计报错（判定来自派生层的 heightChain，见 layout.ts）──
+  const hc = L.heightChain;
+  const rowCtx = { rowCount: hc.rowCount, boardT: t, available: hc.available, fixedSum: hc.fixedSum, diff: hc.diff };
+  if (hc.code === 'FILL-DUP') {
+    emit('RULE-ROW-FILL-DUP', cab.id, 'cabinet', { ...rowCtx, fillCount: hc.fillCount });
+  } else if (hc.code === 'FILL-NOT-LAST') {
+    emit('RULE-ROW-FILL-POSITION', cab.id, 'cabinet', { ...rowCtx, fillIndex: hc.fillIndex });
+  } else if (hc.code === 'FILL-OVERFLOW') {
+    emit('RULE-ROW-FILL-OVERFLOW', cab.id, 'cabinet', { ...rowCtx, over: hc.diff });
+  } else if (hc.code === 'SUM-MISMATCH') {
+    emit('RULE-ROW-HEIGHT-SUM', cab.id, 'cabinet', rowCtx);
+  } else if (hc.code === 'HEIGHT-BAD') {
+    emit('RULE-ROW-HEIGHT-BAD', cab.id, 'cabinet', rowCtx);
+  }
+
+  /**
+   * 多行 × 双面柜：本阶段不支持（行隔板会与共用中板抢同一段空间，
+   * "行隔板要不要穿中板、两排的行要不要对齐"没有定义）。
+   * 明确报"不支持"，而不是画一个谁也说不清对错的柜子。
+   */
+  const multiRow = isMultiRow(cab.layout);
+  const hasBack = Array.isArray(cab.layout.backUnits) && cab.layout.backUnits.length > 0;
+  if (multiRow && (cab.layout.type === 'double' || hasBack)) {
+    emit('RULE-ROW-DOUBLE-UNSUPPORTED', cab.id, 'cabinet', { rowCount: layoutRows(cab.layout).length, cabName: cab.name });
+  }
 
   // 双面柜：后排有自己的宽度链；且 type 与 backUnits 必须互相配套（自相矛盾的模型不静默画）
   const DB = L.double;
-  const hasBack = Array.isArray(cab.layout.backUnits) && cab.layout.backUnits.length > 0;
   if (cab.layout.type === 'double' && !DB) {
     emit('RULE-DOUBLE-NO-BACK', cab.id, 'cabinet');
   }
@@ -96,19 +140,35 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     }
   }
 
-  /** 两排分区一起校验（双面柜的背面排与前排同一套恒等式，只差净宽表） */
-  const rows: Array<{ units: typeof cab.layout.units; netsRow: number[]; label: string }> = [
-    { units: cab.layout.units, netsRow: L.nets, label: '' },
-    ...(DB ? [{ units: cab.layout.backUnits!, netsRow: DB.backNets, label: '（背面排）' }] : []),
+  /**
+   * 参与校验的"分区排"清单：**垂直行**（canonical，每行有自己的净宽表与净高）
+   * + 双面柜的背面排（与垂直行正交，不参与分层）。
+   *
+   * 单行柜下这就是原来那一项（label 为空），v0.2 的报错文案一字不变；
+   * 多行柜才带上"第 N 行" —— 否则两条报错长得一模一样，用户不知道该去哪一行改。
+   */
+  const unitRows: Array<{ units: UnitSpec[]; netsRow: number[]; netHRow: number; label: string; rowLabel: string; basePath: string }> = [
+    ...L.rows.map((r, i) => ({
+      units: r.units,
+      netsRow: r.nets,
+      netHRow: r.netH,
+      label: L.rows.length > 1 ? `（第${i + 1}行）` : '',
+      rowLabel: L.rows.length > 1 ? `（第${i + 1}行）` : '',
+      // 一键修复的写路径前缀：多行柜必须带 row 段落，否则"修第 2 行"会改到第 1 行
+      basePath: unitPathPrefix(cab.layout, i),
+    })),
+    ...(DB
+      ? [{ units: cab.layout.backUnits!, netsRow: DB.backNets, netHRow: L.innerH, label: '（背面排）', rowLabel: '', basePath: BACK_UNITS_PATH }]
+      : []),
   ];
 
-  for (const { units, netsRow, label } of rows) {
+  for (const { units, netsRow, netHRow, label, rowLabel, basePath } of unitRows) {
     units.forEach((u, ui) => {
       const netW = netsRow[ui];
-      // 电器格：洞口上面的抽屉只拥有"内空高 − 洞口高 − 过梁板"这段净高
-      const netH = u.kind === 'appliance' && u.appliance ? L.innerH - u.appliance.openingHeight - t : L.innerH;
+      // 电器格：洞口上面的抽屉只拥有"该行净高 − 洞口高 − 过梁板"这段净高
+      const netH = u.kind === 'appliance' && u.appliance ? netHRow - u.appliance.openingHeight - t : netHRow;
       const unitName = `${u.nickname ?? u.id}${label}`;
-      const ctxBase = { unitIndex: ui, unitName, unitId: u.id };
+      const ctxBase = { unitIndex: ui, unitName, unitId: u.id, unitBasePath: basePath, rowLabel };
 
       if (u.doors) {
         const doors = geom.panels.filter((x) => x.group === u.id && x.role === 'DoorPanel');
@@ -157,7 +217,7 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
           emit('RULE-SHELF-DEPTH', `${cab.id}.${u.id}`, 'unit', { ...ctxBase, sd });
         }
       }
-      // 电器格：洞口必须真的装得下（洞口 ≤ 分区净宽；洞口高 + 过梁板 ≤ 内空高；洞口深 ≤ 排深）
+      // 电器格：洞口必须真的装得下（洞口 ≤ 分区净宽；洞口高 + 过梁板 ≤ 该行净高；洞口深 ≤ 排深）
       if (u.kind === 'appliance' && u.appliance) {
         const a = u.appliance;
         if (a.openingWidth > netW) {
@@ -169,15 +229,15 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
             needW: a.openingWidth + 2 * t,
           });
         }
-        if (a.openingHeight + t > L.innerH) {
+        if (a.openingHeight + t > netHRow) {
           emit('RULE-APPLIANCE-FIT-H', `${cab.id}.${u.id}`, 'unit', {
             ...ctxBase,
             applianceName: a.name,
             openingHeight: a.openingHeight,
             boardT: t,
-            innerH: L.innerH,
+            innerH: netHRow,
             needH: a.openingHeight + 2 * t + p.bodyLift,
-            maxOpening: Math.max(0, Math.floor(L.innerH - t)),
+            maxOpening: Math.max(0, Math.floor(netHRow - t)),
           });
         }
         const rowDepth = DB && label === '（背面排）' ? DB.backRowDepth : DB ? DB.frontRowDepth : p.depth;
@@ -249,12 +309,12 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     emit('RULE-CABINET-SPLIT-WIDTH', cab.id, 'cabinet', { cabName: cab.name, width: p.width, limit: rules.limits.maxSingleCabinetWidth });
   }
 
-  for (const { units, netsRow } of rows) {
+  for (const { units, netsRow, netHRow, label, rowLabel, basePath } of unitRows) {
     units.forEach((u, ui) => {
       const netW = netsRow[ui];
-      const netH = u.kind === 'appliance' && u.appliance ? L.innerH - u.appliance.openingHeight - t : L.innerH;
-      const unitName = u.nickname ?? u.id;
-      const ctxBase = { unitIndex: ui, unitName, unitId: u.id };
+      const netH = u.kind === 'appliance' && u.appliance ? netHRow - u.appliance.openingHeight - t : netHRow;
+      const unitName = `${u.nickname ?? u.id}${label}`;
+      const ctxBase = { unitIndex: ui, unitName, unitId: u.id, unitBasePath: basePath, rowLabel };
 
       if (u.shelves && u.shelves.count > 0 && netW > rules.limits.maxShelfSpan) {
         emit('RULE-SHELF-SPAN', `${cab.id}.${u.id}`, 'unit', { ...ctxBase, netW, max: rules.limits.maxShelfSpan });
@@ -311,6 +371,12 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
   const recomputed = computeCabinetLayout(cab, rules);
   if (JSON.stringify(recomputed.nets) !== JSON.stringify(L.nets)) {
     emit('LAYOUT-CACHE-STALE', cab.id, 'cabinet', { what: '净宽分配对不上' });
+  }
+  if (JSON.stringify(recomputed.rows.map((r) => r.netH)) !== JSON.stringify(L.rows.map((r) => r.netH))) {
+    emit('LAYOUT-CACHE-STALE', cab.id, 'cabinet', { what: '行高分配对不上' });
+  }
+  if (JSON.stringify(recomputed.rows.map((r) => r.nets)) !== JSON.stringify(L.rows.map((r) => r.nets))) {
+    emit('LAYOUT-CACHE-STALE', cab.id, 'cabinet', { what: '各行的净宽分配对不上' });
   }
   if (JSON.stringify(recomputed.double?.backNets ?? null) !== JSON.stringify(L.double?.backNets ?? null)) {
     emit('LAYOUT-CACHE-STALE', cab.id, 'cabinet', { what: '背面排净宽对不上' });

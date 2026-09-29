@@ -281,9 +281,33 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   const innerW = L.innerW;
   const innerH = L.innerH;
   const nets = L.nets;
-  const unitX0 = L.unitX0;
-  const unitCount = cab.layout.units.length;
   const bp = p.backPanel;
+
+  /**
+   * ══════════════════════════════════════════════════════════════════════
+   *  行的绘图上下文（canonical）
+   *
+   *  视图只读 `L.rows`，**不知道**文件里存的是 `rows` 还是 `units`
+   *  （那是 core/layoutModel.ts 唯一口径点的事）。每行自带净宽表、Z 起点与净高 ——
+   *  于是"上层网格、下层三分区"这种柜体不需要在这里写任何 if，
+   *  只是外层多迭代一次。
+   *
+   *  单行柜：`rowCtxs` 恰好一项，且 `netH === innerH`、`z0 === innerBottomZ`
+   *  → 每一处循环的取值与 v0.2 完全相同，图元逐条一致。
+   * ══════════════════════════════════════════════════════════════════════
+   */
+  interface RowCtx {
+    units: Cabinet['layout']['units'];
+    nets: number[];
+    unitX0: number[];
+    /** 该行内空底面 Z */
+    z0: number;
+    /** 该行净高 */
+    netH: number;
+  }
+  const rowCtxs: RowCtx[] = L.rows.map((r) => ({ units: r.units, nets: r.nets, unitX0: r.unitX0, z0: r.z0, netH: r.netH }));
+  /** 是否多行柜 —— 只用来决定**文案**（行标签前缀、逐行净宽清单），不参与任何几何计算 */
+  const multiRow = L.rows.length > 1;
 
   /**
    * 层板在 X 方向的真实跨度 —— 与板件清单严格同源。
@@ -293,17 +317,17 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
    * 视图是派生视图，必须画板件的真实尺寸，否则"从同一份数据派生"就是空话。
    * 位置按居中放置（间隙 0.5 是装配让位，不是尺寸）。
    */
-  const shelfSpanX = (i: number): { a: number; b: number } => {
-    const netW = nets[i];
-    const gap = cab.layout.units[i]?.shelves?.gapPerSide ?? 0;
+  const shelfSpanXIn = (ctx: RowCtx, i: number): { a: number; b: number } => {
+    const netW = ctx.nets[i]!;
+    const gap = ctx.units[i]?.shelves?.gapPerSide ?? 0;
     const w = netW - 2 * gap;
-    const a = unitX0[i] + (netW - w) / 2;
+    const a = ctx.unitX0[i]! + (netW - w) / 2;
     return { a, b: a + w };
   };
 
-  /** 内空底面高度（底板顶面） */
+  /** 内空底面高度（底板顶面）—— 柜级 */
   const innerBottomZ = bodyLift + t;
-  /** 内空顶面高度（顶板底面） */
+  /** 内空顶面高度（顶板底面）—— 柜级 */
   const innerTopZ = H - t;
 
   /**
@@ -338,10 +362,54 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   // 前排层板：贴中板前表面（midY1），另一端按板件派生深度（可能越 overrun，与单面柜同口径）
   const frontShelfY0 = DB ? midY1 : 0;
   const frontShelfY1 = DB ? midY1 + L.shelfDepth : 0;
-  /** 电器格洞口在立面上的 Z 范围（从内空底到过梁板下表面） */
-  const apertureZ = (u: Cabinet['layout']['units'][number]): { z0: number; z1: number } | null => {
+  /** 电器格洞口在立面上的 Z 范围（从**该行**内空底到过梁板下表面） */
+  const apertureZIn = (ctx: RowCtx, u: Cabinet['layout']['units'][number]): { z0: number; z1: number } | null => {
     if (u.kind !== 'appliance' || !u.appliance) return null;
-    return { z0: innerBottomZ, z1: innerBottomZ + Math.min(u.appliance.openingHeight, innerH) };
+    return { z0: ctx.z0, z1: ctx.z0 + Math.min(u.appliance.openingHeight, ctx.netH) };
+  };
+
+  /**
+   * 某一行在 X 处是否"开放"（无门无抽）。
+   *
+   * 用途只有一个：门板图里**被门挡住的行隔板 / 中立板不画**（见 drawFrontLike 的长注释）。
+   * 查询用的区间就是该行真实的 unitX0 / nets，所以这里不产生任何新尺寸 ——
+   * 它只是"把已经算好的区间再查一次"，不存在第二个几何口径。
+   */
+  const opennessAtX = (ctx: RowCtx, x: number): boolean => {
+    for (let i = 0; i < ctx.units.length; i++) {
+      const a = ctx.unitX0[i]!;
+      const b = a + ctx.nets[i]!;
+      if (x >= a && x <= b) {
+        const u = ctx.units[i]!;
+        return !u.doors && !u.drawers;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * 把上下相邻两行的分区边界合并成一组 X 分段。
+   *
+   * 行隔板是**贯通横板**（一块整板横跨内空），但门板图上只要该 X 处被门挡住就不该画实线 ——
+   * 于是把它按"两行各自的真实分区边界"切成段，逐段判断可见性。
+   * 边界全部来自各行已算好的 unitX0 / nets（canonical 派生量），没有任何估算量。
+   */
+  const columnSegments = (a: RowCtx, b: RowCtx): Array<{ a: number; b: number; mid: number }> => {
+    const xs = new Set<number>([t, W - t]);
+    for (const ctx of [a, b]) {
+      for (let i = 0; i < ctx.units.length; i++) {
+        xs.add(ctx.unitX0[i]!);
+        xs.add(ctx.unitX0[i]! + ctx.nets[i]!);
+      }
+    }
+    const sorted = [...xs].filter((x) => x >= t && x <= W - t).sort((p, q) => p - q);
+    const out: Array<{ a: number; b: number; mid: number }> = [];
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const lo = sorted[i]!;
+      const hi = sorted[i + 1]!;
+      if (hi - lo > 0.001) out.push({ a: lo, b: hi, mid: (lo + hi) / 2 });
+    }
+    return out;
   };
 
   // ── 图幅排布 ──
@@ -395,8 +463,12 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   T.rect(0, t, 0, bodyD, layerOfThickness(t), 1); // 左侧板
   T.rect(W - t, W, 0, bodyD, layerOfThickness(t), 1); // 右侧板
   T.rect(t, W - t, 0, bodyD, layerOfThickness(t), 1); // 顶板
-  for (let i = 0; i < unitCount - 1; i++) {
-    const dx = unitX0[i] + nets[i];
+  // 中立板：**逐行取并集**（多行柜里各行中立板可以落在不同 X，只画第一行会漏）
+  const topDividerXs = new Set<number>();
+  rowCtxs.forEach((ctx) => {
+    for (let i = 0; i < ctx.units.length - 1; i++) topDividerXs.add(ctx.unitX0[i]! + ctx.nets[i]!);
+  });
+  for (const dx of topDividerXs) {
     T.rect(dx, dx + t, 0, bodyD, layerOfThickness(t), 1); // 中立板
   }
   if (DB) {
@@ -410,33 +482,35 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     T.rect(t, W - t, backY0, backY1, layerOfThickness(tb), 1); // 背板
   }
 
-  cab.layout.units.forEach((u, i) => {
-    const x0 = unitX0[i];
-    const x1 = x0 + nets[i];
+  rowCtxs.forEach((ctx) => {
+    ctx.units.forEach((u, i) => {
+      const x0 = ctx.unitX0[i]!;
+      const x1 = x0 + ctx.nets[i]!;
 
-    if (u.doors || u.drawers) {
-      T.rect(x0, x1, faceY0, faceY1, L_FRONT, 1.8);
-    }
-    if (u.doors && u.doors.count > 1) {
-      for (let k = 1; k < u.doors.count; k++) {
-        const xk = x0 + (nets[i] * k) / u.doors.count;
-        T.line(xk, xk, faceY0, faceY1, L_FRONT, 1);
+      if (u.doors || u.drawers) {
+        T.rect(x0, x1, faceY0, faceY1, L_FRONT, 1.8);
       }
-    }
-    if (u.kind === 'appliance' && u.appliance) {
-      // 电器外框（俯视）：洞口宽 × 洞口深，贴前脸，虚线表达"留空放机器"
-      const ow = Math.min(u.appliance.openingWidth, nets[i]);
-      const od = Math.min(u.appliance.openingDepth, bodyD);
-      const ax0 = x0 + (nets[i] - ow) / 2;
-      T.rect(ax0, ax0 + ow, D - od, D, L_HW, 1.2, HIDDEN_DASH);
-    }
-    if (u.shelves && u.shelves.count > 0) {
-      const s = shelfSpanX(i);
-      T.rect(s.a, s.b, shelfY0, shelfY1, L_HIDDEN, 1, HIDDEN_DASH);
-    }
-    if (u.rod && u.rod.count > 0) {
-      T.line(x0 + 2, x1 - 2, rodY, rodY, L_HW, 1.6, ROD_DASH);
-    }
+      if (u.doors && u.doors.count > 1) {
+        for (let k = 1; k < u.doors.count; k++) {
+          const xk = x0 + (ctx.nets[i]! * k) / u.doors.count;
+          T.line(xk, xk, faceY0, faceY1, L_FRONT, 1);
+        }
+      }
+      if (u.kind === 'appliance' && u.appliance) {
+        // 电器外框（俯视）：洞口宽 × 洞口深，贴前脸，虚线表达"留空放机器"
+        const ow = Math.min(u.appliance.openingWidth, ctx.nets[i]!);
+        const od = Math.min(u.appliance.openingDepth, bodyD);
+        const ax0 = x0 + (ctx.nets[i]! - ow) / 2;
+        T.rect(ax0, ax0 + ow, D - od, D, L_HW, 1.2, HIDDEN_DASH);
+      }
+      if (u.shelves && u.shelves.count > 0) {
+        const s = shelfSpanXIn(ctx, i);
+        T.rect(s.a, s.b, shelfY0, shelfY1, L_HIDDEN, 1, HIDDEN_DASH);
+      }
+      if (u.rod && u.rod.count > 0) {
+        T.line(x0 + 2, x1 - 2, rodY, rodY, L_HW, 1.6, ROD_DASH);
+      }
+    });
   });
 
   // 背面排（双面柜）：门线 / 门缝在 y∈[0,t]，层板虚线贴中板后表面
@@ -483,25 +557,38 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   } else {
     S.rect(backY0, backY1, innerBottomZ, innerTopZ, layerOfThickness(tb), 1); // 背板
   }
-  // 中立板在侧视图里被左侧板完全遮挡 → 轮廓用虚线表达"此处有一块板"
-  S.rect(0, bodyD, innerBottomZ, innerTopZ, L_HIDDEN, 0.9, HIDDEN_DASH);
+  // 中立板在侧视图里被左侧板完全遮挡 → 轮廓用虚线表达"此处有一块板"（逐行：只跨本行净高）
+  rowCtxs.forEach((ctx) => {
+    S.rect(0, bodyD, ctx.z0, ctx.z0 + ctx.netH, L_HIDDEN, 0.9, HIDDEN_DASH);
+  });
+  // 行隔板：侧视图里是一块实打实的横板（与 2D 立面 / 板件清单同一处派生）
+  L.rowDividers.forEach((z) => {
+    S.rect(0, bodyD, z, z + t, layerOfThickness(t), 1);
+  });
 
-  /** 一排在侧视图里的表达：层板/门/抽/杆的 Y 区间由"这排的脸在哪"决定 */
-  const drawRowSide = (units: Cabinet['layout']['units'], shelfSpan: { y0: number; y1: number }, faceSpan: { y0: number; y1: number }, rodCenterY: number): void => {
+  /** 一排在侧视图里的表达：层板/门/抽/杆的 Y 区间由"这排的脸在哪"决定，Z 由该排内空底与净高决定 */
+  const drawRowSide = (
+    units: Cabinet['layout']['units'],
+    shelfSpan: { y0: number; y1: number },
+    faceSpan: { y0: number; y1: number },
+    rodCenterY: number,
+    z0: number,
+    netHRow: number
+  ): void => {
     units.forEach((u) => {
       if (u.shelves && u.shelves.count > 0) {
-        equalSpacing(innerH, u.shelves.count).forEach((pos) => {
-          S.rect(shelfSpan.y0, shelfSpan.y1, innerBottomZ + pos, innerBottomZ + pos + t, layerOfThickness(t), 1);
+        equalSpacing(netHRow, u.shelves.count).forEach((pos) => {
+          S.rect(shelfSpan.y0, shelfSpan.y1, z0 + pos, z0 + pos + t, layerOfThickness(t), 1);
         });
       }
       if (u.doors) {
-        S.rect(faceSpan.y0, faceSpan.y1, innerBottomZ + u.doors.gapOuter, innerBottomZ + innerH - u.doors.gapOuter, L_FRONT, 1.8);
+        S.rect(faceSpan.y0, faceSpan.y1, z0 + u.doors.gapOuter, z0 + netHRow - u.doors.gapOuter, L_FRONT, 1.8);
       }
       if (u.drawers) {
         // 电器格的抽屉挂在洞口上方：净高是"剩余净高"
-        const netH = u.kind === 'appliance' && u.appliance ? innerH - u.appliance.openingHeight - t : innerH;
+        const netH = u.kind === 'appliance' && u.appliance ? netHRow - u.appliance.openingHeight - t : netHRow;
         const cellH = drawerCellHeights(u, netH, rules);
-        let z = innerBottomZ + u.drawers.gap + (u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0);
+        let z = z0 + u.drawers.gap + (u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0);
         for (const ch of cellH) {
           S.rect(faceSpan.y0, faceSpan.y1, z, z + ch - 2 * u.drawers.gap, L_FRONT, 1.8);
           z += ch + u.drawers.gap;
@@ -509,26 +596,31 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       }
       if (u.kind === 'appliance' && u.appliance) {
         const a = u.appliance;
-        const z1 = Math.min(innerBottomZ + a.openingHeight, innerTopZ);
-        S.rect(shelfSpan.y0, shelfSpan.y1, innerBottomZ, z1, L_HW, 1.2, HIDDEN_DASH);
+        const z1 = Math.min(z0 + a.openingHeight, z0 + netHRow);
+        S.rect(shelfSpan.y0, shelfSpan.y1, z0, z1, L_HW, 1.2, HIDDEN_DASH);
       }
       if (u.rod && u.rod.count > 0) {
         // 垂直于视图方向的一根杆 → 画成小十字
-        const rz = innerBottomZ + u.rod.heightFromBottom;
+        const rz = z0 + u.rod.heightFromBottom;
         S.line(rodCenterY - 70, rodCenterY + 70, rz, rz, L_HW, 1.8);
         S.line(rodCenterY, rodCenterY, rz - 70, rz + 70, L_HW, 1.8);
       }
     });
   };
 
-  drawRowSide(
-    cab.layout.units,
-    DB ? { y0: frontShelfY0, y1: frontShelfY1 } : { y0: shelfY0, y1: shelfY1 },
-    { y0: faceY0, y1: faceY1 },
-    rodY
-  );
+  // 各行（canonical）：① 垂直行 ② 双面柜背面排（与垂直行正交）
+  rowCtxs.forEach((ctx) => {
+    drawRowSide(
+      ctx.units,
+      DB ? { y0: frontShelfY0, y1: frontShelfY1 } : { y0: shelfY0, y1: shelfY1 },
+      { y0: faceY0, y1: faceY1 },
+      rodY,
+      ctx.z0,
+      ctx.netH
+    );
+  });
   if (DB) {
-    drawRowSide(cab.layout.backUnits!, { y0: backShelfY0, y1: backShelfY1 }, { y0: backFaceY0, y1: backFaceY1 }, backRodY);
+    drawRowSide(cab.layout.backUnits!, { y0: backShelfY0, y1: backShelfY1 }, { y0: backFaceY0, y1: backFaceY1 }, backRodY, innerBottomZ, innerH);
   }
 
   // ═══════════════ 4. 内部结构图（移去门 / 抽面）═══════════════
@@ -619,14 +711,29 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     layer: L_TEXT,
     align: 'r',
   });
-  labels.push({
-    k: 'text',
-    p: { x: ix0 + W, y: fy - 500 },
-    text: `净宽分配 ${nets.join(' + ')} = ${nets.reduce((a, b) => a + b, 0)}mm`,
-    size: 120,
-    layer: L_TEXT,
-    align: 'r',
-  });
+  if (multiRow) {
+    // 多行柜：净宽分配是**逐行**的（每行独立做水平分区）。
+    // 把所有行的分配摊在一行里，会被读成"整柜只有这一条宽度链" —— 那正是 P1 要消灭的误读。
+    L.rows.forEach((r, ri) => {
+      labels.push({
+        k: 'text',
+        p: { x: ix0 + W, y: fy - 500 - ri * 190 },
+        text: `R${ri + 1} 净宽 ${r.nets.join(' + ')} = ${r.netTotal}mm　·　净高 ${r.netH}mm`,
+        size: 120,
+        layer: L_TEXT,
+        align: 'r',
+      });
+    });
+  } else {
+    labels.push({
+      k: 'text',
+      p: { x: ix0 + W, y: fy - 500 },
+      text: `净宽分配 ${nets.join(' + ')} = ${nets.reduce((a, b) => a + b, 0)}mm`,
+      size: 120,
+      layer: L_TEXT,
+      align: 'r',
+    });
+  }
   labels.push({
     k: 'text',
     p: { x: ix0 + W, y: ty0 - D - 1900 },
@@ -661,13 +768,16 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     (p.finishedEnds && p.finishedEnds !== 'none')
       ? `见光板（${p.finishedEnds === 'both' ? '左右两端' : p.finishedEnds === 'left' ? '左端' : '右端'}）：外露端板前缘做 R36 圆弧（侧视图近端角画出，前视图两端条带角画出）。它只是端板工艺表达，不改变结构板数量与尺寸。`
       : '',
-    (cab.layout.units.some((u) => (u.shelves?.tilt ?? 0) > 0))
+    (L.rows.some((r) => r.units.some((u) => (u.shelves?.tilt ?? 0) > 0)))
       ? '斜层板：层板沿前立面倾斜，板件真实裁切长 = 水平跨度 ÷ cos(倾角)，四视图画成平行四边形（与销售图纸酒柜同款）。净宽分配仍按水平投影，倾斜不改变分区占用。'
+      : '',
+    multiRow
+      ? `多行柜：rows[0] 在最上面（自上而下编号），每行的 Z 起点与净高由 layout 层确定，视图不再自行推算。行间贯通横隔板由**行边界**派生（位置 = 下一行顶面，跨度 = 内空宽，厚 ${t}mm），并已计入高度链 —— Σ行净高 + (行数−1)×板厚 = 内空高 ${innerH}mm。各行独立做水平分区（不跨行合并净宽），各行中立板只跨本行净高。`
       : '',
     DB
       ? `双面柜（岛台）：正视图 / 内部图为**前脸**；背面排（净宽 ${DB.backNets.join(' + ')} = ${DB.backNets.reduce((a, b) => a + b, 0)}mm）在正投影方向不可见，其门板与层板见俯视图（下方的背面脸带）、侧视图与板件清单。背立面外观图暂未单列。`
       : '',
-    (cab.layout.units.some((u) => u.kind === 'appliance') || (DB && cab.layout.backUnits!.some((u) => u.kind === 'appliance')))
+    (L.rows.some((r) => r.units.some((u) => u.kind === 'appliance')) || (DB && cab.layout.backUnits!.some((u) => u.kind === 'appliance')))
       ? '电器格：虚线框为预留洞口（机器甲购，不进开料清单）；洞口上方的抽屉从过梁板之上排布，净高按"内空高 − 洞口高 − 板厚"计。'
       : '',
   ].filter((s) => s !== '');
@@ -749,142 +859,175 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
      *   · 中立板：只画在两侧都是开放区的位置（被门挡住的不画）。
      * 内部结构图（withFronts=false）维持原样：去掉门板，结构全画。
      */
-    cab.layout.units.forEach((u, i) => {
-      const x0 = unitX0[i];
-      const netW = nets[i];
-      const openUnit = !u.doors && !u.drawers; // 开放格：外观图上能看见内部
+    /**
+     * ── 行（canonical）：按行绘制，行内零特判 ──
+     *
+     * 这里只读 `L.rows`（layout 层已经消化过"文件里存的是 rows 还是 units"）。
+     * 单行柜 `rowCtxs` 恰好一项，且 `z0 === innerBottomZ`、`netH === innerH`、
+     * `unitX0 / nets` 与 `L.unitX0 / L.nets` 逐位相同 → 每条图元与 v0.2 完全一致。
+     * 多行柜只是外层多迭代一次，**没有任何 `if (rows)` 分支**。
+     */
+    rowCtxs.forEach((ctx) => {
+      const rowZ0 = ctx.z0;
+      const rowNH = ctx.netH;
 
-      // 层板：只在内部图，或门板图的开放格里画
-      if (u.shelves && u.shelves.count > 0 && (!withFronts || openUnit)) {
-        const s = shelfSpanX(i);
-        const tilt = u.shelves.tilt ?? 0;
-        const span = s.b - s.a;
-        // 斜层板（Phase E 图元扩展）：右端按 tan(tilt) 下沉，画成平行四边形。
-        // tilt=0 时 shift=0 → 退化为普通矩形，与旧行为一致（不留隐式分支）。
-        const shift = tilt > 0 ? Math.round(span * Math.tan((tilt * Math.PI) / 180)) : 0;
-        equalSpacing(innerH, u.shelves.count).forEach((pos) => {
-          const yb = innerBottomZ + pos;
-          if (shift > 0) {
-            P.poly(
-              [
-                { x: s.a, y: yb },
-                { x: s.b, y: yb - shift },
-                { x: s.b, y: yb - shift + t },
-                { x: s.a, y: yb + t },
-              ],
-              layerOfThickness(t),
-              1,
-              true
-            );
-          } else {
-            P.rect(s.a, s.b, yb, yb + t, layerOfThickness(t), 1);
-          }
-        });
-      }
+      ctx.units.forEach((u, i) => {
+        const x0 = ctx.unitX0[i]!;
+        const netW = ctx.nets[i]!;
+        const openUnit = !u.doors && !u.drawers; // 开放格：外观图上能看见内部
 
-      // 抽面：一格一面，两种图都画（内部图弱化线宽）
-      if (u.drawers) {
-        const d = u.drawers;
-        const cellH = drawerCellHeights(u, innerH, rules);
-        let z = innerBottomZ + d.gap;
-        for (const ch of cellH) {
-          P.rect(x0 + d.gap, x0 + netW - d.gap, z, z + ch - 2 * d.gap, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
-          z += ch + d.gap;
-        }
-      }
-
-      // 门板：整块 + 开向对角线（行业画法）
-      if (u.doors) {
-        const dr = u.doors;
-        const widths = doorWidths(u, netW, rules);
-        // 玻璃门：材质 kind='glass' → 门板图画「黑框灰玻」斜线填充（销售图纸同款）
-        const isGlass = dr.material ? rules.materials[dr.material]?.kind === 'glass' : false;
-        let x = x0 + dr.gapOuter;
-        for (let k = 0; k < widths.length; k++) {
-          const w = widths[k];
-          const left = x;
-          const right = x + w;
-          const zTop = innerBottomZ + dr.gapOuter;
-          const zBot = innerBottomZ + innerH - dr.gapOuter;
-          P.rect(left, right, zTop, zBot, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
-
-          if (withFronts && isGlass) {
-            // 斜线只表示材质（灰玻），不表示开向 —— 开向仍由下方对角线表达。
-            // 45° 斜线在门洞矩形内截断，两道，避开与开向 X 的视觉混淆。
-            P.fillRect(left, right, zTop, zBot, L_FRONT, 0.12);
-            const hatch = (f: number): void => {
-              const hx = left + w * f;
-              const run = Math.min(right - hx, zBot - zTop);
-              if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
-            };
-            hatch(0.33);
-            hatch(0.66);
-          }
-
-          if (withFronts) {
-            /**
-             * 开向对角线 —— 与销售图纸同款：
-             *   · 双扇对开画 X 形（左扇 ↘、右扇 ↗，两条线在门缝处交叉）；
-             *   · 单扇按 hingeSide：铰链在左 → 线从左上到右下；
-             *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
-             * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
-             */
-            const diag = (x1: number, z1: number, x2: number, z2: number): void => {
-              P.line(x1, x2, z1, z2, L_FRONT, 0.9);
-            };
-            if (widths.length === 2) {
-              // 对开 X 形：整个门洞画一个大 X，两条线跨过门缝在中点交叉
-              // （行业画法；与铰链侧无关 —— 两扇铰链天然在两侧）。
-              // 注意必须用门洞边界而非循环内的扇叶边界，否则 X 会被门缝切成两个小 X。
-              if (k === 0) {
-                const openL = x0 + dr.gapOuter;
-                const openR = openL + widths[0]! + dr.gapMid + widths[1]!;
-                diag(openL, zBot, openR, zTop);
-                diag(openL, zTop, openR, zBot);
-              }
-            } else if (widths.length === 1) {
-              if ((dr.hingeSide ?? 'left') === 'left') diag(left, zTop, right, zBot);
-              else diag(right, zTop, left, zBot);
+        // 层板：只在内部图，或门板图的开放格里画。行内层板按**本行净高**均分。
+        if (u.shelves && u.shelves.count > 0 && (!withFronts || openUnit)) {
+          const s = shelfSpanXIn(ctx, i);
+          const tilt = u.shelves.tilt ?? 0;
+          const span = s.b - s.a;
+          // 斜层板（Phase E 图元扩展）：右端按 tan(tilt) 下沉，画成平行四边形。
+          // tilt=0 时 shift=0 → 退化为普通矩形，与旧行为一致（不留隐式分支）。
+          const shift = tilt > 0 ? Math.round(span * Math.tan((tilt * Math.PI) / 180)) : 0;
+          equalSpacing(rowNH, u.shelves.count).forEach((pos) => {
+            const yb = rowZ0 + pos;
+            if (shift > 0) {
+              P.poly(
+                [
+                  { x: s.a, y: yb },
+                  { x: s.b, y: yb - shift },
+                  { x: s.b, y: yb - shift + t },
+                  { x: s.a, y: yb + t },
+                ],
+                layerOfThickness(t),
+                1,
+                true
+              );
             } else {
-              const side = (dr.hingeSide ?? 'left') === 'left';
-              for (let j = 0; j < widths.length; j++) {
-                const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
-                const r2 = l2 + widths[j];
-                if (side) diag(l2, zTop, r2, zBot);
-                else diag(r2, zTop, l2, zBot);
+              P.rect(s.a, s.b, yb, yb + t, layerOfThickness(t), 1);
+            }
+          });
+        }
+
+        // 抽面：一格一面，两种图都画（内部图弱化线宽）。抽面高度按**本行净高**排。
+        if (u.drawers) {
+          const d = u.drawers;
+          const cellH = drawerCellHeights(u, rowNH, rules);
+          let z = rowZ0 + d.gap;
+          for (const ch of cellH) {
+            P.rect(x0 + d.gap, x0 + netW - d.gap, z, z + ch - 2 * d.gap, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+            z += ch + d.gap;
+          }
+        }
+
+        // 门板：整块 + 开向对角线（行业画法）。门板高度按**本行净高**排。
+        if (u.doors) {
+          const dr = u.doors;
+          const widths = doorWidths(u, netW, rules);
+          // 玻璃门：材质 kind='glass' → 门板图画「黑框灰玻」斜线填充（销售图纸同款）
+          const isGlass = dr.material ? rules.materials[dr.material]?.kind === 'glass' : false;
+          let x = x0 + dr.gapOuter;
+          for (let k = 0; k < widths.length; k++) {
+            const w = widths[k];
+            const left = x;
+            const right = x + w;
+            const zTop = rowZ0 + dr.gapOuter;
+            const zBot = rowZ0 + rowNH - dr.gapOuter;
+            P.rect(left, right, zTop, zBot, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+
+            if (withFronts && isGlass) {
+              // 斜线只表示材质（灰玻），不表示开向 —— 开向仍由下方对角线表达。
+              // 45° 斜线在门洞矩形内截断，两道，避开与开向 X 的视觉混淆。
+              P.fillRect(left, right, zTop, zBot, L_FRONT, 0.12);
+              const hatch = (f: number): void => {
+                const hx = left + w * f;
+                const run = Math.min(right - hx, zBot - zTop);
+                if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
+              };
+              hatch(0.33);
+              hatch(0.66);
+            }
+
+            if (withFronts) {
+              /**
+               * 开向对角线 —— 与销售图纸同款：
+               *   · 双扇对开画 X 形（左扇 ↘、右扇 ↗，两条线在门缝处交叉）；
+               *   · 单扇按 hingeSide：铰链在左 → 线从左上到右下；
+               *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
+               * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
+               */
+              const diag = (x1: number, z1: number, x2: number, z2: number): void => {
+                P.line(x1, x2, z1, z2, L_FRONT, 0.9);
+              };
+              if (widths.length === 2) {
+                // 对开 X 形：整个门洞画一个大 X，两条线跨过门缝在中点交叉
+                // （行业画法；与铰链侧无关 —— 两扇铰链天然在两侧）。
+                // 注意必须用门洞边界而非循环内的扇叶边界，否则 X 会被门缝切成两个小 X。
+                if (k === 0) {
+                  const openL = x0 + dr.gapOuter;
+                  const openR = openL + widths[0]! + dr.gapMid + widths[1]!;
+                  diag(openL, zBot, openR, zTop);
+                  diag(openL, zTop, openR, zBot);
+                }
+              } else if (widths.length === 1) {
+                if ((dr.hingeSide ?? 'left') === 'left') diag(left, zTop, right, zBot);
+                else diag(right, zTop, left, zBot);
+              } else {
+                const side = (dr.hingeSide ?? 'left') === 'left';
+                for (let j = 0; j < widths.length; j++) {
+                  const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
+                  const r2 = l2 + widths[j];
+                  if (side) diag(l2, zTop, r2, zBot);
+                  else diag(r2, zTop, l2, zBot);
+                }
               }
             }
+            x += w + dr.gapMid;
           }
-          x += w + dr.gapMid;
         }
-      }
 
-      // 挂衣杆：只在开放格可见（门后的杆在外观图上不画，内部图照画）
-      if (u.rod && u.rod.count > 0 && (!withFronts || openUnit)) {
-        const rz = innerBottomZ + u.rod.heightFromBottom;
-        P.line(x0 + 2, x0 + netW - 2, rz, rz, L_HW, 1.6, ROD_DASH);
-      }
+        // 挂衣杆：只在开放格可见（门后的杆在外观图上不画，内部图照画）。高度按本行内空底起算。
+        if (u.rod && u.rod.count > 0 && (!withFronts || openUnit)) {
+          const rz = rowZ0 + u.rod.heightFromBottom;
+          P.line(x0 + 2, x0 + netW - 2, rz, rz, L_HW, 1.6, ROD_DASH);
+        }
 
-      // 电器格洞口：虚线框 + 名称与洞口尺寸（外观图上机器就在洞里，内部图同样标）
-      if (u.kind === 'appliance' && u.appliance) {
-        const a = u.appliance;
-        const ow = Math.min(a.openingWidth, netW);
-        const ax0 = x0 + (netW - ow) / 2;
-        const az = apertureZ(u);
-        if (az) {
-          P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, 1.2, HIDDEN_DASH);
-          P.text(ax0 + ow / 2, (az.z0 + az.z1) / 2, `${a.name} ${a.openingWidth}×${a.openingHeight}`, 80, L_TEXT, 'c');
+        // 电器格洞口：虚线框 + 名称与洞口尺寸（外观图上机器就在洞里，内部图同样标）。洞口自本行内空底起算。
+        if (u.kind === 'appliance' && u.appliance) {
+          const a = u.appliance;
+          const ow = Math.min(a.openingWidth, netW);
+          const ax0 = x0 + (netW - ow) / 2;
+          const az = apertureZIn(ctx, u);
+          if (az) {
+            P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, 1.2, HIDDEN_DASH);
+            P.text(ax0 + ow / 2, (az.z0 + az.z1) / 2, `${a.name} ${a.openingWidth}×${a.openingHeight}`, 80, L_TEXT, 'c');
+          }
+        }
+      });
+
+      // 中立板（本行）：内部图全画；门板图只画两侧都开放的（其余被门挡住）。
+      // **逐行**绘制 —— 多行柜里上下两行的中立板可以落在不同 X，且各自只跨本行净高。
+      for (let i = 0; i < ctx.units.length - 1; i++) {
+        const bothOpen = !ctx.units[i]!.doors && !ctx.units[i]!.drawers
+          && !ctx.units[i + 1]!.doors && !ctx.units[i + 1]!.drawers;
+        if (!withFronts || bothOpen) {
+          const dx = ctx.unitX0[i]! + ctx.nets[i]!;
+          P.rect(dx, dx + t, rowZ0, rowZ0 + rowNH, layerOfThickness(t), 1); // 中立板
         }
       }
     });
 
-    // 中立板：内部图全画；门板图只画两侧都开放的（其余被门挡住）
-    for (let i = 0; i < unitCount - 1; i++) {
-      const bothOpen = !cab.layout.units[i].doors && !cab.layout.units[i].drawers
-        && !cab.layout.units[i + 1].doors && !cab.layout.units[i + 1].drawers;
-      if (!withFronts || bothOpen) {
-        const dx = unitX0[i] + nets[i];
-        P.rect(dx, dx + t, innerBottomZ, innerTopZ, layerOfThickness(t), 1); // 中立板
+    /**
+     * 行间贯通横隔板 —— 来自 `Cabinet → Rows → row boundary`（layout 层的 `L.rowDividers`），
+     * 不是任何调用方"插一块板"插进来的。它同时把高度链闭合：
+     * 位置 === `rows[k+1].z1`，跨度 === 内空宽，厚度 === 板厚（已在 `resolveRowHeights` 里扣掉）。
+     *
+     * 门板图可见性：只有该 X 处在上下两行**都开放**时才画实线（被门挡住的部分不画）——
+     * 与中立板同一条规则，避免在门板上横切一道线（那是会被读成"门是拼的"的缺陷）。
+     */
+    for (let k = 0; k < rowCtxs.length - 1; k++) {
+      const above = rowCtxs[k]!;
+      const below = rowCtxs[k + 1]!;
+      const z = L.rowDividers[k]!;
+      for (const seg of columnSegments(above, below)) {
+        if (!withFronts || (opennessAtX(above, seg.mid) && opennessAtX(below, seg.mid))) {
+          P.rect(seg.a, seg.b, z, z + t, layerOfThickness(t), 1); // 行隔板
+        }
       }
     }
 
@@ -919,13 +1062,16 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       P.text(x, ny, s, size, layer, align, rot);
     };
 
-    // ① 各分区净宽属于顶部那条尺寸链，位置由尺寸链定死：只登记占位，不参与让路
-    const dimZ = innerTopZ - 250;
-    for (let i = 0; i < unitCount; i++) {
-      const cx = unitX0[i] + nets[i] / 2;
-      placer.reserve(cx, dimZ, `${nets[i]}`, 108, 'c');
-      P.text(cx, dimZ, `${nets[i]}`, 108, L_DIM, 'c');
-    }
+    // ① 各分区净宽属于顶部那条尺寸链，位置由尺寸链定死：只登记占位，不参与让路。
+    //    **逐行**：尺寸链挂在该行顶面之下（单行柜 = 内空顶面之下，与 v0.2 同位置）。
+    rowCtxs.forEach((ctx) => {
+      const dimZ = ctx.z0 + ctx.netH - 250;
+      for (let i = 0; i < ctx.units.length; i++) {
+        const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
+        placer.reserve(cx, dimZ, `${ctx.nets[i]}`, 108, 'c');
+        P.text(cx, dimZ, `${ctx.nets[i]}`, 108, L_DIM, 'c');
+      }
+    });
 
     // ② 侧板：板件又高又窄，横排文字必然伸进分区里压住抽屉说明 —— 竖排贴在板上
     put(t / 2, midZ, '左侧板', 118, L_TEXT, 'c', 90);
@@ -944,39 +1090,53 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     put(W / 2, bodyLift + t / 2, '底板', 118, L_TEXT, 'c');
     put(W / 2, H - t / 2, '顶板', 118, L_TEXT, 'c');
 
-    // ④ 中立板：贴着分隔板放，但压低到分区说明带以下，免得跟挂衣杆说明抢同一行
-    for (let i = 0; i < unitCount - 1; i++) {
-      put(unitX0[i] + nets[i] + t / 2, innerBottomZ + 260, `中立板${i + 1}`, 108, L_TEXT, 'c');
+    // ④ 中立板：贴着分隔板放，但压低到分区说明带以下，免得跟挂衣杆说明抢同一行。
+    //    **逐行**：多行柜里上下两行的中立板位置不同 → 名称必须带行前缀，否则两个"中立板1"。
+    rowCtxs.forEach((ctx, ri) => {
+      for (let i = 0; i < ctx.units.length - 1; i++) {
+        const name = multiRow ? `R${ri + 1} 中立板${i + 1}` : `中立板${i + 1}`;
+        put(ctx.unitX0[i]! + ctx.nets[i]! + t / 2, ctx.z0 + 260, name, 108, L_TEXT, 'c');
+      }
+    });
+
+    // ④b 行间贯通横隔板：贴着板放，标明它来自行边界
+    for (let k = 0; k < rowCtxs.length - 1; k++) {
+      put(W / 2, L.rowDividers[k]! + 150, `行隔板 R${k + 1}|R${k + 2}`, 108, L_TEXT, 'c');
     }
 
-    // ⑤ 各分区内部说明
-    cab.layout.units.forEach((u, i) => {
-      const cx = unitX0[i] + nets[i] / 2;
+    // ⑤ 各分区内部说明（按行，文字位置全部从该行内空底 / 净高起算）
+    rowCtxs.forEach((ctx, ri) => {
+      ctx.units.forEach((u, i) => {
+        const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
+        const rowTag = multiRow ? `R${ri + 1} ` : '';
 
-      if (u.shelves && u.shelves.count > 0) {
-        const positions = equalSpacing(innerH, u.shelves.count);
-        const zLow = innerBottomZ + positions[0];
-        const tilt = u.shelves.tilt ?? 0;
-        put(cx, zLow + t + 180, tilt > 0 ? `斜层板 ×${u.shelves.count}（${tilt}°）` : `层板 ×${u.shelves.count}`, 108, L_TEXT, 'c');
-      }
-      if (u.drawers) {
-        put(cx, innerBottomZ + innerH * 0.55, `抽屉面板 ×${u.drawers.count}`, 112, L_TEXT, 'c');
-      }
-      if (u.rod && u.rod.count > 0) {
-        put(cx, innerBottomZ + u.rod.heightFromBottom + 190, `挂衣杆 · 距内底 ${u.rod.heightFromBottom}`, 108, L_HW, 'c');
-      }
-      if (u.doors) {
-        put(cx, innerTopZ - 620, `门板 ×${u.doors.count}（已移开）`, 108, L_TEXT, 'c');
-      }
+        if (u.shelves && u.shelves.count > 0) {
+          const positions = equalSpacing(ctx.netH, u.shelves.count);
+          const zLow = ctx.z0 + positions[0]!;
+          const tilt = u.shelves.tilt ?? 0;
+          put(cx, zLow + t + 180, `${rowTag}${tilt > 0 ? `斜层板 ×${u.shelves.count}（${tilt}°）` : `层板 ×${u.shelves.count}`}`, 108, L_TEXT, 'c');
+        }
+        if (u.drawers) {
+          put(cx, ctx.z0 + ctx.netH * 0.55, `${rowTag}抽屉面板 ×${u.drawers.count}`, 112, L_TEXT, 'c');
+        }
+        if (u.rod && u.rod.count > 0) {
+          put(cx, ctx.z0 + u.rod.heightFromBottom + 190, `挂衣杆 · 距内底 ${u.rod.heightFromBottom}`, 108, L_HW, 'c');
+        }
+        if (u.doors) {
+          put(cx, ctx.z0 + ctx.netH - 620, `${rowTag}门板 ×${u.doors.count}（已移开）`, 108, L_TEXT, 'c');
+        }
+      });
     });
 
     // ⑥ 最长的一句补充说明最后放：它是解释性的，最该给别人让路。
     // 另外把字数压到 8 个字 —— 原来的"（虚线 = 移去抽屉面板后所见）"
     // 算出来 1496mm 宽，而抽屉分区净宽只有 582mm，文字会溢出视图左边界 400 多毫米。
-    cab.layout.units.forEach((u, i) => {
-      if (!u.drawers) return;
-      const cx = unitX0[i] + nets[i] / 2;
-      put(cx, innerBottomZ + innerH * 0.55 - 200, '虚线 = 移去后所见', 95, L_TEXT, 'c');
+    rowCtxs.forEach((ctx, ri) => {
+      ctx.units.forEach((u, i) => {
+        if (!u.drawers) return;
+        const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
+        put(cx, ctx.z0 + ctx.netH * 0.55 - 200, multiRow ? `R${ri + 1} 虚线 = 移去后所见` : '虚线 = 移去后所见', 95, L_TEXT, 'c');
+      });
     });
 
     // 让不开的标签如实上报（调用方会把它写进假设清单，而不是静默压字）

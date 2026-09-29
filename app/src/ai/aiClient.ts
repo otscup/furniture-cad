@@ -1,7 +1,8 @@
-import { validatePlan } from '../../shared/aiContract.mjs';
+import { proposalShapeError, validatePlan } from '../../shared/aiContract.mjs';
 import type { AiAction } from './compile.ts';
 import type { QuotaView } from './quotaTypes.ts';
 import { snapshotContext, type AiSnapshot } from './snapshot.ts';
+import type { DesignProposal } from './proposal.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -145,6 +146,106 @@ export async function requestPlan(opts: {
     salvagedFromReasoning: body.salvagedFromReasoning === true,
     model: body.model as string | undefined,
     usage: (body.usage as PlanResponse['usage']) ?? null,
+    ms: body.ms as number | undefined,
+    quota: (body.quota as QuotaView | undefined) ?? undefined,
+  };
+}
+
+// ───────────────────────────── AI 设计方案（P3）─────────────────────────────
+
+export interface DesignResponse {
+  ok: boolean;
+  error?: string;
+  /** 通过形状门的方案（**还没进模型**，也还没编译） */
+  proposal?: DesignProposal;
+  /** 模型返回了但形状不对时的原文 —— 不猜、不修，原样给界面显示 */
+  raw?: string;
+  reasoning?: string;
+  finishReason?: string;
+  salvagedFromReasoning?: boolean;
+  model?: string;
+  usage?: PlanResponse['usage'];
+  ms?: number;
+  quota?: QuotaView;
+}
+
+/**
+ * 要一份设计方案（不是要动作）。
+ *
+ * ── 与 requestPlan 的分工 ──
+ *   plan = "照这句话去改现有模型"（动作级，改的是已经存在的东西）；
+ *   design = "照这句需求设计一个方案"（需求级，产出的是**新建**的东西）。
+ *   两条路最后都汇到 `dryRunPlan → 确认 → commitPlan`，写入口只有一个。
+ *
+ * ── 为什么这里还要再验一遍形状 ──
+ *   服务端已经验过。但"服务端验过了"不能成为前端免检的理由 ——
+ *   校验器只有一份（契约），多调一次不产生第二套规则，
+ *   而少调一次就多一处"将来换通道时忘了验"的口子。
+ */
+export async function requestDesign(opts: {
+  text: string;
+  snapshot: AiSnapshot;
+  history?: Array<{ role: 'user' | 'assistant'; text: string }>;
+  model?: string;
+  token?: string | null;
+}): Promise<DesignResponse> {
+  const empty: DesignResponse = { ok: false };
+  let res: Response;
+  try {
+    res = await fetch('/api/ai/design', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts.token ?? null) },
+      body: JSON.stringify({
+        text: opts.text,
+        snapshot: opts.snapshot,
+        history: (opts.history ?? []).slice(-6),
+        model: opts.model,
+      }),
+    });
+  } catch (e) {
+    return { ...empty, error: `连不上本地服务：${(e as Error).message}　（请确认 npm run server 在跑）` };
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch {
+    return { ...empty, error: `本地服务返回了非 JSON（HTTP ${res.status}）` };
+  }
+  if (res.status === 401) return { ...empty, error: String(body.error ?? '未登录或会话已过期') };
+  if (res.status === 429) return { ...empty, error: String(body.error ?? 'AI 额度已用完') };
+  if (res.status === 403) return { ...empty, error: String(body.error ?? '没有权限') };
+  if (!body.ok) {
+    return {
+      ...empty,
+      error: String(body.error ?? '没有拿到方案'),
+      raw: body.raw as string | undefined,
+      reasoning: body.reasoning as string | undefined,
+      finishReason: body.finishReason as string | undefined,
+      model: body.model as string | undefined,
+      usage: (body.usage as DesignResponse['usage']) ?? null,
+      ms: body.ms as number | undefined,
+    };
+  }
+
+  const proposal = body.proposal;
+  const bad = proposalShapeError(proposal);
+  /**
+   * 形状不对 → **整份不要**，不做"尽力修补"。
+   * 半份被修过的方案比没有方案更危险：界面会拿它去预览，
+   * 而预览出来的东西和用户说的不是一回事。
+   */
+  if (bad) {
+    return { ...empty, error: `AI 给的方案形状不对，已整份退回：${bad}`, raw: JSON.stringify(proposal).slice(0, 800) };
+  }
+  return {
+    ok: true,
+    proposal: proposal as DesignProposal,
+    reasoning: body.reasoning as string | undefined,
+    finishReason: body.finishReason as string | undefined,
+    salvagedFromReasoning: body.salvagedFromReasoning === true,
+    model: body.model as string | undefined,
+    usage: (body.usage as DesignResponse['usage']) ?? null,
     ms: body.ms as number | undefined,
     quota: (body.quota as QuotaView | undefined) ?? undefined,
   };

@@ -981,6 +981,8 @@ select.input { height: 24px; padding: 0 4px; }
 /* 草案两个主按钮：颜色跟主按钮一致，避免"哪个才是主操作"看不出来 */
 .ai-btn-draft { border-color: var(--accent); color: var(--accent); }
 .ai-btn-finalize { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+/* 设计方案按钮：同样是一次"生成"动作，沿用主色，和 plan/draft 同族 */
+.ai-btn-design { letter-spacing: .01em; }
 
 /* ═══════════════════════════════════════════════════════════════
    房间管理页（独立 tab：列表 / 新建 / 改名 / 改尺寸 / 删除 / 聚焦）

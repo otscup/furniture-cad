@@ -369,7 +369,7 @@ src/import/
 | **P0** 冻结与护栏 ✅**已完成** | 本文件定稿；冻结 v0.3 数据形状（`CabinetRow`/`layout.rows`）；`layoutModel.ts` 建 canonical 口径；`projectFile` 读写两侧接上；`verify/migration-acceptance.ts` 56 条断言。详见 §15 | 旧文件逐字节往返（sha256 相等）；**零行为变更**，全量回归绿 |
 | **P1** 垂直维度 ✅**已完成** | `computeCabinetLayout` 多行 + 行隔板/行内立板/行内门抽层板 + 高度链断言 + views/3D 最小增量 + `rows` 写路径登记（**`schemaVersion` 仍未升 0.3，见 §16.4**） | **Case 1/2/4 全绿**；`verify:rows` 101 条断言；全量回归绿。详见 §16 |
 | **P2** 组合关系层 ✅**已完成** | `FurnitureAssembly` + `Connection` + `assembly.*` 动作 + 转角校验改用 `Connection`（保留原推断为兜底） | **Case 5/6 全绿**；原 `corner.ts` 断言不回归；`verify:relations` 82 条。详见 §17 |
-| **P3** AI 设计阶段 | `/api/ai/design` + `DesignProposal` 契约与校验器 + `compileProposal` + 界面确认流 + `design.*` 动作 | **`verify/proposal-acceptance`** + 一次端到端"大白话 → 提案 → 确认 → 落模型 → 出 DXF" |
+| **P3** AI 设计阶段 ✅**已完成** | `DesignProposal`（需求级）→ `validateProposal`/`compileProposal`（确定性编译为 `AiAction`）→ `dryRunPlan` → 确认 → `commitPlan`；与既有的 draft/plan 共用唯一写入口 `CommandBus` | 详见 §18；`verify/proposal-acceptance` 89 条 + `verify:fixhint`（PROPOSAL-* 14 码带数字）+ 全链 UI 661/661 不回归 |
 | **P4** 导入骨架 | `src/import/{types,normalize,json,dxf,kujiale}` + `project.import` 命令 + `Provenance` | **`verify/import-acceptance`**；`kujiale` 明示"未实现" |
 | **P5** 效果图识别 | `image.ts` + Vision → Proposal + 置信度门控 | 识别 + **必须用户确认**才落模型；`unknown` 不落模型 |
 | **P6** 设计知识 | 偏好记忆层（与硬规则物理分离）+ 方案排序 | **`verify/preference-acceptance`**；负样本证明偏好改不了硬规则 |
@@ -556,3 +556,54 @@ src/import/
 | `verify:ui` | **661 / 661**（与 P1 后基线**逐条相同**，未新增也未放宽） |
 | `verify:ai` | 70 / 70（含新增的 `assembly.create` / `assembly.delete` 最小样例） |
 | 旧断言 | 一条未删、未放宽；`corner.ts` 在无组合时行为与 P2 前一致（G 组已钉） |
+
+---
+
+## 18. P3 实施记录（已完成）
+
+### 18.1 交付物（按"链路位置"分组）
+
+**需求级 Proposal 类型与校验**
+- `src/ai/proposal.ts`：`DesignProposal` / `ProposalCabinet` / `ProposalRow` / `ProposalUnit` / `ProposalAssembly` / `ProposalConnection` 类型；`validateProposal(p, project)`（语义校验，报 `PROPOSAL-*` 码，每条给具体数字）、`proposalBlocked()`、`defaultSizes()`。
+- `src/ai/compileProposal.ts`：确定性编译器，把 `DesignProposal` 翻成 `AiAction[]`。柜体 → `cabinet.create`（rows/units/backUnits 全透传，落位由 `pickFreeSpot` 定，无坐标）；组合 → `assembly.create`（成员用 `$ref:ref` 占位，真正建出来那一刻由 `planRunner` 换真 id）。
+
+**契约与服务端**
+- `shared/aiContract.mjs`：`buildDesignSystemPrompt()` / `buildDesignRequest()`（系统提示写"设计方案"，server/mock 靠它区分通道）；`proposalShapeError()` 形状门（服务端第一道关 + 前端第二道关共用同一份）；`ACTIONS['cabinet.create']` 补 `rows` 参数（`id-list` / `object-list` 形状校验）。
+- `server/server.mjs`：新增 `/api/ai/design` —— 只做形状校验 + 转发模型 + 抽取 JSON + 形状门退回；**不编译、不碰模型、不产出几何**。
+- `src/ai/aiClient.ts`：`requestDesign()`（前端再验一次形状门，整份退回不修）。
+
+**UI（复用既有收口，不新造提交链路）**
+- `src/ui/panels/AIPanel.tsx`：新增"设计方案"按钮与设计方案段；显示标题/说明、AI 假设、系统补齐的默认值（notes）、待确认问题（openQuestions，**非空即禁用应用**）、`PROPOSAL-*` 校验结果、`reasoning`；确认前零改动模型。
+- `src/ui/panels/PlanRunView.tsx`（新）：把 `dryRunPlan` 的预览渲染抽出来，**plan 模式与 design 模式共用同一份** —— 杜绝"预览看着对、提交却不一样"的漂移。
+- 会话状态新增 `design` 字段，与 chat/draft/plan 一起按房间落 sessionStorage；版本失效时一并作废 design.run。
+
+### 18.2 三条纪律（P3 的架构边界，比代码重要）
+
+1. **Proposal 与正式模型严格分离。** Proposal 只活在会话状态里，编译产物是 `AiAction`，走的是既有的 `dryRunPlan → 确认 → commitPlan` 唯一写入口。它**没有第二条写入口**，结构上不可能是后门。
+2. **AI 只出语义，不碰几何。** Proposal 字段里没有 x/y/z；`compileProposal` 产出的动作不含 `atX/atY`。落位由系统定，组合成员用 `$ref:` 占位（不让模型去猜还不存在的 id）。
+3. **不确定就问，不猜。** `questions` 非空 ⇒ `compileProposal` 返回 `ok:false`，应用按钮禁用；尺寸没给用规则集默认值并写进 `notes` 显示在界面（悄悄补齐 = 骗人）。
+
+### 18.3 `verify/proposal-acceptance` 的 89 条断言（分组）
+
+- A–F：Proposal→编译→干跑→提交的端到端不污染模型、契约校验通过、`$ref:` 解析、多行柜分区 id 不撞车、"预览===提交"逐 command 比对。
+- G：结构边界 —— `proposal.ts` 无任何坐标字段。
+- H：兼容 —— 无提案时模型与序列化与 P2 后完全一致。
+- I（新增通道级）：`buildDesignRequest` 系统提示含"设计方案"、用户需求与快照随通道带出；`proposalShapeError` 拒缺 title / 非数组 cabinets / 缺 ref / 非法 connection kind / 非数组 members；**openQuestions 阻断编译到可执行动作**且原因把原问题带上；无障碍方案能编译→干跑不动模型→确认才写入。
+
+### 18.4 P3 的已知边界 / 有意偏离（需你知晓）
+
+- **设计模式不新增"design.* 写动作"。** 它复用 `cabinet.create` / `assembly.create`，没有为 Proposal 单独开一套写入口 —— 正是"唯一写入口"纪律的体现。
+- **`compileProposal` 不做几何。** 柜体内部结构、落位、组合关系全部交回确定性代码（与 AI 直接出动作的链路同权同位）。
+- **待确认问题（openQuestions）一律不让步**：宁可停在预览，也不拿假设替用户拍板。
+
+### 18.5 回归判据（实测）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| 全量 node 链（30 个脚本，含新增 `verify:proposal`） | 全部 exit=0 |
+| `verify:proposal` | **89 / 89**（新建） |
+| `verify:relations` / `rows` / `migration` / `fixhint` | 82 / 106 / 56 / **27**（PROPOSAL-* 14 码均带具体数字） |
+| `verify:ui` | **661 / 661**（与 P2 后基线逐条相同；新增按钮与 PlanRunView 复用未引入新差异） |
+| `verify:ai` / `aigen` / `draft` / `assembly` | 70 / 60 / 37 / 78（旧链路未回归） |
+| 旧断言 | 一条未删、未放宽；新增 `verify:proposal` 接入 `verify:all` |

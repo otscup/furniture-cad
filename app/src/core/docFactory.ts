@@ -2,6 +2,7 @@ import type {
   ApplianceSpec,
   Cabinet,
   CabinetParams,
+  CabinetRow,
   DrawerSpec,
   Project,
   Room,
@@ -10,6 +11,7 @@ import type {
   Wall,
 } from './types.ts';
 import { nextId } from './ids.ts';
+import { ROW_HEIGHT_FILL } from './layoutModel.ts';
 import { findCabinetTemplate, resolveTemplateUnitWidths, resolveTemplateUnitWidthList } from './templates.ts';
 
 /**
@@ -110,6 +112,14 @@ export function createCabinet(opts: {
   units?: UnitSpec[];
   /** 双面柜（岛台）的背面分区。给出即建 type='double'；row 柜不传 */
   backUnits?: UnitSpec[];
+  /**
+   * 垂直行（v0.3，P1 的形状；P3 起 AI 通道也走这里）。
+   *
+   * **1 行 = 塌回 units**（不写冗余 rows，与 v0.2 逐字节相同）；
+   * ≥2 行 = 上下分层，行序自上而下。行 id 在这里生成（跨行累积 takenIds，
+   * 撞 id 不报错只静默共用记录 —— 那是清单事故，不是小毛病）。
+   */
+  rows?: Array<{ height?: number | 'fill'; units: UnitSpec[] }>;
   rules: RuleSet;
   takenIds?: Iterable<string>;
 }): Cabinet {
@@ -119,7 +129,7 @@ export function createCabinet(opts: {
     ...opts.params,
     backPanel: { ...base.backPanel, ...(opts.params?.backPanel ?? {}) },
   };
-  const units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules);
+  let units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules);
   /**
    * 背面分区的 id 兜底：板件 id 是 `P_{cab}_{unit.id}_…` 拼出来的，
    * 前后排撞 id = 两块不同的板共用一条清单记录（生产下错料）。
@@ -138,13 +148,42 @@ export function createCabinet(opts: {
       return fixed;
     });
   }
+  /**
+   * 垂直行：只有真分了上下两层（≥2 行）才写 `rows`，1 行塌回 units ——
+   * 形状判断只在 layoutModel 一家，这里是"构造时就不产出冗余形状"。
+   */
+  let rows: CabinetRow[] | undefined;
+  if (opts.rows && opts.rows.length > 0) {
+    const rowTaken = new Set<string>(units.map((u) => u.id));
+    rows = opts.rows.map((r) => {
+      const id = nextId('row', rowTaken);
+      rowTaken.add(id);
+      return { id, height: r.height ?? ROW_HEIGHT_FILL, units: r.units };
+    });
+    if (rows.length === 1) {
+      // 单行：塌回，不留 rows（等价 v0.2 形状）
+      units = rows[0]!.units.length > 0 ? rows[0]!.units : units;
+      rows = undefined;
+    } else {
+      // 多行：units 留第一行的镜像（字段必填，存盘时由 toFileLayout 省略），
+      // 读侧一律以 rows 为权威 —— 不会有人把第一行当成整柜。
+      units = rows[0]!.units;
+    }
+  }
+
   return {
     id: opts.id ?? nextId('cab', opts.takenIds ?? []),
     name: opts.name,
     roomId: opts.roomId,
     placement: { x: Math.round(opts.x), y: Math.round(opts.y), rotation: opts.rotation ?? 0 },
     params,
-    layout: { type: backUnits ? 'double' : 'row', widthMode: 'fit_total', units, ...(backUnits ? { backUnits } : {}) },
+    layout: {
+      type: backUnits ? 'double' : 'row',
+      widthMode: 'fit_total',
+      units,
+      ...(backUnits ? { backUnits } : {}),
+      ...(rows ? { rows } : {}),
+    },
   };
 }
 

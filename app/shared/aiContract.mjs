@@ -339,6 +339,19 @@ export const ACTIONS = {
       },
       units: UNIT_INTENT_DOC,
       backUnits: { ...UNIT_INTENT_DOC, desc: '背面分区（从左到右）。给了就建**双面柜（岛台）**：前后两排背靠背、共用中板、没有背板。岛台/吧台这类两面临走的柜子才用' },
+      /**
+       * 垂直行（v0.3 / P1 形状；P3 起设计方案也能表达）。
+       * "上面挂衣服、下面放鞋"这种**上下分层**用 rows；units 是左右并排。
+       */
+      rows: {
+        type: 'row-list',
+        max: 4,
+        desc:
+          '可选。上下分层：每行 { height?, units:[…] }，**从上到下**（第 1 行在最上面）。' +
+          'height 不给 = 各行均分内高；最后一行给 height:"fill" = 吃掉剩余高度。' +
+          'units 的写法与上面的 units 完全一样（kind + width + count / doorCount / rodHeight）。' +
+          '**只分一层就别用 rows**，直接用 units —— rows 只有 1 行时等价于 units',
+      },
     },
     required: ['name'],
     detail:
@@ -636,6 +649,31 @@ function checkParam(actionName, key, p, v, ctx) {
       }
       return null;
     }
+    /**
+     * 垂直行列表：每项 { height?, units: 分区数组 }。
+     *
+     * 分区那一层直接复用 `unitIntentsSemanticError`（与 units 同一份语义校验），
+     * 不在这里另写一份"哪些字段互斥" —— 两处规则一旦分家，
+     * 就会出现"units 里被拒的分区，从 rows 进来就放过"。
+     */
+    case 'row-list': {
+      if (!Array.isArray(v)) return `${where} 必须是一个数组（每行一项，从上到下）`;
+      if (v.length === 0) return `${where} 是空数组 —— 那就等于没说，删掉这个参数`;
+      if (p.max !== undefined && v.length > p.max) return `${where} 最多 ${p.max} 行（实际 ${v.length}）`;
+      for (let i = 0; i < v.length; i++) {
+        const it = v[i];
+        if (!isPlainObject(it)) return `${where} 第 ${i + 1} 行必须是一个对象`;
+        if (it.height !== undefined && it.height !== 'fill' && !finite(it.height)) {
+          return `${where} 第 ${i + 1} 行的 height 必须是数字或 "fill"（收到 ${JSON.stringify(it.height)}）`;
+        }
+        if (it.height !== undefined && it.height !== 'fill' && (it.height < 100 || it.height > 4000)) {
+          return `${where} 第 ${i + 1} 行的 height = ${it.height} 不在 100~4000（mm）之间`;
+        }
+        const bad = unitIntentsSemanticError(it.units);
+        if (bad) return `${where} 第 ${i + 1} 行：${bad.replace('units 第', '第')}`;
+      }
+      return null;
+    }
     case 'roomRef': {
       if (finite(v) || (typeof v === 'string' && v.trim() && v.length <= MAX_STRING)) return null;
       return `${where} 必须是数字序号（1 起）或房间名`;
@@ -736,6 +774,10 @@ function crossValidate(actionName, params) {
     return null;
   }
   if (actionName === 'cabinet.create') {
+    /** rows 与 units 是同一个维度的两种写法，同时给 = 不知道以哪个为准 */
+    if (Array.isArray(params.rows) && Array.isArray(params.units)) {
+      return 'rows（上下分层）与 units（左右并排）只能给一个 —— 只分一层就用 units，要上下分层就用 rows';
+    }
     if (Array.isArray(params.units)) {
       const bad = unitIntentsSemanticError(params.units);
       if (bad) return bad;
@@ -908,6 +950,8 @@ function describeParam(k, p, spec) {
       return `${k}: 字符串数组（id 列表，${p.min ?? 1}~${p.max} 项，不可重复）${opt}${p.desc ? ` ${p.desc}` : ''}`;
     case 'object-list':
       return `${k}: 对象数组，最多 ${p.max} 项，每项 { a, b, kind, edge? }${opt}${p.desc ? ` ${p.desc}` : ''}`;
+    case 'row-list':
+      return `${k}: 行数组（上下分层，从上到下），每项 { height?: 数字|"fill", units:[…] }${opt}${p.desc ? ` ${p.desc}` : ''}`;
     default:
       return `${k}: ${p.type}`;
   }
@@ -1014,6 +1058,211 @@ export function resolveMaxTokens(raw, fallback = DEFAULT_MAX_TOKENS) {
   const n = Number(s) * mult;
   if (!Number.isFinite(n) || n <= 0) return PRACTICAL_MAX_TOKENS;
   return Math.min(MAX_OUTPUT_TOKENS_CAP, Math.max(1, Math.round(n)));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  设计方案（DesignProposal，v0.3 / P3）
+//
+//  为什么要把"出方案"和"出动作"分成两种请求：
+//    让模型一次性既想清楚"要什么"、又排好"先建柜再建组、id 怎么传"，
+//    等于把工程活推给它 —— 它只能猜 id、猜顺序，猜错就是整份拒收。
+//    设计方案这一层只让它说清**需求的结构**，工程那半截由确定性编译器做。
+//
+//  ⚠ 与动作契约的关系：**不是**第二套写入口。
+//    方案编译出来的仍然是 AiAction，照样过 validateAction，照样走总线。
+//    这里唯一的特权是"可以引用还没建出来的柜体"（用 ref），
+//    而 ref 在执行的那一刻就会被换成真 id。
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * 给模型的"这一轮交什么"说明书。
+ *
+ * 与 COMPOSITION_GUIDE 同款纪律：这是给模型看的，不是注释 ——
+ * 每个字都要能被直接执行。改了这里，`verify/proposal-acceptance.ts`
+ * 会跟着断言它确实出现在生成的提示词里。
+ */
+export const PROPOSAL_GUIDE = `
+【这一轮你要交的是**设计方案**，不是动作】
+
+用户说的是需求（"玄关放个鞋柜，下面放鞋、上面放钥匙，再拐个弯接一组挂衣的"）。
+你要做的是把它翻成一个**结构化的方案**，系统负责把它变成柜体与板件。
+
+输出一个 JSON 对象，字段如下：
+  title     一句话标题（必填）
+  summary   你怎么理解这个需求、为什么这样规划（可选，写人话）
+  room      默认房间名（可选；柜体自己给了 room 就以柜体的为准）
+  cabinets  柜体数组（必填，至少 1 个）：
+    ref        方案内引用名（必填，如 "a" / "shoe"）—— **组合靠它引用，不要用 id**
+    name       柜体名（可选，不给就用 ref）
+    room       房间名（可选）
+    width / height / depth   毫米（可选，不给 = 按常规尺寸，系统会告诉你补了多少）
+    units      从左到右的一列分区（可选）：每项 { kind, width, nickname?, count?, doorCount?, rodHeight? }
+    rows       上下分层（可选，与 units 二选一）：每行 { height?, units:[…] }，**从上到下**，
+               最后一行的 height 可以写 "fill"（吃掉剩余高度）
+  assemblies  组合（可选）：
+    ref / name / members:[柜体 ref…] / connections:[{ a: ref, b: ref, kind }]
+    kind: "corner" 角接（L 型，两臂垂直）/ "butt" 续接（并排贴合）/ "stack" 叠放（本阶段无法核对，仅供记录）
+  assumptions 你自己声明的假设（数组）："深度没说，按 600"
+  questions   **必须用户回答**的问题（数组）："柜深按 350 还是 600？"
+              —— 写了 questions 的方案不会被直接应用，系统会先问用户
+
+分区 kind 只有这几种：drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区 / appliance 电器格。
+
+★ 三条最容易犯的错：
+  1. **不要给坐标**（x / y / atX / atY 一律不写）：你没有墙的坐标，猜出来的点会扎进墙里。
+     要说"朝哪边"就给 rotation（0/90/180/270），系统会按它把柜体贴到对的墙上。
+  2. **一个柜子内部的左右分段用 units，上下分层才用 rows** ——
+     "左三段抽屉、右两组对开门"是 **一个**柜体的 units，不是两个柜体。
+  3. 拿不准就写进 questions，不要硬猜：猜出来的尺寸会直接变成下料尺寸。
+`;
+
+/** 方案的示例（模型主要靠示例学格式 —— 与上面的说明必须一致，改一处就得改另一处） */
+export const PROPOSAL_EXAMPLE = {
+  title: '玄关鞋柜 + 转角挂衣区',
+  summary: '门口放 1200 宽的鞋柜，下面三层鞋抽、右侧开放格放钥匙；再拐个弯接一组挂衣区，两柜成 L 型。',
+  room: '玄关',
+  cabinets: [
+    {
+      ref: 'shoe',
+      name: '玄关鞋柜',
+      width: 1200,
+      height: 1000,
+      depth: 350,
+      units: [
+        { kind: 'drawerBank', width: 800, count: 3, nickname: '鞋抽' },
+        { kind: 'open', width: 400, nickname: '钥匙格' },
+      ],
+    },
+    {
+      ref: 'hang',
+      name: '转角挂衣区',
+      width: 900,
+      height: 2400,
+      depth: 600,
+      rotation: 90,
+      rows: [
+        { height: 1400, units: [{ kind: 'hanging', width: 900, rodHeight: 1300 }] },
+        { height: 'fill', units: [{ kind: 'drawerBank', width: 900, count: 2 }] },
+      ],
+    },
+  ],
+  assemblies: [{ ref: 'g1', name: '玄关 L 型', members: ['shoe', 'hang'], connections: [{ a: 'shoe', b: 'hang', kind: 'corner' }] }],
+  assumptions: ['鞋柜深度按常见的 350'],
+  questions: [],
+};
+
+/**
+ * 设计方案的形状校验 —— **唯一实现**。
+ *
+ * 服务端（AI 输出进系统的第一道门）与前端（防呆）共用这一份。
+ * 只管"是不是这个形状"，不管"对不对"：业务对错交给
+ * `validateProposal`（那才是能给出"差多少 / 改哪个"的那一层）。
+ *
+ * @returns {string|null} null = 形状没问题；字符串 = 人话拒收原因
+ */
+export function proposalShapeError(raw) {
+  if (!isPlainObject(raw)) return '方案必须是一个 JSON 对象';
+  if (typeof raw.title !== 'string' || raw.title.trim() === '') return '方案缺 title（一句话标题）';
+  if (!Array.isArray(raw.cabinets)) return '方案缺 cabinets（柜体数组），至少要有一个柜体';
+  if (raw.cabinets.length === 0) return '方案的 cabinets 是空数组 —— 一个柜体都没有，没有东西可预览';
+  for (let i = 0; i < raw.cabinets.length; i++) {
+    const c = raw.cabinets[i];
+    if (!isPlainObject(c)) return `cabinets 第 ${i + 1} 项不是对象`;
+    if (typeof c.ref !== 'string' || c.ref.trim() === '') return `cabinets 第 ${i + 1} 项缺 ref（方案内引用名）`;
+    for (const k of ['width', 'height', 'depth', 'rotation']) {
+      if (c[k] !== undefined && c[k] !== null && !finite(c[k])) return `柜体「${c.ref}」的 ${k} 必须是数字或不给`;
+    }
+    if (c.name !== undefined && c.name !== null && typeof c.name !== 'string') return `柜体「${c.ref}」的 name 必须是字符串或不给`;
+    if (c.room !== undefined && c.room !== null && typeof c.room !== 'string') return `柜体「${c.ref}」的 room 必须是字符串或不给`;
+    if (c.units !== undefined && c.units !== null) {
+      const bad = unitListShapeError(c.units, `柜体「${c.ref}」的 units`);
+      if (bad) return bad;
+    }
+    if (c.backUnits !== undefined && c.backUnits !== null) {
+      const bad = unitListShapeError(c.backUnits, `柜体「${c.ref}」的 backUnits`);
+      if (bad) return bad;
+    }
+    if (c.rows !== undefined && c.rows !== null) {
+      if (!Array.isArray(c.rows)) return `柜体「${c.ref}」的 rows 必须是数组`;
+      for (let j = 0; j < c.rows.length; j++) {
+        const r = c.rows[j];
+        if (!isPlainObject(r)) return `柜体「${c.ref}」第 ${j + 1} 行不是对象`;
+        const h = r.height;
+        if (!(h === undefined || h === null || h === 'fill' || finite(h))) {
+          return `柜体「${c.ref}」第 ${j + 1} 行的 height 必须是数字、"fill" 或不给`;
+        }
+        if (!Array.isArray(r.units)) return `柜体「${c.ref}」第 ${j + 1} 行缺 units（分区数组）`;
+        const bad = unitListShapeError(r.units, `柜体「${c.ref}」第 ${j + 1} 行的 units`);
+        if (bad) return bad;
+      }
+    }
+  }
+  if (raw.assemblies !== undefined && raw.assemblies !== null) {
+    if (!Array.isArray(raw.assemblies)) return 'assemblies 必须是数组';
+    for (let i = 0; i < raw.assemblies.length; i++) {
+      const a = raw.assemblies[i];
+      if (!isPlainObject(a)) return `assemblies 第 ${i + 1} 项不是对象`;
+      if (typeof a.ref !== 'string' || a.ref.trim() === '') return `assemblies 第 ${i + 1} 项缺 ref`;
+      if (!Array.isArray(a.members) || a.members.some((m) => typeof m !== 'string')) {
+        return `组合「${a.ref}」的 members 必须是柜体 ref 的字符串数组`;
+      }
+      if (a.connections !== undefined && a.connections !== null) {
+        if (!Array.isArray(a.connections)) return `组合「${a.ref}」的 connections 必须是数组`;
+        for (const c of a.connections) {
+          if (!isPlainObject(c)) return `组合「${a.ref}」的 connections 里有不是对象的项`;
+          if (typeof c.a !== 'string' || typeof c.b !== 'string') return `组合「${a.ref}」的连接缺 a / b（柜体 ref）`;
+          if (typeof c.kind !== 'string') return `组合「${a.ref}」的连接缺 kind`;
+          if (!['corner', 'butt', 'stack'].includes(c.kind)) return `组合「${a.ref}」的连接 kind 只能是 corner / butt / stack，收到的是「${c.kind}」`;
+        }
+      }
+    }
+  }
+  for (const k of ['questions', 'assumptions']) {
+    if (raw[k] !== undefined && raw[k] !== null && (!Array.isArray(raw[k]) || raw[k].some((q) => typeof q !== 'string'))) {
+      return `${k} 必须是字符串数组`;
+    }
+  }
+  return null;
+}
+
+function unitListShapeError(raw, where) {
+  if (!Array.isArray(raw)) return `${where} 必须是数组`;
+  if (raw.length === 0) return `${where} 是空数组 —— 不给就省略这个字段`;
+  for (let i = 0; i < raw.length; i++) {
+    const u = raw[i];
+    if (!isPlainObject(u)) return `${where} 第 ${i + 1} 项不是对象`;
+    if (typeof u.kind !== 'string' || u.kind === '') return `${where} 第 ${i + 1} 项缺 kind（分区类型）`;
+  }
+  return null;
+}
+
+/** 设计方案请求的系统提示 —— 与动作版（buildSystemPrompt）只共享"你是谁"，不共享"交什么" */
+export function buildDesignSystemPrompt() {
+  return [
+    '你是一个定制家具设计助手，服务于一套**参数化柜体 CAD**。',
+    '你只做一件事：把用户的自然语言需求整理成一份**结构化设计方案**。',
+    '',
+    PROPOSAL_GUIDE,
+    '',
+    '【输出格式】只输出一个 JSON 对象，不要 markdown 围栏，不要寒暄。示例：',
+    JSON.stringify(PROPOSAL_EXAMPLE),
+    '',
+    '【边界】你不产出坐标、板件清单、图元或加工数据 —— 那些由系统推导。',
+    '你也不直接修改设计：你交的是**方案**，用户确认之后才会变成真正的柜体。',
+  ].join('\n');
+}
+
+export function buildDesignRequest(model, text, snapshot, opts = {}) {
+  return {
+    model,
+    messages: [
+      { role: 'system', content: buildDesignSystemPrompt() },
+      { role: 'user', content: buildUserMessage(text, snapshot, opts.history ?? []) },
+    ],
+    temperature: opts.temperature ?? 0.2,
+    response_format: { type: 'json_object' },
+    max_tokens: opts.maxTokens ?? DEFAULT_MAX_TOKENS,
+  };
 }
 
 export function buildChatRequest(model, text, snapshot, opts = {}) {

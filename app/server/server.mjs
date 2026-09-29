@@ -40,7 +40,15 @@ import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
-import { buildChatRequest, extractJson, validatePlan, DEFAULT_MAX_TOKENS, resolveMaxTokens } from '../shared/aiContract.mjs';
+import {
+  buildChatRequest,
+  buildDesignRequest,
+  extractJson,
+  proposalShapeError,
+  validatePlan,
+  DEFAULT_MAX_TOKENS,
+  resolveMaxTokens,
+} from '../shared/aiContract.mjs';
 import { quotaView } from '../shared/quota.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1198,6 +1206,157 @@ async function handleApi(req, res, pathname) {
          * 必须如实告诉前端 —— 它是"模型边想边写下的草稿"，可信度低于正式正文，
          * 界面应当提示用户重点复核，而不是和普通结果一个待遇。
          */
+        salvagedFromReasoning,
+        model: data?.model ?? model,
+        usage,
+        ms,
+        quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
+      });
+    } catch (e) {
+      const ms = Date.now() - t0;
+      if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: e.name, generation: true });
+      return json(res, 200, { ok: false, error: e.name === 'AbortError' ? '调用超时' : `调用失败：${e.message}`, ms });
+    }
+  }
+
+  /**
+   * ── /api/ai/design：**需求 → 设计方案**（P3）──
+   *
+   * 与 /api/ai/plan 的关系（这是本阶段最重要的一条边界）：
+   *   plan   = 动作级：照这句话去**改现有的模型**（动作直接指向已有柜体）；
+   *   design = 需求级：照这句需求**设计一个新方案**（产出的柜体还不存在）。
+   *
+   * 这个接口**不编译命令、不碰模型、不产出几何** —— 与 plan 完全同一条纪律。
+   * 方案回到前端后由 `compileProposal` 编译成动作，再走既有的
+   * 干跑 → 预览 → 确认 → commitPlan。写入口始终只有一个（CommandBus）。
+   *
+   * ── 服务端能验什么、不能验什么 ──
+   *   能验：**形状**（字段类型、必填、枚举形状）—— 契约是静态的，不需要项目数据；
+   *   不能验：**语义**（房间存不存在、尺寸合不合理）—— 那需要项目与规则集，
+   *   而服务端手上只有快照。所以语义校验在前端 `validateProposal` 做，
+   *   这里是"AI 输出进入系统的第一道门"，不是最后一道。
+   */
+  if (pathname === '/api/ai/design' && req.method === 'POST') {
+    const body = await readBody(req);
+    if (gate.account) {
+      const q = auth.checkQuota(gate.account.id, { generation: true });
+      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code, quota: q.view });
+    }
+
+    const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
+    const key = env.AI_API_KEY || '';
+    const model = body.model || env.AI_MODEL || s.model;
+    if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key —— 请在「管理后台」里填好再试' });
+    if (gate.account) {
+      const m = auth.checkModel(gate.account.id, model);
+      if (!m.ok) return json(res, 403, { ok: false, error: m.error, code: m.code });
+    }
+
+    const text = typeof body.text === 'string' ? body.text.trim() : '';
+    if (!text) return json(res, 400, { ok: false, error: 'text 不能为空' });
+    if (text.length > 2000) return json(res, 400, { ok: false, error: '这句话太长了（上限 2000 字），请拆开说' });
+    if (!body.snapshot || typeof body.snapshot !== 'object') {
+      return json(res, 400, { ok: false, error: '缺少 snapshot —— 前端必须显式给出项目快照，服务端不替它去读模型' });
+    }
+
+    const t0 = Date.now();
+    try {
+      const payload = buildDesignRequest(model, text, body.snapshot, {
+        history: Array.isArray(body.history) ? body.history : [],
+        temperature: Number(env.AI_TEMPERATURE ?? 0.2),
+        maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
+      });
+      const r = await fetchWithTimeout(
+        `${baseUrl}/chat/completions`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }, body: JSON.stringify(payload) },
+        Number(env.AI_TIMEOUT_MS ?? 120000)
+      );
+      const raw = await r.text();
+      const ms = Date.now() - t0;
+      if (!r.ok) {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: `HTTP ${r.status}`, generation: true });
+        return json(res, 200, { ok: false, error: `服务商返回 HTTP ${r.status}：${raw.slice(0, 400)}`, ms });
+      }
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms, note: 'bad_envelope', generation: true });
+        return json(res, 200, { ok: false, error: '服务商返回的不是 JSON', raw: raw.slice(0, 400), ms });
+      }
+      const choice = data?.choices?.[0] ?? {};
+      let content = choice?.message?.content ?? '';
+      const reasoning = String(choice?.message?.reasoning_content ?? '');
+      const finish = choice?.finish_reason;
+      const usage = data?.usage ?? null;
+      if (gate.account) {
+        auth.recordUsage(gate.account.id, {
+          model: data?.model ?? model,
+          promptTokens: Number(usage?.prompt_tokens ?? 0),
+          completionTokens: Number(usage?.completion_tokens ?? 0),
+          ok: true,
+          ms,
+          generation: true,
+        });
+      }
+
+      /** 与 plan 同一套救援：推理模型常把预算吃在 reasoning_content 上 */
+      let salvagedFromReasoning = false;
+      if (!String(content).trim() && reasoning.trim()) {
+        const salv = extractJson(reasoning);
+        if (salv.ok) {
+          content = reasoning;
+          salvagedFromReasoning = true;
+          auth.audit({ actor, action: 'ai.design', result: 'salvaged', model: data?.model ?? model, note: 'empty_content_salvaged_from_reasoning' });
+        }
+      }
+      if (!String(content).trim()) {
+        const comp = usage?.completion_tokens;
+        const why =
+          finish === 'length'
+            ? `模型把 ${comp ?? '?'} 个输出 token 全花在思考上、一个字正文都没写出来，并且思考里也没抠出可解析的方案。**不建议靠调大 AI_MAX_TOKENS 解决**：调大了会变成"调用超时"。建议换一个非推理模型，或把需求说得更短。`
+            : reasoning
+              ? `模型只产出了"思考过程"（${reasoning.length} 字）而没有产出正文。`
+              : '模型返回的正文是空的。';
+        auth.audit({ actor, action: 'ai.design', result: 'empty', model: data?.model ?? model, note: finish === 'length' ? 'budget_exhausted' : 'empty_content' });
+        return json(res, 200, { ok: false, error: why, raw: String(content).slice(0, 800), reasoning: reasoning.slice(0, 4000), finishReason: finish, model: data?.model ?? model, usage, ms });
+      }
+
+      const extracted = extractJson(content);
+      if (!extracted.ok) {
+        auth.audit({ actor, action: 'ai.design', result: 'unparsable', model, note: extracted.error });
+        return json(res, 200, { ok: false, error: `${extracted.error}（原始回复已附在下面）`, raw: extracted.raw ?? String(content).slice(0, 800), reasoning: reasoning.slice(0, 4000), finishReason: finish, model: data?.model ?? model, usage, ms });
+      }
+
+      /**
+       * 形状门：**拒了就整份退回**，不"尽力修补"。
+       * 半份被修过的方案会被拿去预览，而预览出来的东西和用户说的不是一回事 ——
+       * 那比"没拿到方案"更糟。
+       */
+      const bad = proposalShapeError(extracted.value);
+      auth.audit({
+        actor,
+        action: 'ai.design',
+        result: bad ? 'rejected' : salvagedFromReasoning ? 'salvaged' : 'ok',
+        model: data?.model ?? model,
+        note: bad ? `shape:${bad.slice(0, 80)}` : undefined,
+      });
+      if (bad) {
+        return json(res, 200, {
+          ok: false,
+          error: `AI 给的方案形状不对，已整份退回：${bad}`,
+          raw: JSON.stringify(extracted.value).slice(0, 800),
+          reasoning: reasoning.slice(0, 4000),
+          finishReason: finish,
+          model: data?.model ?? model,
+          usage,
+          ms,
+          quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
+        });
+      }
+      return json(res, 200, {
+        ok: true,
+        proposal: extracted.value,
         salvagedFromReasoning,
         model: data?.model ?? model,
         usage,

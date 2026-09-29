@@ -1,11 +1,11 @@
 import type { Command } from '../core/commandBus.ts';
-import type { Connection, ConnectionEdge, ConnectionKind, Cabinet, FurnitureAssembly, Project, RuleSet, UnitSpec } from '../core/types.ts';
+import type { Connection, ConnectionEdge, ConnectionKind, Cabinet, FurnitureAssembly, Project, RowHeight, RuleSet, UnitSpec } from '../core/types.ts';
 import * as CMD from '../core/commands.ts';
 import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '../core/docFactory.ts';
 import { nextId } from '../core/ids.ts';
 import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
-import { allUnits, canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
+import { ROW_HEIGHT_FILL, allUnits, canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
 import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
@@ -56,11 +56,24 @@ export interface AiAction {
   params: Record<string, number | string>;
   reason: string;
   index: number;
+  /**
+   * 方案内引用名（P3 DesignProposal 用）。
+   *
+   * 组合要引用"本轮刚建的柜体"，而柜体 id 是总线执行的瞬间才生成的 ——
+   * 编译这一刻不存在。所以编译产物里用 `$ref:<名字>` 占位，
+   * 由 planRunner 在该步骤建成后换成真 id（见 planRunner 的 refs）。
+   * 模型永远拿不到也不需要拿到 id —— 这是"AI 只出语义"的落点之一。
+   */
+  ref?: string;
 }
 
 export type CompileResult =
-  /** `note` = 编译器替 AI 做过的修正。它会拼进 PlanStep.label，界面必须看得到 —— "预览 === 提交" */
-  | { ok: true; command: Command; summary: string; note?: string }
+  /**
+   * `note` = 编译器替 AI 做过的修正。它会拼进 PlanStep.label，界面必须看得到 —— "预览 === 提交"
+   * `createdId` = 这一步**会**建出来的对象 id。planRunner 用它把 `$ref:` 占位换成真 id
+   * （id 在编译期就已确定并写进 command payload，所以预览与提交拿到的是同一个）。
+   */
+  | { ok: true; command: Command; summary: string; note?: string; createdId?: string }
   | { ok: false; error: string };
 
 const mm = (v: number): number => Math.round(Number(v));
@@ -136,7 +149,7 @@ function pickFreeSpot(project: Project, cab: Cabinet, preferRotation?: number): 
  *   多个分区同名会让**不同板件撞成同一个 id**：校验器报 DUP-PANEL-ID，
  *   更糟的是列表里两块不同的板会静默共用一条记录 —— 到了生产就是下错料。
  */
-function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number }): UnitSpec[] | string {
+function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; takenIds?: Set<string> }): UnitSpec[] | string {
   if (!Array.isArray(raw)) return 'units 必须是一个数组';
   if (raw.length === 0) return 'units 是空数组 —— 想用默认分区就不要给这个参数';
   // 语义互斥这一层**不由编译器自己重写**，而是调用契约里同一份实现。
@@ -144,7 +157,15 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number })
   // 那样的话"{kind:'hanging', count:2}"这种坏分区能被真的建出来。
   const semantic = unitIntentsSemanticError(raw);
   if (semantic) return semantic;
-  const taken = new Set<string>();
+  /**
+   * 多行柜：每一行都要接着上一行的 id 往后排。
+   * 各行自己从 unit_001 开始 = 两行共用同一条清单记录（下错料，且不报错）。
+   */
+  /**
+   * 直接在调用方那个 Set 上累加（不拷贝）：多行柜靠它把 id 一直往后排。
+   * 拷贝一份的话第二行又从 unit_001 开始，两行共用同一条清单记录。
+   */
+  const taken = opts.takenIds ?? new Set<string>();
   const out: UnitSpec[] = [];
   for (let i = 0; i < raw.length; i++) {
     const it = (raw[i] ?? {}) as Record<string, unknown>;
@@ -560,6 +581,30 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         if (typeof built === 'string') return { ok: false, error: built };
         units = built;
       }
+      /**
+       * 垂直行（P1 的形状；P3 起设计方案可以表达"上挂衣 / 下鞋抽"）。
+       *
+       * **分区 id 必须跨行唯一**：每行各自从 unit_001 开始，两行就会共用
+       * 同一条清单记录（不报错，直接下错料）。所以 takenIds 是跨行累加的 Set。
+       */
+      let rows: Array<{ height?: RowHeight; units: UnitSpec[] }> | undefined;
+      if (p.rows !== undefined && p.rows !== null) {
+        const rawRows = p.rows as unknown as Array<Record<string, unknown>>;
+        if (!Array.isArray(rawRows)) return { ok: false, error: 'rows 必须是一个数组' };
+        if (rawRows.length === 0) return { ok: false, error: 'rows 是空数组 —— 想建单行柜就不要给这个参数' };
+        const taken = new Set<string>();
+        rows = [];
+        for (let i = 0; i < rawRows.length; i++) {
+          const r = (rawRows[i] ?? {}) as Record<string, unknown>;
+          const built = unitsFromIntents(r.units, { rules, depth, takenIds: taken });
+          if (typeof built === 'string') return { ok: false, error: built.replace('units 第', `rows 第 ${i + 1} 行的第`) };
+          const h = r.height;
+          rows.push({
+            ...(h === undefined || h === null ? {} : { height: h === 'fill' ? ROW_HEIGHT_FILL : mm(Number(h)) }),
+            units: built,
+          });
+        }
+      }
       // 背面分区（岛台）：给了就建双面柜。排深 = (总深 - 板厚) / 2，与派生骨架同口径。
       let backUnits: UnitSpec[] | undefined;
       if (p.backUnits !== undefined) {
@@ -584,6 +629,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         params: { width, height, depth },
         units,
         backUnits,
+        rows,
         takenIds: project.cabinets.map((c) => c.id),
       });
 
@@ -629,7 +675,14 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         }
       }
 
-      return { ok: true, command: CMD.createCabinet(cab, src), summary: `新建柜体「${name}」${note}`, note: note || undefined };
+      return {
+        ok: true,
+        command: CMD.createCabinet(cab, src),
+        summary: `新建柜体「${name}」${note}`,
+        note: note || undefined,
+        // 方案里的组合要靠它把 `$ref:` 换成真 id（见 planRunner 的 refs）
+        createdId: cab.id,
+      };
     }
 
     case 'cabinet.duplicate': {

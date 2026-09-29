@@ -89,11 +89,46 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
   if (opts.gate !== undefined) sandbox.setGate(opts.gate);
 
   const steps: PlanStep[] = [];
-  const runStep = (action: AiAction, displayAction: AiAction): void => {
-    const compiled = compileAction(action, sandbox.getState(), rules);
+  /**
+   * 方案内引用表：`ref 名 → 真实 id`。
+   *
+   * P3 的设计方案里，组合要引用"本轮刚建的柜体"，而柜体 id 是执行瞬间才生成的 ——
+   * 编译那一步还不存在。所以编译器写 `$ref:<名字>` 占位，这里在柜体建成后换成真 id。
+   *
+   * 换 id 这件事**只能在这里做**：换成真 id 之后它才是一条普通动作，
+   * 后面的编译/校验/提交完全不知道 `$ref:` 存在过 —— 命令里落的是真 id，
+   * 所以"预览 === 提交"仍然成立（提交的是同一批 Command 对象）。
+   */
+  const refs = new Map<string, string>();
+  const REF_PREFIX = '$ref:';
+  const resolveRefs = (value: unknown): unknown => {
+    if (typeof value === 'string' && value.startsWith(REF_PREFIX)) {
+      const name = value.slice(REF_PREFIX.length);
+      const id = refs.get(name);
+      // 换不出来就原样留下：编译器的"成员不存在"检查会给一句人话，
+      // 这里不假装换好了（静默换错 id = 组合挂到别的柜子上）
+      return id ?? value;
+    }
+    if (Array.isArray(value)) return value.map(resolveRefs);
+    if (value && typeof value === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = resolveRefs(v);
+      return out;
+    }
+    return value;
+  };
+
+  const runStep = (action: AiAction): void => {
+    /**
+     * 美元引用在这一步之前替换：编译器看到的是真 id，
+     * 于是"成员必须逐个查到"这类检查照旧生效（不会被占位符骗过去）。
+     */
+    const resolved = action.params ? (resolveRefs(action.params as unknown as Record<string, unknown>) as AiAction['params']) : action.params;
+    const resolvedAction: AiAction = { ...action, params: resolved };
+    const compiled = compileAction(resolvedAction, sandbox.getState(), rules);
     if (!compiled.ok) {
       steps.push({
-        action: displayAction,
+        action: resolvedAction,
         label: '(未编译)',
         ok: false,
         error: compiled.error ?? '编译失败（编译器没有给出原因，这本身是个缺陷）',
@@ -113,7 +148,7 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
      */
     const r = sandbox.execute(compiled.command, { strict: true, commitLabel: `AI：${compiled.summary}` });
     steps.push({
-      action: displayAction,
+      action: resolvedAction,
       command: compiled.command,
       /**
        * `note` 是编译器替 AI 做过的修正（例如"AI 猜的落位扎进墙，已自动贴墙修正"）。
@@ -137,6 +172,12 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
       memoryHits: r.memoryHits,
       blockingErrors: r.blockingErrors,
     });
+    /**
+     * 记下"这一轮建出来的柜体叫什么 id" —— 后面组合步骤的 `$ref:` 靠它换。
+     * 只在**真的建成**时才记：失败的步骤不进 refs，于是后续引用会换不出来，
+     * 编译器给出"成员不存在"的人话，而不是悄悄挂到一个不存在的柜子上。
+     */
+    if (r.ok && resolvedAction.ref && compiled.createdId) refs.set(resolvedAction.ref, compiled.createdId);
   };
 
   for (const action of actions) {
@@ -167,11 +208,11 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
         // 否则编译器的守卫会正确地拦下它（那是守卫的功劳，不是展开的功劳）
         const { scope: _scope, ...targetRest } = action.target;
         const expanded: AiAction = { ...action, target: { ...targetRest, cabinetId: id } };
-        runStep(expanded, expanded);
+        runStep(expanded);
       }
       continue;
     }
-    runStep(action, action);
+    runStep(action);
   }
 
   const okCount = steps.filter((s) => s.ok).length;

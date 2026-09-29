@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
+import type { Issue } from '../../core/types.ts';
 import { ACTION_NAMES, ACTIONS } from '../../../shared/aiContract.mjs';
-import { api, requestChat, requestPlan, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
+import { api, requestChat, requestDesign, requestPlan, type ChatTurn, type DesignResponse, type PlanRejection } from '../../ai/aiClient.ts';
 import type { QuotaView } from '../../ai/quotaTypes.ts';
 import { QuotaMeter } from '../QuotaMeter.tsx';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
@@ -15,6 +16,9 @@ import {
   undoLastRound,
   type DraftSession,
 } from '../../ai/draftSession.ts';
+import { validateProposal, type DesignProposal } from '../../ai/proposal.ts';
+import { compileProposal } from '../../ai/compileProposal.ts';
+import { PlanRunView } from './PlanRunView.tsx';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
 import { DraftPreview } from './DraftPreview.tsx';
@@ -120,6 +124,36 @@ interface PlanBundle {
 }
 
 /**
+ * 设计方案通道那一整块的结果（P3：需求级 Proposal）。
+ *
+ * ── 与 PlanBundle 的同与异 ──
+ *   同：最终都编译成 `AiAction[]` → `dryRunPlan`（沙盒）→ 人确认 → `commitPlan`。
+ *   异：它**不直接产动作**，先产一个 `DesignProposal`（AI 对需求的理解与规划），
+ *       `validateProposal`/`compileProposal` 是**确定性代码**做的"把方案翻成动作"。
+ *   关键：`proposal` 本身**从不进正式模型** —— 它只活在会话状态里，
+ *   直到 `commitPlan` 把编译出的动作真正写进去。这就是"Proposal 与正式模型分离"。
+ *
+ *   `openQuestions` 非空时**不允许编译到可执行动作**（compileProposal 会返回 ok:false），
+ *   界面也会把"待确认问题"摆在最显眼处 —— 宁可停下来问，不可替用户拍板。
+ */
+interface DesignBundle {
+  proposal: DesignProposal | null;
+  /** 这一轮发给模型的原始需求文本 —— 用于"修订"（把上一句作为历史再生成一次） */
+  lastText: string;
+  reasoning: string;
+  meta: { model?: string; tokens?: number; reasoningTokens?: number; ms?: number } | null;
+  err: string;
+  /** validateProposal 的产出（含 PROPOSAL-* 各码，给出具体数字） */
+  issues: Issue[];
+  /** 编译器替它定的东西（默认值补齐 / 落位由系统定）—— 必须显示给用户看 */
+  notes: string[];
+  /** 模型列的"待确认问题" —— 非空就禁止应用到模型 */
+  openQuestions: string[];
+  run: PlanRun | null;
+  lastApply: string;
+}
+
+/**
  * 一段会话 = 一个房间的全部工作记录。
  * 三个字段必须**一起**存取：少了哪一个，"回来还是刚才那样"都不成立。
  */
@@ -127,6 +161,7 @@ interface Convo {
   chat: Turn[];
   draft: DraftSession | null;
   plan: PlanBundle;
+  design: DesignBundle;
   updatedAt: number;
 }
 
@@ -141,7 +176,20 @@ const EMPTY_PLAN: PlanBundle = {
   run: null,
 };
 
-const emptyConvo = (): Convo => ({ chat: [], draft: null, plan: { ...EMPTY_PLAN }, updatedAt: 0 });
+const EMPTY_DESIGN: DesignBundle = {
+  proposal: null,
+  lastText: '',
+  reasoning: '',
+  meta: null,
+  err: '',
+  issues: [],
+  notes: [],
+  openQuestions: [],
+  run: null,
+  lastApply: '',
+};
+
+const emptyConvo = (): Convo => ({ chat: [], draft: null, plan: { ...EMPTY_PLAN }, design: { ...EMPTY_DESIGN }, updatedAt: 0 });
 
 /**
  * 落存储前先把"派生快照"摘掉。
@@ -162,6 +210,7 @@ function thinConvo(c: Convo): unknown {
   return {
     chat: c.chat.slice(-CHAT_KEEP),
     plan: { ...c.plan, run: thinRun(c.plan.run) },
+    design: { ...c.design, run: thinRun(c.design.run) },
     draft: c.draft
       ? {
           ...c.draft,
@@ -187,6 +236,7 @@ function loadConvos(): Record<string, Convo> {
         // 但如果结构被改坏了，宁可丢掉草案也不让它带着坏数据继续跑
         draft: (c.draft ?? null) as DraftSession | null,
         plan: { ...EMPTY_PLAN, ...(c.plan ?? {}) },
+        design: { ...EMPTY_DESIGN, ...(c.design ?? {}) },
         updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : 0,
       };
     }
@@ -213,7 +263,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * 谁在跑。同一个模型通道，**同时只允许一个请求**：
    * 并发发两个不但会让用量账目混乱，还会让用户分不清哪个回答对应哪句话。
    */
-  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft'>('');
+  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft' | 'design'>('');
   const busy = busyKind !== '';
   /** 已等待秒数 —— 见文件头"为什么有一个计时器" */
   const [waited, setWaited] = useState(0);
@@ -311,8 +361,15 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       const next: Record<string, Convo> = {};
       for (const [k, c] of Object.entries(prev)) {
         const run = c.plan.run;
-        if (run && !(run.committed && run.committedVersion === version)) {
-          next[k] = { ...c, plan: { ...c.plan, run: null, lastApply: '' } };
+        const dRun = c.design.run;
+        const planStale = run && !(run.committed && run.committedVersion === version);
+        const designStale = dRun && !(dRun.committed && dRun.committedVersion === version);
+        if (planStale || designStale) {
+          next[k] = {
+            ...c,
+            plan: planStale ? { ...c.plan, run: null, lastApply: '' } : c.plan,
+            design: designStale ? { ...c.design, run: null, lastApply: '' } : c.design,
+          };
           touched = true;
         } else {
           next[k] = c;
@@ -349,6 +406,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   const chat = convo.chat;
   const draft = convo.draft;
   const plan = convo.plan;
+  const design = convo.design;
   /**
    * 计划这一块要**按增量**改，所以更新必须从最新的 convo 起算 —— 不能用闭包里的。
    *
@@ -363,6 +421,16 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       setConvos((prev) => {
         const cur = prev[activeRoomId] ?? emptyConvo();
         return { ...prev, [activeRoomId]: { ...cur, plan: { ...cur.plan, ...patch }, updatedAt: Date.now() } };
+      });
+    },
+    [activeRoomId],
+  );
+
+  const setDesign = useCallback(
+    (patch: Partial<DesignBundle>) => {
+      setConvos((prev) => {
+        const cur = prev[activeRoomId] ?? emptyConvo();
+        return { ...prev, [activeRoomId]: { ...cur, design: { ...cur.design, ...patch }, updatedAt: Date.now() } };
       });
     },
     [activeRoomId],
@@ -450,6 +518,94 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   }, [bus, convo.plan.run, props, setPlan]);
 
   const dismissPlan = useCallback(() => setPlan({ ...EMPTY_PLAN }), [setPlan]);
+
+  // ── 设计方案（P3：需求级 Proposal）──
+
+  /**
+   * 生成设计方案。
+   *
+   * 链路：requestDesign → DesignProposal（AI 只出语义）→ validateProposal（确定性校验）
+   * → compileProposal（确定性编译成 AiAction[]）→ dryRunPlan（沙盒）→ 预览。
+   * 全程不碰真模型：proposal 只存在会话状态里，commitPlan 才是唯一的写入口。
+   *
+   * 修订：把上一轮的（用户原话 + AI 给的标题/说明）作为 history 再生成一次，
+   * 模型就能在原有方案上"加一句"而不用从头来。
+   */
+  const generateDesign = useCallback(async () => {
+    const q = text.trim();
+    if (!q || busy) return;
+    setBusyKind('design');
+    setDesign({
+      proposal: null,
+      lastText: q,
+      reasoning: '',
+      meta: null,
+      err: '',
+      issues: [],
+      notes: [],
+      openQuestions: [],
+      run: null,
+      lastApply: '',
+    });
+    try {
+      const history: Array<{ role: 'user' | 'assistant'; text: string }> = design?.lastText
+        ? [
+            { role: 'user', text: design.lastText },
+            { role: 'assistant', text: `${design.proposal?.title ?? ''} ${design.proposal?.summary ?? ''}`.trim() },
+          ]
+        : [];
+      const r: DesignResponse = await requestDesign({
+        text: `${scopePrefix}${q}`,
+        snapshot,
+        history: history.slice(-6),
+        token: props.token,
+      });
+      if (r.quota) setQuota(r.quota);
+      if (!r.ok) {
+        setDesign({ err: r.error ?? '设计方案生成失败', reasoning: r.reasoning ?? '' });
+        props.onToast?.('error', r.error ?? '设计方案生成失败');
+        return;
+      }
+      const p = r.proposal as DesignProposal;
+      const project = bus.getState();
+      const issues = validateProposal(p, project);
+      const compiled = compileProposal(p, project, bus.getRules());
+      const patch: Partial<DesignBundle> = {
+        proposal: p,
+        reasoning: r.reasoning ?? '',
+        meta: { model: r.model, tokens: r.usage?.total_tokens, reasoningTokens: r.usage?.reasoning_tokens, ms: r.ms },
+        issues,
+        notes: compiled.ok ? compiled.notes : [],
+        openQuestions: p.questions ?? [],
+      };
+      if (!compiled.ok) {
+        setDesign({ ...patch, err: compiled.blockedReason ?? '这份方案还不能编译成动作' });
+        props.onToast?.('warn', compiled.blockedReason ?? '这份方案还不能编译成动作');
+        return;
+      }
+      // 干跑：拿真总线上的记忆门，跑在沙盒模型上 —— 与计划通道同一条纪律
+      const g = compiledRules().gate;
+      setDesign({ ...patch, run: dryRunPlan({ bus, actions: compiled.actions, gate: g, selection: props.selection }) });
+    } finally {
+      setBusyKind('');
+    }
+  }, [bus, busy, design, props, scopePrefix, setDesign, snapshot, text]);
+
+  const applyDesign = useCallback(() => {
+    const run = convo.design.run;
+    if (!run) return;
+    const r = commitPlan(run, bus);
+    if (!r.ok) {
+      setDesign({ lastApply: `✗ ${r.error}` });
+      props.onToast?.('error', r.error);
+      return;
+    }
+    const msg = `已应用 ${r.applied} 条（跳过 ${r.skipped} 条）· 模型里还有 ${r.blockingErrors} 条 ERROR`;
+    setDesign({ lastApply: msg });
+    props.onToast?.(r.blockingErrors > 0 ? 'warn' : 'ok', msg);
+  }, [bus, convo.design.run, props, setDesign]);
+
+  const dismissDesign = useCallback(() => setDesign({ ...EMPTY_DESIGN }), [setDesign]);
 
   // ── 草案 ──
 
@@ -807,6 +963,19 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           >
             {busyKind === 'draft' ? `改草案中… ${waited}s` : draft ? '继续改草案' : '改草案（多轮）'}
           </button>
+          <button
+            type="button"
+            className="tb-btn primary ai-btn-design"
+            disabled={busy || !text.trim() || !!quota?.blockedBy}
+            onClick={() => void generateDesign()}
+            title={
+              quota?.blockedBy
+                ? `额度已用完，不能生成：${quota.blockReason}`
+                : '先用自然语言描述需求，AI 给出一个可确认的设计方案（柜体结构 / 组合 / 假设 / 待确认问题），确认后才写进模型。'
+            }
+          >
+            {busyKind === 'design' ? `设计方案生成中… ${waited}s` : design?.proposal ? '重新设计方案' : '设计方案'}
+          </button>
           <button type="button" className="tb-btn" disabled={busy || chat.length === 0} onClick={clearChat}>
             清空对话
           </button>
@@ -869,81 +1038,107 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
       {plan.run ? (
         <Section title={`干跑预览（${plan.run.okCount} 条可应用 / ${plan.run.errorCount} 条失败）`} defaultOpen>
+          <PlanRunView run={plan.run} onApply={apply} onDismiss={dismissPlan} lastApply={plan.lastApply} />
+        </Section>
+      ) : null}
+
+      {/* ═══════════════ 设计方案（P3：需求级 Proposal → 预览 → 确认）══════════════ */}
+      {design.proposal || design.err ? (
+        <Section
+          title={design.proposal ? `设计方案 · ${design.proposal.title}` : '设计方案（生成失败）'}
+          defaultOpen
+        >
           <p className="note">
-            下面每一条都已在<b>沙盒模型</b>上真跑过一遍，用的是和提交完全相同的命令 ——
-            所以「预览 = 提交」是结构性的，不是两边都写对了。
+            下面是 <b>AI 理解出来的设计方案</b>，<b>还没写进模型</b>。结构、假设、待确认问题都摊在这里；
+            你点「应用全部」之前，真模型一个字节都没动。有<b>待确认问题</b>的方案不能应用 —— 必须先回答。
           </p>
-          {plan.run.steps.map((s, i) => (
-            <div key={i} className={`plan-step ${s.ok ? '' : 'plan-step-bad'}`}>
-              <div className="plan-head">
-                <Pill kind={s.ok ? 'ok' : 'ERROR'}>{s.ok ? '可应用' : '失败'}</Pill>
-                <Text mono>{s.action.action}</Text>
-                <span className="muted-sm">
-                  {s.action.target.cabinetName ? `→「${s.action.target.cabinetName}」` : ''}
-                  {s.action.target.unit !== undefined ? ` 分区 ${String(s.action.target.unit)}` : ''}
-                </span>
-              </div>
-              {s.error ? <div className="alert alert-error">{s.error}</div> : null}
-              {s.action.reason ? <div className="plan-reason">AI 理由：{s.action.reason}</div> : null}
-              {s.ok ? (
-                <>
-                  <div className="plan-label">{s.label}</div>
-                  <ul className="diff-list">
-                    {s.diff.slice(0, 8).map((d, j) => (
-                      <li key={j}>
-                        <Text mono>{d.path}</Text>：{fmt(d.from)} → <b>{fmt(d.to)}</b>
-                      </li>
-                    ))}
-                    {s.diff.length > 8 ? <li className="muted-sm">…另有 {s.diff.length - 8} 处</li> : null}
-                  </ul>
-                  {s.memoryHits.length > 0 ? (
-                    <div className="alert alert-error">
-                      被记忆拦住（你之前纠正过的规矩）：{s.memoryHits.map((h) => h.message).join('；')}
-                    </div>
-                  ) : null}
-                  {s.newIssues.length > 0 ? (
-                    <div className="plan-issues">
-                      {s.newIssues.map((x, j) => (
-                        <div key={j}>
-                          <Pill kind={x.severity === 'ERROR' ? 'ERROR' : x.severity === 'WARNING' ? 'WARNING' : 'INFO'}>{x.severity}</Pill>{' '}
-                          <Text mono>{x.code}</Text> {x.message}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="muted-sm">未新增任何规则问题</div>
-                  )}
-                  {s.resolvedIssues.length > 0 ? <div className="muted-sm">顺带消除 {s.resolvedIssues.length} 条问题</div> : null}
-                  {s.clamped.length > 0 ? <div className="muted-sm">被钳制：{s.clamped.join('；')}</div> : null}
-                </>
-              ) : null}
-            </div>
-          ))}
-          <div className="btn-row">
-            <button type="button" className="tb-btn primary" disabled={plan.run.okCount === 0 || plan.run.committed} onClick={apply}>
-              {plan.run.committed ? `✓ 已应用 ${plan.run.okCount} 条` : `应用全部（${plan.run.okCount} 条）`}
-            </button>
-            <button type="button" className="tb-btn" onClick={dismissPlan}>
-              丢弃
-            </button>
-          </div>
-          <Row label="干跑后模型里仍有 ERROR" derived hint="ERROR 会阻断生产数据导出；WARNING 不阻断">
-            {plan.run.blockingErrors > 0 ? <Pill kind="ERROR">{plan.run.blockingErrors}</Pill> : <Pill kind="ok">0</Pill>}
-          </Row>
-          {plan.run.impact.length > 0 ? (
-            <Row
-              label="影响面（连带改变）"
-              derived
-              hint="由干跑前后两次真实派生对比得出。你点选的「一条线」背后连着门板高、抽屉分格、铰链数量 —— 这里列出的是它们实际会怎么变"
-            >
-              <ul className="diff-list">
-                {plan.run.impact.map((line, i) => (
-                  <li key={i}>{line}</li>
+
+          {/* 待确认问题：最显眼，且直接阻断应用 */}
+          {design.openQuestions.length > 0 ? (
+            <div className="alert alert-warn">
+              <b>{design.openQuestions.length} 个待确认问题（不回答不能应用）</b>
+              <ul>
+                {design.openQuestions.map((q, i) => (
+                  <li key={i}>{q}</li>
                 ))}
               </ul>
+              <div className="muted-sm">在上面的输入框里把答案补全后，重新点「设计方案」即可。</div>
+            </div>
+          ) : null}
+
+          {/* 语义校验：PROPOSAL-* 各码，给得出具体数字 */}
+          {design.issues.length > 0 ? (
+            <div className={design.issues.some((i) => i.severity === 'ERROR') ? 'alert alert-error' : 'alert alert-warn'}>
+              <b>方案校验：{design.issues.filter((i) => i.severity === 'ERROR').length} 处错误 / {design.issues.filter((i) => i.severity !== 'ERROR').length} 处提示</b>
+              <ul>
+                {design.issues.map((i, j) => (
+                  <li key={j}>
+                    <Pill kind={i.severity === 'ERROR' ? 'ERROR' : i.severity === 'WARNING' ? 'WARNING' : 'INFO'}>{i.severity}</Pill>{' '}
+                    <Text mono>{i.code}</Text> {i.message}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {/* 假设与系统补齐的默认值：必须显示，否则"悄悄替你定了"等于骗人 */}
+          {design.proposal?.assumptions && design.proposal.assumptions.length > 0 ? (
+            <div className="hint-line">
+              <b>AI 的假设：</b>
+              <ul>
+                {design.proposal.assumptions.map((a, i) => (
+                  <li key={i}>{a}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {design.notes.length > 0 ? (
+            <div className="hint-line">
+              <b>系统替你定的（默认值 / 落位由系统定）：</b>
+              <ul>
+                {design.notes.map((n, i) => (
+                  <li key={i}>{n}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {design.proposal?.summary ? <p className="note">方案说明：{design.proposal.summary}</p> : null}
+
+          {design.reasoning ? (
+            <details>
+              <summary>模型的思考过程（{design.reasoning.length} 字）</summary>
+              <pre className="code">{design.reasoning}</pre>
+            </details>
+          ) : null}
+
+          {design.err ? (
+            <div className="alert alert-error">{design.err}</div>
+          ) : design.run ? (
+            <PlanRunView
+              run={design.run}
+              onApply={applyDesign}
+              onDismiss={dismissDesign}
+              lastApply={design.lastApply}
+              applyLabel="应用设计方案"
+              dismissLabel="丢弃方案"
+            />
+          ) : null}
+
+          {design.meta ? (
+            <Row label="本次调用" derived hint="设计方案通道的用量">
+              <Text mono>
+                {design.meta.model ?? '(未知模型)'}
+                {design.meta.tokens !== undefined ? ` · ${design.meta.tokens} token` : ' · 服务商未返回用量'}
+                {design.meta.reasoningTokens ? `（其中推理 ${design.meta.reasoningTokens}）` : ''}
+                {design.meta.ms !== undefined ? ` · ${(design.meta.ms / 1000).toFixed(1)}s` : ''}
+              </Text>
             </Row>
           ) : null}
-          {plan.lastApply ? <div className="alert alert-info">{plan.lastApply}</div> : null}
+
+          {design.run && design.openQuestions.length > 0 ? (
+            <div className="alert alert-warn">有 {design.openQuestions.length} 个待确认问题，应用按钮已禁用 —— 回答后再重新生成方案。</div>
+          ) : null}
         </Section>
       ) : null}
 
@@ -969,10 +1164,4 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       </Section>
     </div>
   );
-}
-
-function fmt(v: unknown): string {
-  if (v === undefined) return '(无)';
-  if (typeof v === 'string') return v.length > 40 ? `${v.slice(0, 40)}…` : v;
-  return String(v);
 }

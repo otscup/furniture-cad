@@ -153,6 +153,54 @@ export function mockChat(userText) {
  */
 export const MOCK_DELAY_MS = Number(process.env.MOCK_DELAY_MS || 800);
 
+/**
+ * mock 的**设计方案**回答（P3）。
+ *
+ * 房间名从请求里的快照取 —— 与 mockPlan 同一条纪律：
+ * 不依赖种子数值，项目被前面的用例改过也照样对得上。
+ *
+ * 故意给出一个"带问号"的方案吗？不 —— 这条通道验的是**成功路径**
+ * （说一句话 → 拿到方案 → 预览 → 确认 → 模型真的多了柜子）。
+ * 待确认问题的路径由 verify/proposal-acceptance.ts 的 F 组直接验编译器，
+ * 那条不需要 mock。
+ */
+export function mockDesign(ask, snap) {
+  const roomName = snap?.rooms?.[0]?.name;
+  return {
+    title: `按你说的：「${String(ask || '').slice(0, 20)}」`,
+    summary: '玄关放一个鞋柜（下三层鞋抽 + 右侧开放格），再拐个弯接一组挂衣区，两柜成 L 型。',
+    ...(roomName ? { room: roomName } : {}),
+    cabinets: [
+      {
+        ref: 'shoe',
+        name: '玄关鞋柜',
+        width: 1200,
+        height: 1000,
+        depth: 350,
+        units: [
+          { kind: 'drawerBank', width: 800, count: 3, nickname: '鞋抽' },
+          { kind: 'open', width: 400, nickname: '钥匙格' },
+        ],
+      },
+      {
+        ref: 'hang',
+        name: '转角挂衣区',
+        width: 900,
+        height: 2400,
+        depth: 600,
+        rotation: 90,
+        rows: [
+          { height: 1400, units: [{ kind: 'hanging', width: 900, rodHeight: 1300 }] },
+          { height: 'fill', units: [{ kind: 'drawerBank', width: 900, count: 2 }] },
+        ],
+      },
+    ],
+    assemblies: [{ ref: 'g1', name: '玄关 L 型', members: ['shoe', 'hang'], connections: [{ a: 'shoe', b: 'hang', kind: 'corner' }] }],
+    assumptions: ['鞋柜深度按常见的 350'],
+    questions: [],
+  };
+}
+
 export function createMockServer() {
   return http.createServer((req, res) => {
     let raw = '';
@@ -177,7 +225,24 @@ export function createMockServer() {
 
       let message;
       let usage;
-      if (isPlan) {
+      /**
+       * 通道判定：design 与 plan 的 user 消息用的是同一个模板（buildUserMessage），
+       * 只能靠 **system 提示**区分 —— design 的 system 里写着"设计方案"。
+       */
+      const systemText = msgs.find((m) => m.role === 'system')?.content || '';
+      const isDesign = /设计方案/.test(systemText);
+      if (isDesign) {
+        const snapM = /```json\s*([\s\S]*?)```/.exec(user);
+        let snap = null;
+        try {
+          snap = snapM ? JSON.parse(snapM[1]) : null;
+        } catch {
+          /* 快照读不出来就按"没有房间"回，前端的语义校验会给一句人话 */
+        }
+        const ask = (user.split('【用户这一句要求】')[1] || '').trim();
+        message = { role: 'assistant', content: JSON.stringify(mockDesign(ask, snap)) };
+        usage = { prompt_tokens: 1450, completion_tokens: 220, total_tokens: 1670 };
+      } else if (isPlan) {
         const snapM = /```json\s*([\s\S]*?)```/.exec(user);
         let snap = null;
         try {

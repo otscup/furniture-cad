@@ -658,6 +658,89 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `这条已按你说的记下来了，但没有被校验 —— 要真校验得先给柜体加 Z；或者用同一柜内上下两行 rows 表达分层（${num(c, 'hA')}+${num(c, 'hB')}=${num(c, 'total')}），那个是能算的。`,
     manual: '这是已知限制，不是错误：宁可如实说"没核"，不可假装核过。',
   },
+
+  // ═══════════════ 设计方案 DesignProposal（v0.3，P3）═══════════════
+  //
+  // 这一族校验的是**还没进模型的方案**。所以引用用 ref（柜还没建、没有 id），
+  // 尺寸说的是"能不能建"，不是"建得好不好" —— 后者交给模型落位后的规则校验。
+  // 与组合那一族的分工：那边验"已在模型里的组合"，这边验"还在纸上的方案"。
+  'PROPOSAL-EMPTY': {
+    title: '方案里没有柜体',
+    severity: 'ERROR',
+    message: (c) => `这份设计方案里一个柜体都没有（cabinets 只有 ${num(c, 'count')} 项）。`,
+    hint: () => '至少说清要 1 个柜体（宽/高/深与内部分区可以后补，系统会按规则集默认值补齐）。',
+    manual: '方案为空没有可预览、可确认的东西。',
+  },
+  'PROPOSAL-ROOM-MISSING': {
+    title: '方案指向不存在的房间',
+    severity: 'ERROR',
+    message: (c) => `方案里的房间「${str(c, 'room')}」在项目里找不到（项目现在有 ${num(c, 'count')} 个房间：${str(c, 'names')}）。`,
+    hint: (c) => `把房间改成现有这 ${num(c, 'count')} 个之一：${str(c, 'names')}。`,
+    manual: '柜子要落在某个房间里，房间归属是设计决定。',
+  },
+  'PROPOSAL-CAB-NO-REF': {
+    title: '柜体缺方案内引用名',
+    severity: 'ERROR',
+    message: (c) => `方案里第 ${num(c, 'index')} 个柜体没有 ref（组合要靠它引用这个柜）。`,
+    hint: (c) => `给第 ${num(c, 'index')} 个柜体补一个 ref（比如 "cab1"）—— 柜体 id 要等真建出来才有，方案里只能用 ref。`,
+    manual: 'ref 是方案内部的引用名，与模型 id 无关。',
+  },
+  'PROPOSAL-CAB-DUP-REF': {
+    title: '方案内引用名重复',
+    severity: 'ERROR',
+    message: (c) => `方案里 ref「${str(c, 'ref')}」出现了 ${num(c, 'count')} 次。`,
+    hint: (c) => `每个柜体的 ref 只能有 1 个 —— 把重复的 ${num(c, 'count')} 个改成不同名字，否则组合会引用到错的那个。`,
+    manual: '改名即可，不影响模型。',
+  },
+  'PROPOSAL-SIZE-RANGE': {
+    title: '方案里的尺寸做不出来',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的${str(c, 'dim')} ${num(c, 'value')}mm 超出可建范围（${num(c, 'min')}~${num(c, 'max')}mm）。`,
+    hint: (c) => `把${str(c, 'dim')}改到 ${num(c, 'min')}~${num(c, 'max')}mm 之间（现在是 ${num(c, 'value')}mm，差 ${Math.max(num(c, 'min') - num(c, 'value'), num(c, 'value') - num(c, 'max'))}mm）。`,
+    manual: '这个范围与 AI 契约里的 cabinet.create 同源，改规则集即可。',
+  },
+  'PROPOSAL-UNIT-KIND': {
+    title: '方案里的分区类型不认识',
+    severity: 'ERROR',
+    message: (c) => `${str(c, 'where')}第 ${num(c, 'index')} 格的分区类型「${str(c, 'kind')}」本系统不认识（可用 ${num(c, 'count')} 种：${str(c, 'kinds')}）。`,
+    hint: (c) => `改成这 ${num(c, 'count')} 种之一：${str(c, 'kinds')}。`,
+    manual: '分区类型是封闭词汇表（与模型 UnitSpec 同源）。',
+  },
+  'PROPOSAL-ASM-MIN': {
+    title: '组合的柜体不够',
+    severity: 'ERROR',
+    message: (c) => `方案里的组合「${str(c, 'ref')}」只列了 ${num(c, 'count')} 个柜体 —— 一组至少要 2 个。`,
+    hint: () => '补到 2 个及以上（1 个柜体谈不上"成组"），或把这个组合删掉。',
+    manual: '一个柜体不需要成组。',
+  },
+  'PROPOSAL-ASM-MEMBER': {
+    title: '组合引用了方案外的柜体',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'ref')}」的成员「${str(c, 'member')}」不在方案里（本方案共 ${num(c, 'count')} 个柜体）。`,
+    hint: (c) => `成员只能写本方案里那 ${num(c, 'count')} 个柜体的 ref —— 想组合已有柜体，请直接在对象树里选它们成组。`,
+    manual: '设计方案只负责"新建的这一组"，改动已有柜体请用对话里的编辑计划。',
+  },
+  'PROPOSAL-CONN-KIND': {
+    title: '方案里的连接方式不认识',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'ref')}」的连接类型「${str(c, 'kind')}」不认识（可用 ${num(c, 'count')} 种：${str(c, 'kinds')}）。`,
+    hint: (c) => `改成这 ${num(c, 'count')} 种之一：${str(c, 'kinds')}；不写连接也可以，建好后用「按当前落位补全连接」。`,
+    manual: '连接类型是封闭词汇表（与模型 Connection 同源）。',
+  },
+  'PROPOSAL-CONN-REF': {
+    title: '连接引用了组合外的柜体',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'ref')}」的${str(c, 'side')}引用了「${str(c, 'member')}」，它不在这个组合的 ${num(c, 'count')} 个成员里。`,
+    hint: (c) => `连接的两端必须是同一个组合的成员（这个组合有 ${num(c, 'count')} 个）。`,
+    manual: '关系只描述组合内部。',
+  },
+  'PROPOSAL-OPEN-QUESTIONS': {
+    title: '这份方案还有问题要你定',
+    severity: 'WARNING',
+    message: (c) => `AI 列了 ${num(c, 'count')} 个必须先问你的问题，其中第一条是：「${str(c, 'first')}」。`,
+    hint: (c) => `先回答这 ${num(c, 'count')} 个问题（在下面输入框里说一句就行），方案才会被应用到模型 —— 系统不会替你把它们猜掉。`,
+    manual: '这是设计决定，只能由你定：猜出来的尺寸会直接变成下料尺寸。',
+  },
 };
 
 export const RULE_CODES = Object.keys(RULE_CARDS);

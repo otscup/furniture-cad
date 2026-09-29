@@ -71,6 +71,8 @@ DWG 付费/SDK 须先确认授权(ODA 无 Web/SaaS 权)。MCP 白名单不暴露
 - **一轮有没有真的并进草案要显示在会话里**：画面与上一轮相同时，**toast 不算数**（会消失），必须有一条留在消息上的"第 N 轮 · 已并入/未并入 + 原因"。
 - **`.panel-scroll` 三属性缺一不可**：flex:1;overflow:auto;min-height:0，否则长内容溢出滚不到。
 - **断言不可信比失败更危险**：失败时先 JSON.stringify 原始值、先假定自己错、去掉什么要有理由、每个视觉缺陷转永久断言、不变量从图元实际坐标推不许读声明 bbox、新增回归断言须临时关修复确认真失败、几何 0/±1 须精确(sin(π)=1.22e-16 旋转180°误判干涉)。
+- **"带数字"会被兜底值顶替成假绿**：`issueCatalog` 的 `num()` 缺值时返回 0，于是"成员数 0 个"也算"给出了具体数字"。fixhint 的判据必须是**喂进去的那个值真的出现在 message 里**（给有辨识度的 ctx：gap=137/angle=45/count=3/hA=900…），不能只断言 `/\d/`。
+- **批量改文案别用"顺序 replace + 断言"的 python 脚本**：第 N 项字符串对不上就整批抛异常、一个字节都不写（白跑一轮）。先 Read 取原文，再用 Edit 整块替换。
 - **verify:ui 是分钟级链**：不加短超时(命令 SIGINT 让 exit=130 像工程失败)；跑前清手动 dev server(占5273连真.env假失败)；提交前 git checkout 还原 verify/out/*.png（它们是 tracked，跑一次就变）。
 - **verify:ui 见过的间歇性红**：B15「服务端 .env 里确实存着完整 key」「保存是替换而不是追加」——`/api/settings` 落盘与探针读取的时序抖动（文件仍是旧 key）。判据：服务端不引用 `src/core`，与本轮改动无因果 → **复跑一次**再下结论，别急着改代码。
 - **长输出别用 `| tail -N` 收尾**：会把失败断言列表截掉，只剩退出码。要么写文件（`> log 2>&1`）再 grep，要么直接看完整输出——本轮因此白跑了一遍 5 分钟的 verify:ui。
@@ -88,7 +90,9 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（P0→P6，逐步推进，每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）→ P2 Assembly/Connection（Case5/6）→ P3 AI DesignProposal（需求级中间产物，确认后编译为动作）→ P4 Import 骨架（kujiale 仅占位）→ P5 效果图识别+确认 → P6 设计知识（偏好与硬规则物理分离）。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `见本日日志` → P4 Import 骨架（kujiale 仅占位）→ P5 效果图识别+确认 → P6 设计知识（偏好与硬规则物理分离）。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
+- **P2 关系层三条纪律**（`core/relations.ts` 是唯一实现）：① 关系层**不产生几何**（建组合前后 BOM/stats/plan/views/中立导出逐字节不变）；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开 —— **只校验声明，推断只用于 UI 表达，不据此报错**。`stack` 因柜体没有 Z 无法核对，允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`（INFO，给两柜高与"若真叠放总高约 N"）—— 宁可说"没核"，不可假装核过。
+- **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容 / 关键架构决策 / 测试结果 / 遗留问题 / commit hash）。
 
 ## 本会话进行中（2026-09-25 · 已交付两件）
 - **AI 对话框草案**已提交 `6a91374`：draftSession + DraftPreview + AIPanel 草案段 + 样式 + 37 断言验收。

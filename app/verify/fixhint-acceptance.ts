@@ -155,6 +155,18 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'ASSEMBLY-DISCONNECTED': { asmName: 'L 型组', count: 3 },
   'ASSEMBLY-MEMBER-SHARED': { cabName: '左柜', names: 'A 组、B 组', count: 2 },
   'ASSEMBLY-STACK-UNVERIFIED': { asmName: '叠放组', nameA: '下柜', nameB: '上柜', hA: 900, hB: 600, total: 1500 },
+  // ── P3 设计方案（还在纸上的方案：引用用 ref，尺寸说"能不能建"）──
+  'PROPOSAL-EMPTY': { count: 0 },
+  'PROPOSAL-ROOM-MISSING': { room: '次卧', count: 3, names: '主卧、次卧、客厅' },
+  'PROPOSAL-CAB-NO-REF': { index: 2 },
+  'PROPOSAL-CAB-DUP-REF': { ref: 'cab1', count: 2 },
+  'PROPOSAL-SIZE-RANGE': { ref: '鞋柜', dim: '高', value: 5200, min: 300, max: 4000 },
+  'PROPOSAL-UNIT-KIND': { where: '柜体「鞋柜」', index: 1, kind: 'drawer', count: 5, kinds: 'drawerBank / hanging / shelves / open / appliance' },
+  'PROPOSAL-ASM-MIN': { ref: 'L 型组', count: 1 },
+  'PROPOSAL-ASM-MEMBER': { ref: 'L 型组', member: 'cab9', count: 3 },
+  'PROPOSAL-CONN-KIND': { ref: 'L 型组', kind: 'glue', count: 3, kinds: 'corner / butt / stack' },
+  'PROPOSAL-CONN-REF': { ref: 'L 型组', side: 'a 端', member: 'cab9', count: 2 },
+  'PROPOSAL-OPEN-QUESTIONS': { count: 2, first: '柜深按 350 还是 600？' },
 };
 
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];

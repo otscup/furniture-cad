@@ -968,7 +968,7 @@ export class CommandBus {
     // 判据只用 canonical 的 allUnits —— 不在这里再判一次"有没有 rows"
     const hasAnyUnits = cab.layout ? allUnits(cab.layout).length > 0 : false;
     if (!cab.layout || !hasAnyUnits) {
-      cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules) };
+      cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules, cab.params.depth) };
     }
     if (!cab.id) cab.id = nextId('cab', draft.cabinets.map((c) => c.id));
     if (draft.cabinets.some((c) => c.id === cab.id)) return null;

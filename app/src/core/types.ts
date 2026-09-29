@@ -320,6 +320,37 @@ export interface Cabinet {
   placement: { x: number; y: number; rotation: number };
   params: CabinetParams;
   layout: CabinetLayout;
+  /**
+   * 导入来源归属（v0.3，P4）。
+   *
+   * 一条外部数据被导入后，"它来自哪、可信到什么程度、哪里还没确定"
+   * 必须跟着柜体走，而不是只活在导入那一刻的界面里 —— 下次打开项目，
+   * 你仍该看得到"这个柜是从 DXF 导入的、深度是估的、置信度低"。
+   *
+   * 这是 authored 语义模型的一部分（属于真相源，不是派生数据）：
+   * 它描述"这个柜是怎么来的"这一事实，与板件/坐标/清单无关，也不污染几何。
+   */
+  origin?: ImportOrigin;
+}
+
+// ── 导入来源归属（v0.3，P4）──
+/** 已落地的外部来源。未在此枚举内的来源不应直接写进模型（先扩展适配器 + 错误码） */
+export type ImportSource = 'json' | 'dxf' | 'kujiale' | 'imageVision';
+
+/**
+ * 导入来源归属。来源 / 置信度 / 不确定项三者缺一不可，跟着柜体走。
+ * 不确定项（uncertainty）一旦存在，导入即被阻断应用 —— 宁可停下来问，不替用户猜。
+ */
+export interface ImportOrigin {
+  source: ImportSource;
+  /** 人类可读来源（文件名 / 平台名 / URL / 批次说明） */
+  label?: string;
+  /** 同一批次导入共享的 id —— 审计追踪"这些柜是一起来的" */
+  batchId: string;
+  /** 适配器对该柜体的整体置信度 */
+  confidence?: 'high' | 'medium' | 'low';
+  /** 该柜在导入时未能可靠确定的内容（需用户确认，不替用户猜） */
+  uncertainty?: string[];
 }
 
 // ─────────────────────────── 库 / 规则集 ───────────────────────────

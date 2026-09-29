@@ -1,5 +1,5 @@
 import type { Command } from '../core/commandBus.ts';
-import type { Connection, ConnectionEdge, ConnectionKind, Cabinet, FurnitureAssembly, Project, RowHeight, RuleSet, UnitSpec } from '../core/types.ts';
+import type { Connection, ConnectionEdge, ConnectionKind, Cabinet, FurnitureAssembly, ImportOrigin, Project, RowHeight, RuleSet, UnitSpec } from '../core/types.ts';
 import * as CMD from '../core/commands.ts';
 import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '../core/docFactory.ts';
 import { nextId } from '../core/ids.ts';
@@ -65,6 +65,12 @@ export interface AiAction {
    * 模型永远拿不到也不需要拿到 id —— 这是"AI 只出语义"的落点之一。
    */
   ref?: string;
+  /**
+   * 导入来源归属（v0.3，P4）。仅 Import 链路产出的动作带此字段；
+   * 经 planRunner 的 `{...action}` 展开天然透传，最终由 createCabinet 落到 Cabinet.origin。
+   * AI DesignProposal 通道不带它（它不是导入）。
+   */
+  origin?: ImportOrigin;
 }
 
 export type CompileResult =
@@ -626,6 +632,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         y: place.y,
         rotation,
         rules,
+        ...(action.origin ? { origin: action.origin } : {}),
         params: { width, height, depth },
         units,
         backUnits,

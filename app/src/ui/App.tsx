@@ -31,6 +31,7 @@ import { ViewsPanel } from './panels/ViewsPanel.tsx';
 import { MemoryPanel } from './panels/MemoryPanel.tsx';
 import { AdminPanel } from './panels/AdminPanel.tsx';
 import { AIPanel } from './panels/AIPanel.tsx';
+import { ImportPanel } from './panels/ImportPanel.tsx';
 import { RoomsPanel } from './panels/RoomsPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
@@ -1029,6 +1030,9 @@ export function App() {
             <button type="button" className={rightTab === 'ai' ? 'on' : ''} onClick={() => setRightTab('ai')}>
               AI
             </button>
+            <button type="button" className={rightTab === 'import' ? 'on' : ''} onClick={() => setRightTab('import')}>
+              导入
+            </button>
             <button type="button" className={rightTab === 'memory' ? 'on' : ''} onClick={() => setRightTab('memory')}>
               记忆
               {memoryPending > 0 ? <span className="tab-badge tab-badge-warn">{memoryPending}</span> : null}
@@ -1090,6 +1094,7 @@ export function App() {
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} selection={selection} onToast={toast} /> : null}
+          {rightTab === 'import' ? <ImportPanel bus={bus} version={version} onToast={toast} /> : null}
           {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} onLogout={doLogout} /> : null}
         </aside>
       </div>

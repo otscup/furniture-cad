@@ -16,6 +16,7 @@ export type RightTab =
   | 'memory'
   | 'admin'
   | 'ai'
+  | 'import'
   | 'account';
 
 export function Toolbar(props: {

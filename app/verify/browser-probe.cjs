@@ -234,7 +234,18 @@ async function waitForApp(url, timeoutMs = 25000) {
   const killChrome = () => {
     try {
       if (process.platform === 'win32' && chrome.pid) {
+        // 先按启动器 pid 整树强杀（覆盖大多数情况）
         spawnSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], { stdio: 'ignore' });
+        /**
+         * 兜底：Windows 上 Chrome 会把浏览器进程交给新 PID（singleton 重排），
+         * 上面那发 `/pid /T` 打不中真正的浏览器进程 —— 于是每次验收都留一个孤儿
+         * chrome，跑十几轮就把内存吃满（tsc 报 VirtualAlloc failed / errno=1455）。
+         * 按我们**独有**的 remote-debugging-port 把残留的 chrome 整组收掉；
+         * 用户自己开的那份 chrome 不带这个端口，不会被误杀。
+         * 失败（PowerShell 不可用等）静默忽略 —— 至少退回到原来的 /pid 行为。
+         */
+        const ps = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like '*remote-debugging-port=${CDP_PORT}*' } | ForEach-Object { taskkill /pid $_.ProcessId /F }`;
+        spawnSync('powershell', ['-NoProfile', '-Command', ps], { stdio: 'ignore' });
       } else {
         chrome.kill('SIGKILL');
       }

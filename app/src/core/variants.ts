@@ -324,6 +324,6 @@ export function defaultVariant(spec: VariantSpec, rules: RuleSet): Cabinet {
     y: mm(spec.y ?? 0),
     rules,
     params: { width: mm(spec.width), height: mm(spec.height), depth: mm(spec.depth) },
-    units: defaultUnits(mm(spec.width), rules),
+    units: defaultUnits(mm(spec.width), rules, mm(spec.depth)),
   });
 }

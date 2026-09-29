@@ -4,6 +4,7 @@ import type {
   CabinetParams,
   CabinetRow,
   DrawerSpec,
+  ImportOrigin,
   Project,
   Room,
   RuleSet,
@@ -120,6 +121,8 @@ export function createCabinet(opts: {
    * 撞 id 不报错只静默共用记录 —— 那是清单事故，不是小毛病）。
    */
   rows?: Array<{ height?: number | 'fill'; units: UnitSpec[] }>;
+  /** 导入来源归属（P4）。从外部数据进来时由 Import 链路写入，authored 柜为 undefined */
+  origin?: ImportOrigin;
   rules: RuleSet;
   takenIds?: Iterable<string>;
 }): Cabinet {
@@ -129,7 +132,7 @@ export function createCabinet(opts: {
     ...opts.params,
     backPanel: { ...base.backPanel, ...(opts.params?.backPanel ?? {}) },
   };
-  let units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules);
+  let units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules, params.depth);
   /**
    * 背面分区的 id 兜底：板件 id 是 `P_{cab}_{unit.id}_…` 拼出来的，
    * 前后排撞 id = 两块不同的板共用一条清单记录（生产下错料）。
@@ -177,6 +180,7 @@ export function createCabinet(opts: {
     roomId: opts.roomId,
     placement: { x: Math.round(opts.x), y: Math.round(opts.y), rotation: opts.rotation ?? 0 },
     params,
+    ...(opts.origin ? { origin: opts.origin } : {}),
     layout: {
       type: backUnits ? 'double' : 'row',
       widthMode: 'fit_total',
@@ -210,7 +214,7 @@ export function createCabinetFromTemplate(opts: {
   const widths = resolveTemplateUnitWidths(tpl);
   const units: UnitSpec[] =
     tpl.units.length === 0
-      ? defaultUnits(tpl.params.width, opts.rules)
+      ? defaultUnits(tpl.params.width, opts.rules, tpl.params.depth)
       : tpl.units.map((u, i) =>
           makeUnit({
             id: `unit_${String(i + 1).padStart(3, '0')}`,
@@ -417,7 +421,7 @@ export function defaultNickname(kind: UnitSpec['kind']): string {  switch (kind)
  * 默认分区：把柜宽按 2:4:2 拆成三个分区。
  * 每个分区都必须带完整的子规格 —— 否则生成器会静默跳过（比报错更危险）。
  */
-export function defaultUnits(width: number, rules: RuleSet): UnitSpec[] {
+export function defaultUnits(width: number, rules: RuleSet, depth = 600): UnitSpec[] {
   if (width < 700) {
     return [makeUnit({ id: 'unit_001', kind: 'shelves', requestedWidth: width, rules, count: 3 })];
   }
@@ -425,7 +429,7 @@ export function defaultUnits(width: number, rules: RuleSet): UnitSpec[] {
   const b = Math.round(width * 0.5);
   const c = width - a - b;
   return [
-    makeUnit({ id: 'unit_001', kind: 'drawerBank', requestedWidth: a, rules, count: 3 }),
+    makeUnit({ id: 'unit_001', kind: 'drawerBank', requestedWidth: a, rules, count: 3, depth }),
     makeUnit({ id: 'unit_002', kind: 'hanging', requestedWidth: b, rules, rodHeight: 1800 }),
     makeUnit({ id: 'unit_003', kind: 'shelves', requestedWidth: c, rules, count: 4 }),
   ];

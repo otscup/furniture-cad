@@ -741,6 +741,58 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `先回答这 ${num(c, 'count')} 个问题（在下面输入框里说一句就行），方案才会被应用到模型 —— 系统不会替你把它们猜掉。`,
     manual: '这是设计决定，只能由你定：猜出来的尺寸会直接变成下料尺寸。',
   },
+
+  // ═══════════════ Import 外部数据（v0.3，P4）══════════════
+  //
+  // 这一族校验的是"从外部设计数据（JSON / DXF / 酷家乐 / 图片识别）进来的东西"。
+  // 与 PROPOSAL-* 的分工：PROPOSAL 是 AI 自己规划的设计方案（同链路、可复用）；
+  // 这里多管三件事——来源是否可信（IMPORT-UNVERIFIED-CAPABILITY）、
+  // 不确定项是否摆在脸上（IMPORT-UNCERTAINTY）、以及形状门要带数字
+  // （IMPORT-SHAPE，复用契约 proposalShapeError 的字符串，不会用兜底值顶替）。
+  // 阻断应用的条件：ERROR，或 IMPORT-OPEN-QUESTIONS，或 IMPORT-UNCERTAINTY ——
+  // 宁可停下来问，不可替用户把估出来的尺寸猜成下料尺寸。
+  'IMPORT-EMPTY': {
+    title: '导入里没有柜体',
+    severity: 'ERROR',
+    message: (c) => `这份导入数据里一个柜体都没有（cabinets 只有 ${num(c, 'count')} 项）。`,
+    hint: () => '至少给 1 个柜体（宽/高/深与内部分区可以后补，系统会按规则集默认值补齐）。',
+    manual: '导入为空没有可预览、可确认的东西。',
+  },
+  'IMPORT-SHAPE': {
+    title: '导入数据形状不对',
+    severity: 'ERROR',
+    message: (c) => `这份导入数据不是「柜体清单」的形状：${str(c, 'detail')}`,
+    hint: () => '它应当是一个含 cabinets 数组的对象（或柜体数组）。对照 JSON 适配器的示例形状检查字段名。',
+    manual: '形状门复用 aiContract.proposalShapeError —— 与服务端同一份实现，前端只是防呆。',
+  },
+  'IMPORT-OPEN-QUESTIONS': {
+    title: '导入还有问题要你定',
+    severity: 'WARNING',
+    message: (c) => `导入数据列了 ${num(c, 'count')} 个必须先问你的问题，其中第一条是：「${str(c, 'first')}」。`,
+    hint: (c) => `先回答这 ${num(c, 'count')} 个问题（在下面输入框里说一句就行），才会被应用到模型 —— 系统不会替你把它们猜掉。`,
+    manual: '这是设计决定，只能由你定：猜出来的尺寸会直接变成下料尺寸。',
+  },
+  'IMPORT-UNCERTAINTY': {
+    title: '导入里有没确定的内容',
+    severity: 'WARNING',
+    message: (c) => `导入数据有 ${num(c, 'count')} 处没可靠确定的内容，其中第一条是：「${str(c, 'first')}」。`,
+    hint: () => `这些不确定项必须你确认后才能落地（不确定的部分会按规则集默认或标注估算）。在对话框里说一句怎么定，或编辑导入数据补上。`,
+    manual: '不确定就问不猜：把"估的"当"准的"直接下料，是生产事故。',
+  },
+  'IMPORT-LOW-CONFIDENCE': {
+    title: '导入整体置信度偏低',
+    severity: 'WARNING',
+    message: (c) => `这份导入数据整体置信度偏低（${num(c, 'count')} 个柜体来自 ${str(c, 'sources')}），导入结果可能需要你逐柜核对。`,
+    hint: () => '预览时可以逐柜看来源与不确定项；确认无误再应用。',
+    manual: '低置信度不阻断，但请逐柜核对再下料。',
+  },
+  'IMPORT-UNVERIFIED-CAPABILITY': {
+    title: '导入用到了尚未验证的能力',
+    severity: 'WARNING',
+    message: (c) => `来源「${str(c, 'source')}」的「${str(c, 'capability')}」能力在本环境尚未验证（P4 仅预留边界）。`,
+    hint: () => '它不静默假装成功：结果会标 low 置信度并列出不确定项，请用 JSON 适配器或人工核对兜底。',
+    manual: '酷家乐 / 图片识别等真实接入是 P5+ 的活，P4 只把边界画对。',
+  },
 };
 
 export const RULE_CODES = Object.keys(RULE_CARDS);

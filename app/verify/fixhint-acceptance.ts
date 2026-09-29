@@ -129,12 +129,42 @@ const VAGUE = ['检查一下', '调整一下', '自行处理', '请确认后处�
  */
 const NO_NUMBER_OK = new Set(['RULE-APPLIANCE-DOOR', 'RULE-DOUBLE-NO-BACK', 'RULE-ROW-WITH-BACK']);
 
+/**
+ * 数字型 ctx：这几条卡的"差多少"来自派生（间隙 mm / 夹角 / 成员数 / 高度），
+ * 通用 sampleCtx 里没有，光靠 `/\d/` 会**因为兜底 0 而假绿**
+ * （num() 缺值时返回 0，于是"成员数 0 个"也算带数字 —— 这正是本项目反复踩的假绿）。
+ *
+ * 所以这里给每条这类卡喂一组**有辨识度的真实值**，并在下面断言
+ * 「这个值确实出现在 message 里」—— 光有数字不行，得是对的那个数字。
+ * 数值刻意取成 137 / 45 / 3 这种不会与模板里其他数字混淆的。
+ */
+const NUM_CTX: Record<string, Record<string, unknown>> = {
+  'ASSEMBLY-NOT-TOUCHING': { asmName: 'L 型组', nameA: '左柜', nameB: '右柜', kindZh: '角接', gap: 137 },
+  'ASSEMBLY-KIND-MISMATCH': { asmName: 'L 型组', nameA: '左柜', nameB: '右柜', declared: '角接', actual: '续接', angle: 45 },
+  'ASSEMBLY-EDGE-MISMATCH': { asmName: 'L 型组', cabName: '左柜', declared: '左侧', actual: '正面', angle: 45 },
+  'ASSEMBLY-EDGE-AMBIGUOUS': { asmName: 'L 型组', cabName: '左柜', declared: '左侧', actual: '正面', angle: 45 },
+  'ASSEMBLY-CONN-OUTSIDE': { asmName: 'L 型组', cabId: 'cab_x', count: 3 },
+  'ASSEMBLY-CONN-SELF': { asmName: 'L 型组', cabId: 'cab_x', count: 3 },
+  'ASSEMBLY-CONN-DUP': { asmName: 'L 型组', nameA: '左柜', nameB: '右柜', count: 3 },
+  'ASSEMBLY-MEMBER-MISSING': { asmName: 'L 型组', cabId: 'cab_x', count: 3 },
+  'ASSEMBLY-MEMBER-DUP': { asmName: 'L 型组', cabId: 'cab_x', count: 3 },
+  'ASSEMBLY-MEMBER-ROOM': { asmName: 'L 型组', cabName: '左柜', roomName: '次卧', count: 3 },
+  'ASSEMBLY-ROOM-MISSING': { asmName: 'L 型组', roomId: 'room_x', count: 4 },
+  'ASSEMBLY-EMPTY': { asmName: 'L 型组', count: 0 },
+  'ASSEMBLY-ID-DUP': { asmId: 'asm_001', asmName: 'L 型组', count: 2 },
+  'ASSEMBLY-DISCONNECTED': { asmName: 'L 型组', count: 3 },
+  'ASSEMBLY-MEMBER-SHARED': { cabName: '左柜', names: 'A 组、B 组', count: 2 },
+  'ASSEMBLY-STACK-UNVERIFIED': { asmName: '叠放组', nameA: '下柜', nameB: '上柜', hA: 900, hB: 600, total: 1500 },
+};
+
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];
+const numberShown: Array<{ code: string; why: string }> = [];
 for (const code of RULE_CODES) {
   const isProgram = BUILD(code).program === true;
+  const ctx = { ...sampleCtx, ...(NUM_CTX[code] ?? {}) };
   let issue;
   try {
-    issue = buildIssue(code, { target: 'c_test.unit_1', targetKind: 'unit', ctx: sampleCtx });
+    issue = buildIssue(code, { target: 'c_test.unit_1', targetKind: 'unit', ctx });
   } catch (e) {
     rows.push({ code, ok: false, why: `构造失败：${(e as Error).message}` });
     continue;
@@ -160,10 +190,24 @@ for (const code of RULE_CODES) {
       why.push('没给出任何具体数字（说不清差多少）');
     }
   }
+  // 派生喂进去的**每个**数字都必须真的出现在 message 上：
+  // 只断言"有数字"会被 num() 的兜底 0 顶替（"成员数 0 个"也算有数字 = 假绿）
+  const extra = NUM_CTX[code];
+  if (extra) {
+    const missing = Object.entries(extra)
+      .filter(([, v]) => typeof v === 'number' && !msg.includes(String(v)))
+      .map(([k, v]) => `${k}=${v}`);
+    if (missing.length > 0) numberShown.push({ code, why: `message 没写派生给出的值 ${missing.join('、')}｜msg=${msg}` });
+  }
   rows.push({ code, ok: why.length === 0, why: why.join('；') });
 }
 const bad = rows.filter((r) => !r.ok);
 ok('每条设计类报错都给出具体数字（差多少 / 改到多少）', bad.length === 0, JSON.stringify(bad));
+ok(
+  `喂给派生卡的数字都真写进了 message（${Object.keys(NUM_CTX).length} 条：gap/angle/count/hA/hB/total 一个都不能被兜底 0 顶替）`,
+  numberShown.length === 0,
+  JSON.stringify(numberShown)
+);
 ok('每条程序缺陷类都明说了"这是程序缺陷"（不让用户背锅）', rows.filter((r) => BUILD(r.code).program === true).every((r) => r.ok), JSON.stringify(rows.filter((r) => BUILD(r.code).program === true && !r.ok)));
 
 // 人话的核心：说"差多少"，而不是"参数不合法"

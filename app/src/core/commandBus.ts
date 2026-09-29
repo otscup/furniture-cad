@@ -1,11 +1,12 @@
-import type { Cabinet, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
+import type { Cabinet, Connection, FurnitureAssembly, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
 import { validateCornerInterference } from './rules/corner.ts';
+import { pairKey, validateAssemblies } from './relations.ts';
 import { createRoom, defaultCabinetParams, defaultUnits } from './docFactory.ts';
 import { nextId } from './ids.ts';
-import { layoutRows, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
+import { allUnits, layoutRows, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 import type { Gate, GateHit } from '../ai/memory.ts';
 import { formatGateError } from '../ai/memory.ts';
 
@@ -55,6 +56,19 @@ export interface CommandPayload {
   /** room.resize 的新尺寸（mm） */
   w?: number;
   h?: number;
+  /** assembly.create */
+  assembly?: FurnitureAssembly;
+  /** assembly.* 的组合 id */
+  assemblyId?: string;
+  /** assembly.addMember / removeMember 的柜体 id */
+  cabinetId?: string;
+  /** assembly.connect */
+  connection?: Connection;
+  /** assembly.disconnect */
+  connectionId?: string;
+  /** assembly.move 的位移（mm） */
+  dx?: number;
+  dy?: number;
   /**
    * 结构性分区操作落在**哪一行**（`layout.rows` 行序，0 = 最上面）。
    * 单行柜缺省 0；多行柜缺省即拒绝 —— 见 planStructural 里的说明：
@@ -115,6 +129,25 @@ export type SideEffect =
    * 所以 undo/redo 走同一个动作 —— 不需要快照前后两份。
    */
   | { kind: 'mirrorUnits'; cabinetId: string; from: string[]; to: string[]; basePath: string }
+  /**
+   * 组合（v0.3，P2）—— 整组插入/删除。
+   * 与柜体同构：带 index 才能把整组放回原来的位置（组合顺序在界面与快照里都有意义）。
+   */
+  | { kind: 'insertAssembly'; asm: FurnitureAssembly; index: number }
+  | { kind: 'removeAssembly'; asm: FurnitureAssembly; index: number }
+  /**
+   * 组合成员增删 / 关系增删 / 改名 —— 都记"前后两份"，不走路径回退：
+   * `assemblies` 是数组，成员与关系都在数组元素里，用 `assemblies[3].memberIds`
+   * 这种路径回退等于把整个数组换成新数组，撤销时会把别人同时做的改动一起卷回去。
+   * 带前后快照的 patch 只还原这一处，是**最小可逆**的那一种。
+   */
+  | { kind: 'patchAssembly'; assemblyId: string; prev: FurnitureAssembly; next: FurnitureAssembly }
+  /**
+   * 整组平移：一次性改所有成员的 placement。
+   * 存"每个成员的前后 x/y"，而不是存 dx/dy —— dx/dy 反向要取负，看似等价，
+   * 但一旦中途有成员被单独移动过（别的命令），"整组 undo"就会把别的改动也吃掉。
+   */
+  | { kind: 'moveAssembly'; assemblyId: string; moves: Array<{ cabinetId: string; from: { x: number; y: number }; to: { x: number; y: number } }> }
   /**
    * 整项目替换（导入 / 恢复草稿）。它换掉的是【对象引用】而不是某个字段，
    * 所以不能走路径回退，undo/redo 里单独处理 —— 必须同时携带前后两份快照，
@@ -178,6 +211,14 @@ const STRUCTURAL_OPS = new Set([
   'room.resize',
   'wall.create',
   'wall.delete',
+  'assembly.create',
+  'assembly.delete',
+  'assembly.addMember',
+  'assembly.removeMember',
+  'assembly.connect',
+  'assembly.disconnect',
+  'assembly.move',
+  'assembly.rename',
 ]);
 
 /** 写路径白名单：不在名单里的路径一律拒绝（AI 越权防线 #3） */
@@ -465,6 +506,45 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       }
       return;
     }
+
+    // ───────────── 组合（v0.3，P2）─────────────
+    case 'insertAssembly': {
+      const list = project.assemblies ?? (project.assemblies = []);
+      if (forward) {
+        const i = list.findIndex((a) => a.id === se.asm.id);
+        if (i < 0) list.splice(Math.min(se.index, list.length), 0, structuredClone(se.asm));
+      } else {
+        const i = list.findIndex((a) => a.id === se.asm.id);
+        if (i >= 0) list.splice(i, 1);
+      }
+      return;
+    }
+    case 'removeAssembly': {
+      const list = project.assemblies ?? (project.assemblies = []);
+      const i = list.findIndex((a) => a.id === se.asm.id);
+      if (forward) {
+        if (i >= 0) list.splice(i, 1);
+      } else if (i < 0) {
+        list.splice(Math.min(se.index, list.length), 0, structuredClone(se.asm));
+      }
+      return;
+    }
+    case 'patchAssembly': {
+      const list = project.assemblies ?? (project.assemblies = []);
+      const i = list.findIndex((a) => a.id === se.assemblyId);
+      if (i < 0) return;
+      list[i] = structuredClone(forward ? se.next : se.prev);
+      return;
+    }
+    case 'moveAssembly': {
+      for (const m of se.moves) {
+        const cab = project.cabinets.find((c) => c.id === m.cabinetId);
+        if (!cab) continue;
+        const at = forward ? m.to : m.from;
+        cab.placement = { ...cab.placement, x: at.x, y: at.y };
+      }
+      return;
+    }
   }
 }
 
@@ -629,6 +709,21 @@ export class CommandBus {
       }
       if (cmd.op === 'room.create' && !cmd.payload?.room) {
         return { ok: false, error: 'room.create 缺少 payload.room' };
+      }
+      // 组合：载荷缺什么就说什么（plan 那边也会 return null，但这里给得出人话）
+      if (cmd.op === 'assembly.create' && !cmd.payload?.assembly) {
+        return { ok: false, error: 'assembly.create 缺少 payload.assembly' };
+      }
+      if (cmd.op === 'assembly.connect' && !cmd.payload?.connection) {
+        return { ok: false, error: 'assembly.connect 缺少 payload.connection' };
+      }
+      if (cmd.op === 'assembly.disconnect' && !cmd.payload?.connectionId) {
+        return { ok: false, error: 'assembly.disconnect 缺少 payload.connectionId' };
+      }
+      if (
+        cmd.op.startsWith('assembly.') && cmd.op !== 'assembly.create' && !cmd.payload?.assemblyId
+      ) {
+        return { ok: false, error: `${cmd.op} 缺少 payload.assemblyId` };
       }
       /**
        * room.delete 含柜体时拒绝：删房间会把房间从数组摘掉，但柜体的 roomId 仍指着它
@@ -870,10 +965,8 @@ export class CommandBus {
      * 若照旧判 `!cab.layout.units` 就会把整个 rows 结构**覆盖掉**换成单行默认分区 ——
      * 上层柜体在创建的那一刻被静默删掉，而调用方看到的是"创建成功"。
      */
-    const rowArr = Array.isArray(cab.layout?.rows) ? cab.layout!.rows! : null;
-    const hasAnyUnits = rowArr && rowArr.length > 0
-      ? true
-      : Array.isArray(cab.layout?.units) && cab.layout.units.length > 0;
+    // 判据只用 canonical 的 allUnits —— 不在这里再判一次"有没有 rows"
+    const hasAnyUnits = cab.layout ? allUnits(cab.layout).length > 0 : false;
     if (!cab.layout || !hasAnyUnits) {
       cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules) };
     }
@@ -954,6 +1047,160 @@ export class CommandBus {
       return {
         sideEffects: [{ kind: 'mirrorUnits', cabinetId: id, from, to, basePath: row.basePath }],
         diff: [{ path: row.basePath, from: from.join('|'), to: to.join('|') }],
+      };
+    }
+
+    // ════════════════ 组合（v0.3，P2）════════════════
+    //
+    // 这一组 op 的公共纪律：
+    //   ① **引用必须存在**。成员/关系指向不存在的柜体一律拒绝 —— 让调用方看到
+    //      "失败了"，而不是留一条下次派生时才炸的脏数据。
+    //   ② **不猜房间**。组合的 roomId 取自第一个成员；成员跨房间时直接拒绝，
+    //      而不是"取多数派"那种自作聪明。
+    //   ③ **落位不由这里算**。整体移动只做平移（改 x/y），"移到哪不撞"仍由
+    //      detectCollisions 在提交时判定 —— 关系层不写第二套坐标。
+    if (cmd.op === 'assembly.create') {
+      const asm = structuredClone(p.assembly!);
+      if (!asm.memberIds || asm.memberIds.length === 0) return null;
+      const cabById = new Map(draft.cabinets.map((c) => [c.id, c]));
+      for (const id of asm.memberIds) if (!cabById.has(id)) return null;
+      // 成员必须同房间：跨房间的"一组家具"没有意义，且整组移动会跨房间乱飞
+      const rooms = new Set(asm.memberIds.map((id) => cabById.get(id)!.roomId));
+      if (rooms.size > 1) return null;
+      const roomId = asm.roomId || cabById.get(asm.memberIds[0]!)!.roomId;
+      asm.roomId = roomId;
+      if (!asm.id) asm.id = nextId('asm', (draft.assemblies ?? []).map((a) => a.id));
+      if ((draft.assemblies ?? []).some((a) => a.id === asm.id)) return null;
+      // 关系 id 也要唯一：id 撞车不会报错，只会让两条关系共用一条记录
+      const takenConn = new Set<string>();
+      for (const c of asm.connections) {
+        if (!c.id) c.id = nextId('conn', takenConn);
+        takenConn.add(c.id);
+        if (!asm.memberIds.includes(c.a.cabinetId) || !asm.memberIds.includes(c.b.cabinetId)) return null;
+        c.origin = 'authored';
+      }
+      const index = (draft.assemblies ?? []).length;
+      return {
+        sideEffects: [{ kind: 'insertAssembly', asm, index }],
+        diff: [{ path: '(assembly.create)', from: null, to: `${asm.id} ${asm.name}` }],
+      };
+    }
+
+    if (cmd.op === 'assembly.delete') {
+      const id = p.assemblyId;
+      if (!id) return null;
+      const list = draft.assemblies ?? [];
+      const index = list.findIndex((a) => a.id === id);
+      if (index < 0) return null;
+      const asm = structuredClone(list[index]!);
+      return {
+        sideEffects: [{ kind: 'removeAssembly', asm, index }],
+        diff: [{ path: '(assembly.delete)', from: `${asm.id} ${asm.name}`, to: null }],
+      };
+    }
+
+    if (cmd.op === 'assembly.addMember' || cmd.op === 'assembly.removeMember') {
+      const id = p.assemblyId;
+      const cabId = p.cabinetId;
+      if (!id || !cabId) return null;
+      const list = draft.assemblies ?? [];
+      const i = list.findIndex((a) => a.id === id);
+      if (i < 0) return null;
+      const asm = list[i]!;
+      const cab = draft.cabinets.find((c) => c.id === cabId);
+      if (!cab) return null;
+      const prev = structuredClone(asm);
+      const next = structuredClone(asm);
+      if (cmd.op === 'assembly.addMember') {
+        if (next.memberIds.includes(cabId)) return null;
+        // 跨房间不合并：宁可拒绝，不可让"整组移动"把一个柜搬到另一个房间去
+        if (cab.roomId !== next.roomId) return null;
+        next.memberIds.push(cabId);
+      } else {
+        const k = next.memberIds.indexOf(cabId);
+        if (k < 0) return null;
+        next.memberIds.splice(k, 1);
+        // 成员走了，指向它的关系也必须一起走 —— 留着就是"指向组合外"的 ERROR
+        next.connections = next.connections.filter((c) => c.a.cabinetId !== cabId && c.b.cabinetId !== cabId);
+      }
+      return {
+        sideEffects: [{ kind: 'patchAssembly', assemblyId: id, prev, next }],
+        diff: [{ path: `assemblies[${i}].memberIds`, from: prev.memberIds.join('|'), to: next.memberIds.join('|') }],
+      };
+    }
+
+    if (cmd.op === 'assembly.connect' || cmd.op === 'assembly.disconnect') {
+      const id = p.assemblyId;
+      if (!id) return null;
+      const list = draft.assemblies ?? [];
+      const i = list.findIndex((a) => a.id === id);
+      if (i < 0) return null;
+      const asm = list[i]!;
+      const prev = structuredClone(asm);
+      const next = structuredClone(asm);
+      if (cmd.op === 'assembly.connect') {
+        const conn = structuredClone(p.connection!);
+        if (!conn) return null;
+        if (!next.memberIds.includes(conn.a.cabinetId) || !next.memberIds.includes(conn.b.cabinetId)) return null;
+        if (conn.a.cabinetId === conn.b.cabinetId) return null;
+        // 同一对柜只可能有一种空间关系 —— 重复声明会让校验永远有一条 ERROR
+        const dup = next.connections.some(
+          (c) => pairKey(c.a.cabinetId, c.b.cabinetId) === pairKey(conn.a.cabinetId, conn.b.cabinetId)
+        );
+        if (dup) return null;
+        if (!conn.id) conn.id = nextId('conn', next.connections.map((c) => c.id));
+        conn.origin = 'authored';
+        next.connections.push(conn);
+      } else {
+        const connId = p.connectionId;
+        if (!connId) return null;
+        const k = next.connections.findIndex((c) => c.id === connId);
+        if (k < 0) return null;
+        next.connections.splice(k, 1);
+      }
+      return {
+        sideEffects: [{ kind: 'patchAssembly', assemblyId: id, prev, next }],
+        diff: [{ path: `assemblies[${i}].connections`, from: `${prev.connections.length} 条`, to: `${next.connections.length} 条` }],
+      };
+    }
+
+    if (cmd.op === 'assembly.move') {
+      const id = p.assemblyId;
+      const dx = p.dx;
+      const dy = p.dy;
+      if (!id || typeof dx !== 'number' || typeof dy !== 'number') return null;
+      if (!Number.isFinite(dx) || !Number.isFinite(dy)) return null;
+      const list = draft.assemblies ?? [];
+      const asm = list.find((a) => a.id === id);
+      if (!asm) return null;
+      const moves = asm.memberIds
+        .map((cabId) => draft.cabinets.find((c) => c.id === cabId))
+        .filter((c): c is Cabinet => Boolean(c))
+        .map((c) => ({
+          cabinetId: c.id,
+          from: { x: c.placement.x, y: c.placement.y },
+          to: { x: Math.round(c.placement.x + dx), y: Math.round(c.placement.y + dy) },
+        }));
+      if (moves.length === 0) return null;
+      return {
+        sideEffects: [{ kind: 'moveAssembly', assemblyId: id, moves }],
+        diff: [{ path: `(assembly.move) ${asm.name}`, from: null, to: `Δ${Math.round(dx)},${Math.round(dy)}mm` }],
+      };
+    }
+
+    if (cmd.op === 'assembly.rename') {
+      const id = p.assemblyId;
+      const name = p.name;
+      if (!id || typeof name !== 'string' || name.trim() === '') return null;
+      const list = draft.assemblies ?? [];
+      const i = list.findIndex((a) => a.id === id);
+      if (i < 0) return null;
+      const prev = structuredClone(list[i]!);
+      const next = structuredClone(prev);
+      next.name = name;
+      return {
+        sideEffects: [{ kind: 'patchAssembly', assemblyId: id, prev, next }],
+        diff: [{ path: `assemblies[${i}].name`, from: prev.name, to: next.name }],
       };
     }
 
@@ -1177,6 +1424,8 @@ export class CommandBus {
     }
     // 跨柜规则（Phase E）：L 型转角处铰链门开门撞邻柜的软建议
     issues.push(...validateCornerInterference(p, this.rules));
+    // 组合关系（v0.3，P2）：只校验**声明过**的关系；无组合时返回空数组（v0.2 逐位等价）
+    issues.push(...validateAssemblies(p));
     return { geom, issues };
   }
 

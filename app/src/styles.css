@@ -319,6 +319,8 @@ a.tb-btn { text-decoration: none; }
 .tree-leaf-sub { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; color: var(--text-2); padding: 1px 4px; }
 .tree-leaf-sub .tree-name { color: var(--text-2); }
 /* 垂直行标题（v0.3 多行柜）：分区列表按行分组，行头比分区略重一点 */
+.tree-asm { font-weight: 600; }
+.tree-asm .tree-meta { font-weight: 400; }
 .tree-row-head {
   font-size: 10px;
   color: var(--muted);

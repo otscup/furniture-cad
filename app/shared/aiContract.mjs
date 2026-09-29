@@ -366,6 +366,49 @@ export const ACTIONS = {
     detail: '破坏性操作。只有在用户**明确**说"删掉 XX 柜"时才可以产生这条动作，绝不可推测。',
   },
 
+  // ───────── 组合（v0.3，P2）─────────
+  /**
+   * 组合动作：AI 只能**声明"这两个柜是一组、怎么连"**，不碰任何坐标。
+   *
+   * 为什么现在就开放给 AI：
+   *   ① 成员是 **id 引用**，不是坐标 —— 这正好是"AI 只出语义"的边界内；
+   *   ② 用户说"这两个柜做个 L 型"时，AI 若只能建两个独立柜体，
+   *      "它们是一组"这件事就永远只在对话里存在，模型里没有 —— 下一次
+   *      对话问"那组 L 型多宽"，AI 只能靠猜。声明成组合才留得下来。
+   *
+   * 故意**不给** assembly.move / 坐标类参数：挪到哪由落位算法算，
+   * 让 AI 给 dx/dy 就是让它写坐标（本项目禁止）。
+   */
+  'assembly.create': {
+    label: '把几个柜体声明成一组（组合）',
+    target: 'project',
+    params: {
+      name: { type: 'string', max: MAX_STRING, desc: '组合名，例如「主卧 L 型衣柜」' },
+      memberIds: { type: 'id-list', min: 1, max: 12, desc: '成员柜体 id（从左到右/从主到次）。必须都是同一房间里、已经存在的柜体' },
+      connections: {
+        type: 'object-list',
+        max: 24,
+        desc:
+          '可选。成员之间的连接关系：每项 { a, b, kind, edge? }。' +
+          'kind: "corner" = 角接（L 型，两臂垂直在墙角相接）/ "butt" = 续接（并排贴合成一排）；' +
+          'edge 可省略（"back"|"front"|"left"|"right"，柜体的哪条边相接），省略则由系统按落位反推 —— 建议省略，除非你确定。' +
+          '**不要给坐标**：落位由系统算，关系只描述"怎么连"',
+      },
+    },
+    required: ['name', 'memberIds'],
+    detail:
+      '只在你**已经建好**这些柜体之后用（先 cabinet.create 再 assembly.create）。' +
+      '成员必须同房间；跨房间会被拒绝。' +
+      '关系声明后系统会**核对落位**：你说连着但两柜没挨着会报 ERROR（不是悄悄记下）—— 那是落位没到位，不是关系写错。',
+  },
+  'assembly.delete': {
+    label: '删除一个组合（不动柜体）',
+    target: 'project',
+    params: { assemblyId: { type: 'string', max: MAX_STRING, desc: '组合 id' } },
+    required: ['assemblyId'],
+    detail: '删组合**不会**删掉里头的柜体，只是取消"这是一组"的语义。要删柜体用 cabinet.delete。',
+  },
+
   // ───────── 项目 ─────────
   'project.rename': {
     label: '重命名项目',
@@ -543,6 +586,55 @@ function checkParam(actionName, key, p, v, ctx) {
       if (finite(v)) return null; // 1 起的序号，具体范围由编译器按实际分区数判断
       if (typeof v === 'string' && v.trim() && v.length <= MAX_STRING) return null; // 昵称
       return `${where} 必须是数字序号（1 起）或分区昵称字符串`;
+    }
+    /** id 列表：成员引用。值必须是非空字符串（是不是真柜体由编译器查项目，不在这里猜） */
+    case 'id-list': {
+      if (!Array.isArray(v)) return `${where} 必须是一个字符串数组`;
+      if (v.length === 0) return `${where} 是空数组 —— 那就等于没说`;
+      if (p.min !== undefined && v.length < p.min) return `${where} 至少要 ${p.min} 项`;
+      if (p.max !== undefined && v.length > p.max) return `${where} 最多 ${p.max} 项（实际 ${v.length}）`;
+      for (const it of v) {
+        if (typeof it !== 'string' || !it.trim()) return `${where} 里只能放 id 字符串（收到 ${JSON.stringify(it)}）`;
+        if (it.length > MAX_STRING) return `${where} 里的 id 太长：${it.slice(0, 20)}…`;
+      }
+      if (new Set(v).size !== v.length) return `${where} 里有重复的 id —— 同一个柜体只能算一个成员`;
+      return null;
+    }
+    /**
+     * 关系列表：每项 { a, b, kind, edge? }。
+     * 这里只校验**形状**（a/b 是字符串、kind 在枚举里、edge 在枚举里），
+     * "这两个柜到底是不是挨着"由落位派生去判 —— 契约层不碰几何，这是硬边界。
+     */
+    case 'object-list': {
+      if (!Array.isArray(v)) return `${where} 必须是一个数组`;
+      if (v.length === 0) return `${where} 是空数组 —— 那就等于没说，删掉这个参数`;
+      if (p.max !== undefined && v.length > p.max) return `${where} 最多 ${p.max} 条（实际 ${v.length}）`;
+      const kinds = ['corner', 'butt'];
+      const edges = ['back', 'front', 'left', 'right'];
+      for (const it of v) {
+        if (!isPlainObject(it)) return `${where} 里每一项都必须是对象（收到 ${JSON.stringify(it)}）`;
+        for (const side of ['a', 'b']) {
+          const s = it[side];
+          if (typeof s === 'string') {
+            if (!s.trim()) return `${where}.${side} 不能是空字符串`;
+            continue;
+          }
+          if (isPlainObject(s) && typeof s.cabinetId === 'string' && s.cabinetId.trim()) {
+            if (s.edge !== undefined && !edges.includes(s.edge)) {
+              return `${where}.${side}.edge = ${JSON.stringify(s.edge)} 不在允许值内（${edges.join(' / ')}）`;
+            }
+            continue;
+          }
+          return `${where}.${side} 必须是柜体 id 字符串，或 { cabinetId, edge? }`;
+        }
+        if (!kinds.includes(it.kind)) {
+          return `${where}.kind = ${JSON.stringify(it.kind)} 不在允许值内（${kinds.join(' / ')}）`;
+        }
+        if ('edge' in it && it.edge !== undefined && !edges.includes(it.edge)) {
+          return `${where}.edge = ${JSON.stringify(it.edge)} 不在允许值内（${edges.join(' / ')}）`;
+        }
+      }
+      return null;
     }
     case 'roomRef': {
       if (finite(v) || (typeof v === 'string' && v.trim() && v.length <= MAX_STRING)) return null;
@@ -812,6 +904,10 @@ function describeParam(k, p, spec) {
       const fields = Object.entries(p.item ?? {}).map(([ik, ip]) => `${ik}${describeParam(ik, ip, {}).replace(/^[^:]*: /, '(') + ')'}`);
       return `${k}: 数组，最多 ${p.max} 项，从左到右，每项含 ${fields.join('，')}${opt}${p.desc ? ` ${p.desc}` : ''}`;
     }
+    case 'id-list':
+      return `${k}: 字符串数组（id 列表，${p.min ?? 1}~${p.max} 项，不可重复）${opt}${p.desc ? ` ${p.desc}` : ''}`;
+    case 'object-list':
+      return `${k}: 对象数组，最多 ${p.max} 项，每项 { a, b, kind, edge? }${opt}${p.desc ? ` ${p.desc}` : ''}`;
     default:
       return `${k}: ${p.type}`;
   }

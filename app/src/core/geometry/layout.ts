@@ -9,7 +9,7 @@ import type {
   UnitSpec,
 } from '../types.ts';
 import { allocateWidths, splitEqual, type RemainderPolicy } from '../allocate.ts';
-import { ROW_HEIGHT_FILL, SINGLE_ROW_ID, layoutRows } from '../layoutModel.ts';
+import { ROW_HEIGHT_FILL, SINGLE_ROW_ID, canonicalUnits, layoutRows } from '../layoutModel.ts';
 
 /**
  * 柜体派生骨架 —— 生成器、校验器、属性面板、UI 全部共用这一份。
@@ -136,7 +136,14 @@ export function computeCabinetLayout(cab: Cabinet, rules: RuleSet): CabinetDeriv
    * （RULE-ROW-DOUBLE-UNSUPPORTED）。宁可报错，不可安静地画错。
    */
   const rowSource: CabinetRow[] = isDouble
-    ? [{ id: SINGLE_ROW_ID, height: ROW_HEIGHT_FILL, units: cab.layout.units }]
+    /**
+     * 用 **canonical 的第一行**（而不是 `cab.layout.units`）：
+     * 多行柜按约定不写 units 镜像，直接读 `layout.units` 会拿到空数组 ——
+     * 于是 `allocateRowWidths([], …)` 算出 `netTotal = innerW + 板厚`（n−1 = −1），
+     * 派生给出一个**荒谬的数字**，柜体变成 0 分区。虽然校验器仍会报"不支持"，
+     * 但界面读数是错的。取第一行：柜体照常可画，报错由校验器给。
+     */
+    ? [{ id: SINGLE_ROW_ID, height: ROW_HEIGHT_FILL, units: canonicalUnits(cab.layout) }]
     : layoutRows(cab.layout);
 
   const { netH, check } = resolveRowHeights(rowSource, innerH, boardT, rules.policy.remainderPolicy);

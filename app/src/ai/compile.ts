@@ -1,11 +1,11 @@
 import type { Command } from '../core/commandBus.ts';
-import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
+import type { Connection, ConnectionEdge, ConnectionKind, Cabinet, FurnitureAssembly, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import * as CMD from '../core/commands.ts';
 import { createCabinet as buildCabinet, defaultCabinetParams, makeUnit } from '../core/docFactory.ts';
 import { nextId } from '../core/ids.ts';
 import { unitParamRange, unitIntentsSemanticError } from '../../shared/aiContract.mjs';
 import { pickPartsOf } from '../core/geometry/pickLines.ts';
-import { allUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
+import { allUnits, canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
 import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
@@ -226,7 +226,12 @@ export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined)
   if (isMultiRow(cab.layout)) {
     return `柜体「${cab.name}」分了上下 ${layoutRows(cab.layout).length} 行，本阶段 AI 还不能指定是哪一行 —— 请在界面上直接改那一行里的分区`;
   }
-  const units = cab.layout.units;
+  /**
+   * 走 canonical 取法：单行柜下它与 `layout.units` 逐项同一对象（v0.2 逐位等价）；
+   * 多行柜已被上面那道闸门拦住，但**不依赖闸门的执行顺序** —— 万一将来闸门被移走，
+   * 这里拿到的是空数组（走到下一行报错），而不是越界或静默改到别的行。
+   */
+  const units = canonicalUnits(cab.layout);
   if (units.length === 0) return `柜体「${cab.name}」没有任何分区`;
   if (ref === undefined || ref === null) return '没有指明是哪个分区（需要 target.unit：1 起序号或分区昵称）';
   if (typeof ref === 'number') {
@@ -416,7 +421,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (typeof cab === 'string') return { ok: false, error: cab };
       const i = resolveUnitIndex(cab, action.target.unit);
       if (typeof i === 'string') return { ok: false, error: i };
-      const unit = cab.layout.units[i];
+      const unit = canonicalUnits(cab.layout)[i];
       const key = String(p.param);
       const r = unitParamRange(key);
       if (!r) return { ok: false, error: `分区参数 "${key}" 没有登记区间（契约表漏了一项）` };
@@ -502,8 +507,9 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (typeof cab === 'string') return { ok: false, error: cab };
       const i = resolveUnitIndex(cab, action.target.unit);
       if (typeof i === 'string') return { ok: false, error: i };
-      if (cab.layout.units.length <= 1) return { ok: false, error: `柜体「${cab.name}」只剩一个分区，删掉就没有柜体结构了` };
-      const unit = cab.layout.units[i];
+      const rowUnits = canonicalUnits(cab.layout);
+      if (rowUnits.length <= 1) return { ok: false, error: `柜体「${cab.name}」只剩一个分区，删掉就没有柜体结构了` };
+      const unit = rowUnits[i];
       return { ok: true, command: CMD.removeUnit(cab.id, cab.name, unit.id, src), summary: `「${cab.name}」删除分区 ${unit.nickname ?? unit.id}` };
     }
 
@@ -638,6 +644,60 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       return { ok: true, command: CMD.deleteCabinet(cab, src), summary: `删除柜体「${cab.name}」` };
     }
 
+    // ───────────── 组合（v0.3，P2）─────────────
+    case 'assembly.create': {
+      const name = String(p.name);
+      const memberIds = p.memberIds as unknown as string[];
+      /**
+       * 成员 id **必须逐个查到**。这里不"尽力而为"地跳过找不到的那个：
+       * 跳过 = AI 说"这三个是一组"，实际只进了两个，而界面上显示的仍是"创建成功"。
+       * 宁可整条拒收并说清是哪个 id 不存在。
+       */
+      const missing = memberIds.filter((id) => !project.cabinets.some((c) => c.id === id));
+      if (missing.length > 0) {
+        return { ok: false, error: `组合成员里有找不到的柜体：${missing.join('、')}（现有柜体：${project.cabinets.map((c) => c.id).join('、') || '（项目里还没有柜体）'}）` };
+      }
+      const rooms = new Set(memberIds.map((id) => project.cabinets.find((c) => c.id === id)!.roomId));
+      if (rooms.size > 1) {
+        return { ok: false, error: `组合成员不在同一个房间（${[...rooms].join(' / ')}）—— 跨房间的组合没有意义，整组移动会把柜子搬到别的房间去` };
+      }
+      const roomId = [...rooms][0]!;
+      const connections: Connection[] = [];
+      for (const raw of (p.connections ?? []) as unknown as Array<Record<string, unknown>>) {
+        const mkEnd = (v: unknown): { cabinetId: string; edge?: ConnectionEdge } | null => {
+          if (typeof v === 'string') return { cabinetId: v };
+          if (v && typeof v === 'object') {
+            const o = v as { cabinetId?: unknown; edge?: unknown };
+            if (typeof o.cabinetId !== 'string') return null;
+            const e = typeof o.edge === 'string' ? (o.edge as ConnectionEdge) : undefined;
+            return e ? { cabinetId: o.cabinetId, edge: e } : { cabinetId: o.cabinetId };
+          }
+          return null;
+        };
+        const a = mkEnd(raw.a);
+        const b = mkEnd(raw.b);
+        const kind = raw.kind as ConnectionKind;
+        if (!a || !b) return { ok: false, error: '连接的 a / b 都必须是柜体 id（或 { cabinetId, edge? }）' };
+        if (!memberIds.includes(a.cabinetId) || !memberIds.includes(b.cabinetId)) {
+          return { ok: false, error: `连接用到的柜体不在成员列表里：${a.cabinetId} / ${b.cabinetId}` };
+        }
+        if (a.cabinetId === b.cabinetId) return { ok: false, error: `连接的两端是同一个柜体 ${a.cabinetId}` };
+        connections.push({ id: '', kind, a, b, origin: 'authored' });
+      }
+      const asm: FurnitureAssembly = { id: '', name, roomId, memberIds, connections };
+      return { ok: true, command: CMD.createAssembly(asm, src), summary: `新建组合「${name}」（${memberIds.length} 个柜体${connections.length ? `，${connections.length} 条连接` : ''}）` };
+    }
+
+    case 'assembly.delete': {
+      const id = String(p.assemblyId);
+      const asm = (project.assemblies ?? []).find((a) => a.id === id);
+      if (!asm) {
+        const list = (project.assemblies ?? []).map((a) => a.id).join('、');
+        return { ok: false, error: `找不到组合 ${id}${list ? `（现有组合：${list}）` : '（项目里还没有任何组合）'}` };
+      }
+      return { ok: true, command: CMD.deleteAssembly(asm.id, asm.name, src), summary: `删除组合「${asm.name}」（不动柜体）` };
+    }
+
     // ───────────── 项目 ─────────────
     case 'project.rename': {
       const to = String(p.name);
@@ -730,5 +790,7 @@ export const COMPILED_ACTIONS = [
   'cabinet.create',
   'cabinet.duplicate',
   'cabinet.delete',
+  'assembly.create',
+  'assembly.delete',
   'project.rename',
 ] as const;

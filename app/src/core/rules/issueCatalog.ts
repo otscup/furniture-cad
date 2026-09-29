@@ -66,6 +66,9 @@ export interface IssueCtx {
   [k: string]: unknown;
 }
 
+/** 相接容差文案（与 relations.ts 的 CONTACT_TOL 同源，避免两处各写死一个数字） */
+const CONTACT_TOL_TEXT = '2mm';
+
 const num = (c: IssueCtx, key: string, fallback = 0): number => {
   const v = c[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
@@ -530,6 +533,130 @@ const RULE_CARDS: Record<string, RuleCard> = {
       `「${zh(str(c, 'unitName'), str(c, 'unitId'))}」的门板材质「${str(c, 'doorMaterial')}」在材质库里找不到，已按柜体板材回退成「${str(c, 'fallback')}」。`,
     hint: (c) => `材质库里现有的材质共 ${listLen(c, 'candidates')} 种（${listOf(c, 'candidates')}），把门板材质 ID 改成其中一个；确实用它就去规则集里补上「${str(c, 'doorMaterial')}」。`,
     manual: '用哪个材质是设计决定，系统不会替你换掉它。',
+  },
+
+  // ═══════════════ 组合关系（v0.3，P2）═══════════════
+  //
+  // 这一族的定位：**校验"声明的关系"**，不是校验柜体本身。
+  // 组合不产生板件、不改尺寸 —— 所以这一族里没有一条是"尺寸问题"，
+  // 全是"你说的话与落位对不对得上"。这正是关系层该管的事。
+  'ASSEMBLY-NOT-TOUCHING': {
+    title: '声明连着，实际没挨着',
+    severity: 'ERROR',
+    message: (c) =>
+      `组合「${str(c, 'asmName')}」里声明「${str(c, 'nameA')}」与「${str(c, 'nameB')}」是${str(c, 'kindZh')}，但两柜实际没相接：最近处还差 ${num(c, 'gap')}mm（相接容差 ${CONTACT_TOL_TEXT}）。`,
+    hint: (c) => `把其中一个柜朝另一个挪 ${num(c, 'gap')}mm 就贴上了（贴边或共角）；本来就不该连的话删掉这条连接 —— 声明"连着"却没连着，整组移动/转角检查会按错误的前提算。`,
+    manual: '挪哪个柜是设计决定（系统不知道你想让谁靠过去）。',
+  },
+  'ASSEMBLY-KIND-MISMATCH': {
+    title: '连接方式和实际摆放不一致',
+    severity: 'ERROR',
+    message: (c) =>
+      `组合「${str(c, 'asmName')}」里「${str(c, 'nameA')}」与「${str(c, 'nameB')}」声明的是${str(c, 'declared')}，按落位算（两柜轴线夹角 ${num(c, 'angle')}°）其实是${str(c, 'actual')}。`,
+    hint: (c) => `把这条连接的类型改成${str(c, 'actual')}；或者转柜体让夹角到 90°（现在 ${num(c, 'angle')}°）再按角接算。`,
+    manual: '是改声明还是改摆放，取决于你想要哪个。',
+  },
+  'ASSEMBLY-EDGE-MISMATCH': {
+    title: '连接的边和实际不一致',
+    severity: 'ERROR',
+    message: (c) =>
+      `组合「${str(c, 'asmName')}」里「${str(c, 'cabName')}」声明用${str(c, 'declared')}相接，按落位算（两柜轴线夹角 ${num(c, 'angle')}°）贴合的是${str(c, 'actual')}。`,
+    hint: (c) => `续接时贴合边是唯一确定的：把声明改成${str(c, 'actual')}，或干脆不写 edge 交给派生反推（夹角 ${num(c, 'angle')}° 时边是算出来的，不是猜的）。`,
+    manual: '要不要保留这条边的声明由你定；不写 edge 不会丢信息。',
+  },
+  'ASSEMBLY-EDGE-AMBIGUOUS': {
+    title: '角接的边有歧义',
+    severity: 'WARNING',
+    message: (c) =>
+      `组合「${str(c, 'asmName')}」里「${str(c, 'cabName')}」声明用${str(c, 'declared')}角接，按落位算（两柜轴线夹角 ${num(c, 'angle')}°）更接近${str(c, 'actual')}。`,
+    hint: (c) =>
+      `墙角那个点同时属于相邻两条边（夹角 ${num(c, 'angle')}° 时尤其明显），"角接算哪条边"本身没有唯一答案。建议不写 edge，只声明角接 —— 需要精确控制时，这条提示告诉你系统算成了${str(c, 'actual')}。`,
+    manual: '角点归属两条边是几何事实，不是错误。',
+  },
+  'ASSEMBLY-CONN-OUTSIDE': {
+    title: '连接指向组合外的柜体',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」（成员 ${num(c, 'count')} 个）的连接用到了柜体 ${str(c, 'cabId')}，它不在成员列表里。`,
+    hint: (c) => `把它加进成员（成员会变成 ${num(c, 'count') + 1} 个），或删掉这条连接。关系只能描述组合内部 —— 跨出成员的关系会让"整组移动"的边界说不清。`,
+    manual: '要不要把它并进这组是设计决定。',
+  },
+  'ASSEMBLY-CONN-SELF': {
+    title: '柜体连到了自己',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」（成员 ${num(c, 'count')} 个）里有一条连接的两端都是柜体 ${str(c, 'cabId')}。`,
+    hint: (c) => `删掉这条连接：同一对柜体之间最多留 1 条，自己与自己（这 ${num(c, 'count')} 个成员里它只算一个）谈不上"相接"。`,
+    manual: '这是模型数据有问题，删掉即可。',
+  },
+  'ASSEMBLY-CONN-DUP': {
+    title: '同一对柜体重复声明了连接',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」（成员 ${num(c, 'count')} 个）里「${str(c, 'nameA')}」与「${str(c, 'nameB')}」之间有不止 1 条连接。`,
+    hint: () => '两个柜体之间只可能有一种空间关系，保留实际那一条、删掉其余的（每对最多 1 条）。',
+    manual: '保留哪条要看你想要哪种语义。',
+  },
+  'ASSEMBLY-MEMBER-MISSING': {
+    title: '组合成员不存在',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」的成员 ${str(c, 'cabId')} 在项目里找不到（这个组合现在列了 ${num(c, 'count')} 个成员）。`,
+    hint: () => '删掉这个成员 id，或把对应柜体补回来。指向不存在的柜体，整组操作时一定会静默少动一个。',
+    manual: '多半是柜体被删了而组合没跟着改。',
+  },
+  'ASSEMBLY-MEMBER-DUP': {
+    title: '组合成员重复',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」的成员列表（${num(c, 'count')} 项）里 ${str(c, 'cabId')} 出现了不止 1 次。`,
+    hint: () => '成员列表里每个柜体只写一次。重复会让"整组平移"把同一个柜挪两次。',
+    manual: '删掉重复项即可。',
+  },
+  'ASSEMBLY-MEMBER-ROOM': {
+    title: '组合跨了房间',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」（成员 ${num(c, 'count')} 个）里的「${str(c, 'cabName')}」在房间「${str(c, 'roomName')}」，不在本组合所属房间。`,
+    hint: () => '一个组合只属于一个房间：把柜体挪进该房间，或把它从这个组合里去掉。跨房间的组合没有"同一组家具"的意义。',
+    manual: '房间归属是设计决定。',
+  },
+  'ASSEMBLY-ROOM-MISSING': {
+    title: '组合指向不存在的房间',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」所属房间 ${str(c, 'roomId')} 在项目里找不到（项目现在有 ${num(c, 'count')} 个房间）。`,
+    hint: (c) => `把组合改到现有这 ${num(c, 'count')} 个房间里的某一个，或删掉这个组合。`,
+    manual: '多半是房间被删了而组合没跟着改。',
+  },
+  'ASSEMBLY-EMPTY': {
+    title: '组合没有成员',
+    severity: 'ERROR',
+    message: (c) => `组合「${str(c, 'asmName')}」的成员列表是空的（成员数 ${num(c, 'count')}）。`,
+    hint: () => '加进至少 1 个柜体，或删掉这个组合。空组合在整组操作时什么也不做，却占着一个名字。',
+    manual: '删掉或补成员都可以。',
+  },
+  'ASSEMBLY-ID-DUP': {
+    title: '组合 id 重复',
+    severity: 'ERROR',
+    message: (c) => `组合 id ${str(c, 'asmId')}（「${str(c, 'asmName')}」）出现了 ${num(c, 'count')} 次。`,
+    hint: (c) => `${num(c, 'count')} 个组合共用一个 id 时，改一个会连带改到另一个 —— 必须改成唯一 id。`,
+    manual: '这是模型数据有问题，改 id 即可。',
+  },
+  'ASSEMBLY-DISCONNECTED': {
+    title: '这一组在空间上分成了几堆',
+    severity: 'WARNING',
+    message: (c) => `组合「${str(c, 'asmName')}」的 ${num(c, 'count')} 个柜体没有连成一片（中间有断开的地方）。`,
+    hint: (c) => `${num(c, 'count')} 个成员分成了多堆：检查是不是有柜体没挪到位；如果本来就是两组家具，拆成两个组合更清楚。`,
+    manual: '是不是同一组由你定，系统只提示"它们没挨着"。',
+  },
+  'ASSEMBLY-MEMBER-SHARED': {
+    title: '柜体同时属于多个组合',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」同时属于 ${num(c, 'count')} 个组合（${str(c, 'names')}）。`,
+    hint: (c) => `整组移动/整组删除时，这个柜会被这 ${num(c, 'count')} 个组合各操作一次。要么只留一个归属，要么接受"它属于两组"。`,
+    manual: '归属是设计决定。',
+  },
+  'ASSEMBLY-STACK-UNVERIFIED': {
+    title: '叠放关系本阶段核不了',
+    severity: 'INFO',
+    message: (c) =>
+      `组合「${str(c, 'asmName')}」里「${str(c, 'nameA')}」（高 ${num(c, 'hA')}）与「${str(c, 'nameB')}」（高 ${num(c, 'hB')}）声明为叠放，本阶段柜体没有 Z 坐标，核不了谁在上；若真叠放总高约 ${num(c, 'total')}。`,
+    hint: (c) => `这条已按你说的记下来了，但没有被校验 —— 要真校验得先给柜体加 Z；或者用同一柜内上下两行 rows 表达分层（${num(c, 'hA')}+${num(c, 'hB')}=${num(c, 'total')}），那个是能算的。`,
+    manual: '这是已知限制，不是错误：宁可如实说"没核"，不可假装核过。',
   },
 };
 

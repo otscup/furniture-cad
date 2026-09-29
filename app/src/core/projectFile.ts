@@ -41,13 +41,36 @@ export interface ProjectFileEnvelope {
  * （键序也沿用原顺序，所以不会产生"只改了排版"的假 diff）。
  */
 export function serializeProjectFile(project: Project, savedAt = new Date().toISOString()): string {
+  const body = toFileProject(project);
+  /**
+   * schemaVersion **跟着内容走**（P0 定的口径，P2 沿用）：
+   *   · 项目里出现了 v0.3 结构（多行柜 / 组合）⇒ 写 `0.3`；
+   *   · 否则仍是 `0.2` —— 存量文件读进来再存盘**逐字节不变**。
+   * 这样做的原因：版本号不是"程序版本"，是"这份文件里用了哪些结构"。
+   * 提前把所有文件升到 0.3，只会让每个旧项目都产生一次无意义的 diff，
+   * 而真正需要旧版本拒绝的那两类文件（多行 / 有组合）反而混在里头认不出来。
+   */
+  body.schemaVersion = resolveSchemaVersion(body);
   const env: ProjectFileEnvelope = {
     format: PROJECT_FILE_FORMAT,
     formatVersion: PROJECT_FILE_FORMAT_VERSION,
     savedAt,
-    project: toFileProject(project),
+    project: body,
   };
   return JSON.stringify(env, null, 2);
+}
+
+/**
+ * 这份文件实际用到哪个模型版本。
+ *
+ * 判定只有一处 —— 若让各处自己写 `if (assemblies) '0.3' else '0.2'`，
+ * 版本号迟早在两条路径上给出不同的答案，而版本号错了没有任何报错，
+ * 只有"旧版本打开新文件"时那句莫名其妙的失败。
+ */
+export function resolveSchemaVersion(project: Project): string {
+  const hasRows = project.cabinets.some((c) => Array.isArray(c.layout?.rows) && c.layout.rows.length > 1);
+  const hasAssemblies = Array.isArray(project.assemblies) && project.assemblies.length > 0;
+  return hasRows || hasAssemblies ? '0.3' : '0.2';
 }
 
 export type ParseResult =
@@ -119,6 +142,8 @@ export function parseProjectFile(raw: string): ParseResult {
   const wallIds = new Set<string>();
   const cabIds = new Set<string>();
   const unitIds = new Set<string>();
+  /** 柜体 → 房间（组合缺 roomId 时用它从成员反推，可确定、不是猜） */
+  const cabRoomOf = new Map<string, string>();
 
   // ④ 房间与墙
   for (const r of p.rooms as unknown[]) {
@@ -159,6 +184,7 @@ export function parseProjectFile(raw: string): ParseResult {
     if (typeof cab.id !== 'string' || cab.id === '') return { ok: false, error: `柜体缺少 id` };
     if (cabIds.has(cab.id)) return { ok: false, error: `柜体 id 重复：${cab.id}` };
     cabIds.add(cab.id);
+    cabRoomOf.set(cab.id, cab.roomId as string);
     if (typeof cab.name !== 'string' || cab.name === '') return { ok: false, error: `柜体 ${cab.id} 缺少 name` };
     if (typeof cab.roomId !== 'string' || !roomIds.has(cab.roomId)) {
       return { ok: false, error: `柜体 ${cab.id} 的 roomId "${String(cab.roomId)}" 不指向任何房间（悬空柜体）` };
@@ -227,6 +253,89 @@ export function parseProjectFile(raw: string): ParseResult {
       if (flat.length === 0) return { ok: false, error: `柜体 ${cab.id} 的分区是空的 —— 至少保留一个分区，否则不是柜子` };
       const dupUnit = checkIdsUnique(flat as { id: string }[], `柜体 ${cab.id} 的分区`, unitIds);
       if (dupUnit) return { ok: false, error: dupUnit };
+    }
+  }
+
+  /**
+   * ⑦ 组合（v0.3，P2）—— 缺省即无组合，旧文件不受影响。
+   *
+   * ── 分层：这里只挡【会引发事故的】，其余交给校验器 ──
+   *   · 挡：id 重复、成员指向不存在的柜体、关系指向组合外的柜体、kind/edge 取值非法。
+   *     这些是"装进去就会静默错"的 —— 悬空引用会让整组操作少动一个柜，
+   *     id 撞车会让改一个动到另一个。
+   *   · 不挡：缺 name / 缺 roomId / 缺 connections / 空成员。
+   *     这些**不会崩**，只是不完整 —— 用可确定的值兜底并给 warning，
+   *     业务上的对错由加载后的 `validateAssemblies()` 说（它会对空组合报 ERROR）。
+   *
+   * ── 为什么必须这么宽容 ──
+   *   迁移验收 E 组有一条"未来字段不炸旧读者"的护栏：文件里躺着一个**字段不全**
+   *   的 assemblies（旧版本或人工改的），新版本必须还能打开。
+   *   把"缺 name"变成"打不开"，等于让回滚路径上的文件全部变成废纸 ——
+   *   这比留一条 warning 糟得多。拒绝只留给真的会出事故的那些。
+   */
+  if (Array.isArray(p.assemblies)) {
+    const asmIds = new Set<string>();
+    for (const a of p.assemblies as unknown[]) {
+      if (typeof a !== 'object' || a === null || Array.isArray(a)) return { ok: false, error: 'assemblies 里有非法成员' };
+      const asm = a as { id?: unknown; name?: unknown; roomId?: unknown; memberIds?: unknown; connections?: unknown };
+      if (typeof asm.id !== 'string' || asm.id === '') return { ok: false, error: '组合缺少 id' };
+      if (asmIds.has(asm.id)) return { ok: false, error: `组合 id 重复：${asm.id}` };
+      asmIds.add(asm.id);
+      // 缺 name：用 id 顶上（不是"猜一个名字"，是回退到已有的唯一标识）
+      if (typeof asm.name !== 'string' || asm.name === '') {
+        (a as { name: string }).name = asm.id;
+        warnings.push(`组合 ${asm.id} 缺少 name，已用 id 顶替`);
+      }
+      const memberIds = Array.isArray(asm.memberIds) ? (asm.memberIds as unknown[]) : [];
+      if (!Array.isArray(asm.memberIds)) warnings.push(`组合 ${asm.id} 缺少 memberIds，已按空组合处理`);
+      if (!Array.isArray(asm.connections)) {
+        (a as { connections: unknown[] }).connections = [];
+        warnings.push(`组合 ${asm.id} 缺少 connections，已按没有关系处理`);
+      }
+      const seenMember = new Set<string>();
+      for (const mid of memberIds) {
+        if (typeof mid !== 'string' || !cabIds.has(mid)) return { ok: false, error: `组合 ${asm.id} 的成员 ${JSON.stringify(mid ?? null)} 不是项目里的柜体` };
+        if (seenMember.has(mid)) return { ok: false, error: `组合 ${asm.id} 的成员重复：${mid}` };
+        seenMember.add(mid);
+      }
+      // 缺/错 roomId：从成员身上取（可确定的，不是猜）；取不到就留空，由校验器报错
+      const inferredRoom = memberIds.length > 0 ? cabRoomOf.get(String(memberIds[0])) : undefined;
+      if (typeof asm.roomId !== 'string' || !roomIds.has(asm.roomId)) {
+        if (inferredRoom) {
+          (a as { roomId: string }).roomId = inferredRoom;
+          warnings.push(`组合 ${asm.id} 的 roomId 缺失或指向不存在的房间，已按第一个成员所在房间取「${inferredRoom}」`);
+        } else {
+          warnings.push(`组合 ${asm.id} 的 roomId 指向不存在的房间，且没有成员可推断`);
+        }
+      }
+      if (!Array.isArray(asm.connections)) return { ok: false, error: `组合 ${asm.id} 的 connections 必须是数组` };
+      const connIds = new Set<string>();
+      for (const c of asm.connections as unknown[]) {
+        if (typeof c !== 'object' || c === null || Array.isArray(c)) return { ok: false, error: `组合 ${asm.id} 的 connections 里有非法成员` };
+        const conn = c as { id: unknown; kind: unknown; a: unknown; b: unknown; origin: unknown };
+        if (typeof conn.id !== 'string' || conn.id === '') return { ok: false, error: `组合 ${asm.id} 有连接缺少 id` };
+        if (connIds.has(conn.id)) return { ok: false, error: `组合 ${asm.id} 的连接 id 重复：${conn.id}` };
+        connIds.add(conn.id);
+        if (conn.kind !== 'corner' && conn.kind !== 'butt' && conn.kind !== 'stack') {
+          return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 的 kind 非法（只能是 corner / butt / stack）` };
+        }
+        for (const side of [conn.a, conn.b]) {
+          if (typeof side !== 'object' || side === null) return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 缺少一端` };
+          const end = side as { cabinetId: unknown; edge?: unknown };
+          if (typeof end.cabinetId !== 'string' || end.cabinetId === '') {
+            return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 缺少 cabinetId` };
+          }
+          if (!seenMember.has(end.cabinetId)) {
+            return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 指向了组合外的柜体 ${end.cabinetId}` };
+          }
+          if (end.edge !== undefined && end.edge !== 'back' && end.edge !== 'front' && end.edge !== 'left' && end.edge !== 'right') {
+            return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 的 edge 非法（只能是 back / front / left / right）` };
+          }
+        }
+        if (conn.origin !== undefined && conn.origin !== 'authored' && conn.origin !== 'inferred') {
+          return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 的 origin 非法（只能是 authored / inferred）` };
+        }
+      }
     }
   }
 

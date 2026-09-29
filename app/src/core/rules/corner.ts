@@ -4,6 +4,7 @@ import { bboxOf, polyLocalToWorld } from '../geometry/transform.ts';
 import { computeCabinetLayout, doorWidths } from '../geometry/layout.ts';
 import { buildIssue } from './issueCatalog.ts';
 import { canonicalUnits } from '../layoutModel.ts';
+import { authoredConnections, pairKey } from '../relations.ts';
 
 /**
  * ════════════════════════════════════════════════════════════════════
@@ -69,6 +70,28 @@ export function validateCornerInterference(project: Project, rules: RuleSet): Is
     byRoom.set(c.roomId, arr);
   }
 
+  /**
+   * 「要检查哪些柜对」= **声明的转角** ∪ **推断的转角**，去重后各查一次。
+   *
+   * ── 为什么声明排在推断前面 ──
+   *   用户说"这两段是 L 型"是**事实**；靠落位猜出来的是**兜底**。
+   *   以前只有兜底，于是调一次容差、或两柜差 3mm 没贴上，检查就静默消失 ——
+   *   转角撞门这种事，漏检一次就是车间返工一次。
+   *   现在声明过的对**一定**进队列，推断只是补上"用户没声明但确实摆成 L"的那些。
+   *
+   * ── 为什么仍然保留推断 ──
+   *   大多数存量项目没有任何组合声明（v0.2 文件根本没有这个字段）。
+   *   若要求先声明才查，等于把已经工作了几轮的转角检查一夜之间关掉。
+   *
+   * ── 不重复报 ──
+   *   两条路径给的柜对按 `pairKey` 去重，同一对只检查一次（否则用户看到两条
+   *   一模一样的 WARNING，会以为有两个地方撞了）。
+   */
+  const declared = new Set<string>();
+  for (const { conn } of authoredConnections(project)) {
+    if (conn.kind === 'corner') declared.add(pairKey(conn.a.cabinetId, conn.b.cabinetId));
+  }
+
   for (const [, cabs] of byRoom) {
     const fps = new Map<string, Vec2[]>();
     const bbs = new Map<string, { min: Vec2; max: Vec2 }>();
@@ -77,23 +100,42 @@ export function validateCornerInterference(project: Project, rules: RuleSet): Is
       fps.set(c.id, fp);
       bbs.set(c.id, bboxOf(fp));
     }
+    const seen = new Set<string>();
+    const pairs: Array<[Cabinet, Cabinet]> = [];
+    // ① 声明过的转角对先入队（成员必须都在这个房间里）
+    for (const [A, B] of (function* (): Generator<[Cabinet, Cabinet]> {
+      for (let i = 0; i < cabs.length; i++) {
+        for (let j = i + 1; j < cabs.length; j++) {
+          if (declared.has(pairKey(cabs[i]!.id, cabs[j]!.id))) yield [cabs[i]!, cabs[j]!];
+        }
+      }
+    })()) {
+      seen.add(pairKey(A.id, B.id));
+      pairs.push([A, B]);
+    }
+    // ② 推断兜底：其余所有柜对
     for (let i = 0; i < cabs.length; i++) {
       for (let j = i + 1; j < cabs.length; j++) {
-        const A = cabs[i]!;
-        const B = cabs[j]!;
-        const fpA = fps.get(A.id)!;
-        const fpB = fps.get(B.id)!;
-        if (fpA.length < 4 || fpB.length < 4) continue;
-        if (!axisAligned(A) || !axisAligned(B)) continue;
-        if (!isPerpendicular(A, B)) continue;
-        const corner = sharedCorner(fpA, fpB);
-        if (!corner) continue;
-        // 重叠由 detectCollisions 管，这里只管"相接但不重叠"的 L 转角
-        if (boxesOverlap(bbs.get(A.id)!, bbs.get(B.id)!)) continue;
-
-        checkSwing(A, B, corner, bbs.get(B.id)!, rules, out);
-        checkSwing(B, A, corner, bbs.get(A.id)!, rules, out);
+        const k = pairKey(cabs[i]!.id, cabs[j]!.id);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        pairs.push([cabs[i]!, cabs[j]!]);
       }
+    }
+
+    for (const [A, B] of pairs) {
+      const fpA = fps.get(A.id)!;
+      const fpB = fps.get(B.id)!;
+      if (fpA.length < 4 || fpB.length < 4) continue;
+      if (!axisAligned(A) || !axisAligned(B)) continue;
+      if (!isPerpendicular(A, B)) continue;
+      const corner = sharedCorner(fpA, fpB);
+      if (!corner) continue;
+      // 重叠由 detectCollisions 管，这里只管"相接但不重叠"的 L 转角
+      if (boxesOverlap(bbs.get(A.id)!, bbs.get(B.id)!)) continue;
+
+      checkSwing(A, B, corner, bbs.get(B.id)!, rules, out);
+      checkSwing(B, A, corner, bbs.get(A.id)!, rules, out);
     }
   }
   return out;

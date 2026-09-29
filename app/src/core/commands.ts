@@ -1,7 +1,8 @@
-import type { Cabinet, Room, RowHeight, UnitSpec, Wall } from './types.ts';
+import type { Cabinet, Connection, FurnitureAssembly, Room, RowHeight, UnitSpec, Wall } from './types.ts';
 import type { Change, Command, CommandSource } from './commandBus.ts';
 import { newCommandId } from './ids.ts';
 import { ROW_HEIGHT_FILL, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
+import { KIND_ZH } from './relations.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -60,6 +61,143 @@ export function rotateCabinet(cab: Cabinet, deg: number, source: CommandSource =
  * 门扇按等分跟随分区翻转，铰链是五金型号（无左右向）不用动。
  * 单分区柜体没有"左右"可翻 —— 总线拒绝，UI 提示而不是静默成功。
  */
+// ══════════════════════════════════════════════════════════════════════
+//  组合（v0.3，P2）
+//
+//  这一组构造器的共同点：**payload 里只有 id 与语义，没有一个坐标是这里算的**。
+//  整体移动给的是"位移量"（用户拖了多少），落到哪儿由 CommandBus 套到每个成员上，
+//  撞不撞仍由 detectCollisions 在提交时判 —— 关系层不产坐标，这是 P2 的硬边界。
+// ══════════════════════════════════════════════════════════════════════
+
+/** 建一个组合（成员 + 可选的关系声明） */
+export function createAssembly(
+  assembly: FurnitureAssembly,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.create'),
+    op: 'assembly.create',
+    source,
+    target: { kind: 'project', id: assembly.roomId },
+    changes: [],
+    payload: { assembly },
+    label: `新建组合「${assembly.name}」（${assembly.memberIds.length} 个柜体）`,
+  };
+}
+
+export function deleteAssembly(assemblyId: string, name: string, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('assembly.delete'),
+    op: 'assembly.delete',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId },
+    label: `删除组合「${name}」`,
+  };
+}
+
+export function addAssemblyMember(
+  assemblyId: string,
+  asmName: string,
+  cabinetId: string,
+  cabName: string,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.addMember'),
+    op: 'assembly.addMember',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, cabinetId },
+    label: `把「${cabName}」加入组合「${asmName}」`,
+  };
+}
+
+export function removeAssemblyMember(
+  assemblyId: string,
+  asmName: string,
+  cabinetId: string,
+  cabName: string,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.removeMember'),
+    op: 'assembly.removeMember',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, cabinetId },
+    label: `把「${cabName}」移出组合「${asmName}」`,
+  };
+}
+
+export function connectInAssembly(
+  assemblyId: string,
+  asmName: string,
+  connection: Connection,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.connect'),
+    op: 'assembly.connect',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, connection },
+    label: `在组合「${asmName}」里声明一条${KIND_ZH[connection.kind]}`,
+  };
+}
+
+export function disconnectInAssembly(
+  assemblyId: string,
+  asmName: string,
+  connectionId: string,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.disconnect'),
+    op: 'assembly.disconnect',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, connectionId },
+    label: `删除组合「${asmName}」里的一条连接`,
+  };
+}
+
+/** 整组平移：一次命令改所有成员的 placement，一次撤销回到原位 */
+export function moveAssembly(
+  assemblyId: string,
+  asmName: string,
+  dx: number,
+  dy: number,
+  source: CommandSource = 'ui'
+): Command {
+  return {
+    id: newCommandId('assembly.move'),
+    op: 'assembly.move',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, dx, dy },
+    label: `整体移动「${asmName}」Δ${Math.round(dx)},${Math.round(dy)}mm`,
+  };
+}
+
+export function renameAssembly(assemblyId: string, name: string, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('assembly.rename'),
+    op: 'assembly.rename',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId, name },
+    label: `组合改名为「${name}」`,
+  };
+}
+
 /**
  * 镜像柜体：分区左右反序（语义镜像，不是几何镜像）。
  * `rowIndex` 同 addUnit：多行柜必须指明翻哪一行（缺省会被 CommandBus 拒绝）。

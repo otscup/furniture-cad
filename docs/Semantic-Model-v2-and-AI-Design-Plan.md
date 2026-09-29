@@ -368,7 +368,7 @@ src/import/
 |---|---|---|
 | **P0** 冻结与护栏 ✅**已完成** | 本文件定稿；冻结 v0.3 数据形状（`CabinetRow`/`layout.rows`）；`layoutModel.ts` 建 canonical 口径；`projectFile` 读写两侧接上；`verify/migration-acceptance.ts` 56 条断言。详见 §15 | 旧文件逐字节往返（sha256 相等）；**零行为变更**，全量回归绿 |
 | **P1** 垂直维度 ✅**已完成** | `computeCabinetLayout` 多行 + 行隔板/行内立板/行内门抽层板 + 高度链断言 + views/3D 最小增量 + `rows` 写路径登记（**`schemaVersion` 仍未升 0.3，见 §16.4**） | **Case 1/2/4 全绿**；`verify:rows` 101 条断言；全量回归绿。详见 §16 |
-| **P2** 组合关系层 | `Assembly` + `Connection` + `assembly.*` 动作 + 转角校验改用 `Connection`（保留原推断为兜底） | **Case 5/6 全绿**；原 `corner.ts` 断言不回归 |
+| **P2** 组合关系层 ✅**已完成** | `FurnitureAssembly` + `Connection` + `assembly.*` 动作 + 转角校验改用 `Connection`（保留原推断为兜底） | **Case 5/6 全绿**；原 `corner.ts` 断言不回归；`verify:relations` 82 条。详见 §17 |
 | **P3** AI 设计阶段 | `/api/ai/design` + `DesignProposal` 契约与校验器 + `compileProposal` + 界面确认流 + `design.*` 动作 | **`verify/proposal-acceptance`** + 一次端到端"大白话 → 提案 → 确认 → 落模型 → 出 DXF" |
 | **P4** 导入骨架 | `src/import/{types,normalize,json,dxf,kujiale}` + `project.import` 命令 + `Provenance` | **`verify/import-acceptance`**；`kujiale` 明示"未实现" |
 | **P5** 效果图识别 | `image.ts` + Vision → Proposal + 置信度门控 | 识别 + **必须用户确认**才落模型；`unknown` 不落模型 |
@@ -462,7 +462,9 @@ src/import/
 2. **行位置**：行序**自上而下**（`rows[0]` 在最上面），`z0` 从内空底自下而上累加 `净高 + 板厚`。`rowDividers[k] = rows[k+1].z1` —— 隔板位置与行高**同源**，不可能漂。
 3. **行宽**：**每行独立**执行已有的 `allocateWidths`。不展平：展平会让"上行 2 格 + 下行 3 格"算成 5 格分同一段净宽，而宽度链恒等式在整柜口径下照样成立 —— 错得毫无征兆。验收里有专门的**展平反例**断言"逐行算 ≠ 展平算"。
 
-### 16.3 `verify:rows` 的 101 条断言（对应用户给的清单）
+### 16.3 `verify:rows` 的 106 条断言（101 + 架构审查补的 5 条）
+
+> P1 交付后做 P2 前的架构审查时，又补了 ⑧b 组 5 条：**多行 × 双面柜**明确报 `RULE-ROW-DOUBLE-UNSUPPORTED`（ERROR）、派生按单行兜底取 canonical 第一行（`netTotal === innerW − boardT`，不是荒谬值）、不产出 phantom 行隔板、所有派生数字 finite。这 5 条来自审查发现的真实缺陷：`geometry/layout.ts` 的双面柜兜底分支当时直接读 `layout.units`，而多行柜按约定**不写 units 镜像** → 拿到空数组 → `allocateRowWidths([], …)` 算出荒谬宽度。**结论：全项目不许再有第二处判断"是 rows 还是 units"。**
 
 | 组 | 覆盖 | 条数要点 |
 |---|---|---|
@@ -484,7 +486,73 @@ src/import/
 
 ### 16.5 回归判据
 
-- 全量 node 链 **27/27 脚本 exit=0**（含新增 `verify:rows` 101 条）。
+- 全量 node 链 **27/27 脚本 exit=0**（含新增 `verify:rows` 106 条）。
 - `verify:migration` **56/56**、`verify:quota` **38/38**、`tsc --noEmit` 无错。
 - `verify:ui` **661/661 通过**（与 P1 之前的基线逐条相同，未新增也未放宽）。
 - **旧断言一条未删、未放宽**：本次对旧脚本零改动（除 `package.json` 接入 `verify:rows`）。
+
+---
+
+## 17. P2 实施记录（已完成）
+
+### 17.1 交付物（按"链路位置"分组）
+
+| 层 | 文件 | 变更 |
+|---|---|---|
+| **形状** | `core/types.ts` | 新增 `ConnectionEdge / ConnectionKind / ConnectionEnd / Connection / FurnitureAssembly`；`Project.assemblies?`（项目级扁平数组，与 `cabinets` 同构）。**全可选** —— 没有组合的项目与 v0.2 逐字节相同。 |
+| **派生 + 校验** | `core/relations.ts`（**新建**） | `deriveContacts()`（"接不接触"的唯一实现）、`contactIndex()`、`inferConnections()`、`authoredConnections()`、`minDistance()`、`validateAssemblies()`、`pairKey()`、`EDGE_ZH/KIND_ZH`。**这个文件不产生任何几何。** |
+| **文案** | `core/rules/issueCatalog.ts` | 新增 15 张组合规则卡，每条都带**具体数字**（gap mm / 夹角° / 成员数 / 高度）。 |
+| **校验接线** | `core/commandBus.ts` | `deriveFor` 追加 `validateAssemblies(p)`；`SideEffect` 增 `insertAssembly/removeAssembly/patchAssembly/moveAssembly`；`STRUCTURAL_OPS` 增 8 个 `assembly.*`；`planStructural` 增 8 个分支。 |
+| **校验** | `core/rules/corner.ts` | 检查队列 = **声明的 corner 对** ∪ **推断对**（按 `pairKey` 去重）。声明优先，推断兜底 —— 没声明组合时行为与 P2 前完全一致。 |
+| **命令** | `core/commands.ts` | 新增 8 个构造器：`createAssembly / deleteAssembly / addAssemblyMember / removeAssemblyMember / connectInAssembly / disconnectInAssembly / moveAssembly / renameAssembly`。payload 里**只有 id 与语义，没有一个坐标是这里算的**。 |
+| **契约** | `shared/aiContract.mjs` | `ACTIONS` 增 `assembly.create` / `assembly.delete`；`checkParam` 增 `id-list` / `object-list` 两种形状校验。 |
+| **编译器** | `ai/compile.ts` | 增两个 case，加入 `COMPILED_ACTIONS`。 |
+| **快照** | `ai/snapshot.ts` | `AiSnapshot.assemblies?` —— **只在真的有组合时出现**（与 `rows` 同款纪律，旧项目快照一个字节不变）；连接翻成人话 `kindZh`。 |
+| **序列化** | `core/projectFile.ts` | `resolveSchemaVersion()`：**有多行柜或有组合 ⇒ 0.3，否则仍 0.2**；解析端新增组合校验⑦（只挡会引发事故的，其余兜底 + warning，见 §17.4-1）。 |
+| **UI** | `ui/panels/ObjectTree.tsx`、`styles.css` | 多选 ≥2 个同房间柜体 → 「把选中的 N 个柜组成一组」；有组合时渲染「组合（N）」整块：成员数、连接列表（kind + 两柜名 + `inferred` 标记）、「选中整组」「按当前落位补全连接（N）」「删除组合」。 |
+| **验收** | `verify/relations-acceptance.ts`（**新建**，82 条） | 见 §17.3。已接入 `verify:all`。 |
+| **验收** | `verify/fixhint-acceptance.ts` | 新增 `NUM_CTX`（16 条组合卡的真实 ctx）+ 断言「喂进去的每个数字都真写在 message 上」。见 §17.4-2。 |
+| **验收** | `verify/ai-acceptance.ts` | `MINIMAL` 增 `assembly.create` / `assembly.delete` 两个最小样例（契约新增动作必须进最小样例表）。 |
+
+### 17.2 三条纪律（P2 的架构边界，比代码重要）
+
+1. **关系层不产生几何。** `FurnitureAssembly` 是"这三个柜是一组"的**声明**，不改板件、不改尺寸、不进 2D/3D/DXF/BOM。验收 E 组逐字节比对：建组合前后 BOM / stats / plan 图元 / 四视图 / 中立导出（DXF 唯一源）**完全不变**。
+2. **"接不接触"只有一处实现。** `deriveContacts()` 是唯一判据；`validateAssemblies()`、`corner.ts`、UI 的"按当前落位补全连接"全消费它。不允许第二处自己算距离。
+3. **声明（`authored`）与推断（`inferred`）必须分开。** 只有 `origin:'authored'` 的连接会被校验；推断只用于**表达**（UI 里标 `推断`），**不据此报错** —— 拿猜测去骂用户是不可接受的。
+
+### 17.3 `verify:relations` 的 82 条断言
+
+| 组 | 覆盖 | 要点 |
+|---|---|---|
+| A · Case 5 | L 型角接 | 声明 `corner` 与落位一致 → 无 ERROR；`deriveContacts` 认出 corner；改掉一个柜的朝向 → 精确到 `ASSEMBLY-KIND-MISMATCH` |
+| B · Case 6 | 跨柜变深并排 `butt` | 深度不同的两柜并排仍判续接；`edge` 声明错 → `ASSEMBLY-EDGE-MISMATCH` |
+| C · 声明 vs 落位 | 四条精确码 | `NOT-TOUCHING`（带 gap）/ `KIND-MISMATCH`（带 angle）/ `EDGE-MISMATCH` / `EDGE-AMBIGUOUS`；**每条都断言具体规则码**，不只断言"报错了" |
+| D · 结构非法 | 7 条 | 成员不存在 / 成员重复 / 跨房间 / 房间不存在 / 空组合 / id 重复 / 连接指向组合外 / 自连 / 重复连接 |
+| E · 关系层不产生几何 | 逐字节比对 | BOM / stats / plan / views / neutral 建组合前后完全相等 |
+| F · 整组操作 | 命令与撤销 | 整组平移一次命令、一次撤销；移除成员 / 删除组合后连接不悬空 |
+| G · 转角检查 | `corner.ts` | 声明的 corner 对**一定**被查（哪怕落位算不出来）；没声明组合时行为与 P2 前一致 |
+| H · AI 通道 | 不给坐标 | `assembly.create` 的 payload 里没有任何 x/y/z；契约层 `id-list` 拒绝非字符串数组 |
+| I · 序列化与版本 | `schemaVersion` | 有组合 ⇒ 0.3；删掉组合后存盘回 0.2；存量文件往返逐字节不变 |
+| J · 兼容边界 | 旧项目 | `assemblies` 缺省 ⇒ 与 v0.2 逐值相同；`projectFile` 解析器对缺字段只兜底不拒绝 |
+| K · U 型 | 三柜两条角接 | 全绿、无"分成几堆"、首尾两臂不相接不牵连报错 |
+
+### 17.4 P2 的已知边界 / 有意偏离（需你知晓）
+
+1. **`stack` 允许声明但不校验**，报 `ASSEMBLY-STACK-UNVERIFIED`（INFO）。原因：柜体 placement 只有 `(x, y, rotation)`，**没有 Z**，无法判定谁在上。文案里给了两柜高度与"若真叠放总高约 N"，并指了明路（同一柜内用上下两行 `rows` 表达分层，那个是能算的）。**宁可如实说"没核"，不可假装核过。**
+2. **`fixhint` 的"给得出数字"不是靠兜底 0 混过去的。** `num()` 缺值时返回 0，于是"成员数 0 个"也算"有数字" —— 这是典型的**假绿**。所以验收里给这 16 条卡喂有辨识度的真实值（gap=137 / angle=45 / count=3 / hA=900 / hB=600 / total=1500），并断言**这个值确实出现在 message 里**。
+3. **解析器对组合只挡"会引发事故的"**：id 重复、成员指向不存在柜体、关系指向组合外、kind/edge 取值非法。缺 `name` / `roomId` / `connections` / 空成员一律**兜底 + warning**，业务对错交给 `validateAssemblies()` —— 因为"未来字段不炸旧读者"是 §15 定的护栏，不能为了校验方便把"打不开"当成报错。
+4. **`schemaVersion` 仍是内容驱动**：`resolveSchemaVersion()` 一处判定，有 rows>1 或有 assemblies ⇒ 0.3，否则 0.2。存量文件读进来再存盘**逐字节不变**（migration 56 条已钉）。
+
+### 17.5 回归判据（实测）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| 全量 node 链（29 个脚本，含新增 `verify:relations`） | **全部 exit=0** |
+| `verify:relations` | **82 / 82** |
+| `verify:rows` | **106 / 106**（P1 基线未动） |
+| `verify:migration` | **56 / 56**（存量文件逐字节不变） |
+| `verify:fixhint` | **26 / 26**（新增 1 条"数字真写在 message 上"，旧断言未放宽） |
+| `verify:ui` | **661 / 661**（与 P1 后基线**逐条相同**，未新增也未放宽） |
+| `verify:ai` | 70 / 70（含新增的 `assembly.create` / `assembly.delete` 最小样例） |
+| 旧断言 | 一条未删、未放宽；`corner.ts` 在无组合时行为与 P2 前一致（G 组已钉） |

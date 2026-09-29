@@ -25,6 +25,18 @@ export interface Project {
   ruleSetId: string;
   rooms: Room[];
   cabinets: Cabinet[];
+  /**
+   * 家具组合（v0.3，可选）—— 一组柜体的**语义分组 + 关系声明**。
+   *
+   * ── 为什么是项目级扁平数组而不是嵌在 Room 里 ──
+   *   与 `cabinets` 同构（`assembly.roomId` 指向房间）：新增/删除/移动都只需
+   *   动一个数组，命令的 sideEffect、白名单、快照三条线都少一处分支。
+   *   嵌进 Room 会让"移动柜体到别的房间"变成"从一个数组搬到另一个数组"。
+   *
+   * ── 缺省 = 没有组合（v0.2 逐位等价）──
+   *   旧文件没有这个字段，读出来是 `undefined`，所有派生与校验按"无组合"处理。
+   */
+  assemblies?: FurnitureAssembly[];
 }
 
 export interface Room {
@@ -43,6 +55,72 @@ export interface Wall {
   end: Vec2;
   thickness: number;
   height: number;
+}
+
+// ─────────────────────── 组合关系（v0.3，P2）───────────────────────
+
+/**
+ * 柜体局部坐标下的四条边。
+ * 局部坐标：+X 沿柜宽（左→右），+Y 沿进深（背面→正面）。
+ *   `back` = y 0（贴墙那一面）；`front` = y 深（门脸那一面）；`left`/`right` = 两端。
+ */
+export type ConnectionEdge = 'back' | 'front' | 'left' | 'right';
+
+/**
+ * 关系类型。**只描述"怎么连"，不含任何坐标。**
+ *   `corner` 角接（L 型）：两臂轴线垂直、在墙角相接；
+ *   `butt`   续接（并排）：两柜同向、端面或侧面贴合，合成一整排；
+ *   `stack`  叠放：一柜在另一柜之上。
+ *
+ * ── 为什么 `stack` 在类型里但派生不产出它 ──
+ *   柜体的 placement 只有 (x, y, rotation)，**没有 Z**。没有 Z 就无法判定
+ *   "谁在谁上面"，硬算只能猜。所以：`stack` 允许**声明**（用户明确说上下叠放），
+ *   但派生层不产出、也不校验它 —— 报 `RULE-ASSEMBLY-STACK-UNVERIFIED` 说清
+ *   "你说叠放了，本阶段没有 Z 坐标可核"。宁可如实说没核，不可假装核过。
+ */
+export type ConnectionKind = 'corner' | 'butt' | 'stack';
+
+/** 关系的一端：哪个柜 + 它的哪条边（边可选，缺省由派生从落位反推） */
+export interface ConnectionEnd {
+  cabinetId: string;
+  edge?: ConnectionEdge;
+}
+
+export interface Connection {
+  id: string;
+  kind: ConnectionKind;
+  a: ConnectionEnd;
+  b: ConnectionEnd;
+  /**
+   * 这条关系是**谁说的**：
+   *   `authored` = 用户/AI 明确声明的事实（可校验、可据此报错）；
+   *   `inferred` = 派生从落位反推出来的（只用于表达，不据此报错）。
+   * 两者必须分开：把推断当事实去报错，会在用户只是"放得近"时骂他"你说连着其实没连"。
+   */
+  origin: 'authored' | 'inferred';
+}
+
+/**
+ * 家具组合：一组柜体 + 它们之间的连接关系。
+ *
+ * ── 它**不是**几何 ──
+ *   声明组合不产生任何板件、不改任何尺寸、不改 2D/3D/DXF/BOM。
+ *   它是"这两段属于同一组电视墙、并且在这里拐了个弯"这条**语义**，
+ *   落位仍然由 `snapPlace.joinSpots` 算、干涉仍然由 `detectCollisions` 判 ——
+ *   关系层不许自己写第二套坐标，这是本阶段最容易走偏的地方。
+ *
+ * ── 它带来什么 ──
+ *   ① 整体操作（平移整组、整组删）不必靠"框选"这种空间巧合；
+ *   ② 转角撞门检查可以**按声明**必检，而不是靠"看起来像 L 型"猜；
+ *   ③ P3 的 AI 提案可以把"一组"作为可讨论的对象（"把转角这组改成 U 型"）。
+ */
+export interface FurnitureAssembly {
+  id: string;
+  name: string;
+  roomId: string;
+  /** 成员柜体 id（指向 `project.cabinets`）；顺序有意义（界面与快照按此列） */
+  memberIds: string[];
+  connections: Connection[];
 }
 
 // ─────────────────────────── 柜体 ───────────────────────────

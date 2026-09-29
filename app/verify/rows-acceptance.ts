@@ -455,6 +455,30 @@ for (const c of [case2, case4]) {
   })(), g.panels.filter((p) => p.role === 'DividerPanel').map((p) => p.length).join('/'));
 }
 
+// ══════════════════════════ ⑧b 本阶段明确不支持的组合 ══════════════════════════
+
+section('⑧b 多行 × 双面柜：明确拒绝，且派生不许给出荒谬数字');
+
+const doubleMulti = mkCab([
+  { h: 700, units: [unit('shelves', 1200, 2), unit('shelves', 1200, 2)] },
+  { h: ROW_HEIGHT_FILL, units: [unit('drawerBank', 2400, 2)] },
+]);
+doubleMulti.layout.type = 'double';
+doubleMulti.layout.backUnits = [unit('shelves', 1200, 2), unit('shelves', 1200, 2)];
+
+const LDM = computeCabinetLayout(doubleMulti, rules);
+const GDM = generateCabinet(doubleMulti, rules);
+ok('双面 + 多行：校验器报 RULE-ROW-DOUBLE-UNSUPPORTED（ERROR）',
+  validateCabinet(doubleMulti, GDM, rules).some((i) => i.code === 'RULE-ROW-DOUBLE-UNSUPPORTED' && i.severity === 'ERROR'),
+  GDM.issues.map((i) => i.code).join('/'));
+ok('双面 + 多行：派生按单行兜底（取 canonical 第一行，不是空数组）', LDM.rows.length === 1 && LDM.nets.length === 2,
+  eq(LDM.nets.length, 2));
+ok('双面 + 多行：netTotal 不是荒谬值（不是 innerW + 板厚）', LDM.netTotal === LDM.innerW - LDM.boardT,
+  eq(LDM.netTotal, LDM.innerW - LDM.boardT));
+ok('双面 + 多行：不产出行隔板（几何语义未定义，不许猜）', GDM.panels.filter((p) => p.role === 'RowDividerPanel').length === 0);
+ok('双面 + 多行：所有派生数字都是有限数（没有 NaN 混进生产尺寸）',
+  [LDM.innerW, LDM.innerH, LDM.netTotal, ...LDM.nets, ...LDM.unitX0].every((v) => Number.isFinite(v)));
+
 // ══════════════════════════ ⑨ 写路径与命令口径 ══════════════════════════
 
 section('⑨ 写路径：单行沿用 layout.units，多行落在 layout.rows[j].units');

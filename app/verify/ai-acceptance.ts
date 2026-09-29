@@ -116,6 +116,13 @@ const MINIMAL: Record<string, unknown> = {
   'cabinet.duplicate': { action: 'cabinet.duplicate', target: { cabinetName: cab0.name }, params: { offset: 800 } },
   'cabinet.delete': { action: 'cabinet.delete', target: { cabinetName: cab0.name }, params: {} },
   'project.rename': { action: 'project.rename', target: {}, params: { name: '验收项目' } },
+  // v0.3 P2：组合。成员用现有柜体 id，不给任何坐标（AI 不许写坐标是硬边界）
+  'assembly.create': {
+    action: 'assembly.create',
+    target: {},
+    params: { name: '验收组合', memberIds: [cab0.id] },
+  },
+  'assembly.delete': { action: 'assembly.delete', target: {}, params: { assemblyId: 'asm_001' } },
 };
 
 const drift: string[] = [];

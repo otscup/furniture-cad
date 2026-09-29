@@ -1,4 +1,5 @@
 import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
+import { KIND_ZH } from '../core/relations.ts';
 import { canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 
 /**
@@ -69,6 +70,22 @@ export interface AiSnapshot {
   }>;
   limits: AiRuleLimits;
   cabinets: AiCabinetView[];
+  /**
+   * 组合（v0.3，P2）—— **只在真的有组合时出现**（无组合 = 不出现这个键）。
+   *
+   * 与 `rows` 同款纪律：不给旧快照多加一个 `assemblies: []`。
+   * 空数组会让模型以为"这个项目支持组合，只是现在没有"，从而在某轮里凭空
+   * 写出 assembly.create 去引用不存在的柜体；不出现这个键，它就看不见这个能力。
+   */
+  assemblies?: Array<{
+    index: number;
+    id: string;
+    name: string;
+    roomId: string;
+    memberIds: string[];
+    /** 每条连接都翻成人话（"L 型角接"），模型不必去猜 kind 的意思 */
+    connections: Array<{ id: string; kind: string; kindZh: string; a: string; b: string; edgeA?: string; edgeB?: string }>;
+  }>;
 }
 
 export interface AiCabinetView {
@@ -166,6 +183,26 @@ export function buildSnapshot(project: Project, rules: RuleSet): AiSnapshot {
       remainderPolicy: rules.policy.remainderPolicy,
     },
     cabinets: project.cabinets.map((cab, i) => cabinetView(cab, i)),
+    ...(project.assemblies && project.assemblies.length > 0
+      ? {
+          assemblies: project.assemblies.map((asm, i) => ({
+            index: i + 1,
+            id: asm.id,
+            name: asm.name,
+            roomId: asm.roomId,
+            memberIds: asm.memberIds.slice(),
+            connections: asm.connections.map((c) => ({
+              id: c.id,
+              kind: c.kind,
+              kindZh: KIND_ZH[c.kind],
+              a: c.a.cabinetId,
+              b: c.b.cabinetId,
+              ...(c.a.edge ? { edgeA: c.a.edge } : {}),
+              ...(c.b.edge ? { edgeB: c.b.edge } : {}),
+            })),
+          })),
+        }
+      : {}),
   };
 }
 

@@ -161,6 +161,42 @@ export interface UnitSpec {
   rod?: { count: number; heightFromBottom: number; hardware: string };
 }
 
+/**
+ * 行高（v0.3）。
+ *   数字 = 该行的**固定净高**（mm 整数，指内空净高，不含行隔板）；
+ *   'fill' = 吃掉剩余内高（高度链唯一的自由项）。
+ *
+ * 多行柜的高度链恒等式：`Σ(行净高) + (行数-1)×板厚 === innerH`。
+ * 因此 'fill' **有且只有一个、且必须在最后一行** —— 这条由 P1 的校验器强制，
+ * 类型层面只保证取值合法（见 rules/validate.ts 的 RULE-ROW-* 家族）。
+ *
+ * **行序固定为自上而下**：`rows[0]` 是最上面一行，`rows[n-1]` 是最下面一行。
+ * 于是"上部通顶柜 + 下部三分区"就写成 `[{height:480,…}, {height:'fill',…}]`
+ * —— 定死上面那层，剩下的全归下面（'fill' 恰好落在最后一行，不需要额外规则）。
+ */
+export type RowHeight = number | 'fill';
+
+/**
+ * 垂直行（v0.3，上下分层）—— **一行 Section 的容器**。
+ *
+ * ── 为什么是"加一个维度"而不是"加一种柜型" ──
+ *   柜体内部原本只有左右一个维度（`units` 一维数组），于是"上通顶柜 + 下三分区"
+ *   这类结构只能靠新的巨型 if/else 柜型硬编码。引入"行"以后：
+ *     · `UnitSpec` 就是 Section 叶（语义完全不变）；
+ *     · `drawers/shelves/doors/rod/appliance` 就是 Component（原样保留）；
+ *     · 行的不同组合 = 不同柜型 —— 新柜型是**组合**出来的，不是新分支。
+ *
+ * ── 与旧模型的等价关系 ──
+ *   `rows` 缺省（单行）时，模型与 v0.2 **逐位等价**：内存里视作
+ *   `[{ id:'row_001', height:'fill', units }]`，序列化时塌回 `units`。
+ *   见 core/layoutModel.ts —— 全项目只有那一个文件知道这两种形状。
+ */
+export interface CabinetRow {
+  id: string;
+  height: RowHeight;
+  units: UnitSpec[];
+}
+
 export interface CabinetLayout {
   /**
    * 'row' = 单面柜（分区左右并排，唯一的背板在背面）；
@@ -169,7 +205,22 @@ export interface CabinetLayout {
    */
   type: 'row' | 'double';
   widthMode: 'fit_total' | 'fit_units';
+  /**
+   * 第一排（`rows` 缺省时 = 唯一一排）的分区，从左到右。
+   * `rows` 存在时它**不参与读取**（读侧以 `rows` 为权威），且存盘时被省略 ——
+   * 免得旧读者把第一行当成整柜算出错误的生产尺寸。
+   * 单一口径点在 core/layoutModel.ts，别处不许判断 rows/units 谁在。
+   */
   units: UnitSpec[];
+  /**
+   * 垂直行（v0.3，可选）。**只在真的分了上下两层时才出现**：
+   *   · 缺省 = 单行柜（= v0.2 形状，存量文件一个字节都不动）；
+   *   · 1 行 = 等价于缺省，序列化时自动塌回 `units`（不写冗余的 rows）；
+   *   · ≥2 行（自上而下，`rows[0]` 在最上面）= 上下分层，
+   *     行间贯通横隔板由 P1 的派生层生成。
+   * 与 `units` 同时出现时以 `rows` 为准（解析器会就"镜像不一致"给出 warning）。
+   */
+  rows?: CabinetRow[];
   /**
    * 仅 type='double'：背面分区（从左到右，朝 -Y）。
    * row 柜带 backUnits 是自相矛盾的模型 —— 校验器报 ERROR，不静默忽略。

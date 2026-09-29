@@ -26,6 +26,9 @@
 20. 一键修复=承诺→只对修法唯一可判定的规则开放；设计决定只给诚实话术不给假按钮。
 21. "点了错还在"比"没按钮"更糟→一键修复后用真实几何复核。
 22. 报错文案唯一真相源 `issueCatalog.ts` 的 `buildIssue()`；未登记码直接抛错；设计类给数字、程序缺陷类明说"这是程序缺陷"且不给按钮。
+23. **一种形状只许一处判断**：v0.3 起柜体布局有 `units`（单行）与 `rows`（上下分层）两种形状，**只有 `core/layoutModel.ts` 能判断谁在**（读：`layoutRows`/`canonicalUnits` 一律折成 ≥1 行；写：`toFileLayout`/`toFileProject`，单行塌回 `units`、多行只写 `rows`）。别处（生成器/校验/视图/导出/AI 快照）一律面对行数组 —— 否则漏掉一处不是报错，而是那条路径**静默只看到第一行**。
+24. **多行柜文件刻意不写 `units` 镜像**：写了会让旧代码把第一行当整柜按全高算板件（不报错地出错误生产尺寸）→ 宁可让旧读者明确拒绝，不可下错料。行序固定**自上而下**（`rows[0]` 在最上面），`'fill'` 必须落最后一行。`schemaVersion` 跟着内容走：P0 不升版，真写出 rows 才升 0.3。
+25. **验收判据要看"因对的原因失败"**：负样本只断言"被拒了"会被别处的检查顶替而假绿 → 用 `rejectWhy(raw, 正则)` 精确到原因，并临时关掉修复确认真转红。**脚本没接进 `verify:all` 等于不存在**（`quota-acceptance.ts` 曾孤立一轮没人跑）。
 
 ## 技术栈
 React+TS+Vite；2D=Canvas2D 自研(非SVG)；3D=Three.js。后端 Node20+/Fastify(前后端共享类型)。导出=Python+ezdxf(几何TS算好传中立JSON)。DB=SQLite→PostgreSQL。`shared/aiContract.mjs` 是 AI 契约唯一真源(服务/前端编译器/验收三方 import)。不用 opencascade.js。
@@ -76,8 +79,14 @@ DWG 付费/SDK 须先确认授权(ODA 无 Web/SaaS 权)。MCP 白名单不暴露
 ## 部署（NAS 群晖 2026-09-25）
 AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测200)、docker cp /tmp 静默失败用 stdin 法、openrouter/free 504=抖动非提示词、AI_TIMEOUT_MS 默认120s(改 data/.env 加 60000 不重建镜像)。
 
+## 代码托管（GitHub）
+公开仓库 `otscup/furniture-cad`：https://github.com/otscup/furniture-cad （用户 2026-09-29 由私有改公开）。默认分支 `master`，push 走 HTTPS PAT（推送完立即 `git remote set-url` 抹掉 token，`.git/config` 不留凭证）。本机 GitHub SSH 22 端口被代理拦，推送用 HTTPS；发布前必查 `.gitignore` 排除 `.env`/`accounts.json`/`audit.jsonl`/运行时 data，防密钥入库。
+
 ## 核心文档
-docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation。spike/ 一键复现 `bash spike/run.sh`。
+docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
+
+## v0.3 路线（P0→P6，逐步推进，每阶段验收后再进下一阶段）
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）→ P2 Assembly/Connection（Case5/6）→ P3 AI DesignProposal（需求级中间产物，确认后编译为动作）→ P4 Import 骨架（kujiale 仅占位）→ P5 效果图识别+确认 → P6 设计知识（偏好与硬规则物理分离）。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
 
 ## 本会话进行中（2026-09-25 · 已交付两件）
 - **AI 对话框草案**已提交 `6a91374`：draftSession + DraftPreview + AIPanel 草案段 + 样式 + 37 断言验收。

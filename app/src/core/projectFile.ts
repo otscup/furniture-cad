@@ -19,6 +19,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import type { Project } from './types.ts';
+import { toFileProject } from './layoutModel.ts';
 
 export const PROJECT_FILE_FORMAT = 'furniture-cad-project';
 export const PROJECT_FILE_FORMAT_VERSION = 1;
@@ -32,12 +33,19 @@ export interface ProjectFileEnvelope {
   project: Project;
 }
 
+/**
+ * 存盘：信封 + authored 字段。
+ *
+ * 写形状的唯一口径在 `core/layoutModel.ts` 的 `toFileProject()`：
+ * **单行柜只写 `units`、多行柜才写 `rows`** —— 存量单行文件保存后逐字节不变
+ * （键序也沿用原顺序，所以不会产生"只改了排版"的假 diff）。
+ */
 export function serializeProjectFile(project: Project, savedAt = new Date().toISOString()): string {
   const env: ProjectFileEnvelope = {
     format: PROJECT_FILE_FORMAT,
     formatVersion: PROJECT_FILE_FORMAT_VERSION,
     savedAt,
-    project: structuredClone(project),
+    project: toFileProject(project),
   };
   return JSON.stringify(env, null, 2);
 }
@@ -57,6 +65,16 @@ function checkIdsUnique(ids: Iterable<{ id: string }>, what: string, seen: Set<s
     seen.add(obj.id);
   }
   return null;
+}
+
+/**
+ * 两个分区序列是否"同一批分区、同一顺序"。
+ * 用于判定多行文件里的 `units` 镜像是否与 `rows[0].units` 一致 ——
+ * 只比 id 与条数：镜像的意义就是"旧读者能看到同一批分区"，别的字段不影响这件事。
+ */
+function sameUnitIds(a: Array<{ id?: unknown }> | undefined, b: Array<{ id?: unknown }> | undefined): boolean {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((u, i) => u != null && u.id === b[i]?.id);
 }
 
 export function parseProjectFile(raw: string): ParseResult {
@@ -161,13 +179,55 @@ export function parseProjectFile(raw: string): ParseResult {
       warnings.push(`柜体 ${cab.id} 缺少 params.backPanel，将按当前规则集补默认值`);
     }
 
-    const layout = cab.layout as { units: unknown } | undefined;
-    if (typeof layout !== 'object' || layout === null || !Array.isArray(layout.units)) {
-      return { ok: false, error: `柜体 ${cab.id} 缺少 layout.units` };
+    /**
+     * 分区（v0.3）：文件里可能写 `units`（单行 = v0.2 形状）、写 `rows`（多行），
+     * 或两者都写（多行时 `units` 是 rows[0] 的镜像）。
+     *
+     * 读侧**权威**在 core/layoutModel.ts —— 这里只做【结构非法】校验，不折算形状：
+     * 折算会改动内存里的对象，而 `projectfile-acceptance` 要求"读出来与存进去逐字段
+     * 相等"。形状折算属于读取方的口径，不属于校验器的职责。
+     */
+    const layout = cab.layout as { units?: unknown; rows?: unknown } | undefined;
+    if (typeof layout !== 'object' || layout === null) return { ok: false, error: `柜体 ${cab.id} 缺少 layout` };
+    const hasUnits = Array.isArray(layout.units);
+    const rows = Array.isArray(layout.rows) ? (layout.rows as Array<Record<string, unknown>>) : null;
+
+    if (rows) {
+      if (rows.length === 0) return { ok: false, error: `柜体 ${cab.id} 的 layout.rows 是空的 —— 至少保留一行` };
+      const rowIds = new Set<string>();
+      for (const row of rows) {
+        if (typeof row !== 'object' || row === null) return { ok: false, error: `柜体 ${cab.id} 的 rows 里有非法成员` };
+        if (typeof row.id !== 'string' || row.id === '') return { ok: false, error: `柜体 ${cab.id} 有行缺少 id` };
+        if (rowIds.has(row.id)) return { ok: false, error: `柜体 ${cab.id} 的行 id 重复：${row.id}` };
+        rowIds.add(row.id);
+        const h = row.height;
+        if (!(h === 'fill' || (typeof h === 'number' && Number.isInteger(h) && h > 0))) {
+          return {
+            ok: false,
+            error: `柜体 ${cab.id} 的行 ${row.id} 的 height 必须是正整数或 'fill'（实际 ${JSON.stringify(h ?? null)}）`,
+          };
+        }
+        if (!Array.isArray(row.units) || row.units.length === 0) {
+          return { ok: false, error: `柜体 ${cab.id} 的行 ${row.id} 分区是空的 —— 至少保留一个分区，否则不是柜子` };
+        }
+        /**
+         * 跨行撞 id 是**清单事故**（板件 id 由分区 id 派生 → 两块不同的板共用一条
+         * 记录 → 生产下错料）。`unitIds` 是项目级的 Set，所以这条同时保证
+         * 行内唯一、行间唯一、跨柜唯一 —— 一道检查管三层。
+         */
+        const dupRowUnit = checkIdsUnique(row.units as { id: string }[], `柜体 ${cab.id} 的行 ${row.id} 的分区`, unitIds);
+        if (dupRowUnit) return { ok: false, error: dupRowUnit };
+      }
+      if (hasUnits && !sameUnitIds(layout.units as Array<{ id: unknown }>, rows[0]!.units as Array<{ id: unknown }>)) {
+        warnings.push(`柜体 ${cab.id} 的 layout.units 与 rows[0].units 不一致，已按 rows 为准`);
+      }
+    } else {
+      if (!hasUnits) return { ok: false, error: `柜体 ${cab.id} 缺少 layout.units` };
+      const flat = layout.units as unknown[];
+      if (flat.length === 0) return { ok: false, error: `柜体 ${cab.id} 的分区是空的 —— 至少保留一个分区，否则不是柜子` };
+      const dupUnit = checkIdsUnique(flat as { id: string }[], `柜体 ${cab.id} 的分区`, unitIds);
+      if (dupUnit) return { ok: false, error: dupUnit };
     }
-    if (layout.units.length === 0) return { ok: false, error: `柜体 ${cab.id} 的分区是空的 —— 至少保留一个分区，否则不是柜子` };
-    const dupUnit = checkIdsUnique(layout.units as { id: string }[], `柜体 ${cab.id} 的分区`, unitIds);
-    if (dupUnit) return { ok: false, error: dupUnit };
   }
 
   const savedAt = typeof o.savedAt === 'string' ? o.savedAt : '';

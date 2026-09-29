@@ -607,3 +607,77 @@ src/import/
 | `verify:ui` | **661 / 661**（与 P2 后基线逐条相同；新增按钮与 PlanRunView 复用未引入新差异） |
 | `verify:ai` / `aigen` / `draft` / `assembly` | 70 / 60 / 37 / 78（旧链路未回归） |
 | 旧断言 | 一条未删、未放宽；新增 `verify:proposal` 接入 `verify:all` |
+
+---
+
+## 19. P4 实施记录（已完成）
+
+> commit：`6f5541b`。本阶段只建"边界"，不接通所有平台；酷家乐 / 图片识别只留 Adapter 边界（标"待验证能力"），真正的 API / Vision 实现在 P5。
+
+### 19.1 交付物（按"链路位置"分组）
+
+**统一 Import 链路（客户端运行，与 AI Design 同权同位）**
+- `src/ai/import/normalized.ts`：`NormalizedDesign` / `NormalizedCabinet`（同形 `ProposalCabinet` + per-cabinet `source`/`confidence`/`uncertainty`）/`validateNormalized(nd, project)`（形状门复用契约 `proposalShapeError`，通用校验复用 `validateProposal`，导入专属 `IMPORT-*`）/ `importBlocked()`（ERROR / OPEN-QUESTIONS / UNCERTAINTY 阻断）/ `normalizedToProposal()`。
+- `src/ai/import/{jsonAdapter,dxfAdapter,kujialeAdapter,imageVisionAdapter}.ts`：四个 Adapter，确定性解析外部数据 → `NormalizedDesign`。来源归属写进 ND；失败/不完整/不确定**明确暴露不静默猜测**。
+- `src/ai/import/compileImport.ts`：`compileImport(nd, project, rules)` = `validateNormalized` → 阻断即 `ok:false` → 否则 `normalizedToProposal` → `compileProposal` → 给每个 `cabinet.create` 动作注入 `origin`。产物仍是 `AiAction`，走 `dryRunPlan → commitPlan → CommandBus`。
+- `src/ai/import/adapters.ts`：`ADAPTERS` 注册表（`json` verified，`dxf`/`kujiale`/`imageVision` verified:false）+ `parseImport(source, raw, opts)`。
+
+**provenance 落库（穿过整条链路）**
+- `src/core/types.ts`：`Cabinet.origin?: ImportOrigin` / `ImportSource` / `ImportOrigin`（source / label / batchId / confidence / uncertainty）。
+- `src/core/docFactory.ts`：`createCabinet` opts 加 `origin?` 并写入 Cabinet。
+- `src/ai/compile.ts`：`AiAction.origin?`；`buildCabinet`（`createCabinet` 别名）展开 `{...action}` 透传 `action.origin`。
+
+**错误码唯一真相源**
+- `src/core/rules/issueCatalog.ts`：`IMPORT-EMPTY` / `IMPORT-SHAPE` / `IMPORT-OPEN-QUESTIONS` / `IMPORT-UNCERTAINTY` / `IMPORT-LOW-CONFIDENCE` / `IMPORT-UNVERIFIED-CAPABILITY`，每条带**具体数字 / 真实文本**（防被兜底值 0 顶替成假绿）；`buildIssue` 对未登记码直接抛错。
+
+**UI（复用既有收口）**
+- `src/ui/panels/ImportPanel.tsx`：导入页签（来源选择 / 粘贴 / 解析 / 归一化结果 / IMPORT-* 校验 / 不确定项 / 未验证能力），复用 `PlanRunView` 预览，`blocked` 时禁用编译。
+- `src/ui/{App,Toolbar}.tsx`：注册 `导入` 页签（`RightTab` 加 `'import'`）。
+
+**验收**
+- `verify/import-acceptance.ts`：59 条断言，接入 `verify:all`（`npm run verify:import`）。
+
+### 19.2 架构边界（P4 的纪律，与 P3 同源）
+
+1. **Import 不新造写入口。** 编译产物是 `AiAction`，走的是 P3 建好的 `dryRunPlan → 确认 → commitPlan` 唯一写入口；与 AI 设计通道同权同位。"Import 是后门"在结构上不可能。
+2. **AI / Import 只出语义，不碰几何。** `NormalizedDesign` 字段里没有 x/y/z；`compileImport` 产物不含 `atX/atY`；落位由 `pickFreeSpot` 定，DXF 坐标**不进落位**，组合成员用 `$ref:` 占位。
+3. **失败 / 不完整 / 不确定必须暴露，不静默。** 形状错→`IMPORT-SHAPE`；待确认→`IMPORT-OPEN-QUESTIONS`；不确定→`IMPORT-UNCERTAINTY`；未验证能力→`IMPORT-UNVERIFIED-CAPABILITY`（不阻断但必须显示）；uncertainty / questions 非空**阻断应用**。
+4. **外部数据不污染 core semantic model。** 适配器产 `NormalizedDesign`（翻译后的标准语），不直接写 `Panel` / 坐标 / DXF 图元；来源归属只作为 `Cabinet.origin` 元数据随动作透传。
+5. **旧项目完全兼容。** 导入前旧柜一条不少，新柜追加；项目结构（房间 / schema）不变。
+
+### 19.3 `verify/import-acceptance` 的 59 条断言（分组 A–I）
+
+- A：JSON 端到端（解析→编译→干跑→提交），origin 落到 `Cabinet.origin`、动作无坐标、旧柜保留、版本 +1。
+- B：DXF 弱解析诚实（提取块引用、`confidence:'low'`、uncertainty 标"未识别内部结构"、坐标不进标准模型）；uncertainty 触发 `IMPORT-UNCERTAINTY` 阻断；另证"低置信度本身不阻断，只有 uncertainty/questions 拦"。
+- C：`uncertainty` 非空 → `IMPORT-UNCERTAINTY` 阻断，message 含真实不确定内容（非兜底）。
+- D：`questions` 非空 → `IMPORT-OPEN-QUESTIONS` 阻断，message 含真实问题文本。
+- E：酷家乐仅边界占位（非法输入诚实反问、合法输入 `confidence:'low'` + `unverifiedCapabilities`）。
+- F：图片识别仅收 Vision 结构化结果（不执行视觉识别，标 low + 未经人工确认）。
+- G：`IMPORT-SHAPE` 带真实解析错误文本（防假绿）。
+- H：未登记码 `buildIssue` 直接抛错；已登记 `IMPORT-*` 正常产出且带数字。
+- I：多柜 + 组合 ref → 真 id（编译期 `$ref:` 占位、提交后换成真 id、两个导入柜都带 origin）。
+
+### 19.4 顺带修复的既有 core bug（defaultUnits 透传 depth）
+
+`defaultUnits(width, rules)` 过去调用 `makeUnit` 建抽屉区时**不传柜深**，于是 `makeUnit` 默认按 600mm 算抽屉滑轨 `runnerLength = min(500, 600-20) = 500`；当一个实际 <520mm 深的柜体走默认三分区时，500mm 滑轨超过柜深，被严格模式判 `抽屉滑轨长 500mm…` 拒收——而这个柜体可能是真实的`玄关鞋柜(350 深)`。修复：`createCabinet` / `createCabinetFromTemplate` / `defaultVariant` / 命令总线补默认分区 四处都透传真实 `params.depth` 给 `defaultUnits`，滑轨按真实深夹紧。影响面安全可逆，全量回归零变化。
+
+### 19.5 已知边界 / 有意偏离（需你知晓）
+
+- **酷家乐 / 图片识别 = 边界占位，不是已接通。** 二者只收"已结构化 / 已识别"的草稿，非法输入诚实反问，合法输入标 `confidence:'low'` + `unverifiedCapabilities`（kujiale-format-parsing / kujiale-auth-api / vision-floor-plan-recognition）；绝不出现"我解析了 / 我识别了"。真接入在 P5。
+- **DXF = 诚实弱解析。** 只从 DXF 文本抽 `INSERT` 块引用作"柜体意图"，宽高深按块尺寸估算（不可靠），内部结构与板厚标为 `uncertainty`，因此**默认被阻断**直到用户确认——这正是"不确定就问不猜"。
+- **来源信息不绕过链路。** `origin` 只是元数据，不参与几何 / 规则 / 派生；审计与界面读的是同一份 `Cabinet.origin`。
+
+### 19.6 基础设施修复（#91）
+
+`verify/browser-probe.cjs` 的 `killChrome()` 原只 `taskkill /pid /T` 启动器 pid，而 Windows 上 Chrome 会把浏览器交给新 PID（singleton 重排），导致每次验收都留孤儿 chrome，跑十几轮吃满内存（`tsc` 报 `VirtualAlloc failed / errno=1455`）。修复：退出钩子里**额外按独有的 `remote-debugging-port` 用 PowerShell `Get-CimInstance` 兜底强杀**整组残留 chrome（用户自己的 chrome 不带该端口，不会被误杀）。实测验收后 `tasklist` 查 chrome 数为 0。
+
+### 19.7 回归判据（实测）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| 全量 node 链（`verify:all` 除 `verify:ui`） | 全部 exit=0 |
+| `verify:import` | **59 / 59**（新建，接入 `verify:all`） |
+| `verify:ui` | **661 / 661**（导入页签复用 PlanRunView，无新差异） |
+| 其余受 `defaultUnits` 修复牵连的脚本 | `verify`(127) / `proposal`(89) / `variants`(58) / `cabinets`(64) / `rows`(106) / `relations`(82) / `room`(28) / `migration`(56) / `projectfile`(27) / `special`(38) / `glass`(30) 全绿 |
+| 旧断言 | 一条未删、未放宽 |

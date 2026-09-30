@@ -894,6 +894,110 @@ const RULE_CARDS: Record<string, RuleCard> = {
     manual: '这不是程序缺陷，也不是硬规则：转哪个方向是设计决定，交给 AI / 用户继续决策。',
   },
 
+  // ══════════ 统一设计验证：空间语义解释（v0.3，P8.8）══════════
+  //
+  // 这一族是 **P8.8 组合层**（core/designValidation）的出口：它把 P8.7 的空间事实
+  // 翻译成"这在设计上意味着什么"。三条红线写在这里，改之前先读一遍：
+  //
+  //  ① **等级重新审查（本族的裁定标准）**
+  //     硬错误（ERROR）—— 只有"已经被证明非法"的才算：
+  //       · 与墙体重叠（穿墙，几何上装不进去）
+  //       · 声明贴墙而事实不贴 / 贴合面不符 / 缝宽不符（声明与事实矛盾，
+  //         与 P2 的"声明的连接 vs 派生接触不符"同一纪律）
+  //     设计建议（WARNING）—— 几何成立但可能不合理，**不给"好坏"的裁判**：
+  //       · 门脸朝墙、离墙有缝、没靠墙、门前余量、窗被挡
+  //     本族**没有**"看起来不好"这类没有确定规则的等级 —— 判不出来就不发。
+  //
+  //  ② **不与 geometry 层重复报**：柜体嵌墙在**主规则链**里仍归
+  //     RULE-CABINET-IN-WALL（geometry 层，唯一硬规则）。本族的
+  //     DESIGN-CABINET-WALL-CONFLICT 是**设计验证视角**的同一事实（来源是
+  //     P8.7 的 crossing 事实，不是第二次几何判定），只出现在设计验证报告里，
+  //     不进 CommandBus.deriveFor 的主问题链。
+  //
+  //  ③ **一律不给"自动移柜/自动贴墙/自动转朝向"的按钮**：怎么解是设计决定
+  //     （§P8.7/P8.8 明确禁止自动修复）。每条都给得出具体数字与 manual。
+  'DESIGN-CABINET-WALL-CONFLICT': {
+    title: '柜子和墙重叠（穿进墙里）',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${str(c, 'cabName')}」与「${str(c, 'roomName', '房间')}」的墙「${str(c, 'wallName', '未命名墙')}」（厚 ${num(c, 'thickness')}mm）在平面上重叠 —— 柜体（深 ${num(c, 'depth')}mm）有部分穿进了墙体里，这个位置装不下它。`,
+    hint: (c) =>
+      `把柜子沿墙的垂直方向推开：柜深 ${num(c, 'depth')}mm 与 ${num(c, 'thickness')}mm 厚的墙至少要让开这段重叠，让柜体整个落回房间里（墙是结构，挪不开）。`,
+    manual: '往墙的哪一侧挪、挪多少属于设计决定，系统不自动移柜。',
+  },
+  'DESIGN-CABINET-FRONT-WALL': {
+    title: '柜门朝着墙（门开不了）',
+    severity: 'WARNING',
+    message: (c) =>
+      `「${str(c, 'cabName')}」的门脸正对着墙「${str(c, 'wallName', '未命名墙')}」（墙厚 ${num(c, 'thickness')}mm）—— ${num(c, 'faceWidth')}mm 宽的门扇打开时会直接顶在墙上。`,
+    hint: (c) =>
+      `让门脸朝向房间内部（通常是把柜体转 180°），门脸与墙之间至少留出一扇门的宽度（约 ${num(c, 'faceWidth')}mm）。`,
+    manual: '转哪个方向属于设计决定（壁龛、假墙等场景确实可能有意朝墙），系统只提示、不自动转。',
+  },
+  'DESIGN-CABINET-NEAR-WALL': {
+    title: '柜子没贴到墙（留了缝）',
+    severity: 'WARNING',
+    message: (c) =>
+      `「${str(c, 'cabName')}」离墙「${str(c, 'wallName', '未命名墙')}」还有 ${num(c, 'gap')}mm 缝 —— 既没贴上，也没明确拉开，缝里容易积灰、正面也不好收口。`,
+    hint: (c) =>
+      `要么贴上去（把柜体往墙方向挪 ${num(c, 'gap')}mm 让背面贴合），要么干脆拉开到方便打扫的距离（一般 ≥ 50mm，缝口加收口条）。`,
+    manual: '贴上去还是留缝属于设计决定（踢脚线、收口条会让它必须留）。',
+  },
+  'DESIGN-CABINET-FLOATING': {
+    title: '柜子没靠墙',
+    severity: 'WARNING',
+    message: (c) =>
+      `「${str(c, 'cabName')}」在「${str(c, 'roomName', '房间')}」里，但没有靠着这个房间的任何一面墙（房间共 ${num(c, 'wallCount')} 面墙）—— 这是"独立摆放"的形态，不是错误。`,
+    hint: () =>
+      '本来就要做成岛台/独立柜的话，这条忽略即可；本来要靠墙的，把柜体挪到墙边并让背面贴合。',
+    manual: '岛台、独立柜、中岛台面本来就不靠墙 —— 这是设计决定，系统只说明事实。',
+  },
+  'DESIGN-CABINET-NEAR-DOOR': {
+    title: '柜子挡在门口附近',
+    severity: 'WARNING',
+    message: (c) =>
+      `「${str(c, 'cabName')}」距「${str(c, 'wallName', '未命名墙')}」上的${str(c, 'openingName', '门洞')}（宽 ${num(c, 'width')}mm）只剩 ${num(c, 'gap')}mm —— 柜体没有盖住洞口，但已经站在进出要走的通道上了。`,
+    hint: (c) =>
+      `把柜子沿墙挪开：门洞前建议留足 ≥ 900mm 的净通道，现在只剩 ${num(c, 'gap')}mm；也可以把洞口改到别的墙段。`,
+    manual: '挪柜还是改洞口属于设计决定；门扇开启范围本阶段不模拟。',
+  },
+  'DESIGN-WINDOW-BEHIND-CABINET': {
+    title: '窗洞被柜子挡在后面',
+    severity: 'WARNING',
+    message: (c) =>
+      `「${str(c, 'cabName')}」距「${str(c, 'wallName', '未命名墙')}」上的${str(c, 'openingName', '窗洞')}（宽 ${num(c, 'width')}mm）只剩 ${num(c, 'gap')}mm —— 采光和通风会被这只柜影响（柜体没盖住洞口，但紧贴在窗前）。`,
+    hint: (c) =>
+      `沿墙把柜子挪开 ${num(c, 'gap')}mm 以上，或改用矮柜（降到窗台线以下），把窗洞让出来。`,
+    manual: '让不让窗、让多少属于设计决定。',
+  },
+  'DESIGN-ATTACH-NOT-TOUCHING': {
+    title: '声明了贴墙，实际没贴上',
+    severity: 'ERROR',
+    message: (c) =>
+      `落位声明要求「${str(c, 'cabName')}」靠墙，但它与墙「${str(c, 'wallName', '未命名墙')}」实际还差 ${num(c, 'gap')}mm，没有接触到 —— 声明与事实对不上。`,
+    hint: (c) =>
+      `要么把柜体往墙的方向挪 ${num(c, 'gap')}mm 让它真的贴上，要么撤回"靠墙"这个声明 —— 声明过的就要做到（与 P2 的"只校验声明"同一条纪律）。`,
+    manual: '补齐落位还是改声明，属于设计决定。',
+  },
+  'DESIGN-ATTACH-FACE-MISMATCH': {
+    title: '贴墙用错了面',
+    severity: 'ERROR',
+    message: (c) =>
+      `落位声明的贴合面是「${str(c, 'declaredZh')}」，但「${str(c, 'cabName')}」实际贴上墙的是「${str(c, 'actualZh')}」（柜体当前 rotation ${num(c, 'rotation')}°）—— 声明与事实对不上。`,
+    hint: (c) =>
+      `确认哪一面临墙：要「${str(c, 'declaredZh')}」临墙，就按该朝向重新落位（当前 rotation ${num(c, 'rotation')}°）；确实是「${str(c, 'actualZh')}」临墙，就改声明。`,
+    manual: '哪个面临墙是设计决定（左开门/右开门、见光板位置的要求都不同）。',
+  },
+  'DESIGN-ATTACH-OFFSET-MISMATCH': {
+    title: '贴墙的缝隙与声明不符',
+    severity: 'ERROR',
+    message: (c) =>
+      `落位声明要求「${str(c, 'cabName')}」与墙之间留 ${num(c, 'declared')}mm 缝，实测是 ${num(c, 'actual')}mm —— 声明与事实对不上。`,
+    hint: (c) =>
+      `沿墙面法线方向把柜体移动 ${Math.abs(num(c, 'actual') - num(c, 'declared'))}mm，让实际缝隙变成声明的 ${num(c, 'declared')}mm；本来就不留缝的话，把声明改成 0。`,
+    manual: '留不留缝属于设计决定（踢脚线、收口条的厚度会让它必须留）。',
+  },
+
   // ═══════════════ Import 外部数据（v0.3，P4）══════════════
   //
   // 这一族校验的是"从外部设计数据（JSON / DXF / 酷家乐 / 图片识别）进来的东西"。

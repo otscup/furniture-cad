@@ -205,6 +205,18 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   // ── P8.7 空间语义（offset/width/wallLen 等派生值必须真写进 message）──
   'SPATIAL-OPENING-SPAN': { roomName: '书房', wallName: '北墙', openingName: '门洞', offset: 3500, width: 900, wallLen: 4000, over: 400 },
   'SPATIAL-CABINET-OPENING': { cabName: '遮挡柜', roomName: '书房', wallName: '北墙', openingName: '门洞', kindZh: '门洞', width: 900 },
+  // ── P8.8 统一设计验证：空间语义解释（墙厚 / 缝宽 / 门宽 / 墙数 / 声明值都必须真写进 message）──
+  //  这些数值全部来自派生（P8.7 事实或声明），一律给**有辨识度**的值：
+  //  只断言 `/\d/` 会被 num() 的兜底 0 顶替（"还差 0mm"也算带数字 = 假绿）。
+  'DESIGN-CABINET-WALL-CONFLICT': { cabName: '撞墙柜', roomName: '书房', wallName: '北墙', thickness: 137, depth: 617 },
+  'DESIGN-CABINET-FRONT-WALL': { cabName: '朝墙柜', wallName: '北墙', thickness: 137, faceWidth: 913 },
+  'DESIGN-CABINET-NEAR-WALL': { cabName: '离缝柜', wallName: '北墙', gap: 37 },
+  'DESIGN-CABINET-FLOATING': { cabName: '岛台柜', roomName: '中厨', wallCount: 7 },
+  'DESIGN-CABINET-NEAR-DOOR': { cabName: '挡门柜', wallName: '北墙', openingName: '门洞', width: 917, gap: 317 },
+  'DESIGN-WINDOW-BEHIND-CABINET': { cabName: '挡窗柜', wallName: '北墙', openingName: '窗洞', width: 1517, gap: 317 },
+  'DESIGN-ATTACH-NOT-TOUCHING': { cabName: '声明贴墙柜', wallName: '北墙', gap: 317 },
+  'DESIGN-ATTACH-FACE-MISMATCH': { cabName: '贴错面柜', declaredZh: '背面', actualZh: '左端', rotation: 270 },
+  'DESIGN-ATTACH-OFFSET-MISMATCH': { cabName: '缝不符柜', declared: 17, actual: 317 },
 };
 
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];

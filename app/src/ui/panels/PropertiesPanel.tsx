@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { Cabinet, CabinetGeometry, Project, ProjectGeometry, RowHeight, RuleSet, UnitSpec, Wall } from '../../core/types.ts';
 import type { Command, CommandBus } from '../../core/commandBus.ts';
 import * as CMD from '../../core/commands.ts';
@@ -13,6 +13,7 @@ import {
   type AttachAlignment,
 } from '../../core/placement.ts';
 import { buildAlignIntent, buildAttachIntent, commitPlacementIntent } from '../placementIntent.ts';
+import { designViewFor, validateDesign, type CabinetDesignView, type WallContactFact } from '../../core/designValidation/index.ts';
 import type { ToastKind } from '../types.ts';
 
 /**
@@ -74,6 +75,8 @@ function findWall(project: Project, id: string): Wall | null {
 
 function ProjectProps(props: { project: Project; rules: RuleSet; geom: ProjectGeometry; onRun: Run }): ReactNode {
   const { project, rules, geom } = props;
+  // 项目级空间检查汇总（P8.8）：明细在柜体属性里，这里只给一眼的总数
+  const dv = useMemo(() => validateDesign(project), [project]);
   const gs = Object.values(geom.cabinets);
   const issueCount = (sev: string): number => gs.reduce((a, g) => a + g.issues.filter((i) => i.severity === sev).length, 0);
 
@@ -137,6 +140,21 @@ function ProjectProps(props: { project: Project; rules: RuleSet; geom: ProjectGe
         <Row label="问题统计" derived>
           <Text mono>
             {issueCount('ERROR')} ERROR / {issueCount('WARNING')} WARN / {issueCount('INFO')} INFO
+          </Text>
+        </Row>
+      </Section>
+
+      {/** 空间检查汇总（P8.8，只读）：选了柜体后，柜体属性里有逐条明细 */}
+      <Section title="空间检查（只读）">
+        <Row label="结论" derived>
+          <Text mono>
+            {dv.counts.error} 硬错 / {dv.counts.warning} 提示
+          </Text>
+        </Row>
+        <Row label="柜 ↔ 墙" derived>
+          <Text mono>
+            {dv.wallContacts.filter((c) => c.kind === 'back-wall-contact' || c.kind === 'side-wall-contact').length} 面贴合 /{' '}
+            {dv.wallContacts.filter((c) => c.kind === 'floating').length} 只没靠墙
           </Text>
         </Row>
       </Section>
@@ -246,6 +264,13 @@ function CabinetProps(props: {
         * 这正是 Knowledge alignment 偏好唯一合法的证据来源。
         */}
       <PlacementIntentSection bus={props.bus} cab={cab} project={project} onToast={props.onToast} />
+
+      {/*
+        * 空间检查（P8.8）：统一设计验证的**只读**展示 —— 位于哪个房间、靠哪面墙、
+        * 有没有穿墙/挡门。**只有展示，没有按钮**：自动移柜 / 自动贴墙 / 自动重排
+        * 是 P8.8 明令不做的事（怎么解是设计决定）。
+        */}
+      <SpatialCheckSection project={project} cab={cab} />
 
       <Section title="材质">
         <Row label="柜体板">
@@ -665,6 +690,95 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
       </Section>
       <div className="hint-line">拖动墙端点的方形夹点即可改起点/终点 —— 改的是 wall.start / wall.end 语义字段，不是"移动一条线"。</div>
     </div>
+  );
+}
+
+// ─────────────────────── 空间检查（P8.8，只读） ───────────────────────
+
+/** 房间关系的人话 + 符号（✓ = 明确没问题；⚠ = 提示；✕ = 硬错；○ = 判不出来） */
+function roomLine(room: CabinetDesignView['room'], roomName: string): [string, string] {
+  switch (room) {
+    case 'inside':
+      return ['✓', `位于「${roomName}」内`];
+    case 'outside':
+      return ['⚠', `整个落在「${roomName}」的边界之外`];
+    case 'crossing':
+      return ['✕', `跨越「${roomName}」的房间边界（多半同时穿墙，见下方硬错）`];
+    default:
+      return ['○', '房间边界没有闭合，判不出在不在房间里（不猜）'];
+  }
+}
+
+/** 墙接触的人话（正面事实给 ✓，需要留意的给 ⚠ / ✕） */
+function contactLine(c: WallContactFact): [string, string] {
+  const w = c.wallName ?? c.wallId ?? '墙';
+  const tilted = c.rotated ? '（斜向摆放，按最近的一面判定）' : '';
+  switch (c.kind) {
+    case 'back-wall-contact':
+      return ['✓', `背面贴墙「${w}」${tilted}`];
+    case 'side-wall-contact':
+      return ['✓', `侧面顶墙「${w}」${tilted}`];
+    case 'front-wall-contact':
+      return ['⚠', `门脸朝着墙「${w}」，门基本开不了${tilted}`];
+    case 'wall-near':
+      return ['⚠', `离墙「${w}」还有 ${c.gap ?? 0}mm 缝`];
+    case 'wall-conflict':
+      return ['✕', `穿进了墙「${w}」里`];
+    default:
+      return ['⚠', '没靠着这个房间的任何一面墙（独立摆放的形态）'];
+  }
+}
+
+/**
+ * 柜体「空间检查」区。数据来自唯一入口 `validateDesign`（组合层）——
+ * 界面**不自己判**"贴不贴墙"，只把结论画出来。
+ */
+function SpatialCheckSection(props: { project: Project; cab: Cabinet }): ReactNode {
+  const { project, cab } = props;
+  const report = useMemo(() => validateDesign(project), [project]);
+  const view = designViewFor(report, cab.id);
+  if (!view) return null;
+  const [roomSym, roomText] = roomLine(view.room, view.roomName);
+  const mine = view.findings;
+
+  return (
+    <Section title="空间检查（只读）">
+      <ul className="issue-list">
+        <li>
+          <span className="mono">{roomSym}</span> {roomText}
+        </li>
+        {view.contacts.map((c, i) => {
+          const [sym, text] = contactLine(c);
+          return (
+            <li key={`${c.kind}-${c.wallId ?? i}`}>
+              <span className="mono">{sym}</span> {text}
+            </li>
+          );
+        })}
+        {view.contacts.length === 0 ? (
+          <li>
+            <span className="mono">○</span> 这只柜还没和任何墙产生关系（房间里没有墙？）
+          </li>
+        ) : null}
+      </ul>
+
+      {mine.length > 0 ? (
+        <ul className="issue-list">
+          {mine.map((f, k) => (
+            <li key={`${f.code}-${k}`}>
+              <Pill kind={f.status === 'error' ? 'ERROR' : 'WARNING'}>{f.status === 'error' ? '硬错' : '提示'}</Pill>{' '}
+              <span className="mono">{f.code}</span> {f.message}
+              {f.hint ? <div className="fix-hint">→ {f.hint}</div> : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="hint-line">没有发现空间问题。</div>
+      )}
+      <div className="hint-line">
+        这里只说明事实与提示，不给自动移柜/自动贴墙的按钮 —— 挪到哪儿、怎么收口是设计决定。
+      </div>
+    </Section>
   );
 }
 

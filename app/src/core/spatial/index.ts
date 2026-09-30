@@ -12,9 +12,29 @@ export {
   classifyCabWall,
   classifyCabRoom,
   classifyCabOpening,
+  wallInteriorSide,
   type SpatialFacts,
   type CabRoomRelation,
   type CabWallRelation,
   type CabOpeningRelation,
 } from './derive.ts';
-export { SPATIAL_TOL, roomLoop, openingRect, openingName, pointInPoly, polyDistance, polysOverlapInterior, type RoomLoop } from './model.ts';
+// `distPointSeg` / `wallNormalUnit` / `openingZoneRect` 于 P8.8 开放给**解释层**复用
+// （designValidation 要量"离洞口影响带还有多远"、要判柜体哪一面在抵墙）。
+// 开放的是**几何原语**，不是判定：touching / near / crossing / overlap 的判定
+// 仍然只有 derive.ts 一处，解释层不许拿这些原语自己再判一遍。
+export {
+  SPATIAL_TOL,
+  roomLoop,
+  openingRect,
+  openingZoneRect,
+  openingName,
+  pointInPoly,
+  pointOnSeg,
+  segsProperCross,
+  distPointSeg,
+  polyDistance,
+  polysOverlapInterior,
+  wallNormalUnit,
+  type RoomLoop,
+  type RoomLoopStatus,
+} from './model.ts';

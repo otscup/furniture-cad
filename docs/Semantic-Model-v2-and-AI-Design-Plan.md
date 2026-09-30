@@ -1819,3 +1819,158 @@ roomId/wallId 由结构回答，无悬空引用可校验、无世界坐标可重
 不进 P8.8。不做：门扇开启包络、自动贴墙/移柜、AI 空间意图、DXF 墙体导入、图片户型识别、
 Z 轴、BIM/IFC。后续候选（需明确指令）见 §20 禁止清单反向。
 
+### 23.17 P8.8 实施记录：Spatial Constraint Integration（Unified Design Validation）
+
+#### 23.17.1 目标与分层：本层只组合，不复制
+
+P8.7 之后系统有两条各自成链的结论：`validatePlacementDesign`（P8.3：柜间设计语义）
+与 `deriveSpatial`（P8.7：空间事实）。P8.8 的工作是**把两条链路合成一个回答**，
+让系统能一次说清：柜子为什么在这里（P8.5 的 provenance / 意图）、这个位置合法吗
+（Resolver）、这样放合理吗（P8.3）、违反空间事实了吗（P8.7）。
+
+```text
+Semantic Model
+      │
+Placement Resolver ──→ Placement Design Report（P8.3）
+      │                        │
+      └──→ Spatial Report（P8.7）──→ 组合（core/designValidation，P8.8）
+                                   │
+                            Unified Design Validation
+```
+
+三条纪律（写进代码注释，验收逐条钉）：
+
+1. **只组合**：`report.placement` / `report.spatial` 与单独调用两条链路**逐字节相同**
+   （验收 §2/§3 深比较断言）。组合层不许"顺手修一下"下层的结论。
+2. **解释 ≠ 判定**：本层唯一新增的判断是**把事实翻译成人话**（哪一面抵墙 / 门口余量 /
+   声明与事实是否一致）。touching / near / crossing / overlap 的判定仍**只有 P8.7 一处**，
+   读的是 `facts`，不是自己再判一遍。
+3. **纯函数 + 不进主链**：不改 Model、不改 placement、不调 AI、不出几何/DXF/BOM；
+   **不写进 `CommandBus.deriveFor`**（那里只有可阻断生产的硬规则，设计建议混进去会污染
+   `blockingErrors`）。
+
+#### 23.17.2 数据模型（`core/designValidation/model.ts`）
+
+```ts
+DesignValidationReport {
+  status: 'valid' | 'warning' | 'error'
+  placement: DesignPlacementReport   // P8.3 原样
+  spatial:   SpatialReport           // P8.7 原样
+  findings:  DesignValidationFinding[]   // 三层合并，各自保留原码 + layer/sourceCode
+  counts:    { error, warning }
+  wallContacts: WallContactFact[]    // 柜↔墙语义（结构化的 ✓ 用）
+  cabinets:  CabinetDesignView[]     // 单柜视图（界面「空间检查」区消费）
+}
+```
+
+- **不复制 PlacementReport**：`findings` 里的 placement 条目由 `fromPlacementFinding()`
+  折叠而来（只补 `layer`/`sourceCode`，文案与等级一个不改）。
+- 空间层的 issue 只做"搬运 + 归属还原"（target 是墙/洞口/房间 id 时按 id 查一次，
+  好让界面能按柜分组）。
+- 合并后按 `(code, cabId, wallId, openingId)` **去重**：语义解释层与声明验证器
+  可能命中同一条硬错（如"声明贴墙却穿墙"），同一件事只留一条。
+- 单柜视图只收**明确挂在这只柜上**的结论（房间/墙/洞口自身的结构问题不混进每只柜）。
+
+#### 23.17.3 空间语义解释层（`interpret.ts`）
+
+柜↔墙语义（P8.7 只有 touching/near/crossing/none，这里给出设计含义）：
+
+| 语义 | 来源 | 等级 |
+|---|---|---|
+| `back-wall-contact` 背面贴墙 | touching + 抵墙面 = 背面 | 正面事实，**不发结论**（不吵人） |
+| `side-wall-contact` 侧面顶墙 | touching + 抵墙面 = 左/右端 | 正面事实，不发结论 |
+| `front-wall-contact` 门脸朝墙 | touching + 抵墙面 = 前脸 | WARNING（门基本开不了） |
+| `wall-near` 离墙有缝 | near | WARNING（报实测缝宽） |
+| `floating` 没靠墙 | 与任何墙都无关系 | WARNING（"独立摆放"的形态） |
+| `wall-conflict` 穿进墙里 | crossing | ERROR |
+
+**"是哪一个面"怎么定（不写第二套旋转数学）**：设 `n` 为墙单位法线（
+`wallNormalUnit`，纯派生自 `wallPolygon` 角点）、`s` 为"墙中心→柜中心"在 `n` 上的符号，
+则抵墙那一面的外法线必与 `s·n` 反向且与 `n` 几乎平行 —— 四个面里恰好一个满足，唯一解。
+斜向旋转（法线对不上）时回退到"面中点离墙矩形最近的那个面"，并置 `rotated: true`
+（如实说明"是按最近面推的"）。面的几何一律取 `placement.faceSegmentOf`（唯一实现）。
+
+洞口语义（§六：只加解释，不做门扇开启/人流/开合半径）：
+`DESIGN-CABINET-NEAR-DOOR` / `DESIGN-WINDOW-BEHIND-CABINET`（WARNING）——
+只有 P8.7 判成 `clear`（没盖住）且**室内侧判得出**时才量距离；
+`overlap` 的硬错由 P8.7 的 `SPATIAL-CABINET-OPENING` 报，本层不重复报。
+"离洞口影响带多远"用空间层的同一批原语量一次，**只用于报数**，不参与任何事实判定。
+阈值 `DESIGN_TOL.APPROACH = 600mm` 与 `SPATIAL_TOL` 分工明确（前者只影响提示）。
+
+#### 23.17.4 墙贴合声明验证（§五）
+
+```ts
+WallAttachDecl { cabId; face?; offset? }        // 声明只有"哪一面/留多宽缝"
+verifyWallAttachment(project, decl, facts?) → { ok, fact, findings[] }
+```
+
+- **声明里没有 wallId**：哪面墙是**派生事实**（由落位与房间结构算出），写进声明就等于
+  给柜子挂 `Cabinet.wallId` 那种第二份真相（§四明令禁止）。实际贴的是哪面墙，由验证器
+  从事实里读出来告诉用户。
+- **不新增 authored 模型字段**（不写 Cabinet、不升 schemaVersion）：验证器接受显式声明
+  参数，任何授权来源（用户操作/导入/未来的 AI 提案/由知识偏好推导）都可调用。
+- 与 P2 的 `validateAssemblies` 同一条纪律：**只校验声明过的**；声明与事实不符 = ERROR
+  （`NOT-TOUCHING` / `FACE-MISMATCH` / `OFFSET-MISMATCH` / 穿墙走 conflict）。
+- 声明贴墙却没贴上时必须说得出**差多少**，而 P8.7 的 facts 只记录 ≤NEAR 的关系
+  （更远的墙不进 facts）—— 故 `nearestWallDistance()` 用空间层原语量一次，**只为报数**
+  （验收断言：报出来的就是那个实测值，且 > 0，防兜底 0 假绿）。
+
+#### 23.17.5 Intent 与 Validation 的关系（§七）
+
+`User Intent → Resolver → Validation → Report`：意图**不豁免**验证。
+验收 §6 用真实 Resolver 跑一条合法的 `align` 意图（Resolver 返回 ok），落位结果让柜体
+压在墙中心线上 —— 统一验证照样报 ERROR；再叠一条"声明贴墙"也照样是 ERROR。
+（Resolver 只管几何关系、不认识墙，这正是需要组合层的原因。）
+
+#### 23.17.6 错误等级再审查（§三）
+
+等级的唯一真相源仍是 `issueCatalog`（本层不另立一张等级表，避免漂移）：
+
+- **ERROR（已被证明非法）**：与墙体重叠、声明贴墙而事实不符（没贴上/面不符/缝不符）。
+- **WARNING（几何成立但可疑，属"设计建议"）**：门脸朝墙、离墙有缝、没靠墙、门前余量、
+  窗被挡。全部给出 `manual`（"这是你要决定的事"），一个一键修复按钮都不给。
+- **不发**：判不出规则的等级不设；判不出来就沉默（房间边界不闭合 → 房间关系 unknown，
+  不发 floating、不发门前提示；房间没有墙 → 不发 floating）。
+
+#### 23.17.7 Knowledge / AI / 主规则链边界（§八·§九）
+
+- Knowledge：只学"用户明确选过的"（`user-authored`/`user-confirmed`）。
+  验收用**同一命令、同一 diff、只改 authority** 的对照断言：`system-resolved`/`unknown` → 0 条，
+  `user-authored` → 1 条 candidate（低置信、不自动生效）；反向再由 `source === 'system'`
+  入口门禁兜住。error 状态不产偏好：设计验证层源码里没有 knowledge 导入、没有 candidate 生成。
+- AI：本阶段**不扩大写入能力** —— 不新增可写命令、`shared/aiContract.mjs` 与 `ai/compile.ts`
+  都不认识设计验证层；AI 仍只能"提案 → CommandBus"。允许的解释（解释 validation finding）
+  走的是同一份 `DesignValidationReport` 数据，不需要新的写通道。
+- 主规则链不变：`commandBus.deriveFor` 不 import 设计验证（验收源码扫描钉死）。
+
+#### 23.17.8 UI（§十，最小展示）
+
+柜体属性面板新增**只读**「空间检查」区：`✓ 位于「房间」内`、`✓ 背面贴墙「墙名」`、
+`⚠ 离墙「墙名」还有 5mm 缝`、`✕ 穿进了墙「墙名」里`、`○ 房间边界没有闭合，判不出…`，
+下面是该柜的结论清单（Pill + 文案 + fixHint）；项目属性面板给一行汇总。
+**没有任何自动修复/自动拖动/自动重排按钮**，并明写"挪到哪儿、怎么收口是设计决定"。
+
+#### 23.17.9 核心文件
+
+`core/designValidation/{model,interpret,validate,index}.ts`（NEW）、
+`core/spatial/index.ts`（开放 `wallInteriorSide` / `wallNormalUnit` / `openingZoneRect` /
+`distPointSeg` 等**几何原语**给解释层复用，判定仍只有一处）、
+`core/rules/issueCatalog.ts`（9 个 DESIGN 码）、`ui/panels/PropertiesPanel.tsx`（空间检查区）、
+`verify/design-validation-acceptance.ts`（NEW）、`verify/fixhint-acceptance.ts`（新码 NUM_CTX 归位）。
+
+#### 23.17.10 验收
+
+- `verify:design-validation` **77/77**（覆盖指令 §十一 的 15 项 + 附加红线），接入 `verify:all`。
+- **变异测试（确认断言真的会失败）**：把 `front` 误判成背面贴墙 → 4 条红；
+  去掉"房间闭合"门禁 → 2 条红；还原后全绿。**新增断言不是摆设**。
+- 一条断言初版自己写错被逮住：预期"离墙 1440mm"，实测是 840mm（最近的是上墙）——
+  改成断言"文案里的数 = `nearestWallDistance` 的实测值且 > 0"，不写死数字。
+- 实施期环境坑：`npm run typecheck` 在本机会 OOM（TS 7 的 Go 编译器提交内存失败，
+  `VirtualAlloc … errno=1455`），`GOMEMLIMIT=1500MiB npm run verify:all` 即通过（不改代码）。
+- `tsc --noEmit` 0；`verify:all` **全链绿**（38 个脚本套件 + 浏览器 `verify:ui` 686/686）；
+  旧测试零删除零放宽；`schemaVersion` 不变；未新增任何模型字段。
+
+#### 23.17.11 停在 P8.8
+
+不进 P8.9。P8.8 明确不做：自动布局、自动贴墙、自动优化位置、AI 改布局、门扇开启模拟、
+人流分析、DXF 建筑导入、图片识别户型、BIM/IFC、Z 轴、CNC。

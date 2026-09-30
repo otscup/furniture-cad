@@ -1,6 +1,7 @@
 import type { ConnectionKind, Issue, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import { buildIssue } from '../core/rules/issueCatalog.ts';
 import { defaultCabinetParams } from '../core/docFactory.ts';
+import { ADJACENT_ALIGNMENTS, ALIGN_ALIGNMENTS, PLACEMENT_SIDES } from '../core/placement.ts';
 import { ACTIONS } from '../../shared/aiContract.mjs';
 
 /**
@@ -80,6 +81,8 @@ export interface ProposalCabinet {
   backUnits?: ProposalUnit[] | null;
   /** 朝向意图（0/90/180/270）。落位由系统定，这里只说"朝哪边" */
   rotation?: number | null;
+  /** 落位意图（P8.1）：说了"贴着谁/对齐谁"，坐标由确定性引擎算 */
+  placement?: ProposalPlacement | null;
 }
 
 export interface ProposalConnection {
@@ -88,6 +91,25 @@ export interface ProposalConnection {
   /** cabinet ref */
   b: string;
   kind: ConnectionKind;
+}
+
+/**
+ * 落位意图（v0.3，P8.1）—— **语义关系，不是坐标**。
+ *
+ * 方案里永远不出现 x / y：AI 说"贴着谁、对齐谁"，最终坐标由
+ * `core/placement.ts` 的确定性引擎按参照柜的实际位置与两柜尺寸算出。
+ * 这与文件头硬边界①（没有坐标）一脉相承；用户显式给绝对坐标走的是
+ * authored 通道（cabinet.move / 界面拖动），不从方案进来。
+ */
+export interface ProposalPlacement {
+  /** adjacent = 贴着参照柜放（面贴合）；align = 与参照柜某条边/中心齐平 */
+  relation: 'adjacent' | 'align';
+  /** 参照柜：本方案的 ref，或项目里已有柜体的 id / 名字 */
+  reference: string;
+  /** adjacent 必填：贴在参照柜的哪一侧（left/right 并排，front/back 前后叠） */
+  side?: 'left' | 'right' | 'front' | 'back';
+  /** 对齐方式；缺省由系统按行业惯例取（并排背面齐、前后左缘齐）——不猜，取值写进 notes */
+  alignment?: 'left' | 'right' | 'front' | 'back' | 'center';
 }
 
 export interface ProposalAssembly {
@@ -216,6 +238,108 @@ export function validateProposal(p: DesignProposal, project: Project): Issue[] {
       });
     }
   });
+
+  // 落位意图（P8.1）：关系/方向/对齐/参照 —— 语义校验；坐标不存在于方案里，
+  // 由 Placement Engine 在编译执行那一刻按参照柜实际位置计算。
+  // 词汇表直接从 core/placement.ts 读 —— 封闭词汇表不允许有第二份抄本。
+  const PLACE_RELATIONS = ['adjacent', 'align'] as const;
+  for (const [i, c] of p.cabinets.entries()) {
+    const pl = c.placement;
+    if (!pl) continue;
+    const ref = String(c.ref ?? `第 ${i + 1} 个柜体`);
+    if (!PLACE_RELATIONS.includes(pl.relation)) {
+      out.push(buildIssue('PROPOSAL-PLACE-RELATION', {
+        target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+        ctx: { ref, relation: String(pl.relation), count: PLACE_RELATIONS.length, relations: PLACE_RELATIONS.join(' / ') },
+      }));
+      continue;
+    }
+    if (pl.relation === 'align') {
+      if (!ALIGN_ALIGNMENTS.includes(pl.alignment as never)) {
+        out.push(buildIssue('PROPOSAL-PLACE-ALIGNMENT', {
+          target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+          ctx: { ref, alignment: String(pl.alignment), where: 'align 落位', allowed: ALIGN_ALIGNMENTS.join(' / '), count: ALIGN_ALIGNMENTS.length },
+        }));
+      }
+    } else {
+      if (!pl.side || !PLACEMENT_SIDES.includes(pl.side)) {
+        out.push(buildIssue('PROPOSAL-PLACE-SIDE', {
+          target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+          ctx: {
+            ref,
+            why: pl.side ? '的 side 不认识' : '缺 side（adjacent 必须说明贴在参照柜哪一侧）',
+            side: String(pl.side ?? ''),
+            sides: PLACEMENT_SIDES.join(' / '),
+            count: PLACEMENT_SIDES.length,
+          },
+        }));
+      } else if (pl.alignment !== undefined && pl.alignment !== null && !ADJACENT_ALIGNMENTS[pl.side].includes(pl.alignment)) {
+        out.push(buildIssue('PROPOSAL-PLACE-ALIGNMENT', {
+          target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+          ctx: { ref, alignment: String(pl.alignment), where: `side=${pl.side}`, allowed: ADJACENT_ALIGNMENTS[pl.side].join(' / '), count: ADJACENT_ALIGNMENTS[pl.side].length },
+        }));
+      }
+    }
+    if (String(pl.reference) === ref) {
+      out.push(buildIssue('PROPOSAL-PLACE-SELF', {
+        target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+        ctx: { ref, index: i + 1, count: p.cabinets.length },
+      }));
+    } else {
+      const known =
+        seenRef.has(String(pl.reference)) ||
+        project.cabinets.some((k) => k.id === pl.reference || k.name === pl.reference);
+      if (!known) {
+        out.push(buildIssue('PROPOSAL-PLACE-REF', {
+          target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+          ctx: { ref, reference: String(pl.reference), count: p.cabinets.length, existing: project.cabinets.length },
+        }));
+      }
+    }
+  }
+
+  // 落位成环（静态可判）：A 参照 B、B 参照 A（都在本方案里重摆）没有确定的
+  // 先后可言 —— 必须在这里拦下。放过去的话执行期两条各自都能"解析成功"，
+  // 结果取决于执行顺序，那是顺序碰运气，不是确定性落位。
+  const placingIdx = new Map<string, number>();
+  p.cabinets.forEach((c, i) => {
+    if (c.placement) placingIdx.set(String(c.ref), i);
+  });
+  {
+    const pdeps: number[][] = p.cabinets.map(() => []);
+    p.cabinets.forEach((c, i) => {
+      const pl = c.placement;
+      if (!pl) return;
+      const j = placingIdx.get(String(pl.reference));
+      if (j !== undefined && j !== i) pdeps[i].push(j);
+    });
+    const inDeg = pdeps.map((d) => d.length);
+    const dependents: number[][] = p.cabinets.map(() => []);
+    pdeps.forEach((d, i) => {
+      for (const j of d) dependents[j].push(i);
+    });
+    const ready: number[] = [];
+    inDeg.forEach((d, i) => {
+      if (d === 0) ready.push(i);
+    });
+    const done = new Set<number>();
+    while (ready.length > 0) {
+      ready.sort((a, b) => a - b);
+      const i = ready.shift()!;
+      done.add(i);
+      for (const k of dependents[i]) {
+        inDeg[k]--;
+        if (inDeg[k] === 0) ready.push(k);
+      }
+    }
+    if (done.size < pdeps.length) {
+      const stuck = [...p.cabinets.keys()].filter((i) => !done.has(i)).map((i) => String(p.cabinets[i]?.ref ?? `#${i + 1}`));
+      out.push(buildIssue('PROPOSAL-PLACE-CYCLE', {
+        target: t(''), targetKind: 'project',
+        ctx: { refs: [...new Set(stuck)].join('、'), count: new Set(stuck).size },
+      }));
+    }
+  }
 
   // 组合：成员 ref 必须在本方案里，且至少两个；连接的 kind 必须是三种之一
   for (const [i, a] of (p.assemblies ?? []).entries()) {

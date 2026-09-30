@@ -307,10 +307,19 @@ section('F 不确定性：待确认问题必须拦住，默认值必须说出来
 section('G 结构边界：契约与类型层面都不给坐标留口子');
 {
   const src = readFileSync(join(APP, 'src', 'ai', 'proposal.ts'), 'utf8');
-  const coordFields = ['atX', 'atY', 'placement', 'positionX', 'positionY'];
+  // P8.1 演进（判据随修法升级，不是放宽）：
+  //   P3 时任何 placement 字段都必然是坐标，所以整词禁掉；
+  //   P8.1 起 proposal 允许携带**语义落位意图**（relation/reference/side/alignment，
+  //   见 ProposalPlacement 与 core/placement.ts）——它结构上没有坐标的容身之处，
+  //   且契约形状门（proposalShapeError）对夹带 x/y 的 placement 直接拒收。
+  //   因此判据从"禁 placement 这个词"升级为"精确禁坐标"：
+  //   atX/atY/position* 词形 + 注释剥除后的裸 x:/y:/z:/coord: 字段。
+  const coordFields = ['atX', 'atY', 'positionX', 'positionY'];
   const found = coordFields.filter((f) => new RegExp(`\\b${f}\\b`).test(src));
-  eq('proposal.ts 里没有任何坐标字段（只有注释里提到"没有坐标"不算字段）', found.length, 0);
-  ok('提案字段里确实没有 x / y 尺寸以外的坐标语义', !/\b(z|coord)\b\s*:/.test(src.replace(/\/\/.*$/gm, '')));
+  ok('proposal.ts 里没有任何坐标字段（atX/atY/position* 一个都不许有）', found.length === 0, found.join('、'));
+  const stripped = src.replace(/\/\/.*$/gm, '');
+  ok('提案字段里确实没有 x / y 尺寸以外的坐标语义', !/\b(z|coord)\b\s*:/.test(stripped) && !/\b(x|y)\b\s*:/.test(stripped));
+  ok('P8.1 语义落位意图在形状门就拦坐标（placement 夹带 x → 拒收）', typeof proposalShapeError({ title: 't', cabinets: [{ ref: 'a', placement: { relation: 'adjacent', reference: 'b', x: 1 } }] }) === 'string');
 
   // 契约里 cabinet.create 的坐标参数仍然存在（AI 通道的历史能力），
   // 但提案编译**不使用**它们 —— 上面 C 组已断言编译产物里没有 atX/atY

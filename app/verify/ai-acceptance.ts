@@ -105,6 +105,9 @@ const MINIMAL: Record<string, unknown> = {
   'cabinet.move': { action: 'cabinet.move', target: { cabinetName: cab0.name }, params: { x: 100 } },
   'cabinet.nudge': { action: 'cabinet.nudge', target: { cabinetName: cab0.name }, params: { dx: 100 } },
   'cabinet.rotate': { action: 'cabinet.rotate', target: { cabinetName: cab0.name }, params: { deg: 90 } },
+  // v0.3 P8.1：语义落位。AI 只给关系不给坐标；编译期解析参照（这里自参照会被
+  // 拒，但 A3 只拦"两边漂移了"，契约校验能过即证明编译分支接上了）
+  'cabinet.place': { action: 'cabinet.place', target: { cabinetName: cab0.name }, params: { relation: 'adjacent', reference: cab0.name, side: 'right' } },
   'cabinet.setUnitWidth': { action: 'cabinet.setUnitWidth', target: { cabinetName: cab0.name, unit: 1 }, params: { width: 600 } },
   'cabinet.setUnitParam': { action: 'cabinet.setUnitParam', target: { cabinetName: cab0.name, unit: 1 }, params: { param: 'drawers.count', value: 4 } },
   'cabinet.renameUnit': { action: 'cabinet.renameUnit', target: { cabinetName: cab0.name, unit: 1 }, params: { nickname: '抽屉区' } },

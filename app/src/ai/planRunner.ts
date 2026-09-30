@@ -122,9 +122,15 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
     /**
      * 美元引用在这一步之前替换：编译器看到的是真 id，
      * 于是"成员必须逐个查到"这类检查照旧生效（不会被占位符骗过去）。
+     * P8.1 起 target 也过一遍替换：cabinet.place 的落位目标是**本轮刚建**的柜
+     * （id 在它 create 那一步才诞生），与 params 同一套 $ref 占位。
      */
     const resolved = action.params ? (resolveRefs(action.params as unknown as Record<string, unknown>) as AiAction['params']) : action.params;
-    const resolvedAction: AiAction = { ...action, params: resolved };
+    const resolvedAction: AiAction = {
+      ...action,
+      target: action.target ? (resolveRefs(action.target as unknown as Record<string, unknown>) as AiAction['target']) : action.target,
+      params: resolved,
+    };
     const compiled = compileAction(resolvedAction, sandbox.getState(), rules);
     if (!compiled.ok) {
       steps.push({

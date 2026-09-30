@@ -54,6 +54,31 @@ export function rotateCabinet(cab: Cabinet, deg: number, source: CommandSource =
 }
 
 /**
+ * 确定性落位（P8.1）：把 Placement Engine 解析出的位置**一条命令**写进 placement。
+ *
+ * 为什么不复用 moveCabinet + rotateCabinet：那是两条命令、两次版本号，
+ * 中途态是"转了没挪"的半成品，撤销也要撤两次。落位是一个语义动作，
+ * x/y/rotation 必须原子生效 —— 这正是 cabinet.resize 把补偿并进同一条
+ * 命令的同一条理由。
+ *
+ * 坐标从哪来：调用方必须先过 `core/placement.ts` 的解析器
+ * （resolvePlacement / resolvePlacements）。这里不做几何计算 ——
+ * 命令词汇表只负责"把算好的值安全地写进去"。
+ */
+export function placeCabinet(
+  cab: Cabinet,
+  at: { x: number; y: number; rotation: number },
+  source: CommandSource = 'ui',
+  label?: string
+): Command {
+  return cmd('cabinet.place', source, cabTarget(cab.id), [
+    { path: 'placement.x', op: 'set', value: Math.round(at.x), unit: 'mm' },
+    { path: 'placement.y', op: 'set', value: Math.round(at.y), unit: 'mm' },
+    { path: 'placement.rotation', op: 'set', value: Math.round(at.rotation), unit: 'deg' },
+  ], label ?? `落位「${cab.name}」到 (${Math.round(at.x)}, ${Math.round(at.y)}) @ ${Math.round(at.rotation)}°`);
+}
+
+/**
  * 镜像柜体（MI）—— 语义化映射，不是几何镜像。
  *
  * AutoCAD 的 MI 镜像一条线段；语义模型里没有线，镜像的语义等价物是

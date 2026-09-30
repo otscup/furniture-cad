@@ -751,6 +751,52 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `连接的两端必须是同一个组合的成员（这个组合有 ${num(c, 'count')} 个）。`,
     manual: '关系只描述组合内部。',
   },
+
+  // ───── 方案里的落位意图（v0.3，P8.1：PlacementIntent）─────
+  // AI 只说"想怎么放"（相邻/对齐），坐标由 Placement Engine 算 —— 方案里
+  // 出现坐标字段会被形状门（aiContract.proposalShapeError）直接拒收。
+  'PROPOSAL-PLACE-RELATION': {
+    title: '落位关系不认识',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的落位关系「${str(c, 'relation')}」不认识（可用 ${num(c, 'count')} 种：${str(c, 'relations')}）。`,
+    hint: (c) => `改成这 ${num(c, 'count')} 种之一：${str(c, 'relations')}（adjacent = 贴着参照柜放；align = 与参照柜某条边/中心齐平）。`,
+    manual: '落位关系是封闭词汇表（与 core/placement.ts 同源）。',
+  },
+  'PROPOSAL-PLACE-REF': {
+    title: '落位参照的柜体找不到',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的落位参照「${str(c, 'reference')}」既不是本方案的 ${num(c, 'count')} 个柜体之一，也不是项目里已有的柜体。`,
+    hint: (c) => `参照只能写本方案的柜体 ref，或项目里已有柜体的 id / 名字（现在项目里有 ${num(c, 'existing')} 个柜体）。`,
+    manual: '落位必须有参照物，系统不猜"旁边"是哪。',
+  },
+  'PROPOSAL-PLACE-SELF': {
+    title: '柜体以自己为落位参照',
+    severity: 'ERROR',
+    message: (c) => `方案里第 ${num(c, 'index')} 个柜体「${str(c, 'ref')}」的落位参照写了它自己 —— 落位必须有别的柜体做参照（本方案共 ${num(c, 'count')} 个柜体）。`,
+    hint: (c) => `把 reference 改成另一个柜体（要贴着谁、对齐谁就写谁；本方案共 ${num(c, 'count')} 个柜体）。`,
+    manual: '自引用无法解析。',
+  },
+  'PROPOSAL-PLACE-SIDE': {
+    title: '落位方向缺失或不认识',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的 adjacent 落位${str(c, 'why')}（side 有 ${num(c, 'count')} 种取值：${str(c, 'sides')}${str(c, 'side') !== '' ? `，收到的是「${str(c, 'side')}」` : ''}）。`,
+    hint: (c) => `side 说明贴在参照柜的哪一侧，${num(c, 'count')} 选 1：${str(c, 'sides')}。`,
+    manual: '方向是封闭词汇表（与 PlacementSide 同源）。',
+  },
+  'PROPOSAL-PLACE-ALIGNMENT': {
+    title: '落位对齐方式与方向不匹配',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的落位对齐「${str(c, 'alignment')}」用错了地方（${str(c, 'where')} 可用这 ${num(c, 'count')} 种：${str(c, 'allowed')}）。`,
+    hint: () => `并排（side=left/right）用 back/front/center；前后叠（side=front/back）用 left/right/center。缺省时系统按行业惯例取（并排背面齐、前后左缘齐）。`,
+    manual: '对齐集合与 core/placement.ts 的 ADJACENT_ALIGNMENTS 同源。',
+  },
+  'PROPOSAL-PLACE-CYCLE': {
+    title: '落位意图互相参照成环',
+    severity: 'ERROR',
+    message: (c) => `柜体 ${str(c, 'refs')} 的落位意图互相参照成环 —— ${num(c, 'count')} 个柜体谁先落位没有确定答案，系统不按顺序碰运气。`,
+    hint: () => '把其中一个的参照改成位置已确定的柜体（项目里已有的，或本方案里不参与互相参照的），或拆成两份方案分两次应用。',
+    manual: '成环的相对落位没有唯一解，这是设计决定。',
+  },
   'PROPOSAL-OPEN-QUESTIONS': {
     title: '这份方案还有问题要你定',
     severity: 'WARNING',

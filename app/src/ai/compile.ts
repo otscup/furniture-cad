@@ -8,6 +8,7 @@ import { pickPartsOf } from '../core/geometry/pickLines.ts';
 import { ROW_HEIGHT_FILL, allUnits, canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
 import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
+import { resolvePlacement, sceneFromProject, type PlacementAlignment, type PlacementIntent, type PlacementSide } from '../core/placement.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
@@ -434,6 +435,68 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       return { ok: true, command: CMD.rotateCabinet(cab, Number(p.deg), src), summary: `旋转「${cab.name}」` };
     }
 
+    /**
+     * 语义落位（P8.1）：AI 只给"贴着谁 / 对齐谁"，坐标在这里由确定性引擎
+     * （core/placement.ts）对着**当前沙盒状态**算出来 —— 编译产物是一条
+     * 带具体整数坐标的 cabinet.place 命令。之后它走的仍是 干跑→确认→提交
+     * 那条唯一链路，预览 === 提交结构性成立。
+     *
+     * ── 为什么这里拒绝 absolute ──
+     *   绝对坐标是**授权输入**（用户拖动 / 属性面板 / 既有 cabinet.move）。
+     *   AI 的新落位面只收语义关系；它手上看不到墙和别的柜的实时位置，
+     *   让它报坐标等于让它猜 —— 那条弯路在 nudgeOutOfWalls 的注释里记着账。
+     */
+    case 'cabinet.place': {
+      const cab = resolveCabinet(project, action.target);
+      if (typeof cab === 'string') return { ok: false, error: cab };
+      const relation = String(p.relation ?? '');
+      if (relation === 'absolute') {
+        return { ok: false, error: 'cabinet.place 不接受 absolute —— 绝对坐标是用户授权输入（cabinet.move / 界面拖动），AI 落位请用 adjacent / align 表达意图' };
+      }
+      if (relation !== 'adjacent' && relation !== 'align') {
+        return { ok: false, error: `cabinet.place 的 relation 只能是 adjacent / align，收到「${relation || '（缺）'}」` };
+      }
+      const referenceKey = String(p.reference ?? '');
+      if (!referenceKey) return { ok: false, error: 'cabinet.place 缺 reference（参照哪个柜体）' };
+      // 参照解析：先 id 后唯一名字（与 resolveCabinet 同一态度：命中不唯一就报错，绝不替用户挑）
+      let refCab = project.cabinets.find((c) => c.id === referenceKey);
+      if (!refCab) {
+        const exact = project.cabinets.filter((c) => c.name === referenceKey);
+        if (exact.length === 1) refCab = exact[0];
+        else if (exact.length > 1) return { ok: false, error: `有 ${exact.length} 个柜体都叫「${referenceKey}」，请说清参照哪一个` };
+      }
+      if (!refCab) {
+        return { ok: false, error: `找不到参照柜体「${referenceKey}」（现有：${project.cabinets.map((c) => c.name).join('、') || '无'}）` };
+      }
+      if (refCab.id === cab.id) return { ok: false, error: `「${cab.name}」不能以自己为落位参照` };
+      const intent: PlacementIntent =
+        relation === 'adjacent'
+          ? {
+              relation: 'adjacent',
+              targetId: cab.id,
+              referenceId: refCab.id,
+              side: p.side as PlacementSide,
+              ...(p.alignment !== undefined && p.alignment !== null ? { alignment: p.alignment as PlacementAlignment } : {}),
+            }
+          : {
+              relation: 'align',
+              targetId: cab.id,
+              referenceId: refCab.id,
+              alignment: p.alignment as PlacementAlignment,
+            };
+      const r = resolvePlacement(intent, sceneFromProject(project));
+      if (!r.ok) return { ok: false, error: r.error.message };
+      const relationZh =
+        relation === 'adjacent'
+          ? `贴「${refCab.name}」${({ left: '左', right: '右', front: '前', back: '后' } as Record<string, string>)[String(p.side)] ?? ''}侧`
+          : `与「${refCab.name}」${String(p.alignment ?? '')}对齐`;
+      return {
+        ok: true,
+        command: CMD.placeCabinet(cab, r.placement, src, `落位「${cab.name}」${relationZh} → (${r.placement.x}, ${r.placement.y})`),
+        summary: `落位「${cab.name}」：${relationZh}`,
+      };
+    }
+
     // ───────────── 分区 ─────────────
     case 'cabinet.setUnitWidth': {
       const cab = resolveCabinet(project, action.target);
@@ -840,6 +903,7 @@ export const COMPILED_ACTIONS = [
   'cabinet.move',
   'cabinet.nudge',
   'cabinet.rotate',
+  'cabinet.place',
   'cabinet.setUnitWidth',
   'cabinet.setUnitParam',
   'cabinet.renameUnit',

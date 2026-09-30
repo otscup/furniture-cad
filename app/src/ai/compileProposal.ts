@@ -1,5 +1,6 @@
 import type { Issue, Project, RuleSet } from '../core/types.ts';
 import type { AiAction } from './compile.ts';
+import { ADJACENT_DEFAULT_ALIGNMENT, PLACEMENT_SIDES } from '../core/placement.ts';
 import { defaultSizes, proposalBlocked, validateProposal, type DesignProposal, type ProposalRow, type ProposalUnit } from './proposal.ts';
 
 /**
@@ -127,6 +128,70 @@ export function compileProposal(p: DesignProposal, project: Project, rules: Rule
     if (c.backUnits && c.backUnits.length > 0) params.backUnits = c.backUnits.map(stripUnit);
 
     actions.push(mkAction('cabinet.create', { roomId }, params, `设计方案：${name}`, index++, ref));
+  }
+
+  // ── 落位（v0.3，P8.1）：所有 create 之后统一发 cabinet.place ──
+  // 为什么不紧跟在各柜的 create 后面：参照可能是本方案里**靠后**才建的柜，
+  // 先建完再落位，`$ref:` 才换得出真 id。
+  // 多柜连续落位按"参照依赖"排序（A 参照 B → A 排在 B 之后，被参照的先落位），
+  // 顺序稳定（同为就绪时按方案内顺序）—— 同一份方案永远编译出同一批动作。
+  // 成环已在 validateProposal 拦下（PROPOSAL-PLACE-CYCLE），这里排序必然可完成。
+  const placing = p.cabinets.filter((c) => c.placement);
+  if (placing.length > 0) {
+    // $ref 判据用**全部**柜体的 ref：参照可以是本方案里不参与落位的柜
+    //（"相邻柜贴基准柜"—— 基准柜自己不需要落位意图）。只查 placing 会让
+    // $ref 漏生成，执行期按名字找不到本轮刚建的柜 —— 这里抓过一次。
+    const allRefs = new Set(p.cabinets.map((c) => String(c.ref)));
+    const placePos = new Map(placing.map((c, k) => [String(c.ref), k]));
+    const pdeps: number[][] = placing.map((c) => {
+      const pl = c.placement!;
+      const j = placePos.get(String(pl.reference));
+      return j !== undefined && String(pl.reference) !== String(c.ref) ? [j] : [];
+    });
+    const inDeg = pdeps.map((d) => d.length);
+    const dependents: number[][] = placing.map(() => []);
+    pdeps.forEach((d, i) => {
+      for (const j of d) dependents[j].push(i);
+    });
+    const ready: number[] = [];
+    inDeg.forEach((d, i) => {
+      if (d === 0) ready.push(i);
+    });
+    const order: number[] = [];
+    while (ready.length > 0) {
+      ready.sort((a, b) => a - b);
+      const i = ready.shift()!;
+      order.push(i);
+      for (const k of dependents[i]) {
+        inDeg[k]--;
+        if (inDeg[k] === 0) ready.push(k);
+      }
+    }
+    const sideZh: Record<string, string> = { left: '左侧', right: '右侧', front: '前侧', back: '后侧' };
+    const alignZh: Record<string, string> = { left: '左缘', right: '右缘', front: '前缘', back: '背缘', center: '中心' };
+    for (const k of order) {
+      const c = placing[k];
+      const pl = c.placement!;
+      const ref = String(c.ref);
+      const name = String(c.name ?? ref);
+      const inProposal = allRefs.has(String(pl.reference));
+      const params: Record<string, unknown> = {
+        relation: pl.relation,
+        reference: inProposal ? `$ref:${pl.reference}` : String(pl.reference),
+        ...(pl.side ? { side: pl.side } : {}),
+        ...(pl.alignment ? { alignment: pl.alignment } : {}),
+      };
+      // 缺省对齐必须写进 notes：系统替模型按惯例取了什么，界面要显示（悄悄补齐＝骗人）
+      if (pl.relation === 'adjacent' && pl.side && !pl.alignment && PLACEMENT_SIDES.includes(pl.side)) {
+        notes.push(`「${name}」没说对齐方式，按惯例取「${ADJACENT_DEFAULT_ALIGNMENT[pl.side]}」（并排背面齐、前后左缘齐）`);
+      }
+      const reason =
+        pl.relation === 'adjacent'
+          ? `设计方案：把「${name}」贴到「${pl.reference}」的${sideZh[String(pl.side)] ?? String(pl.side)}`
+          : `设计方案：把「${name}」与「${pl.reference}」按${alignZh[String(pl.alignment)] ?? String(pl.alignment)}对齐`;
+      // target 用 $ref 占位：真 id 在 planRunner 执行该柜 create 的瞬间才存在
+      actions.push(mkAction('cabinet.place', { cabinetId: `$ref:${ref}` }, params, reason, index++));
+    }
   }
 
   // ── 组合：成员用 $ref: 占位，真正建出来那一刻由 planRunner 换成真 id ──

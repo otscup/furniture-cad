@@ -234,6 +234,20 @@ export const ACTIONS = {
     params: { deg: { type: 'enum', values: [0, 90, 180, 270], desc: '绕柜背左角的逆时针角度' } },
     required: ['deg'],
   },
+  'cabinet.place': {
+    label: '语义落位（相邻 / 对齐）',
+    target: 'cabinet',
+    params: {
+      relation: { type: 'enum', values: ['adjacent', 'align'], desc: 'adjacent = 贴着参照柜放（面贴合）；align = 与参照柜的边/中心齐平' },
+      reference: { type: 'string', max: MAX_STRING, desc: '参照柜体的名字（不要编 id）' },
+      side: { type: 'enum', values: ['left', 'right', 'front', 'back'], desc: '仅 adjacent：贴在参照柜哪一侧（left/right 并排，front/back 前后叠）', optional: true },
+      alignment: { type: 'enum', values: ['left', 'right', 'front', 'back', 'center'], desc: '对齐方式；缺省按惯例（并排背面齐、前后左缘齐）', optional: true },
+    },
+    required: ['relation', 'reference'],
+    detail:
+      '你只表达"想怎么放"，最终坐标由系统按参照柜的实际位置与两柜尺寸**确定性计算** —— 这个动作不收任何坐标。' +
+      '绝对坐标（x/y）是用户授权输入，走 cabinet.move；不要用 cabinet.place 夹带坐标，系统会直接拒收。',
+  },
 
   // ───────── 柜体：分区 ─────────
   'cabinet.setUnitWidth': {
@@ -1195,6 +1209,33 @@ export function proposalShapeError(raw) {
         const bad = unitListShapeError(r.units, `柜体「${c.ref}」第 ${j + 1} 行的 units`);
         if (bad) return bad;
       }
+    }
+    // 落位意图（P8.1）：只有语义关系，**任何坐标字段都不存在** ——
+    // 方案里出现 x/y 一律拒收（AI 不得把坐标当意图塞进来）。
+    if (c.placement !== undefined && c.placement !== null) {
+      const pl = c.placement;
+      if (!isPlainObject(pl)) return `柜体「${c.ref}」的 placement 必须是对象`;
+      if (pl.x !== undefined || pl.y !== undefined || pl.z !== undefined) {
+        return `柜体「${c.ref}」的 placement 不接受坐标（x/y/z）—— 落位只表达关系（贴着谁/对齐谁），坐标由系统计算`;
+      }
+      if (!['adjacent', 'align'].includes(pl.relation)) {
+        return `柜体「${c.ref}」的 placement.relation 只能是 adjacent / align，收到的是「${String(pl.relation)}」`;
+      }
+      if (typeof pl.reference !== 'string' || pl.reference.trim() === '') {
+        return `柜体「${c.ref}」的 placement.reference 必须是参照柜（方案内 ref 或已有柜体名）`;
+      }
+      if (pl.side !== undefined && pl.side !== null && !['left', 'right', 'front', 'back'].includes(pl.side)) {
+        return `柜体「${c.ref}」的 placement.side 只能是 left / right / front / back，收到的是「${String(pl.side)}」`;
+      }
+      if (
+        pl.alignment !== undefined && pl.alignment !== null &&
+        !['left', 'right', 'front', 'back', 'center'].includes(pl.alignment)
+      ) {
+        return `柜体「${c.ref}」的 placement.alignment 只能是 left / right / front / back / center，收到的是「${String(pl.alignment)}」`;
+      }
+      // adjacent 缺 side 不在形状门拦：语义校验（validateProposal）会给带人话的
+      // PROPOSAL-PLACE-SIDE（"缺 side（adjacent 必须说明贴在参照柜哪一侧）"），
+      // 形状门只负责挡类型与封闭词汇表。
     }
   }
   if (raw.assemblies !== undefined && raw.assemblies !== null) {

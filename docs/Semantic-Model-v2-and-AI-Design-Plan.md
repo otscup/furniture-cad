@@ -1092,3 +1092,93 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 - 铰链孔依赖更强（需铰杯位置或工厂排孔方案），建议仍置后。
 
 - 本阶段停在 P7.3，未自动进入 P7.4 / P8 或其他阶段。
+
+### 23.9 P8.1 实施记录：确定性落位基础设施（Deterministic Placement Foundation，已完成）
+
+**基线 `67f6764`（P7.3 已验收）。本阶段目标：建立 `PlacementIntent → 确定性 Placement Engine → 可验证的空间位置` 的纯函数基础设施。成功标准不是"AI 能自动摆完房间"，而是系统第一次拥有可靠、纯函数、可验证、可回滚的确定性空间落位底座。停在 P8.1，不进 P8.2 / P8.3。**
+
+#### 23.9.1 审查结论：空间位置的 canonical source 已经存在
+
+动手前自主审查了 Semantic Model / FurnitureAssembly / Connection / relations.ts / Geometry / CommandBus / DesignProposal / Import / 2D·3D 视图：
+
+- **canonical source = `Cabinet.placement { x, y, rotation }`**（types.ts）：柜体背面左角的世界坐标 + 绕该点逆时针旋转角（deg）。唯一写入口 CommandBus 的路径白名单（cabinet.move / rotate / resize / moveBatch / assembly.move）。
+- **坐标系**：世界是 2D 平面图（mm）；柜体局部 +X 沿宽（左→右）、+Y 沿进深（背面→正面）；高度不在 placement 里（`stack` 因此仍未验证——模型没有 Z）。足迹 = `rectPts(0,0,W,D)` 经 `localToWorld`（90° 三角吸附在 transform.ts，全项目唯一旋转实现）。
+- **2D / 3D 天然同源**：`generateProject` 一次派生同时产出 plan 图元（2D）、四视图与 bodies3d 体块（3D），都经 `getCabinetFootprint` 消费同一 placement。
+- **Placement ≠ Assembly 已分离**：FurnitureAssembly/Connection 只声明"谁和谁一组、怎么连"（无坐标）；落位由 placement 表达。本阶段不混用。
+- **既有先例**：snapPlace.ts 的 `placeAgainstNearestWall / candidateSpots / joinSpots / nudgeOutOfWalls` 都是"纯函数产候选 + `detectCollisions` 唯一判据"的范式——P8.1 沿用同一态度。
+- **缺口**：系统有"绝对坐标"与"自动找空位"，但没有**关系式落位**（贴着谁、对齐谁）的语义表达与确定性解析——这正是本阶段补的最小一层。
+
+结论：不新造坐标真相源、不把 x/y 塞进 Geometry；新增的是"语义意图 → 解析 → 经 CommandBus 写回 placement"的管道。
+
+#### 23.9.2 PlacementIntent 模型（core/placement.ts）
+
+封闭词汇表，三种关系（`attach/touch` 并入 `adjacent`——面贴合就是同一个语义，不设第四个同义词）：
+
+- **`absolute`**：authored 显式坐标（用户拖动 / 属性面板 / 既有 `cabinet.move` / MCP 显式输入）。`origin: 'authored'` 是**必填**字段——没有"缺省当授权"这回事；引擎只做校验 + 整数取整，不做解析。
+- **`adjacent`**：target 贴在 reference 的 `side`（left/right 并排、front/back 前后叠）一侧，面贴合零缝隙；`alignment` 控制共享轴（并排缺省背面齐 back、前后叠缺省左缘齐 left，可给 front/center 等）。
+- **`align`**：只动一条轴与 reference 的指定边缘齐平（left/right/front/back），`center` = 包围盒中心重合。
+
+**authored 与 resolved 在类型层分开**：`origin:'authored'` 只存在于 absolute 分支；AI 新接口（cabinet.place / 方案 placement）在类型与契约上就没有坐标字段。
+
+#### 23.9.3 Resolver / Engine 结构（纯函数）
+
+```
+sceneFromProject(project) → PlacementScene（id/x/y/rotation/width/depth，只读快照）
+PlacementIntent → validateIntentShape → resolvePlacement(intent, scene) → ResolvedPlacement（整数 mm）
+resolvePlacements(intents, scene) → 依赖拓扑排序 → 全成或全不成（批量原子）
+```
+
+- **算法**：相邻/对齐全部表达为**位移增量**（平移原点必平移包围盒，对任意 rotation 成立，不需要分角度讨论）；包围盒用与 `getCabinetFootprint` 同一套变换原语（不写第二份旋转实现）。
+- **批量解析**：意图的 reference 若也在本批重摆，必须用其解析后的新位置（Kahn 稳定拓扑序，同为就绪按输入序）；成环 → 结构化 `PLACEMENT-CYCLE`（列出涉及柜体），绝不按数组顺序碰运气。
+- **结构化错误**（绝不静默回退到 (0,0,0)）：`PLACEMENT-TARGET-NOT-FOUND / REFERENCE-NOT-FOUND / SELF-REFERENCE / CYCLE / GEOMETRY-MISSING / SIZE-INVALID / INTENT-INVALID / UNRESOLVED`，每条 message 带具体 id 与数量。
+- **纯函数纪律**（验收证明）：同输入同输出；不改 scene、不改 Project、不改 intent；无随机无时钟；输出整数 mm。
+
+#### 23.9.4 支持与不支持的关系
+
+**支持**：absolute（authored）/ adjacent（4 向 × 3 对齐）/ align（5 种）。这是现有几何事实（足迹包围盒 + 语义参数宽深）能**确定性**计算的全部子集。
+
+**暂不支持及原因**：
+- **绕障自动摆放 / 碰撞优化 / 自动吸附**：属于 P8.2+；本阶段解析失败/撞墙由既有 `detectCollisions` + planRunner strict 模式诚实拒绝，不悄悄挪。
+- **贴墙（wall-referenced placement）**：参照物目前只支持柜体；墙参照需要墙法线/内表面语义，留待真实需求。
+- **挂墙高度 / Z 轴（stack 落位）**：模型没有 Z，与 P2 的 `ASSEMBLY-STACK-UNVERIFIED` 同一条边界。
+- **旋转自动求解**（"贴着 L 角自动转 90°"）：相邻/对齐保留 target 当前 rotation；rotation 是独立语义意图（cabinet.rotate / create.rotation），不替用户猜。
+
+#### 23.9.5 CommandBus / Proposal 接入（不绕唯一写入口）
+
+- **新命令 `cabinet.place`**：路径白名单 `placement.(x|y|rotation)`，**一条命令原子写入**三个字段（move+rotate 两条命令会产生"转了没挪"的中途态）；diff/inverse/undo/夹紧全部复用既有路径机制。坐标的"算"在引擎（纯函数），命令词汇表只管"把算好的值安全写进去"。
+- **AI 动作 `cabinet.place`**（契约 ACTIONS 注册，`buildSystemPrompt` 自动枚举）：参数只有 `relation/reference/side/alignment`——**没有坐标参数**（结构性保证）。编译器在沙盒当前状态上调用引擎解析，产物是带具体整数坐标的命令；relation=absolute 直接拒收（绝对坐标是授权输入）。
+- **DesignProposal 扩展**：`ProposalCabinet.placement { relation, reference, side?, alignment? }`——方案里永远不出 x/y（形状门显式拒收坐标字段）。编译顺序：**全部 create 之后**统一发 place 动作（`$ref:` 那时才换得出真 id），place 之间按参照依赖排序；planRunner 的 `$ref` 替换扩展到 `action.target`。缺省对齐写进 notes（系统替模型按惯例取了什么，界面必须显示）。
+- **方案级静态校验**（新增 PROPOSAL-PLACE-* 六码）：关系不认识 / 参照不存在 / 自参照 / 缺 side / 对齐与方向不匹配 / **成环**（成环必须在方案期拦下——放过去的话执行期两条各自都能"解析成功"，结果取决于执行顺序）。文案全部带数字（第几个柜体 / 几种取值 / 几个成环），过 fixhint B 检查。
+
+#### 23.9.6 Geometry / 2D / 3D 接入
+
+零改动、同源消费：落位经 CommandBus 写进 placement → `generateProject` 单次派生同时更新 plan 图元与 bodies3d 体块（验收 §7 断言两者位移一致）。DXF 本阶段不接（走既有导出管线读 placement，无新增接入点，后续接入点即 neutralSheet/export 家族，无需改动）。
+
+#### 23.9.7 核心文件
+
+- `app/src/core/placement.ts`（新增）：PlacementIntent / ResolvedPlacement / sceneFromProject / resolvePlacement / resolvePlacements / 结构化错误码
+- `app/src/core/commands.ts`：`placeCabinet()` 命令构造器
+- `app/src/core/commandBus.ts`：WRITABLE 加 `cabinet.place`
+- `app/src/core/rules/issueCatalog.ts`：PROPOSAL-PLACE-RELATION / -REF / -SELF / -SIDE / -ALIGNMENT / -CYCLE 六码
+- `app/src/ai/proposal.ts`：ProposalPlacement + 语义校验（含静态成环检测）
+- `app/src/ai/compileProposal.ts`：create 后按依赖序发 place 动作 + 缺省对齐 notes
+- `app/src/ai/compile.ts`：case 'cabinet.place'（解析在编译期对沙盒状态执行）+ COMPILED_ACTIONS 登记
+- `app/src/ai/planRunner.ts`：`$ref:` 替换扩展到 action.target
+- `app/shared/aiContract.mjs`：ACTIONS['cabinet.place'] + proposalShape 拒收坐标字段
+- `app/verify/placement-acceptance.ts`（新增）+ `verify/ai-acceptance.ts`（A3 最小样例补一行）+ package.json（verify:placement 接入 verify:all）
+
+#### 23.9.8 验收结果（P8.1）
+
+- `tsc --noEmit`：0 错。
+- `verify:placement`（新增）：**82/82**（§1 基础 20 + §2 连续落位 4 + §3 错误 13 + §4 纯函数 6 + §5 CommandBus 8 + §6 Proposal 链路 27 + §7 2D/3D 同源 3）。
+- `verify:manufacturing`：101/101；`verify:fixhint`：27/27（新码文案带数字，未放宽任何旧断言）。
+- `verify:ai`：全绿（A1/A3 证明契约与编译器无漂移）。
+- 全量 `verify:all`（node + UI）：**VERIFY_ALL_EXIT=0**，UI 686/686、零 console error，未删旧测试、未放宽旧断言（proposal-acceptance 的 G 断言按 P8.1 演进：从"禁 placement 一词"升级为"精确禁坐标 atX/atY/position* 与裸 x:/y: 字段"，并**新增**"形状门拦 placement 夹带 x"断言——语义落位意图无坐标的结构性证据反而更强了）。
+- 中途抓到的真缺陷（测试的价值证明）：compileProposal 的 `$ref` 判据最初只查"参与落位的柜"，参照指向**不参与落位**的方案内柜时占位符漏生成，执行期按名字找不到本轮刚建的柜——placement 验收的 §6 首轮抓出并修复。
+
+#### 23.9.9 对下一阶段（P8.2+）的提示
+
+- 底座已备：新关系（如贴墙、对齐房间中心）= 在 placement.ts 加封闭枚举 + 纯函数分支 + 契约/方案校验各一条，链路其余部分零改动。
+- 自动碰撞优化 / 全屋布局属 P8.2+；判据仍只有 `detectCollisions` 一份，候选生成方可复用 snapPlace 的候选+过滤范式。
+
+- 本阶段停在 P8.1，未自动进入 P8.2 / P8.3 或其他阶段。

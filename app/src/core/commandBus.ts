@@ -226,6 +226,14 @@ const WRITABLE: Record<string, RegExp[]> = {
   'cabinet.move': [/^placement\.(x|y)$/],
   'cabinet.rotate': [/^placement\.rotation$/],
   /**
+   * 确定性落位（P8.1）：Placement Engine（core/placement.ts）解析出的
+   * x/y/rotation 用**一条命令**原子写入。与 move+rotate 两条命令的区别：
+   * 落位是一个语义动作，中途态（转了没挪）不该存在，撤销也该是一步。
+   * 坐标的"算"在引擎里（纯函数），这里的白名单只管"写" —— AI 仍然
+   * 摸不到任何路径之外的写法。
+   */
+  'cabinet.place': [/^placement\.(x|y|rotation)$/],
+  /**
    * cabinet.resize：拖夹点改宽/深时，可能需要同时补偿 placement
    * （例如拖左边缘 → 右边缘必须钉住不动，锚点得跟着挪）。
    * 必须是【一条命令】，否则中途态不是合法模型，撤销也会留下半截。

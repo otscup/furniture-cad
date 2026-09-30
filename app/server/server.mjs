@@ -1407,6 +1407,8 @@ async function handleApi(req, res, pathname) {
     try {
       const payload = buildDesignRequest(model, text, body.snapshot, {
         history: Array.isArray(body.history) ? body.history : [],
+        // P6：前端算好的知识摘要（Resolver 是纯前端确定性函数，服务端只透传文本）
+        knowledgeDigest: typeof body.knowledgeDigest === 'string' ? body.knowledgeDigest.slice(0, 4000) : '',
         temperature: Number(env.AI_TEMPERATURE ?? 0.2),
         maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
       });

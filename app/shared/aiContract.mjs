@@ -1253,10 +1253,14 @@ export function buildDesignSystemPrompt() {
 }
 
 export function buildDesignRequest(model, text, snapshot, opts = {}) {
+  const sys = buildDesignSystemPrompt();
+  // P6：知识摘要作为 system prompt 附加段 —— AI 只把它当参考，产出仍是
+  // DesignProposal，仍走 validateProposal → dryRun → 确认 → CommandBus。
+  const knowledge = typeof opts.knowledgeDigest === 'string' ? opts.knowledgeDigest.trim() : '';
   return {
     model,
     messages: [
-      { role: 'system', content: buildDesignSystemPrompt() },
+      { role: 'system', content: knowledge ? `${sys}\n\n${knowledge}` : sys },
       { role: 'user', content: buildUserMessage(text, snapshot, opts.history ?? []) },
     ],
     temperature: opts.temperature ?? 0.2,

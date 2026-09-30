@@ -5203,6 +5203,32 @@ async function waitForApp(url, timeoutMs = 25000) {
     const v1Import = await statusVersion();
     ok('导入的 4 条动作（3 柜 + 1 组合）真的全部执行（版本 +4）', v1Import === v0Import + 4, `v${v0Import} → v${v1Import}`);
 
+    // ═══════════════════════════════════════════════════════════
+    section('B44 知识面板（P6 三层知识）：手动偏好生效 + 冲突暴露 + AI 摘要');
+
+    ok('「知识」页签存在且能打开', (await activateRightTab('知识')) === true);
+    const knPanelVisible = await evalJs(`!!document.querySelector('.side-right .knowledge-panel')`);
+    ok('知识面板真的渲染出来了', knPanelVisible === true);
+
+    // 手动添加一条偏好（user-stated → active，直接生效）
+    const knTextarea = await evalJs(`(()=>{const t=document.querySelector('.side-right .knowledge-panel textarea.import-text');if(!t)return 'no-ta';const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;setter.call(t,'验收偏好：抽屉行高做 400mm');t.dispatchEvent(new Event('input',{bubbles:true}));return 'OK';})()`);
+    ok('偏好输入框可写', knTextarea === 'OK', String(knTextarea));
+    ok('点「记为偏好」', (await clickImportBtn('记为偏好', 400)) === 'OK');
+    const prefShown = await evalJs(`[...document.querySelectorAll('.side-right .knowledge-panel .kn-statement')].some(e=>e.textContent.includes('验收偏好'))`);
+    ok('新偏好出现在列表里（状态=生效）', prefShown === true);
+
+    // 用户偏好层标注 + 置信/来源可读
+    const prefCard = await evalJs(`(()=>{const c=[...document.querySelectorAll('.side-right .knowledge-panel .kn-entry')].find(x=>x.textContent.includes('验收偏好'));return c? c.textContent.slice(0,160) : 'no-card';})()`);
+    ok('偏好卡片标明「用户偏好 / 用户明说 / 置信 100%」', /用户偏好/.test(prefCard) && /用户明说/.test(prefCard) && /置信\s*100%/.test(prefCard), prefCard);
+
+    // AI 摘要段出现（有 active 偏好后 digest 非空）
+    const digestShown = await evalJs(`!!document.querySelector('.side-right .knowledge-panel .kn-digest')`);
+    ok('「给 AI 的知识摘要」调试段出现（digest 非空）', digestShown === true);
+
+    // 面板说明写明边界（知识不绕过校验）
+    const knNote = await evalJs(`(()=>{const n=document.querySelector('.side-right .knowledge-panel .note');return n? n.textContent : '';})()`);
+    ok('面板明说「硬规则优先 / 不绕过校验 / 候选需确认」', /硬规则/.test(knNote) && /不绕过校验|永远不绕过/.test(knNote) && /确认/.test(knNote), knNote.slice(0, 120));
+
     /**
      * console error 的判定要分两类。
      *

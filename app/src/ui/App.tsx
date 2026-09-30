@@ -18,6 +18,7 @@ import { Viewport } from './Viewport.tsx';
 const ThreeViewport = lazy(() => import('./ThreeViewport.tsx').then((m) => ({ default: m.ThreeViewport })));
 import { Toolbar } from './Toolbar.tsx';
 import type { RightTab } from './Toolbar.tsx';
+import { observeCommand, recordObservation, loadKnowledge, saveKnowledge } from '../ai/knowledge/index.ts';
 import { ContextMenu } from './ContextMenu.tsx';
 import type { CtxItem } from './ContextMenu.tsx';
 import { StatusBar } from './StatusBar.tsx';
@@ -32,6 +33,7 @@ import { MemoryPanel } from './panels/MemoryPanel.tsx';
 import { AdminPanel } from './panels/AdminPanel.tsx';
 import { AIPanel } from './panels/AIPanel.tsx';
 import { ImportPanel } from './panels/ImportPanel.tsx';
+import { KnowledgePanel } from './panels/KnowledgePanel.tsx';
 import { RoomsPanel } from './panels/RoomsPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
@@ -322,6 +324,24 @@ export function App() {
       );
       return next.length === prev.length ? prev : next;
     });
+  }, [version]);
+
+  // ── P6 修改观察：每次命令落账后，从命令日志提取有限语义事实 → 知识候选 ──
+  // 只观察、不升级：candidate 永远等用户在知识面板确认（观察 ≠ 偏好）。
+  const observedSeqRef = useRef(0);
+  useEffect(() => {
+    const log = bus.log();
+    for (let i = log.length - 1; i >= 0; i--) {
+      const e = log[i]!;
+      if (e.seq <= observedSeqRef.current) break;
+      // 撤销/重做/被丢弃的分支不是新事实
+      if (!e.applied || e.command.source === 'system') continue;
+      const cab = e.command.target?.kind === 'cabinet' ? bus.getState().cabinets.find((c) => c.id === e.command.target?.id) : undefined;
+      for (const obs of observeCommand(e.command, e.diff, cab?.name)) {
+        saveKnowledge(recordObservation(loadKnowledge(), obs));
+      }
+    }
+    if (log.length > 0) observedSeqRef.current = Math.max(observedSeqRef.current, log[log.length - 1]!.seq);
   }, [version]);
 
   // ── 工具动作 ──
@@ -1033,6 +1053,9 @@ export function App() {
             <button type="button" className={rightTab === 'import' ? 'on' : ''} onClick={() => setRightTab('import')}>
               导入
             </button>
+            <button type="button" className={rightTab === 'knowledge' ? 'on' : ''} onClick={() => setRightTab('knowledge')}>
+              知识
+            </button>
             <button type="button" className={rightTab === 'memory' ? 'on' : ''} onClick={() => setRightTab('memory')}>
               记忆
               {memoryPending > 0 ? <span className="tab-badge tab-badge-warn">{memoryPending}</span> : null}
@@ -1095,6 +1118,7 @@ export function App() {
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} selection={selection} onToast={toast} /> : null}
           {rightTab === 'import' ? <ImportPanel bus={bus} version={version} onToast={toast} /> : null}
+          {rightTab === 'knowledge' ? <KnowledgePanel bus={bus} version={version} onToast={toast} /> : null}
           {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} onLogout={doLogout} /> : null}
         </aside>
       </div>

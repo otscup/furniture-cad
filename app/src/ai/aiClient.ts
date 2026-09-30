@@ -188,6 +188,8 @@ export async function requestDesign(opts: {
   history?: Array<{ role: 'user' | 'assistant'; text: string }>;
   model?: string;
   token?: string | null;
+  /** P6：知识摘要（Resolver 输出的人话段），服务端拼进 system prompt */
+  knowledgeDigest?: string;
 }): Promise<DesignResponse> {
   const empty: DesignResponse = { ok: false };
   let res: Response;
@@ -200,6 +202,7 @@ export async function requestDesign(opts: {
         snapshot: opts.snapshot,
         history: (opts.history ?? []).slice(-6),
         model: opts.model,
+        ...(opts.knowledgeDigest ? { knowledgeDigest: opts.knowledgeDigest } : {}),
       }),
     });
   } catch (e) {

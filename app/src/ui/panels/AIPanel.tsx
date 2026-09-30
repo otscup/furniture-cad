@@ -20,6 +20,7 @@ import { validateProposal, type DesignProposal } from '../../ai/proposal.ts';
 import { compileProposal } from '../../ai/compileProposal.ts';
 import { PlanRunView } from './PlanRunView.tsx';
 import { compiledRules } from '../../state/memoryStore.ts';
+import { currentKnowledge, resolveKnowledge, knowledgeDigest as knowledgeDigestOf } from '../../ai/knowledge/index.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
 import { DraftPreview } from './DraftPreview.tsx';
 
@@ -559,6 +560,9 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         snapshot,
         history: history.slice(-6),
         token: props.token,
+        // P6：把适用知识（含冲突警告）作为参考上下文交给 AI —— 产出仍是
+        // DesignProposal，仍走同一套校验/干跑/确认，知识不给 AI 任何特权。
+        knowledgeDigest: knowledgeDigestOf(resolveKnowledge({ roomName: activeRoom?.name }, currentKnowledge())),
       });
       if (r.quota) setQuota(r.quota);
       if (!r.ok) {

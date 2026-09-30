@@ -90,7 +90,7 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 / §16 P1 / §17 P2 / §18 P3 / §19 P4 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（P0→P6，逐步推进，每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 效果图识别+确认 → P6 设计知识（偏好与硬规则物理分离）。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识（偏好与硬规则物理分离）。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
 - **P2 关系层三条纪律**（`core/relations.ts` 是唯一实现）：① 关系层**不产生几何**（建组合前后 BOM/stats/plan/views/中立导出逐字节不变）；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开 —— **只校验声明，推断只用于 UI 表达，不据此报错**。`stack` 因柜体没有 Z 无法核对，允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`（INFO，给两柜高与"若真叠放总高约 N"）—— 宁可说"没核"，不可假装核过。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容 / 关键架构决策 / 测试结果 / 遗留问题 / commit hash）。
 

@@ -1025,3 +1025,70 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 - 每条新规则落地前先回答：孔位标高从哪个几何事实读？孔型参数是哪个工厂参数？语义事实是否明确？九条是否全满足？任一不满足 → 先保持 unverified。
 - 建议下一阶段优先做**箱体连接孔（三合一/木榫）**：其"位置"可由几何板件边/中板交点确定性派生（类似层板托孔的几何事实法），最易走通"几何事实 + 工厂参数"范式；铰链孔则需语义携带铰杯位置或工厂排孔方案，依赖更强，建议稍后。
 - 本阶段停在 P7.2，未自动进入 P7.3 / P8 或其他阶段。
+
+### 23.8 P7.3 实施记录：箱体连接孔 Manufacturing Rule（Case Connector Holes，已完成）
+
+**基线 `a867f98`（P7.2 已验收）。本阶段目标：实现箱体连接孔（三合一 / 木榫），复用 P7.2 建立的「几何事实(位置) + 工厂参数(孔型)」范式与 `VERIFIED_RULE_EVALUATORS` 注册表。停在 P7.3，不进 P7.4 / P8。**
+
+#### 23.8.1 先审查现有模型（确认孔位可确定性推出）
+
+自主审查 `Panel / Geometry / Cabinet / Unit / Row / FurnitureAssembly / Connection / relations.ts / ManufacturingRuleSet / VERIFIED_RULE_EVALUATORS`：
+
+- `Panel` 不带世界坐标、无板↔板接触图；`relations.ts` 仅提供柜↔柜接触（`deriveContacts`），无板件级接触图。
+- 但**箱体外壳主连接（侧板 ↔ 顶/底板）拓扑由板件 role 直接判定**：标准 carcass 永远存在左/右侧板与顶/底板，连接关系不依赖运行时几何求解，是确定性结构事实。
+- 进深维 = `panel.width`（每片外壳板 `width = p.depth`，侧板与顶/底板共享同一进深）→ 无第二尺寸真相源。
+- 结论：**孔位可完全在「板件自身边 + 沿边位置（沿进深、从背面 Y=0 量起）」表达**，无需柜体世界坐标、不产生第二尺寸。这是本阶段能严格证明的子集，符合用户「只做确定性最强的一种连接方式」。
+
+#### 23.8.2 实现哪种连接加工（最可证明子集）
+
+仅 **箱体外壳主连接**（侧↔顶/底、顶/底↔侧）升格 verified，支持两种孔型：
+
+- **三合一（cam-lock）**：`caseConnectors.type: 'cam-lock'`（默认，孔径 15 / 孔深 13 / 每边 2 孔 / 配对加工）。
+- **木榫（wood-dowel）**：`caseConnectors.type: 'wood-dowel'`（位置算法相同，仅 `holeType` 与工厂参数不同）。
+
+**verified 边界**：`role ∈ {LeftSidePanel, RightSidePanel, TopPanel, BottomPanel}`。
+**unverified 边界（诚实留待真实规则，不伪造语义 / 不脑补坐标）**：中立板 / 行隔板 / 中板 / 背板的连接孔、柜↔柜组合连接（assembly connector machining）。`unverifiedAspects` 已同步更新措辞。
+
+#### 23.8.3 几何事实 vs 工厂参数（严格二分）
+
+- **位置 = 几何事实**：连接边由 role 拓扑决定（`CONNECTOR_EDGES`：侧板钻 top+bottom 边，顶/底板钻 left+right 边）；沿边位置由进深 `panel.width` 经 `edgeHolePositions(depth, endMargin, count)` 派生（1 孔=中点；2 孔=两端留量；≥3 孔=两端留量 + `equalSpacing` 内插）。该助手是**工厂留量作用于几何进深的制造间距**，非几何事实、非第二尺寸源。
+- **孔型 = 工厂参数**：`holeType / diameterMm / depthMm / endMarginMm / holesPerJoint / pairMachining` 全部来自 `mfgRules.caseConnectors`（`source: 'deterministic.caseConnectors'`）。
+- Manufacturing 仍只读派生层（Panel），不重算 `width`/尺寸、不回写坐标、不创造新语义。
+
+#### 23.8.4 注册表架构（不堆 if/else、不重构几何）
+
+- `derive.ts` 新增纯函数 `caseConnectorOps(ctx)`：自判适用面（role 命中 `CASE_CONNECTOR_ROLES` 才处理）、参数合法性闸门（`holesPerJoint<1` / `endMarginMm` 非数或 ≥ 进深 / `diameterMm` 非正 / 规则未启用 → 降级 unverified，不补默认不脑补）。
+- 直接注册进既有 `VERIFIED_RULE_EVALUATORS`（现 4 项：edgeBandingOps / backPanelOps / shelfPinOps / caseConnectorOps）。
+- `unverifiedOps(role, inAuthoredAssembly, mfgRules)` 增加 `mfgRules` 参数：外壳主连接被 verified 覆盖时跳过 unverified 箱体连接孔，其余结构板仍标 unverified 箱体连接孔。
+- **无需新抽象、无需重构 Geometry 系统**，满足「不重新堆 if/else」要求。
+
+#### 23.8.5 模型与规则扩展
+
+- `model.ts`：`ManufacturingOperation` 加 `connectorHoles?: MfgConnectorHoles`（`holeType`、`diameterMm`、`depthMm`、`pairMachining`、`lines: MfgConnectorHoleLine[]`）；`MfgConnectorHoleLine` 含 `edge`、`positions:number[]`（沿进深、从背面 Y=0 量）、`joint`、`withPanelRole`。仅 verified 填，unverified 不填。
+- `rules.ts`：新增 `MfgCaseConnectorRule`（带 `source:'deterministic.caseConnectors'` 与 VERIFIED_PROMOTION_CHECKLIST 注释）；`DEFAULT_MANUFACTURING_RULES.caseConnectors` = `{enabled:true, type:'cam-lock', endMarginMm:37, holesPerJoint:2, diameterMm:15, depthMm:13, pairMachining:true}`。
+
+#### 23.8.6 验收结果（P7.3）
+
+- `tsc --noEmit`：0 错。
+- `verify:manufacturing`：101/101（§12 7 + §13 23 + **§14 新增 39**：A 结构性 / B 三合一 verified（侧顶底、边=top+bottom/left+right、孔位=37/563、provenance、工厂参数）/ C 木榫（位置同算法）/ D 不同进深 500/600/700 孔位随之变 / E 不同板厚 15mm 位置不变（只依赖进深）/ F 参数变体只改制造参数 / G 多行柜（侧板 verified、行隔板 unverified）/ H 多柜组合（外壳 verified、组合连接 unverified）/ J 参数缺失非法降级 / K 非连接板无孔 / L 左右一致+几何一致+provenance+不改模型）。§⑥ allowed source 白名单扩展 `deterministic.caseConnectors`（合规，非放宽）；§⑦ 改判「组合连接」专指柜↔柜、排除外壳连接。
+- `verify:fixhint`：27/27（Test Integrity 保留）。
+- `verify:all`（node + UI）：**686/686 通过、0 失败、console 0**，未删旧测试、未放宽旧断言。
+- 原层板托孔（§13）与封边/背板（§12）验收全部继续过。
+
+#### 23.8.7 本阶段明确不做（避免过度扩展）
+
+铰链孔、抽屉五金、完整五金库、CNC / 套料 / 自动优化 / 自动 Placement、P8；不重构 Geometry 系统；中立板/行隔板/中板/背板连接与组合连接孔保持 unverified（待真实规则，不伪造坐标）。
+
+#### 23.8.8 核心文件
+
+- `app/src/core/manufacturing/model.ts`（MfgConnectorHoles / MfgConnectorHoleLine）
+- `app/src/core/manufacturing/rules.ts`（MfgCaseConnectorRule / DEFAULT_MANUFACTURING_RULES.caseConnectors / unverifiedAspects 措辞）
+- `app/src/core/manufacturing/derive.ts`（caseConnectorOps / VERIFIED_RULE_EVALUATORS 注册 / unverifiedOps 加 mfgRules / edgeHolePositions / CASE_CONNECTOR_ROLES / CONNECTOR_EDGES）
+- `app/verify/manufacturing-acceptance.ts`（§14 新增 39 条）
+
+#### 23.8.9 对下一阶段（P7.4+）的提示
+
+- 升格中立板/行隔板/中板/背板连接孔与组合连接孔时，须先有确定性位置事实（行隔板 Z 已是几何事实，但连接孔数/配对/与邻板关系尚无规则）→ 任一语义不充分则保持 unverified。
+- 铰链孔依赖更强（需铰杯位置或工厂排孔方案），建议仍置后。
+
+- 本阶段停在 P7.3，未自动进入 P7.4 / P8 或其他阶段。

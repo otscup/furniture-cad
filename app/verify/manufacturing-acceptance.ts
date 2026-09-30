@@ -162,11 +162,11 @@ console.log('P7 · Manufacturing Semantics 验收');
   const geom = generateProject(project, rules);
   const mfg = deriveManufacturing(project, geom, rules);
 
-  // 除"确定性层板托孔"外，没有任何未确认加工被标成 verified（不脑补）
+  // 除"确定性层板托孔 / 箱体外壳连接孔"外，没有任何未确认加工被标成 verified（不脑补）
   const fabricatedVerified = mfg.parts.some((p) =>
-    p.operations.some((o) => ['drilling', 'connector-hole', 'hardware-mount', 'groove'].includes(o.role) && o.verification === 'verified' && o.source !== 'deterministic.shelfElevations'),
+    p.operations.some((o) => ['drilling', 'connector-hole', 'hardware-mount', 'groove'].includes(o.role) && o.verification === 'verified' && o.source !== 'deterministic.shelfElevations' && o.source !== 'deterministic.caseConnectors'),
   );
-  ok('⑥ 除确定性层板托孔外，没有任何未确认加工被标成 verified（不脑补）', !fabricatedVerified);
+  ok('⑥ 除确定性层板托孔/箱体外壳连接孔外，没有任何未确认加工被标成 verified（不脑补）', !fabricatedVerified);
 
   // 层板件本身不再声称托孔（托孔在侧板，固定层板不钻孔）
   const shelf = mfg.parts.find((p) => p.role === 'ShelfPanel')!;
@@ -197,8 +197,8 @@ console.log('P7 · Manufacturing Semantics 验收');
   const geom = generateProject(project, rules);
   const mfg = deriveManufacturing(project, geom, rules);
 
-  // 没有任何组合连接孔被标成 verified
-  const asmVerifiedConn = mfg.parts.some((p) => p.operations.some((o) => o.role === 'connector-hole' && o.verification === 'verified'));
+  // 没有任何「组合连接」孔被标成 verified（箱体内壳连接 deterministic.caseConnectors 是另一回事，已升格）
+  const asmVerifiedConn = mfg.parts.some((p) => p.operations.some((o) => o.role === 'connector-hole' && o.verification === 'verified' && o.source !== 'deterministic.caseConnectors'));
   ok('⑦ 组合连接不生成 verified 加工（不自动编造）', !asmVerifiedConn);
 
   // 但诚实标了一条 unverified 的组合连接孔操作
@@ -529,6 +529,229 @@ console.log('P7 · Manufacturing Semantics 验收');
     ok('⑬ 侧板长 === 几何侧板长（制造只读几何，不重算）', side.length === gSide.length, `mfg=${side.length} geom=${gSide.length}`);
     ok('⑬ 托孔标高 ≤ 侧板长（物理合理，单一尺寸来源）', pin.holes!.elevations.every((e) => e >= 0 && e <= side.length));
     ok('⑬ provenance.manufacturingRuleSetId === 所用规则集', side.provenance.manufacturingRuleSetId === mfgRules.id, `${side.provenance.manufacturingRuleSetId} vs ${mfgRules.id}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ⑭ 箱体外壳连接孔（P7.3）：三合一 / 木榫，verified 且孔位可证明
+// ─────────────────────────────────────────────────────────────────
+{
+  const base = sampleProject(rules);
+  const findConn = (part: ManufacturingPart): ManufacturingOperation | undefined =>
+    part.operations.find((o) => o.role === 'connector-hole' && o.source === 'deterministic.caseConnectors');
+  const findUnvConn = (part: ManufacturingPart): ManufacturingOperation | undefined =>
+    part.operations.find((o) => o.role === 'connector-hole' && o.verification === 'unverified');
+
+  // A. verified 结构性判据（覆盖连接孔）：verified 连接孔 source 非 unverified；
+  //    unverified 连接孔绝不携带 connectorHoles；verified 连接孔必有 connectorHoles。
+  {
+    const mfgAll = deriveManufacturing(base, generateProject(base, rules), rules);
+    let structOk = true;
+    for (const p of mfgAll.parts) for (const o of p.operations) {
+      const coord = o.role === 'connector-hole';
+      if (o.verification === 'verified' && coord && o.source === 'manufacturing-rule:unverified') structOk = false;
+      if (o.verification === 'unverified' && coord && o.connectorHoles) structOk = false;
+      if (o.role === 'connector-hole' && o.verification === 'verified' && !o.connectorHoles) structOk = false;
+    }
+    ok('⑭ verified 连接孔结构性判据：source 非 unverified；unverified 不携带 connectorHoles；verified 必有坐标', structOk);
+  }
+
+  // B. 三合一（默认 cam-lock）：侧/顶/底板带 verified 连接孔，坐标系可证明
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabConn', depth: 600 });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const depth = geom.cabinets['cabConn']!.panels.find((p) => p.role === 'LeftSidePanel')!.width;
+    const expPos = [37, depth - 37]; // edgeHolePositions(depth,37,2)
+
+    const side = mfg.cabinets['cabConn']!.find((p) => p.role === 'LeftSidePanel')!;
+    const top = mfg.cabinets['cabConn']!.find((p) => p.role === 'TopPanel')!;
+    const bottom = mfg.cabinets['cabConn']!.find((p) => p.role === 'BottomPanel')!;
+    const sc = findConn(side)!, tc = findConn(top)!, bc = findConn(bottom)!;
+
+    ok('⑭ 三合一：侧/顶/底板都带 verified 连接孔（source deterministic.caseConnectors）', !!sc && sc.verification === 'verified' && !!tc && tc.verification === 'verified' && !!bc && bc.verification === 'verified');
+    ok('⑭ 三合一：nameZh=三合一连接孔、holeType=cam-lock', sc.nameZh === '三合一连接孔' && sc.connectorHoles!.holeType === 'cam-lock');
+    // 侧板：top/bottom 两条边；顶/底板：left/right 两条边
+    ok('⑭ 三合一：侧板连接边 = top/bottom', !!sc.connectorHoles && deepEqual(sc.connectorHoles.lines.map((l) => l.edge).sort(), ['bottom', 'top']));
+    ok('⑭ 三合一：顶板连接边 = left/right', !!tc.connectorHoles && deepEqual(tc.connectorHoles.lines.map((l) => l.edge).sort(), ['left', 'right']));
+    // 孔位 = 工厂留量(37)作用于几何进深，逐值 === 预期
+    ok('⑭ 三合一：侧板孔位 === 几何进深推导值（37 / 563）', !!sc.connectorHoles && deepEqual(sc.connectorHoles.lines[0]!.positions, expPos), `got=${JSON.stringify(sc.connectorHoles?.lines[0]?.positions)} exp=${JSON.stringify(expPos)}`);
+    ok('⑭ 三合一：顶/底板孔位与侧板一致（共享进深）', !!tc.connectorHoles && !!bc.connectorHoles && deepEqual(tc.connectorHoles.lines[0]!.positions, expPos) && deepEqual(bc.connectorHoles.lines[0]!.positions, expPos));
+    // provenance：joint / withPanelRole 正确
+    ok('⑭ 三合一：侧板 top 边连接对象 = TopPanel（joint side-to-top）', sc.connectorHoles!.lines.some((l) => l.edge === 'top' && l.joint === 'side-to-top' && l.withPanelRole === 'TopPanel'));
+    ok('⑭ 三合一：顶板 left 边连接对象 = LeftSidePanel（joint top-to-left）', tc.connectorHoles!.lines.some((l) => l.edge === 'left' && l.joint === 'top-to-left' && l.withPanelRole === 'LeftSidePanel'));
+    // 工厂参数逐字段来自规则
+    const cc = DEFAULT_MANUFACTURING_RULES.caseConnectors;
+    ok('⑭ 三合一：孔径/孔深/配对加工来自规则', sc.connectorHoles!.diameterMm === cc.diameterMm && sc.connectorHoles!.depthMm === cc.depthMm && sc.connectorHoles!.pairMachining === cc.pairMachining);
+  }
+
+  // C. 木榫（wood-dowel）：同位置算法，孔型不同
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabDowel', depth: 600 });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, caseConnectors: { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, type: 'wood-dowel' } });
+    const depth = geom.cabinets['cabDowel']!.panels.find((p) => p.role === 'LeftSidePanel')!.width;
+    const side = mfg.cabinets['cabDowel']!.find((p) => p.role === 'LeftSidePanel')!;
+    const sc = findConn(side)!;
+    ok('⑭ 木榫：nameZh=木榫连接孔、holeType=wood-dowel', sc.nameZh === '木榫连接孔' && sc.connectorHoles!.holeType === 'wood-dowel');
+    ok('⑭ 木榫：孔位与三合一同算法（几何进深推导，位置不变）', deepEqual(sc.connectorHoles!.lines[0]!.positions, [37, depth - 37]));
+  }
+
+  // D. 不同进深 → 孔位随之变化（位置来自几何进深，单一来源）
+  for (const D of [500, 600, 700]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabD_${D}`, depth: D });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    const sc = findConn(side)!;
+    const expect = [37, D - 37];
+    ok(`⑭ 进深 ${D}：侧板孔位 === 几何进深推导（37 / ${D - 37}）`, !!sc && deepEqual(sc.connectorHoles!.lines[0]!.positions, expect), `got=${JSON.stringify(sc?.connectorHoles?.lines[0]?.positions)}`);
+  }
+
+  // E. 不同板厚 → 连接孔位置不变（只依赖进深 panel.width，不依赖 thickness），几何一致
+  {
+    const thin = rules.materials['M_BOARD_15_WOOD'];
+    const cab18 = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabT18', depth: 600 });
+    const proj18: Project = { ...base, cabinets: [cab18] };
+    const side18 = deriveManufacturing(proj18, generateProject(proj18, rules), rules).cabinets['cabT18']!.find((p) => p.role === 'LeftSidePanel')!;
+    let sameAcrossThickness = true;
+    if (thin) {
+      const cab15 = createCabinet({ id: 'cabT15', name: 'cabT15', roomId: 'room_001', placement: { x: 0, y: 0, rotation: 0 }, params: { width: 2400, height: 2400, depth: 600, boardMaterial: 'M_BOARD_15_WOOD' }, layout: { type: 'row', widthMode: 'fit_total', units: [mkUnit('shelves', 1200)] }, rules });
+      const proj15: Project = { ...sampleProject(rules), cabinets: [cab15] };
+      const side15 = deriveManufacturing(proj15, generateProject(proj15, rules), rules).cabinets['cabT15']!.find((p) => p.role === 'LeftSidePanel')!;
+      const p18 = generateProject(proj18, rules).cabinets['cabT18']!.panels.find((p) => p.role === 'LeftSidePanel')!.width;
+      const p15 = generateProject(proj15, rules).cabinets['cabT15']!.panels.find((p) => p.role === 'LeftSidePanel')!.width;
+      // 两块板进深都 = 600 ⇒ 孔位必须逐值相等（证明位置不随板厚变）
+      sameAcrossThickness = deepEqual(findConn(side18)!.connectorHoles!.lines[0]!.positions, findConn(side15)!.connectorHoles!.lines[0]!.positions) && p18 === 600 && p15 === 600;
+      ok('⑭ 不同板厚(18→15mm)：连接孔位置不变（只依赖进深，几何一致）', sameAcrossThickness, `p18=${p18} p15=${p15}`);
+    } else {
+      // 无 15mm 板材可对比时，退而证明位置仅来自 panel.width（进深），与厚度无关
+      const g18 = generateProject(proj18, rules).cabinets['cabT18']!;
+      const sideGeom = g18.panels.find((p) => p.role === 'LeftSidePanel')!;
+      sameAcrossThickness = deepEqual(findConn(side18)!.connectorHoles!.lines[0]!.positions, [37, sideGeom.width - 37]);
+      ok('⑭ 连接孔位置 === 几何进深推导（与板厚无关，取现有板材验证）', sameAcrossThickness);
+    }
+  }
+
+  // F. 不同参数（holesPerJoint / endMargin）只改变制造参数与孔位，不改几何事实
+  for (const v of [
+    { endMarginMm: 20, holesPerJoint: 1 },
+    { endMarginMm: 50, holesPerJoint: 3 },
+  ]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabP_${v.endMarginMm}_${v.holesPerJoint}`, depth: 600 });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, caseConnectors: { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, ...v } });
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    const sc = findConn(side)!;
+    const expPos = v.holesPerJoint === 1 ? [Math.round(600 / 2)] : v.holesPerJoint === 3 ? [50, 300, 550] : [v.endMarginMm, 600 - v.endMarginMm];
+    ok(`⑭ 参数(边距${v.endMarginMm}/每边${v.holesPerJoint}孔)：孔位来自规则`, !!sc && deepEqual(sc.connectorHoles!.lines[0]!.positions, expPos), `got=${JSON.stringify(sc?.connectorHoles?.lines[0]?.positions)} exp=${JSON.stringify(expPos)}`);
+    ok(`⑭ 参数(边距${v.endMarginMm}/每边${v.holesPerJoint}孔)：工厂参数逐字段反映`, !!sc && sc.connectorHoles!.lines.length === 2);
+  }
+
+  // G. 多行柜：侧板仍 verified 连接（主外壳），行隔板连接保持 unverified（诚实）
+  {
+    const twoRow = mkCab([
+      { h: 'fill', units: [mkUnit('shelves', 1200)] },
+      { h: 600, units: [mkUnit('shelves', 1200)] },
+    ], { id: 'cabConnRow' });
+    const proj: Project = { ...base, cabinets: [twoRow] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets['cabConnRow']!.find((p) => p.role === 'LeftSidePanel')!;
+    ok('⑭ 多行柜：侧板仍带 verified 外壳连接孔', !!findConn(side) && findConn(side)!.verification === 'verified');
+    const rd = mfg.parts.find((p) => p.role === 'RowDividerPanel')!;
+    ok('⑭ 多行柜：行隔板连接保持 unverified（待真实规则，不脑补）', !!findUnvConn(rd) && findUnvConn(rd)!.detail!.includes('待真实规则'));
+    // 行隔板不是 verified 连接孔
+    ok('⑭ 多行柜：行隔板不带 verified 连接孔（无坐标）', !rd.operations.some((o) => o.role === 'connector-hole' && o.verification === 'verified'));
+  }
+
+  // H. 多柜组合（authored connection）：外壳连接仍 verified，组合连接仍 unverified
+  {
+    const a = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabCA' });
+    const b = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabCB' });
+    const conn: Connection = { id: 'conn_c', kind: 'butt', a: { cabinetId: 'cabCA' }, b: { cabinetId: 'cabCB' }, origin: 'authored' };
+    const asm: FurnitureAssembly = { id: 'asm_c', name: '并排组', roomId: 'room_001', memberIds: ['cabCA', 'cabCB'], connections: [conn] };
+    const proj: Project = { ...sampleProject(rules), cabinets: [a, b], assemblies: [asm] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const sideA = mfg.cabinets['cabCA']!.find((p) => p.role === 'LeftSidePanel')!;
+    ok('⑭ 多柜组合：成员柜外壳连接仍 verified（确定性，不受组合声明影响）', !!findConn(sideA) && findConn(sideA)!.verification === 'verified');
+    ok('⑭ 多柜组合：组合连接仍 unverified（组合连接加工孔，不自动生成）', mfg.parts.some((p) => p.source.cabinetId === 'cabCA' && !!findUnvConn(p) && (findUnvConn(p)!.detail ?? '').includes('assembly connector')));
+  }
+
+  // J. 参数缺失 / 非法 → 降级 unverified，不产生坐标
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabMissC' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const missing: typeof DEFAULT_MANUFACTURING_RULES = { ...DEFAULT_MANUFACTURING_RULES, caseConnectors: { enabled: true, type: 'cam-lock', source: 'deterministic.caseConnectors', endMarginMm: 37, holesPerJoint: 2 } as unknown as typeof DEFAULT_MANUFACTURING_RULES['caseConnectors'] };
+    const mfg = deriveManufacturing(proj, geom, rules, missing);
+    const side = mfg.cabinets['cabMissC']!.find((p) => p.role === 'LeftSidePanel')!;
+    const unv = findUnvConn(side);
+    ok('⑭ 参数缺失：外壳连接降级 unverified（不脑补、不补默认值）', !!unv && unv.source === 'manufacturing-rule:unverified' && (unv.detail ?? '').includes('参数非法'));
+    ok('⑭ 参数缺失：不产生 verified 连接孔', !findConn(side));
+  }
+  for (const bad of [
+    { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, holesPerJoint: 0 },
+    { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, endMarginMm: 400 }, // ≥ 进深/2(600/2=300) ⇒ 两孔交叉
+    { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, diameterMm: 0 },
+  ]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabBadC_${bad.holesPerJoint}_${bad.endMarginMm}_${bad.diameterMm}` });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, caseConnectors: bad });
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    ok(`⑭ 参数非法(hole=${bad.holesPerJoint},margin=${bad.endMarginMm},d=${bad.diameterMm})：降级 unverified`, !findConn(side) && !!findUnvConn(side));
+  }
+  // 信息不足（规则未启用）→ 外壳连接标 unverified（open question），不脑补
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabOffC' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, caseConnectors: { ...DEFAULT_MANUFACTURING_RULES.caseConnectors, enabled: false } });
+    const side = mfg.cabinets['cabOffC']!.find((p) => p.role === 'LeftSidePanel')!;
+    ok('⑭ 规则未启用（信息不足）：外壳连接标 unverified，无坐标', !findConn(side) && !!findUnvConn(side) && !findUnvConn(side)!.connectorHoles);
+  }
+
+  // K. 非连接板不能产生连接孔：层板 / 门板无 connectorHoles；中立板/行隔板只有 unverified
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabNoConn' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const shelf = mfg.cabinets['cabNoConn']!.find((p) => p.role === 'ShelfPanel')!;
+    ok('⑭ 层板件不带连接孔（托孔在侧板、连接孔在侧/顶/底）', !shelf.operations.some((o) => o.role === 'connector-hole'));
+    // 门板来自带门样本柜（本 shelves 柜无门）：门板不带 verified 连接孔
+    const doorMfg = deriveManufacturing(base, generateProject(base, rules), rules);
+    const door = doorMfg.parts.find((p) => p.role === 'DoorPanel');
+    ok('⑭ 门板不带连接孔（铰链孔仍 unverified，非本规则）', !door || !door.operations.some((o) => o.role === 'connector-hole' && o.verification === 'verified'));
+  }
+
+  // L. 左右侧板来源一致 + 制造尺寸与几何一致 + provenance + 无第二尺寸 + 不修改模型
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabProvC' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfgRules = DEFAULT_MANUFACTURING_RULES;
+    const mfg = deriveManufacturing(proj, geom, rules, mfgRules);
+    const L = mfg.cabinets['cabProvC']!.find((p) => p.role === 'LeftSidePanel')!;
+    const R = mfg.cabinets['cabProvC']!.find((p) => p.role === 'RightSidePanel')!;
+    const lC = findConn(L)!, rC = findConn(R)!;
+    ok('⑭ 左右侧板都带 verified 外壳连接孔', !!lC && !!rC && lC.verification === 'verified' && rC.verification === 'verified');
+    ok('⑭ 左右侧板连接孔（边/位置）一致', !!lC && !!rC && deepEqual(lC.connectorHoles!.lines, rC.connectorHoles!.lines));
+    const gL = geom.cabinets['cabProvC']!.panels.find((p) => p.role === 'LeftSidePanel')!;
+    ok('⑭ 侧板长 === 几何侧板长（制造只读几何，不重算）', L.length === gL.length, `mfg=${L.length} geom=${gL.length}`);
+    ok('⑭ 连接孔位置来自几何进深（panel.width），不重算第二尺寸', lC.connectorHoles!.lines[0]!.positions.every((p) => p >= 0 && p <= gL.width) && gL.width === cab.params.depth);
+    ok('⑭ provenance.manufacturingRuleSetId === 所用规则集', L.provenance.manufacturingRuleSetId === mfgRules.id);
+    // 不修改 Semantic Model：派生前后项目柜体参数不变
+    const before = JSON.stringify(base.cabinets.map((c) => c.params));
+    deriveManufacturing(proj, geom, rules, mfgRules);
+    const after = JSON.stringify(base.cabinets.map((c) => c.params));
+    ok('⑭ 派生不修改 Semantic Model（柜体 params 派生前后一致）', before === after);
   }
 }
 

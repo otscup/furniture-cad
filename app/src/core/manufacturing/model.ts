@@ -33,7 +33,7 @@ export type MfgOperationRole =
   | 'edge-banding' // 封边（当前唯一 verified 的加工，来自几何 panel.edge）
   | 'back-panel-treatment' // 背板工艺（来自语义 cab.params.backPanel.method）
   | 'drilling' // 钻孔（层板托孔 / 铰链孔 / 抽屉五金孔）—— 当前 unverified
-  | 'connector-hole' // 连接孔（箱体三合一 / 组合连接）—— 当前 unverified
+  | 'connector-hole' // 连接孔（箱体外壳三合一 / 木榫可 verified；组合连接仍 unverified）
   | 'groove' // 开槽（未来扩展点）
   | 'hardware-mount' // 五金安装（未来扩展点）
   | 'machining'; // 通用加工（未来扩展点）
@@ -55,6 +55,45 @@ export interface MfgDrillHoles {
   insetBackMm: number;
 }
 
+/**
+ * 箱体连接孔（三合一 / 木榫）的坐标描述 —— **只有 verified 连接孔才允许填**，
+ * unverified 一律不填（绝不脑补坐标）。
+ *
+ * ── 坐标约定（关键：不依赖柜体世界坐标、不依赖第二套尺寸）──
+ *   连接孔沿板件的**某条边**钻，孔位用「面板自身坐标系」表达：
+ *     · `edge`        = 这块板自己的哪条边（板件边缘，CNC 直接认）；
+ *     · `positions`   = 沿该边的位置（mm，**沿进深方向、从背面 Y=0 量起**）；
+ *     · 进深这一维 = 本板 `panel.width`（= 柜进深 p.depth），**只读几何，不另算**。
+ *   为什么能这样做：箱体外壳主连接（侧板↔顶板/底板、顶板/底板↔侧板）的孔线永远
+ *   平行于进深轴、在两侧/顶底板各自的边缘上 —— 同一套 `positions` 对两块板都成立
+ *   （它们共享进深），所以在每块板各自的「边 + 沿边位置」里描述即可，无需柜体 Z。
+ *   这样制造层只读 `panel.width`（单一尺寸来源），不重新计算任何板件尺寸。
+ */
+export interface MfgConnectorHoles {
+  /** 五金类型：三合一（偏心件+连接杆）或木榫。来自制造规则，非几何非语义。 */
+  holeType: 'cam-lock' | 'wood-dowel';
+  /** 孔径（mm）。工厂参数。 */
+  diameterMm: number;
+  /** 孔深（mm，沿板厚方向钻入）。工厂参数（应 ≤ 板厚）。 */
+  depthMm: number;
+  /** 是否两块板配对加工（箱体外壳连接恒为 true：侧与顶/底都钻）。 */
+  pairMachining: boolean;
+  /** 本板每条需钻连接孔的边 + 沿边孔位 + 连接对象（provenance）。 */
+  lines: MfgConnectorHoleLine[];
+}
+
+/** 单条连接孔线（某块板的一条边上的全部连接孔） */
+export interface MfgConnectorHoleLine {
+  /** 这块板自己的哪条边（板件边缘）。 */
+  edge: 'top' | 'bottom' | 'left' | 'right' | 'front' | 'back';
+  /** 沿该边的孔位（mm，沿进深从背面 Y=0 量起）。**来自工厂留量规则作用于几何进深**。 */
+  positions: number[];
+  /** 这条线对应哪种连接（provenance，便于审计与排产）。 */
+  joint: 'side-to-top' | 'side-to-bottom' | 'top-to-left' | 'top-to-right' | 'bottom-to-left' | 'bottom-to-right';
+  /** 连接到的另一块板（geometry role，provenance）。 */
+  withPanelRole: MfgPartRole;
+}
+
 /** 单条制造加工：角色 / 来源 / 置信 / 验证状态，四件套缺一不可 */
 export interface ManufacturingOperation {
   role: MfgOperationRole;
@@ -74,6 +113,8 @@ export interface ManufacturingOperation {
   detail?: string;
   /** 钻孔坐标（仅 verified 钻孔填；unverified 不填，避免下料尺寸被猜出来） */
   holes?: MfgDrillHoles;
+  /** 连接孔坐标（仅 verified 连接孔填；unverified 不填，避免孔位被猜出来） */
+  connectorHoles?: MfgConnectorHoles;
 }
 
 /** 制造件大类：回答「这是什么」而不只是一块矩形 */

@@ -88,6 +88,51 @@ export interface MfgShelfPinRule {
 }
 
 /**
+ * 箱体外壳连接孔（三合一 / 木榫）—— P7.3 第二条真实制造规则，满足 VERIFIED_PROMOTION_CHECKLIST。
+ *
+ * ── 性质澄清（与 P7.2 层板托孔一脉相承）──
+ *   箱体外壳是几何事实：侧板、顶板、底板永远存在且彼此相接（标准 carcass）。
+ *   连接的「孔在哪里」由两部分决定：
+ *     · **几何事实**：哪两块板连接 + 连接边 + 进深这一维（`panel.width` = p.depth）。
+ *       拓扑（侧↔顶/底、顶/底↔侧）由板件 role 直接判定，制造层只读、不重算、不猜。
+ *     · **工厂参数**：孔型（三合一/木榫）、孔径、孔深、边距、每边孔数、是否配对加工。
+ *       这些**不是几何、不是语义**，来自本规则。
+ *   孔位坐标用「板件自身边 + 沿边位置」表达（见 model.ts MfgConnectorHoles），
+ *   沿边位置 = 工厂留量规则（endMargin + 孔数）作用于几何进深 —— 不产生第二尺寸真相源。
+ *
+ * ── verified 升格触发（确定性，缺一不可）──
+ *   ① mfgRules.caseConnectors.enabled = true；
+ *   ② 板件 role ∈ {LeftSidePanel, RightSidePanel, TopPanel, BottomPanel}（其余结构板待真实规则）；
+ *   ③ 孔线位置 = 工厂留量作用于几何进深（panel.width），不重算；
+ *   ④ 工厂参数完整且合法（见 derive.ts 参数校验；缺失/非法 → 降级 unverified）。
+ *
+ * ── 本阶段只做「最可证明的子集」──
+ *   仅箱体外壳主连接（侧↔顶/底、顶/底↔侧）升格 verified；中立板/行隔板/中板/背板与
+ *   侧板的连接、以及柜↔柜组合连接，当前规则无法确定性推出孔位，仍标 unverified
+ *   （不伪造语义、不脑补坐标）。这与用户 P7.3 指示「先实现确定性最强的一种连接方式」一致。
+ */
+export interface MfgCaseConnectorRule {
+  enabled: boolean;
+  /**
+   * 孔型：三合一（偏心连接件）或木榫。决定哪些板钻、孔几何不同，但**位置算法相同**
+   * （都落在同一连接边的同一组进深位置上），故用同一规则 + 此工厂参数切换。
+   */
+  type: 'cam-lock' | 'wood-dowel';
+  /** 孔位来源：几何事实（侧↔顶/底拓扑 + 进深）被工厂留量规则派生。 */
+  source: 'deterministic.caseConnectors';
+  /** 距板两端的最小边距（mm）。工厂参数；两孔不得交叉 ⇒ 须 < 进深/2。 */
+  endMarginMm: number;
+  /** 每条连接边的孔数（含两端）。工厂参数；≥1。 */
+  holesPerJoint: number;
+  /** 孔径（mm）。工厂参数。 */
+  diameterMm: number;
+  /** 孔深（mm，沿板厚钻入）。工厂参数；应 ≤ 板厚（板厚为几何事实，制造层只读）。 */
+  depthMm: number;
+  /** 是否两块板配对加工（箱体外壳连接恒为 true）。 */
+  pairMachining: boolean;
+}
+
+/**
  * 当前制造规则**尚未**能确定性给出的加工。
  * 制造派生层遇到这些角色/连接，一律标 unverified，**绝不脑补孔位或坐标**。
  */
@@ -98,6 +143,7 @@ export interface ManufacturingRuleSet {
   edgeBanding: MfgEdgeBandingRule;
   backPanel: MfgBackPanelRule;
   shelfPins: MfgShelfPinRule;
+  caseConnectors: MfgCaseConnectorRule;
   /**
    * 必须标记 unverified 的制造方面（按角色/连接罗列，便于审计与未来逐项点亮）。
    * 这些不是「不做」，而是「当前规则无法确认，需工厂排孔/工艺方案补」。
@@ -108,7 +154,7 @@ export interface ManufacturingRuleSet {
 export const DEFAULT_MANUFACTURING_RULES: ManufacturingRuleSet = {
   id: 'mfg_factory_default_v1',
   name: '工厂默认制造规则（占位，待真实工厂校准）',
-  note: 'P7 占位值。换工厂 = 换本文件，不改代码。已确认能力：封边、背板工艺、层板托孔（几何标高派生，侧板钻孔）。其余加工标 unverified。',
+  note: 'P7 占位值。换工厂 = 换本文件，不改代码。已确认能力：封边、背板工艺、层板托孔（几何标高派生，侧板钻孔）、箱体外壳连接孔（侧↔顶/底，几何拓扑+进深派生，侧/顶/底板钻孔）。其余加工标 unverified。',
   edgeBanding: { enabled: true, source: 'geometry.edge' },
   backPanel: { source: 'semantic.backPanel.method' },
   shelfPins: {
@@ -118,10 +164,20 @@ export const DEFAULT_MANUFACTURING_RULES: ManufacturingRuleSet = {
     insetFrontMm: 37,
     insetBackMm: 37,
   },
+  caseConnectors: {
+    enabled: true,
+    type: 'cam-lock',
+    source: 'deterministic.caseConnectors',
+    endMarginMm: 37,
+    holesPerJoint: 2,
+    diameterMm: 15,
+    depthMm: 13,
+    pairMachining: true,
+  },
   unverifiedAspects: [
     'hinge boring（铰链孔）',
     'drawer hardware mount holes（抽屉五金安装孔）',
-    'case connector holes（箱体三合一/木榫连接孔）',
+    'case connector holes for 中立板/行隔板/中板/背板（待真实规则）',
     'assembly connector machining（组合连接加工孔）',
   ],
 };

@@ -90,16 +90,16 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 / §16 P1 / §17 P2 / §18 P3 / §19 P4 / §23 P7+P7.1 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（P0→P7，逐步推进，每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353` → P7 Manufacturing Semantics 一阶段（manufacturing/ 纯派生层：尺寸只读几何、verified 仅封边+背板、其余 unverified 不脑补；bridge 无损回投影接 BOM/DXF；只读制造页签；32 条验收）✅ `2552072` → P7.1 Manufacturing Rule Hardening + Test Integrity（层板托孔升格 verified、numOrUndef/countText 堵"缺失=0"假绿、derive/rules/model 扩展、ManufacturingRuleSet 分类定稿、39+27 验收）✅ `0ec9c77` → P7.2 Manufacturing Rule Architecture Review + Shelf Pin Rule Hardening（equalSpacing 定性为几何辅助/层板标高=几何事实、VERIFIED_RULE_EVALUATORS 注册表派发、verified 升格 9 条落 VERIFIED_PROMOTION_CHECKLIST、shelfPinOps 参数闸门、manufacturing 39→62 验收）✅ `a867f98`。**停在 P7.2，不自动进 P7.3/P8。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353` → P7 Manufacturing Semantics 一阶段（manufacturing/ 纯派生层：尺寸只读几何、verified 仅封边+背板、其余 unverified 不脑补；bridge 无损回投影接 BOM/DXF；只读制造页签；32 条验收）✅ `2552072` → P7.1 Manufacturing Rule Hardening + Test Integrity（层板托孔升格 verified、numOrUndef/countText 堵"缺失=0"假绿、derive/rules/model 扩展、ManufacturingRuleSet 分类定稿、39+27 验收）✅ `0ec9c77` → P7.2 Manufacturing Rule Architecture Review + Shelf Pin Rule Hardening（equalSpacing 定性为几何辅助/层板标高=几何事实、VERIFIED_RULE_EVALUATORS 注册表派发、verified 升格 9 条落 VERIFIED_PROMOTION_CHECKLIST、shelfPinOps 参数闸门、manufacturing 39→62 验收）✅ `a867f98` → P7.3 箱体连接孔 Manufacturing Rule（caseConnectorOps 注册进 VERIFIED_RULE_EVALUATORS、外壳主连接 verified 三合一/木榫、manufacturing 39→101 验收）✅ `P7.3HASH`。**停在 P7.3，不自动进 P7.4/P8。**
 - **P2 关系层三条纪律**（`core/relations.ts` 是唯一实现）：① 关系层**不产生几何**（建组合前后 BOM/stats/plan/views/中立导出逐字节不变）；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开 —— **只校验声明，推断只用于 UI 表达，不据此报错**。`stack` 因柜体没有 Z 无法核对，允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`（INFO，给两柜高与"若真叠放总高约 N"）—— 宁可说"没核"，不可假装核过。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容 / 关键架构决策 / 测试结果 / 遗留问题 / commit hash）。
 
-## 本会话进行中（P7.2 · 制造规则架构审查 + 层板托孔硬化）
-- **基线 `0ec9c77`（P7.1 已验收）**，本阶段**不新增任何 verified 加工**（铰链/三合一/木榫/背板槽仍 unverified），目标=验证 P7.1 架构能否承载后续真实规则。
-- **① 层板托孔性质判定**：`equalSpacing`（allocate.ts）定性为**几何辅助算法**（非制造规则）；层板标高=几何事实；规则=「在层板标高处钻孔」确定性决策（位置读几何事实、孔型=工厂参数、是否钻=确定性触发）。是名副其实的确定性规则，非占位。
-- **② 架构可扩展**：`derive.ts` 加 `VERIFIED_RULE_EVALUATORS` 注册表（统一 `MfgRuleEvalCtx`），新增规则=加纯函数 evaluator+注册，**不再向 buildPart 堆 if/else**；每条 evaluator 须自判适用面（shelfPinOps 判左右侧板、backPanelOps 判 BackPanel——漏自判曾被既有 ⑥ 测试抓出）。
-- **③ verified 升格 9 条**：`rules.ts` 导出 `VERIFIED_PROMOTION_CHECKLIST`（9 条），全满足才 verified，否则 unverified/unsupported；`shelfPinOps` 加参数合法性闸门（holes<1 或留量非数/负→降级 unverified，不补默认不脑补）。
-- **④ 测试硬化**：`verify:manufacturing` 新增 §13（23 条：结构性判据/不同柜高/多行/参数变体/边界高度/参数缺失非法/不应打孔/左右侧板/provenance/无第二尺寸），39→62。
-- **验收**：tsc 0 错；`verify:manufacturing` 62/62；`verify:fixhint` 27/27；全量 `verify:all` 待跑（UI 回归中）。架构边界全保持。
-- 文档加 §23.7 P7.2 记录；commit `a867f98`（hash 已回填路线行）。
-- **下一步建议（写进 §23.7.8）**：升格铰链/三合一/木榫复用注册表+二分法(几何事实位置 vs 工厂参数孔型)；优先做箱体连接孔(位置可由板件交点派生，最易走通范式)；铰链孔依赖更强稍后。
+## 本会话进行中（P7.3 · 箱体连接孔 Manufacturing Rule，已完成验收）
+- **基线 `a867f98`（P7.2 已验收）**，本阶段实现**箱体外壳主连接孔（三合一 / 木榫）** verified，复用 P7.2 注册表 + 二分法范式。
+- **① 审查结论**：Panel 无坐标/relations 仅柜↔柜接触，但外壳主连接（侧↔顶/底）拓扑由 role 直接判定（标准 carcass 永远存在），进深=`panel.width` 共享 → 孔位可确定性表达在「板件自身边 + 沿进深(背面 Y=0 量起)」，无第二尺寸源。这是能严格证明的子集。
+- **② 最可证明子集**：仅 `role ∈ {LeftSidePanel, RightSidePanel, TopPanel, BottomPanel}` 升格 verified；中立板/行隔板/中板/背板连接、柜↔柜组合连接仍 unverified（不伪造语义、不脑补坐标）。
+- **③ 二分法**：位置=几何事实（CONNECTOR_EDGES 拓扑 + `edgeHolePositions(depth, endMargin, count)` 制造间距助手）；孔型/孔径/孔深/边距/每边孔数/配对加工=工厂参数 `mfgRules.caseConnectors`（`source:'deterministic.caseConnectors'`）。Manufacturing 仍只读派生层。
+- **④ 注册表架构**：新增纯函数 `caseConnectorOps(ctx)`（自判适用面 + 参数闸门），直接注册进既有 `VERIFIED_RULE_EVALUATORS`（现 4 项）；`unverifiedOps` 加 `mfgRules` 参数判定覆盖。**无需新抽象、未重构 Geometry。**
+- **⑤ 验收**：tsc 0 错；`verify:manufacturing` 101/101（§14 新增 39 条全过，§12/§13 旧断言保留未放宽）；`verify:fixhint` 27/27；全量 `verify:all` 686/686 通过、0 失败、console 0。
+- 文档加 §23.8 P7.3 记录；主 commit 待回填 `P7.3HASH` 至路线行。
+- **下一步（写进 §23.8.9）**：中立板/行隔板/中板/背板连接孔与组合连接孔须先有确定性位置事实再升格；铰链孔依赖更强置后。

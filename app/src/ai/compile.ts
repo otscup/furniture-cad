@@ -12,6 +12,7 @@ import {
   ATTACH_ALIGNMENTS,
   resolvePlacement,
   sceneFromProject,
+  toPlacementIntentDecl,
   type AttachAlignment,
   type PlacementAlignment,
   type PlacementFace,
@@ -516,7 +517,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         const faceZh: Record<string, string> = { left: '左端', right: '右端', front: '正面', back: '背面' };
         return {
           ok: true,
-          command: CMD.placeCabinet(cab, ra.placement, src, `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面 → (${ra.placement.x}, ${ra.placement.y})`),
+          command: CMD.placeCabinet(cab, ra.placement, src, `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面 → (${ra.placement.x}, ${ra.placement.y})`, toPlacementIntentDecl(attachIntent)),
           summary: `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面`,
           // 贴上去的可能是门脸 —— 几何成立不等于设计合理，结论带出去但不拦
           design: designCheckPlacement(project, attachIntent, ra),
@@ -545,7 +546,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
           : `与「${refCab.name}」${String(p.alignment ?? '')}对齐`;
       return {
         ok: true,
-        command: CMD.placeCabinet(cab, r.placement, src, `落位「${cab.name}」${relationZh} → (${r.placement.x}, ${r.placement.y})`),
+        command: CMD.placeCabinet(cab, r.placement, src, `落位「${cab.name}」${relationZh} → (${r.placement.x}, ${r.placement.y})`, toPlacementIntentDecl(intent)),
         summary: `落位「${cab.name}」：${relationZh}`,
         design: designCheckPlacement(project, intent, r),
       };

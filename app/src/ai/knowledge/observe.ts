@@ -22,7 +22,12 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-import type { Command, CommandSource, DiffEntry } from '../../core/commandBus.ts';
+import type { Command, CommandSource, DiffEntry, PlacementAuthority } from '../../core/commandBus.ts';
+import type { PlacementIntentDecl } from '../../core/placement.ts';
+import {
+  ADJACENT_DEFAULT_ALIGNMENT,
+  ATTACH_DEFAULT_ALIGNMENT,
+} from '../../core/placement.ts';
 import {
   contextKey,
   placementContextZh,
@@ -59,6 +64,22 @@ const norm360 = (deg: number): number => ((Math.round(deg) % 360) + 360) % 360;
  *   · 'ui' / 'mcp' = 界面手改 / 脚本代用户执行 → 人才做的决定
  */
 const isHumanSource = (s: CommandSource): boolean => s !== 'ai' && s !== 'system';
+
+/**
+ * authority → 证据来源（P8.5-C1）。
+ *
+ * 旧代码用 `cmd.source` 直接代理"是不是人的选择"，但 AI 提案经人点「应用」提交时
+ * source 仍是 'ai'，导致确认过的提案被当成 ai-inferred、结构性收不到落位证据。
+ * 现在 authority 由总线派生：user-authored / user-confirmed → user-observed；
+ * system-resolved → system；unknown（未确认 AI / 导入）→ ai-inferred。
+ * authority 未传（旧调用路径）时退化到旧行为，保证不回归。
+ */
+function authorityToOrigin(authority: PlacementAuthority | undefined, source: CommandSource): KnowledgeEvidence['source'] {
+  if (authority === 'user-authored' || authority === 'user-confirmed') return 'user-observed';
+  if (authority === 'system-resolved') return 'system';
+  if (authority === 'unknown') return 'ai-inferred';
+  return source === 'ai' ? 'ai-inferred' : 'user-observed';
+}
 
 function predicateFromChange(
   ch: DiffEntry,
@@ -141,38 +162,118 @@ function predicateFromChange(
 }
 
 /**
+ * 从 cabinet.place 的落位意图里提取**对齐方式**观察（P8.5-C1）。
+ *
+ * 为什么现在能学 alignment：P8.4 时模型只存 x/y/rotation，"按背面齐还是中心齐"
+ * 落盘即消失、事后无法反推，硬造 relation 字段 = 拿猜测当证据。P8.5 给命令层
+ * 加了 placementIntent（声明通道），确认过的 AI 落位提案把"用了哪个对齐"带进了命令，
+ * 于是 alignment 成了**可观察事实**（不再靠从坐标猜）。
+ *
+ * 门禁（与 orientation 同源纪律）：
+ *   · 必须是人的授权（user-authored / user-confirmed）—— AI 草稿未确认不计；
+ *   · 必须拿得到上下文（contact / turnSide）—— 说不出情形就不产生知识；
+ *   · 永远只产 candidate，不自动 active（弱证据：UI 没有对齐入口，这只算
+ *     "用户接受了 AI 给的对齐"，须用户在知识面板确认才生效）。
+ */
+function alignmentFromIntent(
+  intent: PlacementIntentDecl,
+  human: boolean,
+  placementCtx?: PlacementContext | null,
+): Omit<SemanticObservation, 'evidence'> | null {
+  if (!human) return null;
+  if (!placementCtx || (placementCtx.contact === undefined && placementCtx.turnSide === undefined)) return null;
+  let align: string | undefined;
+  let relZh = '';
+  if (intent.relation === 'adjacent') {
+    align = intent.alignment ?? ADJACENT_DEFAULT_ALIGNMENT[intent.side];
+    relZh = `贴${intent.side}侧`;
+  } else if (intent.relation === 'align') {
+    align = intent.alignment;
+    relZh = `对齐`;
+  } else if (intent.relation === 'attach') {
+    align = intent.alignment ?? ATTACH_DEFAULT_ALIGNMENT;
+    relZh = `面贴合（${intent.targetFace}↔${intent.referenceFace}）`;
+  } else {
+    return null; // absolute 是授权输入，不记为对齐偏好
+  }
+  if (!align) return null;
+  return {
+    predicate: { kind: 'alignment', op: 'prefer', value: align, context: placementCtx },
+    statement: `在${placementContextZh(placementCtx)}里，落位按「${relZh} · ${align}对齐」`,
+  };
+}
+
+/**
  * 从一条已执行的命令里提取语义观察（可能 0 ~ N 条）。
  * 吃 **LogEntry.diff**（CommandBus 已算好的权威路径 diff）—— 观察器只翻译，
  * 不重新 diff（两份判定必然漂移）。
+ *
+ * @param authority 由 CommandBus 派生的落位权威（P8.5-C1）。未传时退化到旧的
+ *        source 代理行为（向后兼容），不回归。
  */
 export function observeCommand(
   cmd: Command,
   diff: DiffEntry[],
   cabinetName?: string,
   placementCtx?: PlacementContext | null,
+  authority?: PlacementAuthority,
 ): SemanticObservation[] {
-  // `cabinet.place` **刻意不在列表里**：它的坐标是 Resolver 算出来的，不是人的选择
-  // （系统自动落位产生偏好 = 把算法的输出当成用户的习惯，必然自我强化）。
-  if (cmd.op !== 'cabinet.update' && cmd.op !== 'cabinet.create' && cmd.op !== 'cabinet.rotate') return [];
   // 撤销/重做不是新事实 —— 不观察（否则 undo 一次会把"旧值"当成新偏好）
   if (cmd.source === 'system') return [];
 
-  const source = cmd.source === 'ai' ? 'ai-inferred' : 'user-observed';
+  const human =
+    authority === 'user-authored' ||
+    authority === 'user-confirmed' ||
+    (authority === undefined && isHumanSource(cmd.source));
+  const origin = authorityToOrigin(authority, cmd.source);
   const detail = cmd.label || cmd.intent?.nl || `${cmd.op} ${diff.map((c) => c.path).join(', ')}`;
+
+  // `cabinet.place` 在 P8.4 刻意不在列表里（它的坐标是 Resolver 算的，不是人的选择）；
+  // P8.5 起：确认过的落位提案会把 placementIntent 带进命令，于是"用了哪个对齐"
+  // 成了可观察事实 —— 列入允许集合，但只从 intent 提取对齐证据（见下），不把
+  // 解析出的坐标当人的习惯。
+  if (
+    cmd.op !== 'cabinet.update' &&
+    cmd.op !== 'cabinet.create' &&
+    cmd.op !== 'cabinet.rotate' &&
+    cmd.op !== 'cabinet.place'
+  )
+    return [];
+
   const out: SemanticObservation[] = [];
-  for (const ch of diff) {
-    const obs = predicateFromChange(ch, isHumanSource(cmd.source), placementCtx);
-    if (!obs) continue;
-    out.push({
-      ...obs,
-      evidence: { at: Date.now(), source, detail, cabinetId: cmd.target?.id },
-      // 落位类偏好挂在**情形**上（contact / turnSide），不挂在某个柜子的名字上：
-      // 挂名字就等于"这只柜喜欢 270°"—— 既不可复用（换个柜子就不算），
-      // 又会在该生效时不生效（scope 不匹配 → 被 scopeMatches 挡掉）。
-      // 是哪只柜改的，证据里 `cabinetId` 已经留痕了，不需要再占用 scope。
-      scopeCabinet: obs.predicate?.context ? undefined : cabinetName,
-    });
+
+  // ① 路径 diff → 谓词（朝向 / 行高 / 分区类型 / 数量 / 尺寸）
+  // 注意：**cabinet.place 不进这条分支**。它的 diff（x/y/rotation）是 Resolver 算出来的，
+  // 不是人的选择——若从这里提取"朝向"，等于把系统输出当成人习惯（P8.4 明令禁止）。
+  // cabinet.place 只走 ②（从声明过的 placementIntent 提取对齐），绝不从坐标反推。
+  if (cmd.op !== 'cabinet.place') {
+    for (const ch of diff) {
+      const obs = predicateFromChange(ch, human, placementCtx);
+      if (!obs) continue;
+      out.push({
+        ...obs,
+        evidence: { at: Date.now(), source: origin, detail, cabinetId: cmd.target?.id },
+        // 落位类偏好挂在**情形**上（contact / turnSide），不挂在某个柜子的名字上：
+        // 挂名字就等于"这只柜喜欢 270°"—— 既不可复用（换个柜子就不算），
+        // 又会在该生效时不生效（scope 不匹配 → 被 scopeMatches 挡掉）。
+        // 是哪只柜改的，证据里 `cabinetId` 已经留痕了，不需要再占用 scope。
+        scopeCabinet: obs.predicate?.context ? undefined : cabinetName,
+      });
+    }
   }
+
+  // ② cabinet.place 的落位意图 → 对齐方式证据（P8.5-C1）
+  if (cmd.op === 'cabinet.place' && cmd.placementIntent) {
+    const alignObs = alignmentFromIntent(cmd.placementIntent, human, placementCtx);
+    if (alignObs) {
+      out.push({
+        ...alignObs,
+        evidence: { at: Date.now(), source: origin, detail, cabinetId: cmd.target?.id },
+        scopeCabinet: undefined,
+      });
+    }
+  }
+
   return out;
 }
 

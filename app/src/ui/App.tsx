@@ -340,7 +340,9 @@ export function App() {
       const cab = e.command.target?.kind === 'cabinet' ? bus.getState().cabinets.find((c) => c.id === e.command.target?.id) : undefined;
       // 落位上下文（P8.4）：朝向类观察必须带"发生在哪一类情形里"，拿不到就不观察
       const pCtx = cab ? placementContextOf(bus.getState(), cab.id) : null;
-      for (const obs of observeCommand(e.command, e.diff, cab?.name, pCtx)) {
+      const prov = e.placementProvenance;
+      const authority = Array.isArray(prov) ? prov[0]?.authority : prov?.authority;
+      for (const obs of observeCommand(e.command, e.diff, cab?.name, pCtx, authority)) {
         saveKnowledge(recordObservation(loadKnowledge(), obs));
       }
     }

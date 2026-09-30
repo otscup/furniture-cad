@@ -51,7 +51,15 @@ export type PredicateKind =
   | 'unitKind'      // 分区类型（枚举：drawerBank/hanging/shelves/open/appliance）
   | 'layoutStyle'   // 布局风格（枚举：moreDrawers/moreHanging/moreOpen）
   /** 柜体朝向 deg（0/90/180/270）—— **只在 PlacementContext 下有意义**，见下 */
-  | 'orientation';
+  | 'orientation'
+  /**
+   * 落位对齐方式（P8.5-C1）—— adjacent/align 用 left/right/front/back/center，
+   * attach 用 start/center/end（沿接触面方向）。**只在 PlacementContext 下有意义**：
+   * "贴着参照柜按背面齐"的偏好，换个接触形态就不一定成立（与 orientation 同源）。
+   * 证据来自用户确认的 AI 落位提案（cabinet.place 的 placementIntent）—— UI 没有
+   * 对齐入口，所以这只算弱证据，须用户在知识面板确认才生效。
+   */
+  | 'alignment';
 
 /** 比较方向：prefer = 软建议值；min/max = 范围边界（hardRule 用）；forbid = 禁止 */
 export type PredicateOp = 'prefer' | 'min' | 'max' | 'forbid';
@@ -80,7 +88,7 @@ export interface PlacementContext {
 }
 
 /** 有上下文的落位类维度（这些维度**不接受**无上下文的谓词） */
-export const PLACEMENT_KINDS: PredicateKind[] = ['orientation'];
+export const PLACEMENT_KINDS: PredicateKind[] = ['orientation', 'alignment'];
 
 export interface KnowledgePredicate {
   kind: PredicateKind;

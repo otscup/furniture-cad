@@ -206,7 +206,7 @@ export function resolveKnowledge(ctx: KnowledgeContext, entries: KnowledgeEntry[
 
 /** 段落维度是否可判定参与冲突（供观察器决定是否生成谓词） */
 export function isJudgable(kind: KnowledgePredicate['kind']): boolean {
-  return NUMERIC_KINDS.has(kind) || kind === 'unitKind' || kind === 'layoutStyle';
+  return NUMERIC_KINDS.has(kind) || kind === 'unitKind' || kind === 'layoutStyle' || kind === 'alignment';
 }
 
 /**
@@ -223,6 +223,23 @@ export function preferredOrientation(res: KnowledgeResolution, ctx: PlacementCon
     if (!contextCovers(p.context, ctx)) continue;
     const n = Number(p.value);
     if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * 当前情形下**建议**的落位对齐方式（P8.5-C1）—— 与 preferredOrientation 同源纪律：
+ * 只回答"建议什么"，不改变几何；只从 `applicable` 读；无依据返回 null。
+ *
+ * 对齐证据来自用户确认的 AI 落位提案（cabinet.place 的 placementIntent），
+ * 属弱证据（UI 没有对齐入口），须用户在知识面板确认才进 applicable。
+ */
+export function preferredAlignment(res: KnowledgeResolution, ctx: PlacementContext): string | null {
+  for (const { entry } of res.applicable) {
+    const p = entry.predicate;
+    if (!p || p.kind !== 'alignment' || p.op !== 'prefer') continue;
+    if (!contextCovers(p.context, ctx)) continue;
+    if (typeof p.value === 'string') return p.value;
   }
   return null;
 }

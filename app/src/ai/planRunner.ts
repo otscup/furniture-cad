@@ -297,6 +297,7 @@ export function commitPlan(run: PlanRun, bus: CommandBus): CommitOutcome {
   if (bus.getVersion() !== run.baseVersion) {
     return { ok: false, error: '模型在预览之后被改动过，这份计划的落点可能已经失效 —— 请重新生成' };
   }
+  markConfirmed(run);
   let applied = 0;
   let skipped = 0;
   /**
@@ -324,6 +325,11 @@ export function commitPlan(run: PlanRun, bus: CommandBus): CommitOutcome {
   return { ok: true, applied, skipped, blockingErrors: bus.issues().filter((i) => i.severity === 'ERROR').length };
 }
 
+/** 标记计划步骤为「用户已确认」——bus 据此把 authority 派生为 user-confirmed（P8.5-C1） */
+function markConfirmed(run: PlanRun): void {
+  for (const step of run.steps) if (step.command) step.command.confirmedPlan = true;
+}
+
 /** 只提交其中指定序号（1 起）的步骤 —— 让用户可以"只要前面两条，第三条不要" */
 export function commitPlanSubset(run: PlanRun, bus: CommandBus, stepIndexes: number[]): CommitOutcome {
   const wanted = new Set(stepIndexes);
@@ -331,6 +337,7 @@ export function commitPlanSubset(run: PlanRun, bus: CommandBus, stepIndexes: num
   if (v0 !== run.baseVersion) {
     return { ok: false, error: '模型在预览之后被改动过 —— 请重新生成计划' };
   }
+  markConfirmed(run);
   let applied = 0;
   let skipped = 0;
   for (let i = 0; i < run.steps.length; i++) {

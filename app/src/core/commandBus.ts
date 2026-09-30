@@ -1,4 +1,5 @@
 import type { Cabinet, Connection, FurnitureAssembly, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
+import type { PlacementIntentDecl } from './placement.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
@@ -89,8 +90,81 @@ export interface Command {
   payload?: CommandPayload;
   /** AI 或 UI 的原始意图，写进审计日志（出事故时唯一能复盘的东西） */
   intent?: { nl?: string; assumptions?: string[] };
+  /**
+   * 落位意图声明（P8.5-C1，命令层 provenance）。
+   *
+   * 只声明"这次落位是怎么来的"（语义关系/面/对齐），**不决定坐标**——
+   * 坐标仍由 Resolver 算、由 `cabinet.place` 写。仅 `cabinet.place` 会带它
+   * （由 compile 从 AI 提案的 relation/reference/face/alignment 重建）。
+   * 它**不在 Semantic Model 里**，不进 project.json、不进任何派生层。
+   */
+  placementIntent?: PlacementIntentDecl;
+  /**
+   * 这条命令是不是"用户确认过的 AI 计划"（P8.5-C1）。
+   *
+   * ⚠ 只由 apply 路径（commitPlan / commitPlanSubset）在用户点「应用」时打上。
+   * 调用方**无权声明 authority**——authority 由总线从 (source × confirmedPlan)
+   * 派生。这个布尔只是一个事实维度（"来自已确认的计划吗"），不是 authority 本身。
+   */
+  confirmedPlan?: boolean;
   /** 人类可读摘要，用于命令历史面板 */
   label?: string;
+}
+
+/**
+ * 落位权威（P8.5-C1）—— 谁**授权**了这次落位，由总线派生，调用方无从伪造。
+ *
+ *   · user-authored   = 人自己给的（界面 / 属性面板 / MCP 显式 / 拖拽）
+ *   · user-confirmed  = AI 提案，人点「应用」确认（confirmedPlan=true）
+ *   · system-resolved = 系统自动（自动贴墙 / 自动落位 / 整组平移 / resize 补偿 / 撤销）
+ *   · unknown         = 导入、手工摆放、不可判定（绝不伪造意图）
+ *
+ * 为什么要有它：P8.4 用 `Command.source` 代理"是不是人的选择"，但 `compile.ts`
+ * 让 AI 编译的命令 source 恒为 'ai'（含用户点应用后的提交）——于是用户确认过的
+ * 提案被当成 ai-inferred，结构性地一条落位证据都收不到。authority 把"授权方"
+ * 从"发出方"里分离出来，确认真的确认过的 AI 落位也算 user 证据。
+ */
+export type PlacementAuthority = 'user-authored' | 'user-confirmed' | 'system-resolved' | 'unknown';
+
+/** 落位 provenance 记录（P8.5-C1，会话内；不进 project.json） */
+export interface PlacementProvenance {
+  targetId: string;
+  /** null = 来源未知（导入 / 手摆）—— 不伪造 intent */
+  intent: PlacementIntentDecl | null;
+  authority: PlacementAuthority;
+  byOp: string;
+  /** 当时的模型版本（不是时间戳：版本是本项目唯一的可复现指针） */
+  atVersion: number;
+  status: 'live' | 'superseded';
+  supersededBy?: { op: string; atVersion: number };
+}
+
+/** 落位相关命令（这些 op 会写 placement，才需要 provenance） */
+const PLACEMENT_OPS = new Set(['cabinet.place', 'cabinet.move', 'cabinet.rotate', 'cabinet.nudge', 'cabinet.resize', 'assembly.move']);
+
+/**
+ * 派生落位权威（P8.5-C1）—— 总线单点，**调用方无从声明 authority**。
+ *
+ *   source='system'            → system-resolved（自动解析 / 撤销 / 整组平移）
+ *   confirmedPlan=true         → user-confirmed（人点「应用」确认过的 AI 提案）
+ *   source∈{ui,mcp}            → user-authored（人自己的动作）
+ *   其余（source='ai' 未确认） → unknown（绝不冒充 user 证据）
+ */
+function derivePlacementAuthority(cmd: Command): PlacementAuthority {
+  if (cmd.source === 'system') return 'system-resolved';
+  if (cmd.confirmedPlan) return 'user-confirmed';
+  if (cmd.source === 'ui' || cmd.source === 'mcp') return 'user-authored';
+  return 'unknown';
+}
+
+/** 一条落位命令影响了哪些柜体的 placement（用于 provenance 的失效判定） */
+function affectedPlacementCabinets(cmd: Command, project: Project): string[] {
+  if (cmd.op === 'assembly.move') {
+    const asm = project.assemblies?.find((a) => a.id === cmd.payload?.assemblyId);
+    return asm ? [...asm.memberIds] : [];
+  }
+  if (cmd.target?.kind === 'cabinet' && cmd.target.id) return [cmd.target.id];
+  return [];
 }
 
 export interface DiffEntry {
@@ -170,6 +244,15 @@ export interface LogEntry {
   issueDelta: { errors: number; warnings: number; added: Issue[] };
   applied: boolean;
   discarded: boolean;
+  /**
+   * 落位 provenance（P8.5-C1，会话内，不进 project.json）。
+   * 仅落位相关命令（cabinet.place / move / rotate / nudge / resize，
+   * assembly.move）会带；其它命令为 undefined。
+   * assembly.move 影响多个成员 → 用数组（每条一个 targetId），同一条命令一次撤销。
+   * ⚠ 任何派生层（几何 / 清单 / DXF / P8.3 校验 / 制造）**一律不读**——
+   * 它是被动记录，真相源永远是 `Cabinet.placement`。
+   */
+  placementProvenance?: PlacementProvenance | PlacementProvenance[];
 }
 
 export interface DerivedSummary {
@@ -922,6 +1005,19 @@ export class CommandBus {
     this.modelVersion++;
     this.geomCache = null;
 
+    // P8.5-C1：落位 provenance（会话内，不进 project.json）。
+    // 只声明不决定坐标；atVersion = 提交后的版本号。总线单点写、派生层不读。
+    const provs: PlacementProvenance[] | undefined = PLACEMENT_OPS.has(cmd.op)
+      ? affectedPlacementCabinets(cmd, draft).map((id) => ({
+          targetId: id,
+          intent: cmd.placementIntent ?? null,
+          authority: derivePlacementAuthority(cmd),
+          byOp: cmd.op,
+          atVersion: this.modelVersion,
+          status: 'live' as const,
+        }))
+      : undefined;
+
     this.entries.push({
       seq: this.entries.length + 1,
       at: Date.now(),
@@ -938,8 +1034,10 @@ export class CommandBus {
       },
       applied: true,
       discarded: false,
+      ...(provs ? { placementProvenance: provs.length === 1 ? provs[0] : provs } : {}),
     });
     this.pointer = this.entries.length - 1;
+    this.recomputeProvenance();
     this.notify();
     return result;
   }
@@ -1335,6 +1433,7 @@ export class CommandBus {
     this.pointer--;
     this.modelVersion++;
     this.geomCache = null;
+    this.recomputeProvenance();
     this.notify();
     return true;
   }
@@ -1347,6 +1446,7 @@ export class CommandBus {
     this.pointer++;
     this.modelVersion++;
     this.geomCache = null;
+    this.recomputeProvenance();
     this.notify();
     return true;
   }
@@ -1397,6 +1497,48 @@ export class CommandBus {
     while (this.pointer < targetSeq) if (!this.redo()) break;
   }
 
+  /**
+   * 重算每只柜 provenance 的 live / superseded（P8.5-C1）。
+   *
+   * 规则：同一只柜的 provenance 记录里，**最后一条（按提交顺序）为 live，
+   * 之前的全为 superseded**（保留为历史来源，不再产生偏好证据）。
+   * 这覆盖了 review §E 的全部失效情形：rotate / move / nudge / resize / 手动移回
+   * 都会产生一条更新的记录 → 旧记录自动 superseded；重跑同一 intent（cabinet.place）
+   * 产生新 live 记录。
+   *
+   * 为什么集中重算而不是"写新时手动标旧"：撤销/重做会改变 active 集合，集中重算
+   * 让 provenance 与模型状态**原子同步**，不存在"模型回去了、provenance 没回去"。
+   * activeLog 只含 applied 且未丢弃的条目，所以被撤销的分支自然不参与。
+   */
+  private recomputeProvenance(): void {
+    const active = this.activeLog();
+    const byCab = new Map<string, Array<{ entry: LogEntry; prov: PlacementProvenance }>>();
+    for (const e of active) {
+      const list = e.placementProvenance;
+      if (!list) continue;
+      const arr = Array.isArray(list) ? list : [list];
+      for (const prov of arr) {
+        const bucket = byCab.get(prov.targetId) ?? [];
+        bucket.push({ entry: e, prov });
+        byCab.set(prov.targetId, bucket);
+      }
+    }
+    for (const bucket of byCab.values()) {
+      for (let i = 0; i < bucket.length; i++) {
+        const prov = bucket[i]!.prov;
+        const last = i === bucket.length - 1;
+        if (last) {
+          prov.status = 'live';
+          prov.supersededBy = undefined;
+        } else {
+          prov.status = 'superseded';
+          const next = bucket[i + 1]!.prov;
+          prov.supersededBy = { op: next.byOp, atVersion: next.atVersion };
+        }
+      }
+    }
+  }
+
   /** 直接替换整个项目（导入 / 恢复版本）—— 也走日志，可撤销 */
   replaceProject(next: Project, label: string): void {
     const prev = this.project;
@@ -1418,6 +1560,9 @@ export class CommandBus {
       applied: true,
       discarded: false,
     });
+    // 导入 = 整批替换模型：导入来源由既有 `cabinet.origin` 回答，provenance 不写
+    // （缺省即 unknown，绝不伪造意图）。清空历史 provenance，避免指向已不存在的柜。
+    for (const e of this.entries) e.placementProvenance = undefined;
     this.pointer = this.entries.length - 1;
     this.notify();
   }

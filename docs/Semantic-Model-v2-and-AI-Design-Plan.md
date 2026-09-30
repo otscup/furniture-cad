@@ -1496,3 +1496,86 @@ predicate = { kind: 'orientation', op: 'prefer', value: 270, context: { contact:
 #### 23.12.9 停在 P8.4
 
 下一步候选（仅记录不做）：alignment 类偏好需先让落位意图可追溯；UI 渲染"设计语义提示"区块；用户偏好影响 Proposal 后的二次确认回路。
+
+---
+
+### 23.13 P8.5 实施记录：落位意图的 Provenance（Placement Intent Provenance，C1 已落地）
+
+> 承接 P8.4 §23.12.5 主动缩范围的原因：**语义模型的 `Cabinet.placement` 不存落位意图**，"按背面齐还是中心齐"落盘即消失、事后只能从坐标猜，于是 alignment 偏好本阶段不做。
+> P8.5 用**命令层 provenance**（审查报告推荐方案 C1）把"这次落位是怎么来的"带进命令，使 alignment 成为**可观察事实**——不再猜。
+> 边界（审查报告 §H 铁律，全部结构保证）：provenance 是被动记录，**不进 Semantic Model、不进 project.json、不进任何派生层**；落位权威由**总线单点派生**，调用方无从声明。
+
+#### 23.13.1 架构审查两个待拍板点（本次实现的处理）
+
+| 待拍板点 | 结论 | 理由 |
+| --- | --- | --- |
+| 跨会话可见是否属验收项 | **否 → 走 C1** | C1 只在命令层加声明通道，不动 `Cabinet/types.ts`、不进 `project.json`、不动 resolver；跨会话持久化（柜体级落盘）列为条件性第二阶段 B，本期不做 |
+| 是否补"用户可选 alignment 入口" | **属产品待办，非数据模型** | UI 当前没有对齐入口，这是产品功能而非数据模型问题；本阶段只把"用了哪个对齐"变成可观察事实（须用户在知识面板确认才生效） |
+
+#### 23.13.2 数据模型（命令层，不进模型）
+
+```ts
+// core/placement.ts —— 复用落位词表，不新造面/对齐词汇（DistributiveOmit 对联合类型逐成员剥键）
+export type PlacementIntentDecl = DistributiveOmit<PlacementIntent, 'targetId'>;
+export function toPlacementIntentDecl(intent: PlacementIntent): PlacementIntentDecl;
+
+// core/commandBus.ts —— 命令只声明"怎么来的"，不决定坐标
+interface Command {
+  placementIntent?: PlacementIntentDecl;  // 仅 cabinet.place 带（compile 从 AI 提案重建）
+  confirmedPlan?:   boolean;             // 仅 apply 路径（commitPlan/commitPlanSubset）打上
+}
+type PlacementAuthority = 'user-authored' | 'user-confirmed' | 'system-resolved' | 'unknown';
+interface PlacementProvenance {           // 会话内，不进 project.json
+  targetId: string; intent: PlacementIntentDecl | null; authority: PlacementAuthority;
+  byOp: string; atVersion: number; status: 'live' | 'superseded'; supersededBy?: { op: string; atVersion: number };
+}
+```
+
+#### 23.13.3 落位权威派生（总线单点，根治 P8.4 根因 A3）
+
+旧代码用 `Command.source` 代理"是不是人的选择"，但 `compile.ts` 让 AI 编译的命令 source 恒为 `'ai'`（含用户点应用后的提交）→ 用户确认过的提案被当成 `ai-inferred`，结构性收不到落位证据。
+
+`derivePlacementAuthority(cmd)` 在总线里**唯一**计算，调用方无权声明：
+
+| `cmd.source` | `confirmedPlan` | authority |
+| --- | --- | --- |
+| `ui` / `mcp` | — | `user-authored`（人的动作） |
+| `ai` | `true`（用户点「应用」确认） | `user-confirmed` |
+| `system` | — | `system-resolved`（自动贴墙/整组平移/撤销） |
+| `ai`（未确认）/ 导入 / 手摆 | — | `unknown`（绝不冒充 user 证据） |
+
+`confirmedPlan` 只由 `planRunner.commitPlan` / `commitPlanSubset` 在用户点「应用」时经 `markConfirmed()` 打上。
+
+#### 23.13.4 失效判定（集中重算，与 undo/redo 原子同步）
+
+`recomputeProvenance()` 在每次 `execute` / `undo` / `redo` 末尾跑，按 `targetId` 分桶、**最后一条 = live，之前全 = superseded**（带 `supersededBy`）。覆盖全部失效情形：rotate / move / nudge / resize / 手动移回 / 重跑同一 intent。因为只读 `activeLog()`（applied 且未丢弃），撤销分支自然退出，provenance 与模型状态原子一致。
+`replaceProject()`（导入）清空所有历史条目的 `placementProvenance`——导入来源由既有 `cabinet.origin` 回答，绝不伪造"导入来的柜是谁摆的"。
+
+#### 23.13.5 观察门禁（alignment 现在可学，但门禁同源纪律）
+
+`observeCommand(cmd, diff, name?, ctx?, authority?)` 新增 `authority` 参数（未传退化旧 `source` 代理行为，向后兼容）。
+
+- `alignment` 谓词（P8.5 新增到 `PredicateKind`）：只从**确认过的 `cabinet.place` 的 `placementIntent`** 提取（`adjacent`/`align`/`attach` → 对齐方式），且必须 `human`（user-authored / user-confirmed）、必须带 `PlacementContext`、只产 candidate（弱证据，须用户在知识面板确认才生效）。`absolute` 是授权输入，不记为对齐偏好。
+- **关键修复**：`cabinet.place` 的 diff（x/y/rotation）是 Resolver 算的，不是人的选择——所以 ① 路径分支对 `cabinet.place` **整体跳过**（只走 ② intent→alignment），否则 Resolver 算出的 `rotation` 会被误判成"人的朝向偏好"（这会破坏 P8.4 的 `placement-preference` §2 验收）。
+- `authorityToOrigin`：user-authored / user-confirmed → `user-observed`；system-resolved → `system`；unknown → `ai-inferred`。
+
+#### 23.13.6 边界硬保证（结构 + 断言，同 P8.4 纪律）
+
+- `placement.ts` 不 import knowledge、不出现 `placementProvenance`（落位层只读 decl）。
+- 派生层 `geometry/project.ts`、`placementDesign.ts`（P8.3）、`export/roomBook.ts`、`export/neutralSheet.ts`（DXF/清单）**不读** `placementProvenance` / `PlacementAuthority` / `derivePlacementAuthority`——落位来源不影响几何算法。
+- `placementProvenance` 全仓只出现在 `core/commandBus.ts`（定义+写）与 `src/ui/App.tsx`（读 `authority` 传给观察器）；观察者 `observe.ts` 只吃 `authority` 参数，职责分离，不引用该字段。
+
+#### 23.13.7 核心文件
+
+新增：`verify/placement-provenance-acceptance.ts`（54 断言，已接入 `verify:all`）。
+修改：`core/placement.ts`（PlacementIntentDecl + toPlacementIntentDecl）、`core/commandBus.ts`（authority 派生 + provenance 记录 + recompute + 导入清空）、`core/commands.ts`（placeCabinet 透传 placementIntent）、`ai/compile.ts`（落位命令带 decl）、`ai/planRunner.ts`（markConfirmed）、`ai/knowledge/model.ts`（PredicateKind 'alignment' + PLACEMENT_KINDS）、`resolver.ts`（isJudgable + preferredAlignment）、`observe.ts`（authority 门禁 + alignmentFromIntent）、`digest.ts`（PRED_ZH）、`src/ui/App.tsx`（传 authority）、`package.json`。
+
+#### 23.13.8 验收
+
+- `tsc --noEmit` 0 错；`verify:placement-provenance` **54/54**（声明通道 / authority 矩阵 / 真实 apply 路径 / 观察门禁 / superseded 失效 / undo-redo 原子 / 导入不伪造 / 源码扫描）。
+- 回归：P8.4 `verify:placement-preference` **96/96**（修复 cabinet.place 误判后保持全绿）、knowledge 61/61、placement 82/82、attach 105/105、placement-design 107/107、relations、proposal、import、manufacturing 等全绿。
+- 旧测试零删除、零放宽。
+
+#### 23.13.9 停在 P8.5
+
+本期只落地方案 C1（命令层 provenance）。条件性第二阶段 B（柜体级落盘 / 跨会话可见）与"用户可选 alignment 入口"均为后续候选，不在本期范围。

@@ -26,6 +26,7 @@ const PRED_ZH: Record<string, string> = {
   unitKind: '分区类型',
   layoutStyle: '布局风格',
   orientation: '柜体朝向',
+  alignment: '落位对齐',
 };
 
 /**

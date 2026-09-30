@@ -161,6 +161,32 @@ export interface ResolvedPlacement {
   rotation: number;
 }
 
+/**
+ * 落位意图的**声明**（命令层 provenance，P8.5-C1）。
+ *
+ * ── 为什么是 Omit<PlacementIntent, 'targetId'> 而不是另写一份 ──
+ *   命令已经通过 `Command.target.id` 指明"要放置哪个柜体"，decl 里再带
+ *   targetId 就是重复且会漂移的第二份。词表（relation / side / alignment /
+ *   face / offset）必须与 `core/placement.ts` 的 `PlacementIntent` **逐字同一份**
+ *   —— 新造第二套面/对齐词表，迟早出现"声明的 right"与"几何的 right"各指一条边。
+ *   `toPlacementIntentDecl` 从已解析的 `PlacementIntent` 直接剥 targetId，
+ *   编译期保证两边永不脱节。
+ *
+ * ── 只声明，不决定坐标 ──
+ *   decl 是"这次落位是怎么来的"的被动记录；坐标仍由 Resolver 算、由
+ *   `cabinet.place` 写。任何派生层（几何/清单/DXF/P8.3 校验）一律不读它。
+ */
+export type PlacementIntentDecl = DistributiveOmit<PlacementIntent, 'targetId'>;
+
+/** 分布式的 Omit：对联合类型逐成员剥离键（普通 Omit 在联合上只会保留共有键） */
+type DistributiveOmit<T, K extends keyof any> = T extends unknown ? Omit<T, K> : never;
+
+/** 从解析用的 `PlacementIntent` 得到命令层声明（剥掉 targetId，保留全部语义词） */
+export function toPlacementIntentDecl(intent: PlacementIntent): PlacementIntentDecl {
+  const { targetId: _drop, ...rest } = intent;
+  return rest as PlacementIntentDecl;
+}
+
 /** 结构化错误码（引擎层，不进模型 issues —— 解析失败发生在模型写入之前） */
 export type PlacementErrorCode =
   | 'PLACEMENT-TARGET-NOT-FOUND'

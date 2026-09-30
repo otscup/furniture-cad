@@ -1,5 +1,6 @@
 import type { Cabinet, Connection, FurnitureAssembly, Room, RowHeight, UnitSpec, Wall } from './types.ts';
 import type { Change, Command, CommandSource } from './commandBus.ts';
+import type { PlacementIntentDecl } from './placement.ts';
 import { newCommandId } from './ids.ts';
 import { ROW_HEIGHT_FILL, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 import { KIND_ZH } from './relations.ts';
@@ -18,8 +19,8 @@ import { KIND_ZH } from './relations.ts';
  * ══════════════════════════════════════════════════════════════════════
  */
 
-function cmd(op: string, source: CommandSource, target: Command['target'], changes: Change[], label: string, intent?: Command['intent']): Command {
-  return { id: newCommandId(op), op, source, target, changes, label, intent };
+function cmd(op: string, source: CommandSource, target: Command['target'], changes: Change[], label: string, intent?: Command['intent'], extra?: Partial<Command>): Command {
+  return { id: newCommandId(op), op, source, target, changes, label, intent, ...extra };
 }
 
 const cabTarget = (id: string): Command['target'] => ({ kind: 'cabinet', id });
@@ -69,13 +70,17 @@ export function placeCabinet(
   cab: Cabinet,
   at: { x: number; y: number; rotation: number },
   source: CommandSource = 'ui',
-  label?: string
+  label?: string,
+  /** 落位意图声明（P8.5-C1）：从 AI 提案的 relation/reference/face/alignment 重建；只声明不决定坐标 */
+  placementIntent?: PlacementIntentDecl
 ): Command {
   return cmd('cabinet.place', source, cabTarget(cab.id), [
     { path: 'placement.x', op: 'set', value: Math.round(at.x), unit: 'mm' },
     { path: 'placement.y', op: 'set', value: Math.round(at.y), unit: 'mm' },
     { path: 'placement.rotation', op: 'set', value: Math.round(at.rotation), unit: 'deg' },
-  ], label ?? `落位「${cab.name}」到 (${Math.round(at.x)}, ${Math.round(at.y)}) @ ${Math.round(at.rotation)}°`);
+  ], label ?? `落位「${cab.name}」到 (${Math.round(at.x)}, ${Math.round(at.y)}) @ ${Math.round(at.rotation)}°`,
+  undefined,
+  placementIntent ? { placementIntent } : undefined);
 }
 
 /**

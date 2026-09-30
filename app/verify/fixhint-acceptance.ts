@@ -187,6 +187,9 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   // ── P8.2 落位意图：面贴合（面词表长度 / 缝隙上限都得真写进 message）──
   'PROPOSAL-PLACE-FACE': { ref: '贴合柜', why: '缺 targetFace（attach 必须说明是哪两个面贴在一起）', face: '', faces: 'left / right / front / back', count: 4 },
   'PROPOSAL-PLACE-OFFSET': { ref: '贴合柜', offset: '-20', max: 2000 },
+  // ── P8.3 落位后的设计语义（rotation / 门脸宽 / 朝内的柜数 / 候选数 都得真写进 message）──
+  'DESIGN-FRONT-BLOCKED': { cabName: '副臂B', otherName: '主臂A', rotation: 90, front: '左（-X）', faceWidth: 900, count: 1, altCount: 3, alternatives: '0°（门脸朝前（+Y））； 180°（门脸朝后（-Y））； 270°（门脸朝右（+X））' },
+  'DESIGN-ORIENTATION-SUSPECT': { cabName: '转臂B', otherName: '主臂A', rotation: 270, front: '右（+X）', faceWidth: 600, count: 2, altCount: 3, alternatives: '0°（门脸朝前（+Y））； 90°（门脸朝左（-X））； 180°（门脸朝后（-Y））' },
   // ── P4 导入家族（外部数据带进来的数量：真有数 → 真显示；缺失 → 必须说"无法识别"）──
   'IMPORT-EMPTY': { count: 0 },
   'IMPORT-OPEN-QUESTIONS': { count: 3, first: '门板要不要通顶' },

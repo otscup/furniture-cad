@@ -2,6 +2,7 @@ import { CommandBus, type Command, type DiffEntry } from '../core/commandBus.ts'
 import type { Gate, GateHit } from './memory.ts';
 import type { Issue, Project, RuleSet } from '../core/types.ts';
 import { compileAction, type AiAction } from './compile.ts';
+import { validatePlacementDesign, type DesignPlacementReport } from '../core/placementDesign.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -62,6 +63,14 @@ export interface PlanRun {
    * 由前后两次真实派生对比得出，不是静态表 —— 静态表会与生成器漂移。
    */
   impact: string[];
+  /**
+   * 设计语义结论（P8.3）：干跑出的这份草稿，在**已落位**之后是否还站得住设计语义。
+   *
+   * 与 `blockingErrors` 的区别：那是"放不放得下 / 尺寸对不对"（硬规则），
+   * 这是"放得合不合理"（门脸是不是贴着邻居、L 型是不是转错方向）。
+   * 它**不影响能不能提交** —— 可疑只提示，改不改 rotation 由人/AI 定。
+   */
+  design?: DesignPlacementReport;
   /**
    * 提交完成时的模型版本。
    *
@@ -231,6 +240,8 @@ export function dryRunPlan(opts: { bus: CommandBus; actions: AiAction[]; gate?: 
     baseVersion,
     committed: false,
     impact: buildImpact(bus, sandbox),
+    // 设计语义只对"已经落位"的草稿有意义 —— 放在最后，读的是干跑结束时的状态
+    design: validatePlacementDesign(sandbox.getState()),
   };
 }
 

@@ -18,6 +18,7 @@ import {
   type PlacementIntent,
   type PlacementSide,
 } from '../core/placement.ts';
+import { designCheckPlacement, type DesignPlacementReport } from '../core/placementDesign.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
@@ -89,7 +90,12 @@ export type CompileResult =
    * `createdId` = 这一步**会**建出来的对象 id。planRunner 用它把 `$ref:` 占位换成真 id
    * （id 在编译期就已确定并写进 command payload，所以预览与提交拿到的是同一个）。
    */
-  | { ok: true; command: Command; summary: string; note?: string; createdId?: string }
+  /**
+   * `design`（P8.3）= 落位解析之后的**设计语义结论**（valid / warning / error）。
+   * 它不改命令、不改坐标、不拦截提交 —— 只是把"几何上放得下、但门脸贴着邻居"
+   * 这类可疑之处结构化地带出去，交给预览与 AI 下一轮决策。
+   */
+  | { ok: true; command: Command; summary: string; note?: string; createdId?: string; design?: DesignPlacementReport }
   | { ok: false; error: string };
 
 const mm = (v: number): number => Math.round(Number(v));
@@ -512,6 +518,8 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
           ok: true,
           command: CMD.placeCabinet(cab, ra.placement, src, `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面 → (${ra.placement.x}, ${ra.placement.y})`),
           summary: `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面`,
+          // 贴上去的可能是门脸 —— 几何成立不等于设计合理，结论带出去但不拦
+          design: designCheckPlacement(project, attachIntent, ra),
         };
       }
       const intent: PlacementIntent =
@@ -539,6 +547,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         ok: true,
         command: CMD.placeCabinet(cab, r.placement, src, `落位「${cab.name}」${relationZh} → (${r.placement.x}, ${r.placement.y})`),
         summary: `落位「${cab.name}」：${relationZh}`,
+        design: designCheckPlacement(project, intent, r),
       };
     }
 

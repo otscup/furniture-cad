@@ -819,6 +819,26 @@ const RULE_CARDS: Record<string, RuleCard> = {
     manual: '这是设计决定，只能由你定：猜出来的尺寸会直接变成下料尺寸。',
   },
 
+  // ───── 落位后的设计语义（v0.3，P8.3：几何合法 ≠ 设计合理）─────
+  //  Resolver 说"能不能放"，这一族说"放得合不合理"。全部是 **WARNING**：
+  //  门脸贴邻居、L 型转错方向，在别的家具/镜像/背靠背布局里都可能是有意为之，
+  //  系统没有硬规则能证明它一定非法 —— 所以只提示、不拦截、更不自动改 rotation。
+  //  （能证明的一定非法由 P2 的 ASSEMBLY-* 管，本族不重复实现。）
+  'DESIGN-FRONT-BLOCKED': {
+    title: '门脸贴着邻居（柜门开不了）',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」的门脸朝${str(c, 'front')}（当前 rotation ${num(c, 'rotation')}°），正贴着与它相接的「${str(c, 'otherName')}」—— 几何上接触成立（这一对里有 ${num(c, 'count')} 只柜门脸朝内），但 ${num(c, 'faceWidth')}mm 宽的门脸被挡住，柜门开不了；不朝内的朝向有 ${num(c, 'altCount')} 种。`,
+    hint: (c) => `把「${str(c, 'cabName')}」换成不朝内的朝向：${str(c, 'alternatives')}。改朝向会改它占的地方，位置要按新朝向重新解析 —— 系统不会替你自动转。`,
+    manual: '这是设计决定（转哪个方向由你或 AI 定）：门脸贴邻居不一定非法（背靠背、岛台可能是有意的），所以只提示不拦截。',
+  },
+  'DESIGN-ORIENTATION-SUSPECT': {
+    title: 'L 型组合里门脸朝内',
+    severity: 'WARNING',
+    message: (c) => `corner（L 型）相接：几何上接触成立（这一对里有 ${num(c, 'count')} 只柜门脸朝内），但「${str(c, 'cabName')}」的门脸朝${str(c, 'front')}（rotation ${num(c, 'rotation')}°）朝的是组合内侧 —— ${num(c, 'faceWidth')}mm 宽的门脸会被另一臂挡住；同样不朝内的朝向有 ${num(c, 'altCount')} 种，本系统不替你选。`,
+    hint: (c) => `L 型的转角方向没有唯一正确答案（左右转角、镜像结构都可能合理），这里只列同样不朝内的那些：${str(c, 'alternatives')}。选定朝向后位置要重新解析，系统不代劳。`,
+    manual: '这不是程序缺陷，也不是硬规则：转哪个方向是设计决定，交给 AI / 用户继续决策。',
+  },
+
   // ═══════════════ Import 外部数据（v0.3，P4）══════════════
   //
   // 这一族校验的是"从外部设计数据（JSON / DXF / 酷家乐 / 图片识别）进来的东西"。

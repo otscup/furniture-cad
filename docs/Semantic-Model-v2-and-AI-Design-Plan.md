@@ -1283,3 +1283,130 @@ Z 轴 / top·bottom 面 / 柜体上下叠放 / 贴墙 / 房间边界 / 门窗 / 
 - 全量 `verify:all`（node + UI）：**VERIFY_ALL_EXIT=0**，UI 686/686、零 console error。未删旧测试、未放宽旧断言；两条"前提已被缺陷掩盖"的 P2 夹具与两处 `kind:'corner'` 声明改为**按实际落位如实声明**（判据随修法演进，见 23.10.1）。
 
 - 本阶段停在 P8.2，未自动进入 P8.3。
+
+### 23.11 P8.3 实施记录：落位之后的设计语义验证（Design / Assembly Validation，已完成）
+
+**基线 `7850046`（P8.2 已验收）。本阶段不再新增落位关系，而是补上 P8.2 暴露的架构缺口：几何上合法的 Placement，不一定等于设计语义上合理的 Placement。目标是 `PlacementIntent → Resolver → ResolvedPlacement → Design Validation → valid / warning / error`，且**Validator 不重算 Placement、不改 rotation、不替用户选朝向**。不做全屋布局、不引入 Z、不停在 P8.4。**
+
+#### 23.11.1 审查结论：现有系统已经有哪些"设计语义"
+
+动手前逐项审查了 `FurnitureAssembly` / `Connection` / `Assembly.kind` / corner / `deriveContacts()` / P8.2 attach / `Cabinet.rotation`。**一处需要纠正的事实**：指令里提到 `Assembly.kind = corner`，但模型里 **`FurnitureAssembly` 没有 `kind` 字段——kind 在 `Connection` 上**（`corner | butt | stack`）。本阶段**不新增 `Assembly.kind`**：那等于重新定义已经存在的事实，而且一组三只柜完全可以既有角接又有续接，一个 kind 说不清。
+
+可复用的既有设计语义：
+
+| 已有事实 | 位置 | P8.3 怎么用 |
+| --- | --- | --- |
+| `Connection.kind = corner/butt/stack` | types.ts | 语义来源；本层只读不重定义 |
+| 唯一接触判定 `deriveContacts()` | relations.ts | **只消费它的结论**（连"是不是 corner"都问它要），不写第二份接触检测 |
+| 声明 vs 派生的硬校验 `validateAssemblies()` | relations.ts | 已证明非法的（KIND-MISMATCH / EDGE-MISMATCH …）**直接透传为 error**，不重写 |
+| "角接的角点属于两条边，本身有歧义" | relations.ts `cornerEdgeOf` | 直接决定了本层**不能**用"接触边是不是 front"作判据（见 23.11.4） |
+| 人话词表 `EDGE_ZH` / `KIND_ZH` | relations.ts | 复用，不另写一套面/关系叫法 |
+| 唯一旋转实现 `localToWorld` + `rectPts` | transform.ts | facing 全部从这里派生（源码扫描：设计层无 cos/sin） |
+
+四层边界（本阶段把它写成了代码里的文件头注释）：
+
+```text
+P2 Relations  = 对象之间有什么关系
+P8 Placement  = 根据关系，确定对象应该在哪里
+P8.3 Design   = 这样放是否符合已有的设计/Assembly 语义（只判断，不重算、不改）
+Geometry      = 确定性计算实际空间几何
+Manufacturing = 从最终几何派生制造信息（继续只读）
+```
+
+#### 23.11.2 分层模型：resolved / valid / warning / error
+
+```ts
+DesignPlacementReport {
+  status: 'valid' | 'warning' | 'error';
+  findings: DesignPlacementFinding[];   // status / code / message / cabinetId / neighborId / alternatives / ambiguous
+  contacts: DesignContactFact[];        // a/b/kind/edgeA/edgeB/turn?（全部来自 deriveContacts）
+}
+```
+
+| 档 | 含义 | 由谁判定 |
+| --- | --- | --- |
+| **resolved** | 落位解析成功（能不能放） | Placement Resolver（`core/placement.ts`）—— 本层不改它 |
+| **error** | 已证明非法 | ① P2 的硬事实（声明 corner 实际 butt 等）透传；② 解析层失败（透传其结构化错误，**绝不因为"算不出"就当 valid**） |
+| **warning** | 几何成立但设计语义可疑 | 本层唯一新增的判定（见 23.11.4） |
+| **valid** | 既没硬冲突也没可疑 | — |
+
+汇总规则：有任一 error ⇒ `error`；只有 warning ⇒ `warning`；都没有 ⇒ `valid`。
+
+#### 23.11.3 Facing / Orientation：派生，不落模型
+
+`core/placement.ts` 新增四个最小 helper（实现复用**同一个** `faceSegmentOf`，即唯一的面几何）：
+
+```ts
+frontDirection(cab) / backDirection(cab) / leftDirection(cab) / rightDirection(cab)  // 外法线单位向量
+```
+
+**不新增 `Cabinet.facing` 之类的字段**：它与 `rotation` 是同一件事的两种写法，写进模型就是第二份真相（改了 rotation 忘了改 facing，系统就会自相矛盾）。派生的东西不会与模型不一致 —— 验收里钉住 `Object.keys(cab.placement)` 仍只有 `['rotation','x','y']`。
+
+另加一个**事实**型派生（不是规则）：
+
+```ts
+cornerTurnSide(A, B): 'left' | 'right'
+// 站在 A 的背面朝 A 的门脸看，B 在左手边 = left（左转角），否则 right
+```
+
+左右转角**都可能完全合理**，所以它是事实不是判据，只负责把"到底是哪一个"说清楚（验收断言左右两种构造各得 `left`/`right`，且都为 valid）。
+
+#### 23.11.4 本阶段唯一新增的判定：门脸是否朝内
+
+判据（几何事实，唯一可判定）：
+
+> 从柜体**门脸中点**沿**门脸外法线**射出的射线，是否穿过**与它相接**的那只柜的包围盒（slab 法）。命中 ⇒ 门开出去就撞上邻居。
+
+三条收窄，都是为了避免假警报：
+
+1. **只检查已相接的柜对**（接触来自 `deriveContacts`）。隔 2m 的柜不该报 —— 那是开门半径/碰撞优化，本阶段不做。
+2. **不用"接触边是不是 front"来判**。角接时共享角点天然属于两条边，P2 的 `cornerEdgeOf` 自己就声明过这份歧义（因此边不符只报 WARNING）；真拿它判，标准 L 型会被误报（实测：一个完全正确的 L，A 的角接边会被算成 `front`）。
+3. **不写"corner 必须 rotation=270"这类习惯**。左右转角、镜像结构、不同家具都可能合理 —— 没有硬规则能证明它一定非法，所以只能是 warning。
+
+#### 23.11.5 不替用户选：alternatives 与 ambiguous
+
+可疑时给出**所有**同样成立的候选朝向，不排序、不推荐：
+
+```ts
+alternatives: [{ rotation: 270, front: '右（+X）', note: '…位置需按该朝向重新解析（本模块不改 placement、不替你选）' }, …]
+ambiguous: true   // 候选不止一个
+```
+
+候选算法：在当前原点下逐一试 0/90/180/270，留下"门脸射线不命中邻居"的那些。每条候选都写明**位置要按新朝向重新解析** —— 改朝向会改 footprint，说了才算诚实（"预览 ≠ 提交"的老教训）。
+
+**没有 `autoFix`**：转哪个方向是设计决定，界面不许给假按钮（原则 20）。验收断言 finding 上不存在 `autoFix`/`fix`，且校验前后 `placement` 与 `rotation` 逐值不变。
+
+#### 23.11.6 与 P2 的边界：硬冲突透传，不重写
+
+`validateAssemblies()` 报出的 ERROR/WARNING 原样带出（`code: 'DESIGN-ASSEMBLY'` + `sourceCode: 'ASSEMBLY-KIND-MISMATCH'`），**message 仍由 `issueCatalog` 产出**，本层不另拼一份。INFO（如 `ASSEMBLY-STACK-UNVERIFIED`）不计入 —— 信息提示不是设计疑问。
+
+#### 23.11.7 Proposal / CommandBus 接入
+
+- **不新增写入命令**：最终仍写 `Cabinet.placement`，命令仍是 `cabinet.place`。
+- `CompileResult.design`：AI 编译 `cabinet.place` 时顺带给出设计结论（adjacent/align/attach 三条路径都带）。
+- `PlanRun.design`：干跑结束时对草稿整体评一次 —— **预览阶段就能看见"几何成立但门脸朝内"**。
+- **warning 不拦截**：有设计疑问时 `blockingErrors` 仍为 0、仍可提交，且 `preview === commit` 照旧成立（验收两条都钉住）。
+- **刻意不进主规则链**：设计语义是提示不是硬规则。进了主链等于把"可能合理"的布局报成项目错误，也会挤掉 P6 的 `Hard Rule > Design Knowledge > User Preference`（用户偏好本该能影响朝向选择，不该被硬规则堵死）。
+- AI 边界不变：契约里没有坐标参数，形状门照旧拦坐标；本层只新增"结论"，不给 AI 任何新的写权限。
+
+#### 23.11.8 核心文件
+
+新增 `app/src/core/placementDesign.ts`（纯函数设计语义层）、`app/verify/placement-design-acceptance.ts`（107 断言）。修改：`core/placement.ts`（facing helper + 导出 `faceSegmentOf`/`sceneItemOf`）、`core/rules/issueCatalog.ts`（两个新码）、`ai/compile.ts`（`CompileResult.design`）、`ai/planRunner.ts`（`PlanRun.design`）、`verify/fixhint-acceptance.ts`（两码进 NUM_CTX）、`package.json`（`verify:placement-design` 接进 `verify:all`）。
+
+#### 23.11.9 测试结果
+
+- `tsc --noEmit`：0 错。
+- `verify:placement-design`（新增）：**107/107** —— §1 facing 派生 12（0/90/180/270 × front/back/left/right 与独立重算一致 + 无第二字段/无第二套旋转）+ §2 resolved+valid 6 + §3 **几何合法但设计可疑**核心 fixture 12（含"候选含 270 / ambiguous / 当前朝向不在候选 / 不改 rotation / 无 autoFix"）+ §4 门对门 5 + §5 左/右转角 7 + §6 不同宽深与 550/600 混深 × start/center/end 共 25 + §7 P2 硬冲突透传 5 + §8 resolved+error 5 + §9 架构 9（同输入同结果/不改模型/不改 placement/源码扫描：无第二套接触·面表·旋转·文案）+ §10 不拦截 & preview===commit 10 + §11 2D/3D 同一 resolved placement 4。
+- 旧链一条未动：`verify:placement` 82/82、`verify:attach` 105/105、`verify:relations` 82/82、`verify:proposal` 90/90、`verify:import` 59/59、`verify:manufacturing` 101/101、`verify:fixhint` 27/27（两个新码进了 NUM_CTX，喂进去的 90/900/1/3 与 270/600/2/3 真出现在 message 里）。
+- 全量 `verify:all`（node + UI）：**VERIFY_ALL_EXIT=0**，UI 686/686、零 console error、全链 2639 条断言 0 红（= P8.2 的 2532 + 本阶段新增 107）。
+
+#### 23.11.10 明确不支持 / P8.4+ 候选
+
+明确不做：自动改 rotation、自动在多方案中选、Z 轴、上下叠放、贴墙/房间边界/门窗、碰撞优化、全屋布局、AI 自动布局、P8.4。
+
+留给后续阶段的候选（本阶段只记录不做）：
+1. **界面呈现**：`PlanRun.design` 已把结论带出，但 UI 尚未渲染"设计语义提示"区块（本阶段刻意不动 UI，避免把提示变成既成事实的拦截）。
+2. **Attachment 的开门半径**：现在只判"紧贴"，尚未判"隔 500mm 门扇扫到邻居"（需先有门扇开启包络这一确定性事实）。
+3. **用户偏好影响朝向**：P6 的 userPreference 可作为 candidate orientation preference 影响下一次 Proposal，但不得覆盖硬几何约束。
+
+- 本阶段停在 P8.3，未自动进入 P8.4。

@@ -1,4 +1,4 @@
-import type { ConnectionEdge, Project, Vec2 } from './types.ts';
+import type { Cabinet, ConnectionEdge, Project, Vec2 } from './types.ts';
 import { bboxOf, localToWorld, polyLocalToWorld, rectPts } from './geometry/transform.ts';
 // 面名 ↔ 几何边的映射**只从 relations.ts 借**：P2 已经为 Connection 声明
 // 定死了"第几条边叫 back/right/front/left"（EDGE_ORDER）。Attach 的面语义若
@@ -228,16 +228,21 @@ function footprintBox(it: PlacementSceneItem): { min: { x: number; y: number }; 
   return bboxOf(polyLocalToWorld(rectPts(0, 0, it.width, it.depth), { x: it.x, y: it.y }, it.rotation));
 }
 
+/** Cabinet → 引擎快照项（只读派生，不动模型） */
+export function sceneItemOf(cab: Cabinet): PlacementSceneItem {
+  return {
+    id: cab.id,
+    x: cab.placement.x,
+    y: cab.placement.y,
+    rotation: cab.placement.rotation,
+    width: cab.params.width,
+    depth: cab.params.depth,
+  };
+}
+
 /** Project → 引擎快照。只读派生，不改动 project（width/depth 来自语义参数，非几何） */
 export function sceneFromProject(project: Project): PlacementScene {
-  return project.cabinets.map((c) => ({
-    id: c.id,
-    x: c.placement.x,
-    y: c.placement.y,
-    rotation: c.placement.rotation,
-    width: c.params.width,
-    depth: c.params.depth,
-  }));
+  return project.cabinets.map(sceneItemOf);
 }
 
 /** 单条意图的形状与取值校验（对不对项目无关的部分） */
@@ -379,7 +384,7 @@ const fmtVec = (v: Vec2): string => `${Math.round(v.x * 1000) / 1000}, ${Math.ro
  *   面中点 − 体中心，矩形局部边轴对齐，减出来就是纯法向。旋转仍走
  *   transform.ts 的 `localToWorld`（全项目唯一旋转实现），这里没有第二套三角函数。
  */
-function faceGeometry(it: PlacementSceneItem, face: PlacementFace): { normal: Vec2; start: Vec2; end: Vec2 } {
+export function faceSegmentOf(it: PlacementSceneItem, face: PlacementFace): { normal: Vec2; start: Vec2; end: Vec2 } {
   const local = rectPts(0, 0, it.width, it.depth);
   const i = EDGE_ORDER.indexOf(face);
   const p0 = local[i]!;
@@ -402,6 +407,35 @@ function faceGeometry(it: PlacementSceneItem, face: PlacementFace): { normal: Ve
 }
 
 /**
+ * 一个面的**外法线**（单位向量，世界坐标）—— 全项目唯一的"面朝向"实现。
+ *
+ * 设计语义层（P8.3）要判断"门脸朝哪"，只能从这里取，不许自己再写一遍
+ * 旋转：多一份实现就多一处"界面说朝左、清单说朝右"的机会。
+ */
+export function faceDirectionOf(it: PlacementSceneItem, face: PlacementFace): Vec2 {
+  return faceSegmentOf(it, face).normal;
+}
+
+/**
+ * 柜体某个面朝世界的哪个方向 —— **由 rotation 派生**，不新增语义字段。
+ *
+ * 为什么不加 `Cabinet.facing` 之类的字段：它和 rotation 是同一件事的两种写法，
+ * 写进模型就是第二份真相（改了 rotation 忘了改 facing，系统就会自相矛盾）。
+ * 需要朝向时派生即可，派生的东西不会与模型不一致。
+ */
+export function faceDirection(cab: Cabinet, face: PlacementFace): Vec2 {
+  return faceDirectionOf(sceneItemOf(cab), face);
+}
+/** 门脸（正面）朝向 */
+export const frontDirection = (cab: Cabinet): Vec2 => faceDirection(cab, 'front');
+/** 背面（贴墙侧）朝向 */
+export const backDirection = (cab: Cabinet): Vec2 => faceDirection(cab, 'back');
+/** 左端朝向 */
+export const leftDirection = (cab: Cabinet): Vec2 => faceDirection(cab, 'left');
+/** 右端朝向 */
+export const rightDirection = (cab: Cabinet): Vec2 => faceDirection(cab, 'right');
+
+/**
  * attach 解析（纯函数）：两个**有名有姓的面**贴合。
  *
  * ① 两面必须朝向相对（外法线反向平行）—— right ↔ right 这种在几何上不可能贴合，
@@ -419,8 +453,8 @@ function resolveAttach(
   align: AttachAlignment,
   offset: number
 ): PlacementResolve {
-  const T = faceGeometry(target, targetFace);
-  const R = faceGeometry(reference, referenceFace);
+  const T = faceSegmentOf(target, targetFace);
+  const R = faceSegmentOf(reference, referenceFace);
   const facing = dot2(T.normal, R.normal);
   if (facing > -1 + 1e-9) {
     const angle = Math.round((Math.acos(Math.min(1, Math.max(-1, -facing))) * 180) / Math.PI);

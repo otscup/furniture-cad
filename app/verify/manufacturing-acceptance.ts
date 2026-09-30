@@ -14,6 +14,7 @@
  *    ⑨ DXF 与 Manufacturing Part 来源一致
  *    ⑩ 修改 Semantic Model 后 Manufacturing 正确重新派生
  *    ⑪ 真实闭环：2D / 3D / BOM / DXF / Manufacturing 来自同一 Semantic Model，关键尺寸一致
+ *    ⑫ 层板托孔（P7.1 第一条真实制造规则）：verified、标高来自几何、横向留量来自制造规则、可关
  *    （P0–P6 旧测试由 verify:all 整体回归，本脚本只钉 P7 新增的不变量）
  *
  *  ── 判据纪律（与既有验收一致）──
@@ -29,6 +30,7 @@ import type { Cabinet, CabinetRow, Connection, FurnitureAssembly, Project, RuleS
 import { CommandBus } from '../src/core/commandBus.ts';
 import { createCabinet, makeUnit, sampleProject } from '../src/core/docFactory.ts';
 import { generateProject } from '../src/core/geometry/project.ts';
+import { equalSpacing } from '../src/core/allocate.ts';
 import { toNeutralExport, type NeutralExport } from '../src/export/neutralSheet.ts';
 import {
   deriveManufacturing,
@@ -160,23 +162,27 @@ console.log('P7 · Manufacturing Semantics 验收');
   const geom = generateProject(project, rules);
   const mfg = deriveManufacturing(project, geom, rules);
 
-  // 没有任何「钻孔/连接孔/五金安装/开槽」操作被标记为 verified
+  // 除"确定性层板托孔"外，没有任何未确认加工被标成 verified（不脑补）
   const fabricatedVerified = mfg.parts.some((p) =>
-    p.operations.some((o) => ['drilling', 'connector-hole', 'hardware-mount', 'groove'].includes(o.role) && o.verification === 'verified'),
+    p.operations.some((o) => ['drilling', 'connector-hole', 'hardware-mount', 'groove'].includes(o.role) && o.verification === 'verified' && o.source !== 'deterministic.shelfElevations'),
   );
-  ok('⑥ 没有任何未确认加工被标成 verified（不脑补）', !fabricatedVerified);
+  ok('⑥ 除确定性层板托孔外，没有任何未确认加工被标成 verified（不脑补）', !fabricatedVerified);
 
-  // 层板确实带一条 unverified 的钻孔操作（诚实暴露）
+  // 层板件本身不再声称托孔（托孔在侧板，固定层板不钻孔）
   const shelf = mfg.parts.find((p) => p.role === 'ShelfPanel')!;
-  ok('⑥ 层板带 unverified 的层板托孔操作', shelf.operations.some((o) => o.role === 'drilling' && o.verification === 'unverified'));
-  ok('⑥ 层板 unverified 数组非空（明确暴露未确认方面）', shelf.unverified.length > 0);
+  ok('⑥ 层板件本身不声称钻孔（托孔已升格到侧板 verified）', !shelf.operations.some((o) => o.role === 'drilling'));
 
-  // 封边是 verified（这是唯一已确认的能力）
+  // 封边是 verified（来自几何 panel.edge）
   const side = mfg.parts.find((p) => p.role === 'LeftSidePanel')!;
   ok('⑥ 侧板封边操作 verified（来自几何 panel.edge）', side.operations.some((o) => o.role === 'edge-banding' && o.verification === 'verified'));
   // 背板工艺 verified（来自语义 backPanel.method）
   const back = mfg.parts.find((p) => p.role === 'BackPanel')!;
   ok('⑥ 背板工艺操作 verified（来自语义 backPanel.method）', back.operations.some((o) => o.role === 'back-panel-treatment' && o.verification === 'verified'));
+
+  // 侧板带 verified 层板托孔（P7.1 第一条真实制造规则；孔位来自几何，不脑补）
+  const pin = side.operations.find((o) => o.role === 'drilling' && o.source === 'deterministic.shelfElevations');
+  ok('⑥ 侧板带 verified 层板托孔（标高来自几何，不脑补）', !!pin && pin.verification === 'verified');
+  ok('⑥ 层板托孔带结构化孔位（elevations 非空，基准=柜内底）', !!pin?.holes && pin.holes.elevations.length > 0 && pin.holes.reference === 'cabinet-inner-bottom');
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -303,6 +309,62 @@ console.log('P7 · Manufacturing Semantics 验收');
   const body3dHeights = geom.bodies3d.filter((b) => b.cabId === cab.id).map((b) => Math.round(b.sz * 100) / 100);
   ok('⑪ 制造侧板长 === 几何 bodyH', sideLen === bodyH, `side=${sideLen} bodyH=${bodyH}`);
   ok('⑪ 3D 体块高度含 bodyH（关键尺寸跨出口一致）', body3dHeights.some((h) => Math.abs(h - bodyH) < 0.5), `heights=${JSON.stringify(body3dHeights)} bodyH=${bodyH}`);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ⑫ 层板托孔（P7.1 第一条真实制造规则）
+// ═════════════════════════════════════════════════════════════════
+{
+  const project = sampleProject(rules);
+  const geom = generateProject(project, rules);
+  const mfg = deriveManufacturing(project, geom, rules);
+  const cab = project.cabinets[0]!;
+  const g = geom.cabinets[cab.id]!;
+  const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+  const pin = side.operations.find((o) => o.role === 'drilling' && o.source === 'deterministic.shelfElevations');
+
+  ok('⑫ 侧板带 verified 层板托孔（来源 deterministic.shelfElevations）', !!pin && pin.verification === 'verified');
+
+  // 触发条件：样本柜存在带 shelves 的分区
+  const hasShelf = g.layout.rows.some((r) => r.units.some((u) => u.shelves && u.shelves.count > 0));
+  ok('⑫ 样本柜存在带 shelves 的分区（verified 升格条件满足）', hasShelf);
+
+  // 标高 === 几何 equalSpacing 层板标高集合（柜内底基准），逐值一致（孔位不另算）
+  const innerBottomZ = cab.params.bodyLift + g.layout.boardT;
+  const expected = new Set<number>();
+  for (const r of g.layout.rows) {
+    for (const u of r.units) {
+      const s = u.shelves;
+      if (s && s.count > 0) for (const pos of equalSpacing(r.netH, s.count)) expected.add(Math.round(r.z0 - innerBottomZ + pos));
+    }
+  }
+  const exp = [...expected].sort((a, b) => a - b);
+  ok('⑫ 托孔标高 === 几何层板标高集合（逐值一致，单一来源）', !!pin?.holes && deepEqual(pin.holes.elevations, exp), `pin=${JSON.stringify(pin?.holes?.elevations)} exp=${JSON.stringify(exp)}`);
+
+  // 横向留量来自制造规则（工厂参数），不是几何、不是语义
+  ok(
+    '⑫ 托孔横向留量来自制造规则 shelfPins（非几何）',
+    !!pin?.holes && pin.holes.insetFrontMm === DEFAULT_MANUFACTURING_RULES.shelfPins.insetFrontMm && pin.holes.holesPerElevationPerSide === DEFAULT_MANUFACTURING_RULES.shelfPins.holesPerElevationPerSide,
+  );
+
+  // 无 shelves 的柜：侧板不带 verified 托孔（不硬钻）
+  const plain = mkCab([{ h: 'fill', units: [mkUnit('open', 1200)] }]);
+  const proj2: Project = { ...sampleProject(rules), cabinets: [plain] };
+  const geom2 = generateProject(proj2, rules);
+  const mfg2 = deriveManufacturing(proj2, geom2, rules);
+  const side2 = mfg2.parts.find((p) => p.role === 'LeftSidePanel')!;
+  ok('⑫ 无 shelves 的柜：侧板不带 verified 托孔（不硬钻）', !side2.operations.some((o) => o.role === 'drilling' && o.source === 'deterministic.shelfElevations'));
+
+  // shelfPins.enabled=false → 不钻（工厂可关，不钻默认孔）
+  const shelved = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }]);
+  const proj3: Project = { ...sampleProject(rules), cabinets: [shelved] };
+  const geom3 = generateProject(proj3, rules);
+  const off = deriveManufacturing(proj3, geom3, rules, {
+    ...DEFAULT_MANUFACTURING_RULES,
+    shelfPins: { ...DEFAULT_MANUFACTURING_RULES.shelfPins, enabled: false },
+  });
+  const sideOff = off.parts.find((p) => p.role === 'LeftSidePanel')!;
+  ok('⑫ shelfPins.enabled=false → 侧板不带 verified 托孔（规则可关）', !sideOff.operations.some((o) => o.role === 'drilling' && o.source === 'deterministic.shelfElevations'));
 }
 
 // ─────────────────────────────────────────────────────────────────

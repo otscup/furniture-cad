@@ -38,6 +38,23 @@ export type MfgOperationRole =
   | 'hardware-mount' // 五金安装（未来扩展点）
   | 'machining'; // 通用加工（未来扩展点）
 
+/** 钻孔的坐标描述 —— **只有 verified 钻孔才允许填**，unverified 一律不填（绝不脑补坐标）。 */
+export interface MfgDrillHoles {
+  /**
+   * 孔位基准：柜内底面（唯一 Z 锚点）。
+   * 与生成器板件 edgeLabel 的「距柜内底 Nmm」同源 —— 车间对同一个高度只有一个读法，
+   * 不必先问「哪一行的内底」。这样制造层读的是几何已派生的标高，不另算一份。
+   */
+  reference: 'cabinet-inner-bottom';
+  /** 每侧板的孔位标高（mm，自柜内底向上）。来自几何 equalSpacing（层板标高），非猜测。 */
+  elevations: number[];
+  /** 每标高每侧板的孔数（前 + 后，或工厂约定）。属于制造工艺留量，来自制造规则，非几何。 */
+  holesPerElevationPerSide: number;
+  /** 前 / 后距板边的工艺留量（mm，来自制造规则 shelfPins，非几何） */
+  insetFrontMm: number;
+  insetBackMm: number;
+}
+
 /** 单条制造加工：角色 / 来源 / 置信 / 验证状态，四件套缺一不可 */
 export interface ManufacturingOperation {
   role: MfgOperationRole;
@@ -46,6 +63,7 @@ export interface ManufacturingOperation {
    * 这条操作的来源（审计 + 不脑补的核心）：
    *   'geometry.edge'            = 几何板件的封边边位（设计规则决定）
    *   'semantic.backPanel.method'= 语义层的背板工艺字段
+   *   'deterministic.shelfElevations' = 层板标高来自几何 equalSpacing（柜内底基准）
    *   'manufacturing-rule:unverified' = 制造规则明确「这一步当前无法确认」
    */
   source: string;
@@ -54,6 +72,8 @@ export interface ManufacturingOperation {
   verification: MfgVerification;
   /** 生产可读的细节（封边边位 / 板条规格 / 工艺名 / 为何未确认） */
   detail?: string;
+  /** 钻孔坐标（仅 verified 钻孔填；unverified 不填，避免下料尺寸被猜出来） */
+  holes?: MfgDrillHoles;
 }
 
 /** 制造件大类：回答「这是什么」而不只是一块矩形 */

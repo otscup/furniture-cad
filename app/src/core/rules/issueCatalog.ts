@@ -73,6 +73,23 @@ const num = (c: IssueCtx, key: string, fallback = 0): number => {
   const v = c[key];
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 };
+/**
+ * 与 `num` 的区别：`num` 缺值兜底 0，会把"字段缺失 / 未知"悄悄变成 0，
+ * 让测试误以为"消息里带数字了"（假绿）。`numOrUndef` 在缺值/非数时返回 undefined，
+ * 调用方据此显式报"数量无法识别"，而不是拿 0 顶替。
+ *
+ * 使用口径（项目级一致）：凡是"外部数据带进来的数量/计数"（导入、识别、统计），
+ * 一律用 `numOrUndef`；只有"本系统已算出的确定尺寸差"才用 `num`（那些值校验器必给）。
+ */
+const numOrUndef = (c: IssueCtx, key: string): number | undefined => {
+  const v = c[key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+};
+/** 数量文案：真有数 → "N 个"；缺失 → 明确"无法识别"，绝不说"0 个" */
+const countText = (c: IssueCtx, key: string): string => {
+  const n = numOrUndef(c, key);
+  return n === undefined ? '数量无法识别（数据缺失或非数组）' : `${n} 个`;
+};
 const str = (c: IssueCtx, key: string, fallback = ''): string => {
   const v = c[key];
   return typeof v === 'string' ? v : v === undefined ? fallback : String(v);
@@ -754,7 +771,12 @@ const RULE_CARDS: Record<string, RuleCard> = {
   'IMPORT-EMPTY': {
     title: '导入里没有柜体',
     severity: 'ERROR',
-    message: (c) => `这份导入数据里一个柜体都没有（cabinets 只有 ${num(c, 'count')} 项）。`,
+    message: (c) => {
+      const n = numOrUndef(c, 'count');
+      return n === undefined
+        ? `这份导入数据里一个柜体都没有：${countText(c, 'count')}。`
+        : `这份导入数据里一个柜体都没有（cabinets 只有 ${n} 项）。`;
+    },
     hint: () => '至少给 1 个柜体（宽/高/深与内部分区可以后补，系统会按规则集默认值补齐）。',
     manual: '导入为空没有可预览、可确认的东西。',
   },
@@ -768,21 +790,33 @@ const RULE_CARDS: Record<string, RuleCard> = {
   'IMPORT-OPEN-QUESTIONS': {
     title: '导入还有问题要你定',
     severity: 'WARNING',
-    message: (c) => `导入数据列了 ${num(c, 'count')} 个必须先问你的问题，其中第一条是：「${str(c, 'first')}」。`,
-    hint: (c) => `先回答这 ${num(c, 'count')} 个问题（在下面输入框里说一句就行），才会被应用到模型 —— 系统不会替你把它们猜掉。`,
+    message: (c) => {
+      const n = numOrUndef(c, 'count');
+      if (n === undefined) return `这份导入数据有问题要你定：${countText(c, 'count')}。`;
+      return `导入数据列了 ${n} 个必须先问你的问题，其中第一条是：「${str(c, 'first')}」。`;
+    },
+    hint: (c) => `先回答这 ${numOrUndef(c, 'count') ?? '若干'} 个问题（在下面输入框里说一句就行），才会被应用到模型 —— 系统不会替你把它们猜掉。`,
     manual: '这是设计决定，只能由你定：猜出来的尺寸会直接变成下料尺寸。',
   },
   'IMPORT-UNCERTAINTY': {
     title: '导入里有没确定的内容',
     severity: 'WARNING',
-    message: (c) => `导入数据有 ${num(c, 'count')} 处没可靠确定的内容，其中第一条是：「${str(c, 'first')}」。`,
+    message: (c) => {
+      const n = numOrUndef(c, 'count');
+      if (n === undefined) return `这份导入数据有没可靠确定的内容：${countText(c, 'count')}。`;
+      return `导入数据有 ${n} 处没可靠确定的内容，其中第一条是：「${str(c, 'first')}」。`;
+    },
     hint: () => `这些不确定项必须你确认后才能落地（不确定的部分会按规则集默认或标注估算）。在对话框里说一句怎么定，或编辑导入数据补上。`,
     manual: '不确定就问不猜：把"估的"当"准的"直接下料，是生产事故。',
   },
   'IMPORT-LOW-CONFIDENCE': {
     title: '导入整体置信度偏低',
     severity: 'WARNING',
-    message: (c) => `这份导入数据整体置信度偏低（${num(c, 'count')} 个柜体来自 ${str(c, 'sources')}），导入结果可能需要你逐柜核对。`,
+    message: (c) => {
+      const n = numOrUndef(c, 'count');
+      const cabNote = n === undefined ? '柜体' + countText(c, 'count') : `${n} 个柜体`;
+      return `这份导入数据整体置信度偏低（${cabNote}来自 ${str(c, 'sources')}），导入结果可能需要你逐柜核对。`;
+    },
     hint: () => '预览时可以逐柜看来源与不确定项；确认无误再应用。',
     manual: '低置信度不阻断，但请逐柜核对再下料。',
   },
@@ -804,7 +838,11 @@ const RULE_CARDS: Record<string, RuleCard> = {
   'IMPORT-CAVEAT': {
     title: '图片识别有需你确认的生产项',
     severity: 'WARNING',
-    message: (c) => `这份图片识别有 ${num(c, 'count')} 项图片看不见、需你确认的生产结构，其中第一条是：「${str(c, 'first')}」。`,
+    message: (c) => {
+      const n = numOrUndef(c, 'count');
+      if (n === undefined) return `这份图片识别有需你确认的生产结构：${countText(c, 'count')}。`;
+      return `这份图片识别有 ${n} 项图片看不见、需你确认的生产结构，其中第一条是：「${str(c, 'first')}」。`;
+    },
     hint: () => '预览里逐项「已知晓」后才会生成；它们会随 Cabinet 来源归属留痕（深度/板厚等若为估计值，下料前请复核）。',
     manual: 'Vision 不编造看不见的生产结构：这些项不是被猜掉的，而是交回给你定。',
   },

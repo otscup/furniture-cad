@@ -87,14 +87,18 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 公开仓库 `otscup/furniture-cad`：https://github.com/otscup/furniture-cad （用户 2026-09-29 由私有改公开）。默认分支 `master`，push 走 HTTPS PAT（推送完立即 `git remote set-url` 抹掉 token，`.git/config` 不留凭证）。本机 GitHub SSH 22 端口被代理拦，推送用 HTTPS；发布前必查 `.gitignore` 排除 `.env`/`accounts.json`/`audit.jsonl`/运行时 data，防密钥入库。
 
 ## 核心文档
-docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 / §16 P1 / §17 P2 / §18 P3 / §19 P4 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
+docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 / §16 P1 / §17 P2 / §18 P3 / §19 P4 / §23 P7+P7.1 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
-## v0.3 路线（P0→P6，逐步推进，每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353`。**不动已工作的 CommandBus/geometry/rules/2D/3D/DXF。**
+## v0.3 路线（P0→P7，逐步推进，每阶段验收后再进下一阶段）
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353` → P7 Manufacturing Semantics 一阶段（manufacturing/ 纯派生层：尺寸只读几何、verified 仅封边+背板、其余 unverified 不脑补；bridge 无损回投影接 BOM/DXF；只读制造页签；32 条验收）✅ `2552072` → P7.1 Manufacturing Rule Hardening + Test Integrity（层板托孔升格 verified、numOrUndef/countText 堵"缺失=0"假绿、derive/rules/model 扩展、ManufacturingRuleSet 分类定稿、39+27 验收）✅ `<P7.1-hash>`。**停在 P7.1，不自动进 P8。**
 - **P2 关系层三条纪律**（`core/relations.ts` 是唯一实现）：① 关系层**不产生几何**（建组合前后 BOM/stats/plan/views/中立导出逐字节不变）；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开 —— **只校验声明，推断只用于 UI 表达，不据此报错**。`stack` 因柜体没有 Z 无法核对，允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`（INFO，给两柜高与"若真叠放总高约 N"）—— 宁可说"没核"，不可假装核过。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容 / 关键架构决策 / 测试结果 / 遗留问题 / commit hash）。
 
-## 本会话进行中（2026-09-25 · 已交付两件）
-- **AI 对话框草案**已提交 `6a91374`：draftSession + DraftPreview + AIPanel 草案段 + 样式 + 37 断言验收。
-- **房间独立管理页**已提交 `1e423c4`：commandBus 加 room.delete/room.resize（含 resizeRoom 副作用 + 含柜体拒删）；RoomsPanel（列表/新建/改名/改尺寸/删除/聚焦）；Viewport focusRoom 取景；28 断言验收。
-- 两个功能 typecheck + 全 node 验收链 + verify:ui 645/645 均通过。本会话两大诉求已闭环。
+## 本会话进行中（P7.1 · 制造规则硬化 + 测试完整性）
+- **基线 `2552072`（P7 已验收）**，本阶段不动 P7 既有逻辑、不进 P8。
+- **Test Integrity 硬化**：`issueCatalog.ts` 加 `numOrUndef`/`countText`，IMPORT 家族 5 码"缺失"分支显式报"无法识别"，绝不表述成 0；确立项目级口径（外部数量用 numOrUndef，系统内确定差才用 num）。
+- **ManufacturingRuleSet 分类定稿**：verified（封边/背板/层板托孔）vs unverified（铰链/抽屉五金/箱体连接/组合连接）清晰分离，注释写明 verified 升格四条件；verified 只来自确定性制造规则，AI/Vision/Import 不输出孔位坐标。
+- **第一条真实制造规则（层板托孔）**：`shelfPinOps` 从几何 `g.layout.rows` 的 `equalSpacing` 标高派生（柜内底基准），侧板 verified 钻孔，横向留量来自制造规则；unverifiedAspects 移除层板托孔；derive/rules/model 扩展。
+- **验收**：tsc 0 错；`verify:manufacturing` 39/39（⑫ 新增 7）；`verify:fixhint` 27/27（C2 新增）；全量 `verify:all` 待跑。架构边界全保持。
+- 文档 `docs/Semantic-Model-v2-and-AI-Design-Plan.md` 加 §23.6 P7.1 记录。
+- commit 待提交（hash 回填路线行 `<P7.1-hash>`）。

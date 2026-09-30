@@ -132,7 +132,19 @@ const VAGUE = ['检查一下', '调整一下', '自行处理', '请确认后处�
  * 硬造一个数字反而是在形状报错里塞水。它带 manual（形状门复用契约实现），
  * 满足"本就报不出数字就明说"的出口。
  */
-const NO_NUMBER_OK = new Set(['RULE-APPLIANCE-DOOR', 'RULE-DOUBLE-NO-BACK', 'RULE-ROW-WITH-BACK', 'IMPORT-SHAPE']);
+const NO_NUMBER_OK = new Set([
+  'RULE-APPLIANCE-DOOR',
+  'RULE-DOUBLE-NO-BACK',
+  'RULE-ROW-WITH-BACK',
+  'IMPORT-SHAPE',
+  // 以下导入家族都是「外部数据完整性 / 结构」问题，没有"差多少 mm"的概念；
+  // 真有数时由 NUM_CTX 断言数字确实出现，缺失时由下方"缺失≠0"断言强制报"无法识别"。
+  'IMPORT-EMPTY',
+  'IMPORT-OPEN-QUESTIONS',
+  'IMPORT-UNCERTAINTY',
+  'IMPORT-CAVEAT',
+  'IMPORT-LOW-CONFIDENCE',
+]);
 
 /**
  * 数字型 ctx：这几条卡的"差多少"来自派生（间隙 mm / 夹角 / 成员数 / 高度），
@@ -172,6 +184,12 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'PROPOSAL-CONN-KIND': { ref: 'L 型组', kind: 'glue', count: 3, kinds: 'corner / butt / stack' },
   'PROPOSAL-CONN-REF': { ref: 'L 型组', side: 'a 端', member: 'cab9', count: 2 },
   'PROPOSAL-OPEN-QUESTIONS': { count: 2, first: '柜深按 350 还是 600？' },
+  // ── P4 导入家族（外部数据带进来的数量：真有数 → 真显示；缺失 → 必须说"无法识别"）──
+  'IMPORT-EMPTY': { count: 0 },
+  'IMPORT-OPEN-QUESTIONS': { count: 3, first: '门板要不要通顶' },
+  'IMPORT-UNCERTAINTY': { count: 3, first: '柜体深度未知' },
+  'IMPORT-CAVEAT': { count: 3, first: '柜体深度未见' },
+  'IMPORT-LOW-CONFIDENCE': { count: 2, sources: '酷家乐,图片识别' },
 };
 
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];
@@ -220,6 +238,29 @@ for (const code of RULE_CODES) {
 }
 const bad = rows.filter((r) => !r.ok);
 ok('每条设计类报错都给出具体数字（差多少 / 改到多少）', bad.length === 0, JSON.stringify(bad));
+
+// ═══════════════════════ C2 Test Integrity：缺失值不被当成 0 ═══════════════════════
+// 这是 P7.1 的核心加固：num() 缺值兜底 0，会让"字段缺失/未知"被静默说成 0，
+// 测试误以为"消息里带数字了"（假绿）。下面强制：缺失时消息必须说"无法识别/缺失"，
+// 且绝不能把 missing 表述成"0"。
+section('C2 Test Integrity：字段缺失 ≠ 0（真 0 与 undefined/missing/unknown 必须区分）');
+const MISSING_COUNT_CODES = ['IMPORT-EMPTY', 'IMPORT-OPEN-QUESTIONS', 'IMPORT-UNCERTAINTY', 'IMPORT-CAVEAT', 'IMPORT-LOW-CONFIDENCE'];
+const missingRows: Array<{ code: string; ok: boolean; why: string }> = [];
+for (const code of MISSING_COUNT_CODES) {
+  let issue;
+  try {
+    issue = buildIssue(code, { target: 'c_test', targetKind: 'cabinet', ctx: { cabName: '测试柜' } });
+  } catch (e) {
+    missingRows.push({ code, ok: false, why: `构造失败：${(e as Error).message}` });
+    continue;
+  }
+  const msg = issue.message;
+  const why: string[] = [];
+  if (!/无法识别|缺失/.test(msg)) why.push('缺失时未说"无法识别/缺失"，而是假装给了个数字');
+  if (/只有 0 项|0 个|0 处|0 个柜体/.test(msg)) why.push('缺失却被表述成"0"（把 missing 当成了 0）');
+  missingRows.push({ code, ok: why.length === 0, why: why.join('；') });
+}
+ok('导入家族：字段缺失时明确报"无法识别"，绝不把 missing 当成 0 假绿', missingRows.every((r) => r.ok), JSON.stringify(missingRows));
 ok(
   `喂给派生卡的数字都真写进了 message（${Object.keys(NUM_CTX).length} 条：gap/angle/count/hA/hB/total 一个都不能被兜底 0 顶替）`,
   numberShown.length === 0,

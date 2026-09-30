@@ -19,9 +19,10 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-import type { Cabinet, Panel, Project, ProjectGeometry, RuleSet } from '../types.ts';
+import type { Cabinet, CabinetGeometry, Panel, Project, ProjectGeometry, RuleSet } from '../types.ts';
 import { layoutRows } from '../layoutModel.ts';
 import { authoredConnections } from '../relations.ts';
+import { equalSpacing } from '../allocate.ts';
 import { DEFAULT_MANUFACTURING_RULES, type ManufacturingRuleSet } from './rules.ts';
 import type {
   ManufacturingOperation,
@@ -149,6 +150,9 @@ function backPanelOps(cab: Cabinet): ManufacturingOperation[] {
 /**
  * 当前规则无法确认的加工 → unverified 操作（绝不脑补孔位/坐标）。
  * 每个都带 verification='unverified' + confidence='none' + 明确 detail 说明为何未确认。
+ *
+ * 注意：层板托孔已升格为 verified（见 shelfPinOps，在侧板上钻），
+ * 所以这里不再为 ShelfPanel 生成未确认的托孔。
  */
 function unverifiedOps(role: MfgPartRole, inAuthoredAssembly: boolean): ManufacturingOperation[] {
   const ops: ManufacturingOperation[] = [];
@@ -159,7 +163,6 @@ function unverifiedOps(role: MfgPartRole, inAuthoredAssembly: boolean): Manufact
     ops.push({ role: 'connector-hole', nameZh, source: 'manufacturing-rule:unverified', confidence: 'none', verification: 'unverified', detail });
   };
 
-  if (role === 'ShelfPanel') drill('层板托孔', 'shelf-pin holes；语义模型未携带孔位，需工厂排孔方案');
   if (role === 'DoorPanel') drill('铰链孔', 'hinge boring；语义模型未携带孔位，需工厂排孔方案');
   if (role.startsWith('Drawer')) drill('抽屉五金安装孔', 'drawer hardware mount holes（滑轨/拉手）；语义模型未携带孔位');
   if (CASE_SHELL_ROLES.includes(role)) conn('箱体连接孔', 'case connector holes（三合一/木榫）；语义模型未携带孔位');
@@ -168,9 +171,59 @@ function unverifiedOps(role: MfgPartRole, inAuthoredAssembly: boolean): Manufact
   return ops;
 }
 
+/**
+ * 层板托孔（第一条真实制造规则，verified）—— 只在侧板（Left/Right）上钻。
+ *
+ * 标高来源 = 几何 equalSpacing 派生的层板标高，基准为柜内底（innerBottomZ =
+ * bodyLift + boardT），与生成器板件 edgeLabel「距柜内底 Nmm」同源。制造层只读这里，
+ * **不重算、不猜**。横向留量（inset / 每标高孔数）来自 mfgRules.shelfPins（工厂参数）。
+ *
+ * 触发条件（verified 升格）：mfgRules.shelfPins.enabled 且本柜存在带 shelves 的分区。
+ * 没有 shelves → 不钻（保持 unverified 由 unverifiedOps 负责其余）。
+ */
+function shelfPinOps(cab: Cabinet, g: CabinetGeometry, mfgRules: ManufacturingRuleSet): ManufacturingOperation[] {
+  if (!mfgRules.shelfPins.enabled) return [];
+  const L = g.layout;
+  const innerBottomZ = cab.params.bodyLift + L.boardT;
+  const set = new Set<number>();
+  let hasShelf = false;
+  for (const row of L.rows) {
+    for (const u of row.units) {
+      const s = u.shelves;
+      if (s && s.count > 0) {
+        hasShelf = true;
+        for (const pos of equalSpacing(row.netH, s.count)) {
+          set.add(Math.round(row.z0 - innerBottomZ + pos));
+        }
+      }
+    }
+  }
+  if (!hasShelf) return [];
+  const elevations = [...set].sort((a, b) => a - b);
+  const pin = mfgRules.shelfPins;
+  return [
+    {
+      role: 'drilling',
+      nameZh: '层板托孔',
+      source: 'deterministic.shelfElevations',
+      confidence: 'high',
+      verification: 'verified',
+      detail: `侧板按层板标高钻托孔：标高 ${elevations.join('/')}mm（柜内底基准）；每标高每侧 ${pin.holesPerElevationPerSide} 孔，前后留量各 ${pin.insetFrontMm}/${pin.insetBackMm}mm`,
+      holes: {
+        reference: 'cabinet-inner-bottom',
+        elevations,
+        holesPerElevationPerSide: pin.holesPerElevationPerSide,
+        insetFrontMm: pin.insetFrontMm,
+        insetBackMm: pin.insetBackMm,
+      },
+    },
+  ];
+}
+
 function buildPart(
   panel: Panel,
   cab: Cabinet,
+  g: CabinetGeometry,
   rules: RuleSet,
   mfgRules: ManufacturingRuleSet,
   inAuthoredAssembly: boolean,
@@ -179,6 +232,8 @@ function buildPart(
   const verifiedOps: ManufacturingOperation[] = [];
   if (mfgRules.edgeBanding.enabled) verifiedOps.push(...edgeBandingOps(panel, rules));
   if (role === 'BackPanel') verifiedOps.push(...backPanelOps(cab));
+  // 侧板：层板托孔（verified，标高来自几何）
+  if (role === 'LeftSidePanel' || role === 'RightSidePanel') verifiedOps.push(...shelfPinOps(cab, g, mfgRules));
 
   const unverified = unverifiedOps(role, inAuthoredAssembly);
   const allOps = [...verifiedOps, ...unverified];
@@ -245,7 +300,7 @@ export function deriveManufacturing(
       warnings.push({ code: 'MFG-CABINET-NO-GEOM', severity: 'warning', message: `柜体「${cab.name}」无派生几何，跳过制造派生` });
       continue;
     }
-    const list = g.panels.map((panel) => buildPart(panel, cab, rules, mfgRules, inAuthoredAssembly.has(cab.id)));
+    const list = g.panels.map((panel) => buildPart(panel, cab, g, rules, mfgRules, inAuthoredAssembly.has(cab.id)));
     cabinets[cab.id] = list;
     parts.push(...list);
   }

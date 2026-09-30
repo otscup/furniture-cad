@@ -908,3 +908,53 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 
 - **不做**（按 P7 边界）：CNC 完整支持、工厂定制、自动排版/套料、复杂五金库、AI 决定工艺、重写 DXF、重构 Semantic Model。
 - **扩展点已留**：`MfgOperationRole` 枚举（groove/hardware-mount/machining 已占位）；未来排孔/套料加枚举+对应 derive 规则即可，不动几何与 Semantic Model；真实孔位需先在 `ManufacturingRuleSet` 给出可判定规则，才允许 unverified → verified。
+
+### 23.6 P7.1 实施记录：制造规则硬化 + 测试完整性（Manufacturing Rule Hardening + Test Integrity，已完成）
+
+> 基线 `2552072`（P7 已验收，本阶段不动 P7 任何既有逻辑、不进 P8）。
+> 目标：① 堵住「`num()` 缺值兜底 0」类假绿（缺失值必须显式说"无法识别"，绝不表述成 0）；② 系统梳理 `ManufacturingRuleSet → ManufacturingOperation → verification` 的 verified/unverified/unsupported 分类并写明 verified 升格条件；③ 实现第一条**真实**制造规则（层板托孔），全链路确定性、不脑补坐标；④ 明确本阶段边界（不做完整五金库/CNC/套料/AI 直出坐标/P8）。
+
+#### 23.6.1 交付物
+
+| 文件 | 变更 |
+|---|---|
+| `app/src/core/rules/issueCatalog.ts` | 新增两个工具函数：`numOrUndef(c,key)`（缺值/非数返回 `undefined`，与兜底 0 的 `num` 区分）；`countText(c,key)`（真有数→"N 个"，缺失→"数量无法识别（数据缺失或非数组）"）。IMPORT 家族五条（EMPTY / OPEN-QUESTIONS / UNCERTAINTY / LOW-CONFIDENCE / CAVEAT）的"缺失"分支统一走 `countText`，**绝不说"0 个/0 项"**。确立项目级口径：外部数据带进来的数量一律 `numOrUndef`，只有本系统算出的确定尺寸差才用 `num`。 |
+| `app/src/core/manufacturing/model.ts` | 新增 `MfgDrillHoles`（结构化孔位：`reference:'cabinet-inner-bottom'` / `elevations[]` / `holesPerElevationPerSide` / `insetFrontMm` / `insetBackMm`）。`ManufacturingOperation` 增加 `source` 枚举值 `'deterministic.shelfElevations'` 与可选 `holes?: MfgDrillHoles`（**仅 verified 钻孔填，unverified 不填坐标**）。 |
+| `app/src/core/manufacturing/rules.ts` | 新增 `MfgShelfPinRule`（`enabled` / `source:'deterministic.shelfElevations'` / `holesPerElevationPerSide` / `insetFrontMm` / `insetBackMm`）；`ManufacturingRuleSet` 增加 `shelfPins` 字段；`DEFAULT_MANUFACTURING_RULES.shelfPins = {enabled:true, 2, 37, 37}`；从 `unverifiedAspects` 移除「层板托孔」（已升格 verified），保留铰链孔/抽屉五金孔/箱体连接孔/组合连接加工孔 4 项。注释写明 verified 升格四条件。 |
+| `app/src/core/manufacturing/derive.ts` | `shelfPinOps(cab,g,mfgRules)`：从 `g.layout.rows` 收集带 `shelves` 分区的 `equalSpacing(row.netH, count)` 标高（基准 `innerBottomZ = bodyLift + boardT`，柜内底），去重排序，生成 verified 钻孔并填 `holes`。`buildPart` 加 `g` 参数，侧板（Left/Right）挂 verified 托孔；`unverifiedOps` 移除 ShelfPanel 的未确认托孔（托孔已升格到侧板）。 |
+| `app/verify/fixhint-acceptance.ts` | `NUM_CTX` 增加 5 条 IMPORT 家族（带真实 `count` 值）；`NO_NUMBER_OK` 例外集扩展纳入 5 条 IMPORT 码；新增 **C2 Test Integrity** 段：字段缺失时消息含"无法识别/缺失"且**不含**"只有 0 项/0 个/0 处/0 个柜体"。26 → 27 条。 |
+| `app/verify/manufacturing-acceptance.ts` | `⑫ 层板托孔` 段：侧板 verified 托孔、样本柜存在 shelves 触发、标高逐值===几何 `equalSpacing` 集合、横向留量来自 `DEFAULT_MANUFACTURING_RULES.shelfPins`、无 shelves 柜不钻、`shelfPins.enabled=false` 不钻。32 → 39 条。 |
+
+#### 23.6.2 ManufacturingRuleSet 分类（本阶段定稿）
+
+| 加工 | 现状 | verification | 升格 verified 的条件 |
+|---|---|---|---|
+| 封边 edge-banding | 来自几何 `panel.edge` | **verified** | 几何边位存在即确认（设计规则定边位） |
+| 背板工艺 back-panel-treatment | 来自语义 `backPanel.method` | **verified** | 语义字段给出 groove/inset |
+| **层板托孔 shelf-pin holes** | 几何 `equalSpacing` 标高 + 工厂留量 | **verified（P7.1 新增）** | ① `shelfPins.enabled`；② 柜体有 `shelves.count>0`；③ 标高全来自几何 equalSpacing（不重算不猜）；④ 横向留量来自制造规则（工厂参数） |
+| 铰链孔 hinge boring | 语义未携带 | unverified | 需工厂排孔方案 + 语义携带孔位（unverified → verified） |
+| 抽屉五金安装孔 | 语义未携带 | unverified | 同上 |
+| 箱体连接孔（三合一/木榫） | 语义未携带 | unverified | 需制造规则给出可判定连接孔方案 |
+| 组合连接加工孔 | authored 组合声明 | unverified | 经制造规则确认（绝不自动生成 verified） |
+
+**铁律**：verified 只能来自确定性可验证的制造规则（几何/语义已派生的确定事实）。AI / Vision / Import **绝不**输出孔位坐标，孔位坐标只能由确定性规则从几何派生；信息不足则保持 unverified，不污染 Semantic Model、不建第二尺寸计算体系、不把制造规则塞进 Geometry/CommandBus。
+
+#### 23.6.3 测试完整性纪律（项目级一致口径）
+
+- 真 0 与 `undefined`/`missing`/`unknown` 必须区分：`num()`（兜底 0）只用于"本系统已算出的确定尺寸差"；外部数据带进来的数量一律 `numOrUndef`，缺失显式报"无法识别"。
+- 不删旧测试、不放宽旧断言、`numOrUndef` 让"字段缺失"显式浮出而非静默变 0。
+- 验收判据精确到"因对的原因失败"：C2 段对 5 条 IMPORT 码在 ctx 缺 `count` 时构造，断言消息含"无法识别/缺失"且**不含**"0"。
+
+#### 23.6.4 验收结果（P7.1）
+
+- `tsc --noEmit`：0 错。
+- `verify:manufacturing`：39/39（⑫ 新增 7 条全过）。
+- `verify:fixhint`：27/27（C2 新增段全过）。
+- `verify:all`（node + UI）：全绿，console 0，未减少测试覆盖、未放宽断言（详见 §23.6.5 全量回归记录）。
+- 架构边界全部保持：Semantic Model 唯一真相源；Geometry/Rules 确定性计算；Manufacturing 只读派生层；AI/Vision/Import 语义理解层；无第二尺寸真相源；Manufacturing 不回写 Semantic Model；未改 CommandBus/设计规则/几何真相。
+
+#### 23.6.5 仍存架构边界（本阶段未做，留待后续阶段）
+
+- 不做：完整五金库、铰链全套、三合一全套、抽屉五金库、CNC、套料排版、自动优化、AI 直出坐标、自动 Placement、P8。
+- 4 类 unverified 加工（铰链/抽屉五金/箱体连接/组合连接）仍诚实标 unverified，待真实工厂规则接入后逐项升格。
+- 本阶段停在 P7.1，未自动进入 P8。

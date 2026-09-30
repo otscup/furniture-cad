@@ -52,12 +52,15 @@ export function compileImport(nd: NormalizedDesign, project: Project, rules: Rul
   const origins = new Map<string, ImportOrigin>();
   for (const c of nd.cabinets) {
     const ref = String(c.ref);
+    // 把「硬阻断的不确定项」与「图片识别的诚实 caveats」合并进来源归属——
+    // 留痕审计：这个柜来自图片，哪些生产结构是估计/未确认的。
+    const trail = [...(c.uncertainty ?? []), ...(c.caveats ?? [])].filter((s) => typeof s === 'string' && s.trim() !== '');
     origins.set(ref, {
       source: c.source ?? nd.source,
       label: nd.label,
       batchId: nd.batchId,
       confidence: c.confidence,
-      uncertainty: c.uncertainty,
+      uncertainty: trail.length ? trail : undefined,
     });
   }
   const actions = compiled.actions.map((a) => {

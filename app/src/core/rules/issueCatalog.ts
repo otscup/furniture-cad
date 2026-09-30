@@ -793,6 +793,21 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: () => '它不静默假装成功：结果会标 low 置信度并列出不确定项，请用 JSON 适配器或人工核对兜底。',
     manual: '酷家乐 / 图片识别等真实接入是 P5+ 的活，P4 只把边界画对。',
   },
+  // ═══════════════ Import 图片识别 caveats（v0.3，P5）══════════════
+  //
+  // caveats = 「图片看见了外面、但生产上还得你定」的诚实项：真实深度、板厚、
+  // 隐藏隔板、真实尺寸（无标注时只是视觉估计）等。**不阻断**——它们会被用户
+  // 在预览里「已知晓并确认」后生成，并随 Cabinet.origin.uncertainty 留痕审计。
+  // 与 IMPORT-UNCERTAINTY（P4 硬阻断，用于「连候选都不敢给」）分工：
+  //   · caveats  → 有候选、可确认、不卡死（P5 人机协作识别链路）
+  //   · uncertainty → 硬阻断（P4 占位适配器对「没真做识别」的诚实拒收）
+  'IMPORT-CAVEAT': {
+    title: '图片识别有需你确认的生产项',
+    severity: 'WARNING',
+    message: (c) => `这份图片识别有 ${num(c, 'count')} 项图片看不见、需你确认的生产结构，其中第一条是：「${str(c, 'first')}」。`,
+    hint: () => '预览里逐项「已知晓」后才会生成；它们会随 Cabinet 来源归属留痕（深度/板厚等若为估计值，下料前请复核）。',
+    manual: 'Vision 不编造看不见的生产结构：这些项不是被猜掉的，而是交回给你定。',
+  },
 };
 
 export const RULE_CODES = Object.keys(RULE_CARDS);

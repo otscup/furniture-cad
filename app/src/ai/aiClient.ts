@@ -405,6 +405,77 @@ export async function requestChat(opts: {
   };
 }
 
+// ───────────────────────────── 视觉识别（P5）─────────────────────────────
+
+/**
+ * 视觉识别通道的客户端。
+ *
+ * 与服务端 /api/ai/vision 对接—— 该路由复用 server.mjs 既有的 AI 网关配置
+ * （baseUrl/apiKey/model），与 /api/ai/chat 同源。前端只负责把图片（data URL）
+ * 发过去、把结构化结果拿回来，**不做识别、不碰几何**。识别结果由映射层
+ * （visionResultToNormalized）译成 NormalizedDesign，之后走 P4 统一链路。
+ */
+export interface VisionResponse {
+  ok: boolean;
+  error?: string;
+  /** 结构化识别结果（通过形状校验前的原始 VisionResult） */
+  result?: import('./vision/types.ts').VisionResult;
+  /** 模型返回了但解析不出 JSON 时的原文 */
+  raw?: string;
+  model?: string;
+  usage?: PlanResponse['usage'];
+  ms?: number;
+}
+
+export async function requestVision(opts: {
+  image: string;
+  mime?: string;
+  filename?: string;
+  hint?: string;
+  knownScaleMm?: number;
+  model?: string;
+  token?: string | null;
+}): Promise<VisionResponse> {
+  const empty: VisionResponse = { ok: false };
+  let res: Response;
+  try {
+    res = await fetch('/api/ai/vision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts.token ?? null) },
+      body: JSON.stringify({
+        image: opts.image,
+        mime: opts.mime,
+        filename: opts.filename,
+        hint: opts.hint,
+        knownScaleMm: opts.knownScaleMm,
+        model: opts.model,
+      }),
+    });
+  } catch (e) {
+    return { ...empty, error: `连不上本地服务：${(e as Error).message}　（请确认 npm run server 在跑）` };
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch {
+    return { ...empty, error: `本地服务返回了非 JSON（HTTP ${res.status}）` };
+  }
+  if (res.status === 401) return { ...empty, error: String(body.error ?? '未登录或会话已过期') };
+  if (res.status === 429) return { ...empty, error: String(body.error ?? 'AI 额度已用完') };
+  if (res.status === 403) return { ...empty, error: String(body.error ?? '没有权限') };
+  if (!body.ok) {
+    return { ...empty, error: String(body.error ?? '视觉识别失败'), raw: typeof body.raw === 'string' ? body.raw : undefined };
+  }
+  return {
+    ok: true,
+    result: body.result as VisionResponse['result'],
+    raw: typeof body.raw === 'string' ? body.raw : undefined,
+    model: body.model as string | undefined,
+    usage: (body.usage as VisionResponse['usage']) ?? null,
+    ms: body.ms as number | undefined,
+  };
+}
+
 // ───────────────────────────── 账号 / 会话 ─────────────────────────────
 
 export interface AuthAccount {

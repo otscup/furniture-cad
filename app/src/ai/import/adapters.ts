@@ -27,7 +27,7 @@ export const ADAPTERS: Record<ImportSource, AdapterMeta> = {
   json: { source: 'json', label: 'JSON 柜体清单', deterministic: true, verified: true, note: '确定性解析，可跑通示例' },
   dxf: { source: 'dxf', label: 'DXF（保守意图提取）', deterministic: true, verified: false, note: '仅提取块引用，不产坐标；几何识别待 P5' },
   kujiale: { source: 'kujiale', label: '酷家乐（边界占位）', deterministic: true, verified: false, note: 'P4 仅预留边界，不接入真实 API' },
-  imageVision: { source: 'imageVision', label: '图片识别（收 Vision 结果）', deterministic: true, verified: false, note: 'P4 仅接收结构化结果，视觉识别待 P5' },
+  imageVision: { source: 'imageVision', label: '图片识别（Vision → 候选方案）', deterministic: true, verified: true, note: 'P5 已接通：VisionProvider 识别 → 诚实映射成候选 → 确认 → 模型；离线/验收用 MockVisionProvider 跑通闭环，真实 API 走服务端网关（/api/ai/vision，复用 baseUrl/key）' },
 };
 
 export interface ParseImportOptions {

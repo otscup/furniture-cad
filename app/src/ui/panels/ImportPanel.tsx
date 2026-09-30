@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
 import type { Issue } from '../../core/types.ts';
@@ -6,6 +6,8 @@ import type { ImportSource } from '../../core/types.ts';
 import { ADAPTERS, parseImport } from '../../ai/import/adapters.ts';
 import { compileImport } from '../../ai/import/compileImport.ts';
 import { importBlocked, validateNormalized, type NormalizedDesign } from '../../ai/import/normalized.ts';
+import { analyzeImageToNormalized, MockVisionProvider, RemoteVisionProvider, type VisionInput } from '../../ai/vision/index.ts';
+import { loadToken } from '../../ai/aiClient.ts';
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { PlanRunView } from './PlanRunView.tsx';
@@ -13,22 +15,20 @@ import { Pill, Section, Text } from './common.tsx';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  ImportPanel —— 外部设计数据 → 导入（P4）
+ *  ImportPanel —— 外部设计数据 → 导入（P4 骨架 + P5 图片识别）
  *
  *  ── 与 AI 设计通道同一条路 ──
- *    粘贴/上传 → parseImport（适配器）→ NormalizedDesign → validateNormalized
- *    → compileImport（确定性编译成 AiAction[]，注入来源归属）→ dryRunPlan（沙盒）
- *    → 人确认 → commitPlan → CommandBus。
- *    与 AI 通道唯一区别是「设计意图从哪来」：那边是 LLM，这边是适配器。
- *    落到模型这一步**完全相同**，所以 Import 在结构上不可能绕过 Rules / Geometry / 审计。
+ *    粘贴/上传 → 解析/识别 → NormalizedDesign → validateNormalized
+ *    → compileImport → dryRunPlan（沙盒）→ 人确认 → commitPlan → CommandBus。
+ *    JSON / DXF / 酷家乐走 parseImport；图片走 VisionProvider → 诚实映射
+ *    （visionResultToNormalized），两路最后都汇到同一个写入口。
  *
- *  ── 失败 / 不完整 / 不确定必须写在脸上（不静默）──
- *    · 形状错 → IMPORT-SHAPE，红，不能编译；
- *    · 有不确定项 → IMPORT-UNCERTAINTY，红，阻断；
- *    · 有待确认问题 → IMPORT-OPEN-QUESTIONS，阻断；
- *    · 来源未验证 → IMPORT-UNVERIFIED-CAPABILITY，黄，必须显示；
- *    · 整体低置信度 → IMPORT-LOW-CONFIDENCE，黄，提示逐柜核对。
- *  这些一律在「编译并预览」之前拦住，绝不替用户把估出来的尺寸猜成下料尺寸。
+ *  ── 图片识别的人机协作闭环（P5）──
+ *    选「图片识别」→ 上传图（或点「示例图（离线 Mock）」）→ VisionProvider
+ *    识别 → 候选方案（柜体数 / rows / units / 组件 / 组合关系 + 估计尺寸）
+ *    → 图片看不见的生产结构（真实深度 / 板厚 / 隐藏隔板 / 真实尺寸）作为
+ *    **caveats** 列在预览里，需用户逐项「已知晓」后才允许生成 → 确认落模型。
+ *    Vision 不编造看不见的结构；确认后这些项随 Cabinet.origin 留痕审计。
  * ══════════════════════════════════════════════════════════════════════
  */
 
@@ -43,37 +43,53 @@ export function ImportPanel(props: {
   const [source, setSource] = useState<ImportSource>('json');
   const [raw, setRaw] = useState('');
   const [fileLabel, setFileLabel] = useState<string | null>(null);
+  const [imgData, setImgData] = useState<string | null>(null);
+  const [imgMime, setImgMime] = useState<string | undefined>(undefined);
+  const [hintText, setHintText] = useState('');
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [nd, setNd] = useState<NormalizedDesign | null>(null);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [parseErr, setParseErr] = useState<string | null>(null);
+  const [visionErr, setVisionErr] = useState<string | null>(null);
   const [run, setRun] = useState<PlanRun | null>(null);
   const [lastApply, setLastApply] = useState('');
   const [busy, setBusy] = useState(false);
+  const [ack, setAck] = useState(false);
 
-  const onFile = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      setRaw(String(reader.result ?? ''));
-      setFileLabel(f.name);
-      setNd(null);
-      setRun(null);
-      setIssues([]);
-      setParseErr(null);
-      setLastApply('');
-    };
-    reader.readAsText(f);
-  }, []);
+  const remoteProvider = useMemo(() => new RemoteVisionProvider({ token: loadToken() }), []);
 
   const resetDownstream = useCallback(() => {
     setNd(null);
     setRun(null);
     setIssues([]);
     setParseErr(null);
+    setVisionErr(null);
     setLastApply('');
+    setAck(false);
   }, []);
+
+  const onFile = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (source === 'imageVision') {
+      const reader = new FileReader();
+      reader.onload = () => {
+        setImgData(String(reader.result ?? ''));
+        setImgMime(f.type || undefined);
+        setFileLabel(f.name);
+        resetDownstream();
+      };
+      reader.readAsDataURL(f);
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        setRaw(String(reader.result ?? ''));
+        setFileLabel(f.name);
+        resetDownstream();
+      };
+      reader.readAsText(f);
+    }
+  }, [source, resetDownstream]);
 
   const doParse = useCallback(() => {
     resetDownstream();
@@ -85,6 +101,34 @@ export function ImportPanel(props: {
       setParseErr((err as Error).message);
     }
   }, [source, raw, fileLabel, bus, resetDownstream]);
+
+  const runVision = useCallback(async (useMock: boolean) => {
+    if (!useMock && !imgData) {
+      setVisionErr('请先选择一张图片');
+      return;
+    }
+    setVisionErr(null);
+    setBusy(true);
+    try {
+      const provider = useMock ? new MockVisionProvider() : remoteProvider;
+      const input: VisionInput = {
+        image: useMock ? 'mock://example' : (imgData as string),
+        mime: imgMime,
+        filename: fileLabel ?? undefined,
+        hint: hintText.trim() || (useMock ? 'fixture:main' : undefined),
+      };
+      const { design } = await analyzeImageToNormalized(provider, input, {
+        label: fileLabel ?? (useMock ? '示例图（离线 Mock）' : undefined),
+      });
+      setNd(design);
+      setIssues(validateNormalized(design, bus.getState()));
+      setAck(false);
+    } catch (err) {
+      setVisionErr((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }, [imgData, imgMime, fileLabel, hintText, remoteProvider]);
 
   const doCompile = useCallback(() => {
     if (!nd) return;
@@ -116,11 +160,19 @@ export function ImportPanel(props: {
     setRun(null);
     setNd(null);
     setRaw('');
+    setImgData(null);
     setFileLabel(null);
+    setHintText('');
     props.onToast?.(r.blockingErrors > 0 ? 'warn' : 'ok', msg);
   }, [run, bus, props]);
 
   const blocked = nd ? importBlocked(issues) : false;
+  // 图片识别的诚实项：有 caveats 且未「已知晓」→ 不能生成（强制用户确认）
+  const hasCaveats = nd
+    ? Boolean(nd.caveats && nd.caveats.length) || nd.cabinets.some((c) => c.caveats && c.caveats.length)
+    : false;
+  const ackNeeded = hasCaveats && !ack;
+  const compileDisabled = busy || blocked || ackNeeded;
 
   return (
     <div className="panel import-panel">
@@ -154,33 +206,63 @@ export function ImportPanel(props: {
         })}
       </div>
 
-      {/* 输入 */}
-      <Section title={`粘贴 ${ADAPTERS[source].label} 数据`}>
-        <textarea
-          className="import-text"
-          value={raw}
-          placeholder={
-            source === 'json'
-              ? '粘贴一个含 cabinets 数组的 JSON（例：{"title":"玄关","cabinets":[{"ref":"shoe","width":900,"height":2400,"depth":350}]}）'
-              : source === 'dxf'
-                ? '粘贴 DXF 文本（将保守提取块引用，不产坐标，标 low 置信度）'
-                : '粘贴结构化结果 JSON（酷家乐草稿 / 图片识别结果）'
-          }
-          onChange={(e) => setRaw(e.target.value)}
-          rows={8}
-        />
-        <div className="row">
-          <button type="button" className="btn" onClick={() => fileRef.current?.click()}>
-            上传文件
-          </button>
-          {fileLabel ? <span className="muted-sm">已选：{fileLabel}</span> : null}
-          <input ref={fileRef} type="file" accept=".json,.dxf,.txt" style={{ display: 'none' }} onChange={onFile} />
-          <button type="button" className="btn btn-primary" disabled={!raw.trim()} onClick={doParse}>
-            解析导入
-          </button>
-        </div>
-        {parseErr ? <div className="alert alert-error">{parseErr}</div> : null}
-      </Section>
+      {/* 输入区：图片识别走 Vision，其余走文本/文件 */}
+      {source === 'imageVision' ? (
+        <Section title="上传柜体效果图 / 截图">
+          <div className="row">
+            <button type="button" className="btn" onClick={() => fileRef.current?.click()}>
+              选择图片
+            </button>
+            <button type="button" className="btn" disabled={busy} onClick={() => runVision(false)}>
+              识别这张图
+            </button>
+            <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => runVision(true)}>
+              示例图（离线 Mock）
+            </button>
+            {fileLabel ? <span className="muted-sm">已选：{fileLabel}</span> : null}
+            <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={onFile} />
+          </div>
+          {imgData ? <img className="import-img-preview" src={imgData} alt="预览" /> : null}
+          <input
+            className="import-hint"
+            placeholder="可选：给模型的提示，如「这是玄关鞋柜」「左柜已知宽 400」"
+            value={hintText}
+            onChange={(e) => setHintText(e.target.value)}
+          />
+          <p className="note">
+            真实识别走服务端 AI 网关（/api/ai/vision，复用已配置的 baseUrl / key）；
+            无 key 时可用「示例图（离线 Mock）」体验完整闭环。Vision 不编造看不见的生产结构。
+          </p>
+          {visionErr ? <div className="alert alert-error">{visionErr}</div> : null}
+        </Section>
+      ) : (
+        <Section title={`粘贴 ${ADAPTERS[source].label} 数据`}>
+          <textarea
+            className="import-text"
+            value={raw}
+            placeholder={
+              source === 'json'
+                ? '粘贴一个含 cabinets 数组的 JSON（例：{"title":"玄关","cabinets":[{"ref":"shoe","width":900,"height":2400,"depth":350}]}）'
+                : source === 'dxf'
+                  ? '粘贴 DXF 文本（将保守提取块引用，不产坐标，标 low 置信度）'
+                  : '粘贴结构化结果 JSON（酷家乐草稿 / 图片识别结果）'
+            }
+            onChange={(e) => setRaw(e.target.value)}
+            rows={8}
+          />
+          <div className="row">
+            <button type="button" className="btn" onClick={() => fileRef.current?.click()}>
+              上传文件
+            </button>
+            {fileLabel ? <span className="muted-sm">已选：{fileLabel}</span> : null}
+            <input ref={fileRef} type="file" accept=".json,.dxf,.txt" style={{ display: 'none' }} onChange={onFile} />
+            <button type="button" className="btn btn-primary" disabled={!raw.trim()} onClick={doParse}>
+              解析导入
+            </button>
+          </div>
+          {parseErr ? <div className="alert alert-error">{parseErr}</div> : null}
+        </Section>
+      )}
 
       {/* 归一化结果 + 校验 */}
       {nd ? (
@@ -204,7 +286,10 @@ export function ImportPanel(props: {
                   <Pill kind={c.confidence === 'low' ? 'WARNING' : c.confidence === 'high' ? 'ok' : 'INFO'}>{c.confidence}</Pill>
                 ) : null}
                 {c.uncertainty && c.uncertainty.length > 0 ? (
-                  <div className="alert alert-warn">不确定：{c.uncertainty.join('；')}</div>
+                  <div className="alert alert-warn">不确定（阻断）：{c.uncertainty.join('；')}</div>
+                ) : null}
+                {c.caveats && c.caveats.length > 0 ? (
+                  <div className="alert alert-info">图片未确认（生成前请知晓）：{c.caveats.join('；')}</div>
                 ) : null}
               </li>
             ))}
@@ -225,11 +310,20 @@ export function ImportPanel(props: {
             <div className="note ok">✓ 形状与来源校验通过</div>
           )}
 
+          {/* 图片识别诚实项确认门 */}
+          {hasCaveats ? (
+            <label className="import-ack">
+              <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
+              我已逐项确认以上图片未确认项（真实深度 / 板厚 / 隐藏隔板 / 真实尺寸等），按估计或默认生成。
+            </label>
+          ) : null}
+
           <div className="row">
-            <button type="button" className="btn btn-primary" disabled={busy || blocked} onClick={doCompile}>
-              {blocked ? '有拦不住的问题，不能编译' : '编译并预览'}
+            <button type="button" className="btn btn-primary" disabled={compileDisabled} onClick={doCompile}>
+              {blocked ? '有拦不住的问题，不能编译' : ackNeeded ? '请先确认图片未确认项' : '编译并预览'}
             </button>
-            {blocked ? <span className="muted-sm">红色问题必须先解决（不确定项 / 待确认问题 / 形状错误）</span> : null}
+            {blocked ? <span className="muted-sm">红色问题必须先解决（待确认问题 / 形状错误）</span> : null}
+            {ackNeeded ? <span className="muted-sm">图片识别的诚实项需勾选「已知晓」后才允许生成</span> : null}
           </div>
         </Section>
       ) : null}

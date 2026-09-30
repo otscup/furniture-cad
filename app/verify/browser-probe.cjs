@@ -5150,6 +5150,59 @@ async function waitForApp(url, timeoutMs = 25000) {
     await clickPanelBtn('放弃草案', 460);
     ok('放弃草案后草图收起（界面不留一个别人以为还在的东西）', (await evalJs(`!!document.querySelector('.side-right .draft-preview')`)) === false);
 
+    // ═══════════════════════════════════════════════════════════
+    section('B43 导入面板（P4 Import + P5 图片识别）：Mock 识别 → caveat 确认门 → 编译预览 → 应用');
+
+    // 导入面板的按钮不是 .tb-btn，是 .btn —— 用专用 helper（B43 专用，别与 clickPanelBtn 混用）
+    const clickImportBtn = async (label, waitMs = 320) => {
+      const r = await evalJs(`(()=>{
+        const l=${JSON.stringify(label)};
+        const b=[...document.querySelectorAll('.side-right button')]
+          .find(x=>x.textContent.includes(l));
+        if(!b) return 'no-btn'; b.click(); return 'OK';
+      })()`);
+      await sleep(waitMs);
+      return r;
+    };
+
+    ok('「导入」页签存在且能打开', (await activateRightTab('导入')) === true);
+    const importPanelVisible = await evalJs(`!!document.querySelector('.side-right .import-panel')`);
+    ok('导入面板真的渲染出来了', importPanelVisible === true);
+    const srcBtns = await evalJs(`[...document.querySelectorAll('.side-right .import-source')].map(b=>b.querySelector('b')?.textContent)`);
+    ok('四个来源按钮齐全（JSON / DXF / 酷家乐 / 图片识别）', JSON.stringify(srcBtns) === JSON.stringify(['JSON 柜体清单', 'DXF（保守意图提取）', '酷家乐（边界占位）', '图片识别（Vision → 候选方案）']), JSON.stringify(srcBtns));
+    ok('酷家乐 / DXF 标着「待验证」（不假装已接通）', (await evalJs(`[...document.querySelectorAll('.side-right .import-source')].filter(b=>b.textContent.includes('待验证')).length`)) === 2);
+
+    ok('切到「图片识别」来源', (await clickImportBtn('图片识别')) === 'OK');
+    ok('图片输入区出现（示例图 / 离线 Mock 入口可见）', (await evalJs(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.includes('示例图（离线 Mock）'))`)) === true);
+
+    // 离线 Mock：确定性 fixture，无网络 —— 识别出 3 柜 + 组合 + caveats
+    ok('点「示例图（离线 Mock）」触发识别', (await clickImportBtn('示例图（离线 Mock）', 600)) === 'OK');
+    const cabCount = await evalJs(`document.querySelectorAll('.side-right .import-panel .import-cab').length`);
+    ok('归一化结果列出 3 个柜体', cabCount === 3, `实为 ${cabCount}`);
+    const caveatShown = await evalJs(`[...document.querySelectorAll('.side-right .import-panel .alert-info')].some(e=>e.textContent.includes('图片未确认'))`);
+    ok('「图片未确认」诚实项显示在柜体卡上（真实深度/板厚等不静默）', caveatShown === true);
+    const ackBox = await evalJs(`!!document.querySelector('.side-right .import-panel .import-ack input[type=checkbox]')`);
+    ok('caveat 确认门（勾选「已知晓」）出现', ackBox === true);
+
+    // 确认门：没勾选 → 编译按钮禁用（Vision 的估计值不许绕过用户直接进模型）
+    const compileBtnDisabledBefore = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.includes('请先确认图片未确认项'));return b? b.disabled : 'no-btn';})()`);
+    ok('未勾选确认前编译按钮禁用（文案写明原因）', compileBtnDisabledBefore === true, String(compileBtnDisabledBefore));
+    await evalJs(`(()=>{const c=document.querySelector('.side-right .import-panel .import-ack input[type=checkbox]');if(c){c.click();}return !!c;})()`);
+    await sleep(200);
+    const compileReady = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='编译并预览');return b? !b.disabled : 'no-btn';})()`);
+    ok('勾选确认后「编译并预览」启用', compileReady === true, String(compileReady));
+
+    ok('编译并预览', (await clickImportBtn('编译并预览', 600)) === 'OK');
+    ok('预览段出现（预览 = 提交，与 AI 设计通道同一块 PlanRunView）', (await evalJs(`[...document.querySelectorAll('.side-right .sec-head')].some(e=>e.textContent.includes('预览（与提交完全相同）'))`)) === true);
+
+    const v0Import = await statusVersion();
+    const appliedOk = await clickImportBtn('应用导入', 600);
+    ok('点「应用导入」', appliedOk === 'OK');
+    const importToast = await text('.toasts');
+    ok('导入回执出现（应用了几条、不静默生效）', /已导入\s*4\s*条/.test(importToast), importToast.slice(0, 200));
+    const v1Import = await statusVersion();
+    ok('导入的 4 条动作（3 柜 + 1 组合）真的全部执行（版本 +4）', v1Import === v0Import + 4, `v${v0Import} → v${v1Import}`);
+
     /**
      * console error 的判定要分两类。
      *

@@ -44,8 +44,15 @@ export interface NormalizedCabinet extends ProposalCabinet {
   source?: ImportSource;
   /** 适配器对该柜的置信度（不给 = 用整批） */
   confidence?: 'high' | 'medium' | 'low';
-  /** 该柜没可靠确定的内容（阻断应用） */
+  /** 该柜没可靠确定的内容（阻断应用，P4 硬门） */
   uncertainty?: string[];
+  /**
+   * 图片看见外面、但生产上还需用户确认的项（**不阻断**）。
+   * 例如：真实深度/板厚看不见、尺寸只是视觉估计、内部隔板看不见。
+   * 经 IMPORT-CAVEAT 暴露，用户在预览里「已知晓」后生成，并随
+   * Cabinet.origin.uncertainty 留痕审计。与 uncertainty 分工：caveats 有候选可确认。
+   */
+  caveats?: string[];
 }
 
 export interface NormalizedDesign {
@@ -66,6 +73,8 @@ export interface NormalizedDesign {
   questions?: string[] | null;
   /** 适配器未验证的能力（酷家乐 / 图片识别占位时填，不阻断但必须显示） */
   unverifiedCapabilities?: string[] | null;
+  /** 图片识别的诚实项（不阻断；IMPORT-CAVEAT 暴露，用户确认后生成并留痕） */
+  caveats?: string[] | null;
 }
 
 // ════════════════════ 校验（对着项目与规则集，带数字）═══════════════════════
@@ -83,6 +92,14 @@ export interface NormalizedDesign {
 export function validateNormalized(nd: NormalizedDesign, project: Project): Issue[] {
   const out: Issue[] = [];
   const t = (suffix: string): string => `import${suffix}`;
+
+  // 0. 开放问题优先报（即便下面形状/空也会报，但"必须你先定"这件事用户必须看到）。
+  //    放在形状门之前：模糊到连柜体都数不清的图（cabinets 为空 + questions 非空）
+  //    也能以 OPEN-QUESTIONS 硬阻断，而不是只报一个 IMPORT-SHAPE/EMPTY 把问题淹没。
+  const questions = (nd.questions ?? []).filter((q) => typeof q === 'string' && q.trim() !== '');
+  if (questions.length > 0) {
+    out.push(buildIssue('IMPORT-OPEN-QUESTIONS', { target: t(''), targetKind: 'project', ctx: { count: questions.length, first: questions[0] } }));
+  }
 
   // 1. 形状门（复用契约，唯一实现）；宽松忽略 source/confidence 等多余字段
   const shapeErr = proposalShapeError(nd as unknown as Record<string, unknown>);
@@ -128,11 +145,7 @@ export function validateNormalized(nd: NormalizedDesign, project: Project): Issu
     }
   }
 
-  // 5. 开放问题（阻断）
-  const questions = (nd.questions ?? []).filter((q) => typeof q === 'string' && q.trim() !== '');
-  if (questions.length > 0) {
-    out.push(buildIssue('IMPORT-OPEN-QUESTIONS', { target: t(''), targetKind: 'project', ctx: { count: questions.length, first: questions[0] } }));
-  }
+  // 5. （开放问题已在第 0 步优先报过，避免被形状/空门淹没）
 
   // 6. 不确定项（阻断 —— 不替用户猜）
   const uncertainty = nd.cabinets
@@ -149,6 +162,19 @@ export function validateNormalized(nd: NormalizedDesign, project: Project): Issu
       target: t(''),
       targetKind: 'project',
       ctx: { count: lowCount, sources: nd.source },
+    }));
+  }
+
+  // 8. 图片识别 caveats（**不阻断**，IMPORT-CAVEAT 暴露；用户确认后生成并留痕）
+  const caveats = [
+    ...(nd.caveats ?? []).filter((u) => typeof u === 'string' && u.trim() !== ''),
+    ...nd.cabinets.flatMap((c) => c.caveats ?? []).filter((u) => typeof u === 'string' && u.trim() !== ''),
+  ];
+  if (caveats.length > 0) {
+    out.push(buildIssue('IMPORT-CAVEAT', {
+      target: t(''),
+      targetKind: 'project',
+      ctx: { count: caveats.length, first: caveats[0] },
     }));
   }
 

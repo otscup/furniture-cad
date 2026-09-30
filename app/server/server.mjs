@@ -991,6 +991,150 @@ async function handleApi(req, res, pathname) {
   }
 
   /**
+   * ─────────────── AI 视觉识别：图片/效果图 → 结构化候选（P5）───────────────
+   *
+   *  复用 server.mjs 既有的 AI 网关配置（env.AI_BASE_URL / AI_API_KEY / AI_MODEL），
+   *  与 /api/ai/chat 同源、换服务商 = 填 baseUrl 不改代码。具体视觉能力由模型决定
+   *  （OpenAI / Gemini / Claude / 本地模型 / 兼容网关均可，只要支持 image_url）。
+   *
+   *  职责边界（与 core 解耦）：
+   *   · 本路由**只做识别**，把图 + 指令发给 OpenAI 兼容 /chat/completions，
+   *     拿回一个描述「看见了什么」的 JSON；
+   *   · **不碰几何、不写模型**—— JSON 回到前端后，由 visionResultToNormalized
+   *     诚实映射成 NormalizedDesign，再走 P4 统一链路（compileImport → 预览 → 确认
+   *     → CommandBus）。换 Vision 服务商 / 模型，Semantic Model / Geometry / Rules 一行不动。
+   */
+  if (pathname === '/api/ai/vision' && req.method === 'POST') {
+    const body = await readBody(req);
+    const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
+    const key = env.AI_API_KEY || '';
+    const model = body.model || env.AI_MODEL || s.model;
+    if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
+    if (typeof body.image !== 'string' || !body.image) return json(res, 400, { ok: false, error: 'image 不能为空（应为 data URL）' });
+    if (gate.account) {
+      const q = auth.checkQuota(gate.account.id, { generation: true });
+      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code, quota: q.view });
+      const m = auth.checkModel(gate.account.id, model);
+      if (!m.ok) return json(res, 403, { ok: false, error: m.error, code: m.code });
+    }
+    const t0 = Date.now();
+    const systemPrompt = [
+      '你是定制家具设计软件里的视觉识别助手。用户会发一张柜体效果图/截图，',
+      '你要识别并**只输出**一个 JSON 对象，符合下面的 TypeScript 形状（不要输出任何多余文字，也不要用 markdown 代码块包裹）：',
+      '',
+      'interface VisionResult {',
+      '  cabinets: VisionCabinet[];',
+      '  relations?: { from: string; to: string; kind: "L-shape" | "side-by-side" | "stacked" | "adjacent"; confidence: "high"|"medium"|"low" }[];',
+      '  scale?: { known: boolean; text?: string; referenceMm?: number; confidence: "high"|"medium"|"low" };',
+      '  overallConfidence: "high"|"medium"|"low";',
+      '  notes?: string[];',
+      '  ambiguous?: string[];',
+      '}',
+      'interface VisionCabinet {',
+      '  ref: string; name?: string;',
+      '  width?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+      '  height?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+      '  depth?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+      '  rows?: { heightMm?: number; heightRatio?: number; units?: VisionUnit[]; confidence: "high"|"medium"|"low" }[];',
+      '  units?: VisionUnit[];',
+      '  components?: { type: "door"|"drawer"|"open-shelf"|"shelf"|"appliance-cavity"; location?: string; confidence: "high"|"medium"|"low" }[];',
+      '  rotation?: number; room?: string; confidence: "high"|"medium"|"low";',
+      '  notVisible?: ("depth"|"board-thickness"|"inner-partitions"|"connection"|"real-size")[];',
+      '}',
+      'interface VisionUnit { kind: "shelves"|"drawerBank"|"hanging"|"open"|"appliance"; widthMm?: number; widthRatio?: number; count?: number; doorCount?: number; confidence: "high"|"medium"|"low" }',
+      '',
+      '诚实纪律（最重要）：',
+      '· 图片里**看不见**真实深度、板厚、隐藏隔板、柜体连接方式、整柜真实尺寸（无标注时只是视觉估计）—— 一律写进 notVisible，不要编造具体数值。',
+      '· 整柜尺寸若无标注，source 必须填 "estimate"，并在 scale.known 填 false；有尺寸标注/可识别参考物才填 "annotation"/"reference" 且 scale.known=true。',
+      '· 只把你**确实看见**的左右分区(units) / 上下分层(rows) / 门·抽屉·开放格(components) 写进去；看不见内部结构的别脑补层板。',
+      '· 若连柜体数量都判断不清，把疑问写进 ambiguous（字符串数组），cabinets 可留空。',
+    ].join('\n');
+    const userText = typeof body.hint === 'string' && body.hint.trim()
+      ? body.hint
+      : '请识别这张柜体效果图，给出结构化 JSON。';
+    try {
+      const payload = {
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: userText },
+              { type: 'image_url', image_url: { url: body.image } },
+            ],
+          },
+        ],
+        temperature: 0.2,
+        max_tokens: typeof body.maxTokens === 'number' && body.maxTokens > 0 ? body.maxTokens : resolveMaxTokens(env.AI_MAX_TOKENS),
+      };
+      const r = await fetchWithTimeout(
+        `${baseUrl}/chat/completions`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+          body: JSON.stringify(payload),
+        },
+        Number(env.AI_TIMEOUT_MS ?? 120000),
+      );
+      const text = await r.text();
+      if (!r.ok) {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: `HTTP ${r.status}` });
+        return json(res, 200, { ok: false, error: `HTTP ${r.status}：${text.slice(0, 400)}` });
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: 'bad_envelope' });
+        return json(res, 200, { ok: false, error: '服务商返回的不是 JSON', raw: text.slice(0, 400), ms: Date.now() - t0 });
+      }
+      const content = String(data?.choices?.[0]?.message?.content ?? '');
+      const usage = data?.usage ?? null;
+      // 兼容模型把 JSON 包在 ```json ... ``` 里的情况
+      const jsonStr = content.replace(/^[\s\S]*?```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
+      let parsed;
+      try {
+        parsed = JSON.parse(jsonStr || content);
+      } catch {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: 'bad_vision_json' });
+        return json(res, 200, { ok: false, error: '模型未返回可解析的 JSON', raw: content.slice(0, 400), model: data?.model ?? model, usage, ms: Date.now() - t0 });
+      }
+      if (!Array.isArray(parsed?.cabinets) || parsed.cabinets.length === 0) {
+        if (gate.account) auth.recordUsage(gate.account.id, { model, ok: true, ms: Date.now() - t0 });
+        return json(res, 200, { ok: false, error: '模型未识别出任何柜体（cabinets 为空）', raw: content.slice(0, 400), model: data?.model ?? model, usage, ms: Date.now() - t0 });
+      }
+      if (gate.account) {
+        auth.recordUsage(gate.account.id, {
+          model: data?.model ?? model,
+          promptTokens: Number(usage?.prompt_tokens ?? 0),
+          completionTokens: Number(usage?.completion_tokens ?? 0),
+          ok: true,
+          ms: Date.now() - t0,
+          generation: true,
+        });
+      }
+      return json(res, 200, {
+        ok: true,
+        result: parsed,
+        model: data?.model ?? model,
+        usage,
+        ms: Date.now() - t0,
+        quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
+      });
+    } catch (e) {
+      const timedOut = e.name === 'AbortError';
+      if (gate.account) auth.recordUsage(gate.account.id, { model, ok: false, ms: Date.now() - t0, note: e.name });
+      return json(res, 200, {
+        ok: false,
+        ms: Date.now() - t0,
+        error: timedOut ? `超时（超过 ${Number(env.AI_TIMEOUT_MS ?? 120000)}ms）` : e.message,
+        note: timedOut ? '视觉识别模型单次可能要十几秒；若确实很慢，把 AI_TIMEOUT_MS 调大。' : '连不上这个地址。',
+      });
+    }
+  }
+
+  /**
    * ─────────────── AI 规划：自然语言 → 动作清单 ───────────────
    *
    *  与 /api/ai/chat 的关键区别：这个接口**不是通用转发**。

@@ -1031,3 +1031,57 @@ select.input { height: 24px; padding: 0 4px; }
 .quota-bar-error { background: var(--danger); }
 
 .quota-blocked { margin-top: 6px; }
+
+/* ═══════════════════════════════════════════════════════════════
+   导入面板（P4 统一 Import + P5 图片识别共用 —— 与 AI 面板同一视觉语言）
+   ═══════════════════════════════════════════════════════════════ */
+
+.import-panel .import-sources { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 6px 0 10px; }
+.import-source {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2);
+  padding: 7px 9px; cursor: pointer; text-align: left; font-size: 11px; color: var(--text-2);
+}
+.import-source b { font-size: 11.5px; color: var(--text); }
+.import-source:hover { border-color: var(--line-strong); }
+.import-source.on { border-color: var(--accent); background: var(--accent-soft); }
+.import-source.on b { color: var(--accent); }
+
+.import-text {
+  width: 100%; box-sizing: border-box; font-family: var(--mono, monospace); font-size: 11px;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text);
+  padding: 7px 8px; resize: vertical; min-height: 0;
+}
+.import-text:focus { outline: none; border-color: var(--accent); }
+
+.import-hint {
+  width: 100%; box-sizing: border-box; font-size: 11px;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text);
+  padding: 6px 8px; margin-top: 6px;
+}
+.import-hint:focus { outline: none; border-color: var(--accent); }
+
+.import-img-preview {
+  display: block; max-width: 100%; max-height: 180px; object-fit: contain;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2);
+  margin: 8px 0 2px; padding: 4px;
+}
+
+.import-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 8px; }
+
+.import-cab-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.import-cab {
+  border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2);
+  padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; font-size: 11.5px;
+}
+.import-cab .alert { margin: 0; }
+
+.import-issues { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.import-issues .alert { margin: 0; }
+
+.import-ack {
+  display: flex; align-items: flex-start; gap: 6px; font-size: 11px; line-height: 1.55;
+  color: var(--text-2); background: var(--warn-soft); border: 1px solid #fde68a;
+  border-radius: 5px; padding: 7px 9px; margin: 8px 0; cursor: pointer;
+}
+.import-ack input { margin-top: 2px; }

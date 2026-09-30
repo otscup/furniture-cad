@@ -88,7 +88,7 @@ AI 网关 6 位 key 非占位符、宿主机测 000 是 DNS 假故障(容器内 
 docs/：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15~§19 + §23 P7/P7.1/P7.2/P7.3/P8.1/P8.2/P8.3 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembly/Connection ✅ `66da2b5` → P3 AI DesignProposal ✅ `26a7639` → P4 Import 骨架 ✅ `6f5541b` → P5 图片识别闭环 ✅ `8aecd76` → P6 设计知识系统 ✅ `a556353` → P7 Manufacturing Semantics ✅ `2552072` → P7.1 Rule Hardening+Test Integrity ✅ `0ec9c77` → P7.2 Rule 架构审视+层板托孔 ✅ `a867f98` → P7.3 箱体连接孔 ✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→`cabinet.place`；canonical= `Cabinet.placement` 不变；adjacent/align/absolute(authored)；静态成环检测）✅ `4290a3a` → P8.2 语义面接触落位（attach 具名面贴合、复用 P2 `EDGE_ORDER`、FACE-NOT-OPPOSING）✅ `7850046` → P8.3 设计语义验证（见下）✅ `P83HASH`。**停在 P8.3，不自动进 P8.4。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembly/Connection ✅ `66da2b5` → P3 AI DesignProposal ✅ `26a7639` → P4 Import 骨架 ✅ `6f5541b` → P5 图片识别闭环 ✅ `8aecd76` → P6 设计知识系统 ✅ `a556353` → P7 Manufacturing Semantics ✅ `2552072` → P7.1 Rule Hardening+Test Integrity ✅ `0ec9c77` → P7.2 Rule 架构审视+层板托孔 ✅ `a867f98` → P7.3 箱体连接孔 ✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→`cabinet.place`；canonical= `Cabinet.placement` 不变；adjacent/align/absolute(authored)；静态成环检测）✅ `4290a3a` → P8.2 语义面接触落位（attach 具名面贴合、复用 P2 `EDGE_ORDER`、FACE-NOT-OPPOSING）✅ `7850046` → P8.3 设计语义验证（见下）✅ `53f20a8`。**停在 P8.3，不自动进 P8.4。**
 - **P2 关系层三条纪律**（`core/relations.ts` 唯一实现）：① 关系层**不产生几何**；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开——**只校验声明**。`stack` 无 Z 可核→允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`(INFO)。
 - **P8 落位四条纪律**：① canonical 仍是 `Cabinet.placement{x,y,rotation}`，ResolvedPlacement 只是管道中间产物；② 引擎纯函数(不改 Model/不调 AI/不依赖 UI/不出 DXF/不改 Geometry)；③ attach 不是 adjacent+gap=0(两面各有其名、朝向对不上即报错不退化)；④ **设计语义层只判断不重算、只提示不拦截、不替用户选朝向**。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容/关键架构决策/测试结果/遗留问题/commit hash）。
@@ -102,5 +102,5 @@ P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembl
 - **⑤ 不替用户选**：可疑 → `DESIGN-FRONT-BLOCKED`/`DESIGN-ORIENTATION-SUSPECT`(WARNING) + `alternatives`(当前原点下四个轴向朝向里门脸不朝内的全部候选) + `ambiguous`；每个候选写明"位置需按新朝向重新解析"；**无 autoFix**（转哪个方向是设计决定）。
 - **⑥ 接入**：`CompileResult.design`、`PlanRun.design`（干跑预览即带结论）；**不新增写入命令**、**warning 不拦截提交**、preview===commit 照旧。**刻意不进主规则链**（设计语义是提示，进了主链会把"可能合理"报成项目错误，也会挤掉 P6 的 Hard Rule > Design Knowledge > User Preference）。
 - **⑦ 验收**：tsc 0；`verify:placement-design` 107/107；placement 82/82、attach 105/105、relations 82/82、proposal 90/90、import 59/59、manufacturing 101/101、fixhint 27/27（两新码进 NUM_CTX）；全量 verify:all EXIT=0。
-- 文档 §23.11；commit `P83HASH`。
+- 文档 §23.11；commit `53f20a8`。
 - **明确不做**：自动改 rotation、自动选方案、Z 轴、上下叠放、贴墙/房间边界/门窗、碰撞优化、全屋布局、P8.4。

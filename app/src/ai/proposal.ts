@@ -1,7 +1,7 @@
 import type { ConnectionKind, Issue, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import { buildIssue } from '../core/rules/issueCatalog.ts';
 import { defaultCabinetParams } from '../core/docFactory.ts';
-import { ADJACENT_ALIGNMENTS, ALIGN_ALIGNMENTS, PLACEMENT_SIDES } from '../core/placement.ts';
+import { ADJACENT_ALIGNMENTS, ALIGN_ALIGNMENTS, ATTACH_ALIGNMENTS, PLACEMENT_FACES, PLACEMENT_SIDES } from '../core/placement.ts';
 import { ACTIONS } from '../../shared/aiContract.mjs';
 
 /**
@@ -102,14 +102,28 @@ export interface ProposalConnection {
  * authored 通道（cabinet.move / 界面拖动），不从方案进来。
  */
 export interface ProposalPlacement {
-  /** adjacent = 贴着参照柜放（面贴合）；align = 与参照柜某条边/中心齐平 */
-  relation: 'adjacent' | 'align';
+  /**
+   * · adjacent = 贴着参照柜放（面贴合，缝隙 0）
+   * · align    = 与参照柜某条边/中心齐平
+   * · attach   = **指定两个面贴合**（本柜 targetFace 面 ↔ 参照柜 referenceFace 面）
+   */
+  relation: 'adjacent' | 'align' | 'attach';
   /** 参照柜：本方案的 ref，或项目里已有柜体的 id / 名字 */
   reference: string;
   /** adjacent 必填：贴在参照柜的哪一侧（left/right 并排，front/back 前后叠） */
   side?: 'left' | 'right' | 'front' | 'back';
-  /** 对齐方式；缺省由系统按行业惯例取（并排背面齐、前后左缘齐）——不猜，取值写进 notes */
-  alignment?: 'left' | 'right' | 'front' | 'back' | 'center';
+  /** attach 必填：本柜参与贴合的面（只有四个垂直面，top/bottom 需要 Z，本阶段不做） */
+  targetFace?: 'left' | 'right' | 'front' | 'back';
+  /** attach 必填：参照柜参与贴合的面，必须与 targetFace 朝向相对 */
+  referenceFace?: 'left' | 'right' | 'front' | 'back';
+  /**
+   * 对齐方式；缺省由系统按行业惯例取（adjacent：并排背面齐、前后左缘齐；
+   * attach：起始端齐）—— 不猜，取值写进 notes。
+   * adjacent/align 用 left/right/front/back/center；attach 用 start/center/end。
+   */
+  alignment?: 'left' | 'right' | 'front' | 'back' | 'center' | 'start' | 'end';
+  /** attach 可选：沿贴合面留的缝隙（mm），0 = 真正贴合；负数拒收 */
+  offset?: number | null;
 }
 
 export interface ProposalAssembly {
@@ -242,7 +256,7 @@ export function validateProposal(p: DesignProposal, project: Project): Issue[] {
   // 落位意图（P8.1）：关系/方向/对齐/参照 —— 语义校验；坐标不存在于方案里，
   // 由 Placement Engine 在编译执行那一刻按参照柜实际位置计算。
   // 词汇表直接从 core/placement.ts 读 —— 封闭词汇表不允许有第二份抄本。
-  const PLACE_RELATIONS = ['adjacent', 'align'] as const;
+  const PLACE_RELATIONS = ['adjacent', 'align', 'attach'] as const;
   for (const [i, c] of p.cabinets.entries()) {
     const pl = c.placement;
     if (!pl) continue;
@@ -261,6 +275,38 @@ export function validateProposal(p: DesignProposal, project: Project): Issue[] {
           ctx: { ref, alignment: String(pl.alignment), where: 'align 落位', allowed: ALIGN_ALIGNMENTS.join(' / '), count: ALIGN_ALIGNMENTS.length },
         }));
       }
+    } else if (pl.relation === 'attach') {
+      // attach：**两个面**都要有名有姓（面词汇直接来自 P2 的 EDGE_ORDER）。
+      // 缺面 / 面名不认识都在这里给人话；两面朝向不相对是几何事实，由引擎在执行那一刻报。
+      for (const [who, val] of [['targetFace', pl.targetFace], ['referenceFace', pl.referenceFace]] as const) {
+        if (!val || !PLACEMENT_FACES.includes(val)) {
+          out.push(buildIssue('PROPOSAL-PLACE-FACE', {
+            target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+            ctx: {
+              ref,
+              why: val ? `的 ${who} 不认识` : `缺 ${who}（attach 必须说明是哪两个面贴在一起）`,
+              face: String(val ?? ''),
+              faces: PLACEMENT_FACES.join(' / '),
+              count: PLACEMENT_FACES.length,
+            },
+          }));
+        }
+      }
+      if (pl.alignment !== undefined && pl.alignment !== null && !ATTACH_ALIGNMENTS.includes(pl.alignment as never)) {
+        out.push(buildIssue('PROPOSAL-PLACE-ALIGNMENT', {
+          target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+          ctx: { ref, alignment: String(pl.alignment), where: 'attach 落位', allowed: ATTACH_ALIGNMENTS.join(' / '), count: ATTACH_ALIGNMENTS.length },
+        }));
+      }
+      if (pl.offset !== undefined && pl.offset !== null) {
+        const off = Number(pl.offset);
+        if (!Number.isFinite(off) || off < 0) {
+          out.push(buildIssue('PROPOSAL-PLACE-OFFSET', {
+            target: t(`.cabinets[${i}].placement`), targetKind: 'project',
+            ctx: { ref, offset: String(pl.offset), max: 2000 },
+          }));
+        }
+      }
     } else {
       if (!pl.side || !PLACEMENT_SIDES.includes(pl.side)) {
         out.push(buildIssue('PROPOSAL-PLACE-SIDE', {
@@ -273,7 +319,7 @@ export function validateProposal(p: DesignProposal, project: Project): Issue[] {
             count: PLACEMENT_SIDES.length,
           },
         }));
-      } else if (pl.alignment !== undefined && pl.alignment !== null && !ADJACENT_ALIGNMENTS[pl.side].includes(pl.alignment)) {
+      } else if (pl.alignment !== undefined && pl.alignment !== null && !ADJACENT_ALIGNMENTS[pl.side].includes(pl.alignment as never)) {
         out.push(buildIssue('PROPOSAL-PLACE-ALIGNMENT', {
           target: t(`.cabinets[${i}].placement`), targetKind: 'project',
           ctx: { ref, alignment: String(pl.alignment), where: `side=${pl.side}`, allowed: ADJACENT_ALIGNMENTS[pl.side].join(' / '), count: ADJACENT_ALIGNMENTS[pl.side].length },

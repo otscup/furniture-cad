@@ -8,7 +8,16 @@ import { pickPartsOf } from '../core/geometry/pickLines.ts';
 import { ROW_HEIGHT_FILL, allUnits, canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { detectCollisions } from '../core/geometry/project.ts';
 import { candidateSpots, joinSpots, nudgeOutOfWalls } from '../core/snapPlace.ts';
-import { resolvePlacement, sceneFromProject, type PlacementAlignment, type PlacementIntent, type PlacementSide } from '../core/placement.ts';
+import {
+  ATTACH_ALIGNMENTS,
+  resolvePlacement,
+  sceneFromProject,
+  type AttachAlignment,
+  type PlacementAlignment,
+  type PlacementFace,
+  type PlacementIntent,
+  type PlacementSide,
+} from '../core/placement.ts';
 import { PLACEMENT_BLOCKING_CODES } from '../core/variants.ts';
 
 /**
@@ -451,10 +460,10 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (typeof cab === 'string') return { ok: false, error: cab };
       const relation = String(p.relation ?? '');
       if (relation === 'absolute') {
-        return { ok: false, error: 'cabinet.place 不接受 absolute —— 绝对坐标是用户授权输入（cabinet.move / 界面拖动），AI 落位请用 adjacent / align 表达意图' };
+        return { ok: false, error: 'cabinet.place 不接受 absolute —— 绝对坐标是用户授权输入（cabinet.move / 界面拖动），AI 落位请用 adjacent / align / attach 表达意图' };
       }
-      if (relation !== 'adjacent' && relation !== 'align') {
-        return { ok: false, error: `cabinet.place 的 relation 只能是 adjacent / align，收到「${relation || '（缺）'}」` };
+      if (relation !== 'adjacent' && relation !== 'align' && relation !== 'attach') {
+        return { ok: false, error: `cabinet.place 的 relation 只能是 adjacent / align / attach，收到「${relation || '（缺）'}」` };
       }
       const referenceKey = String(p.reference ?? '');
       if (!referenceKey) return { ok: false, error: 'cabinet.place 缺 reference（参照哪个柜体）' };
@@ -469,6 +478,42 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         return { ok: false, error: `找不到参照柜体「${referenceKey}」（现有：${project.cabinets.map((c) => c.name).join('、') || '无'}）` };
       }
       if (refCab.id === cab.id) return { ok: false, error: `「${cab.name}」不能以自己为落位参照` };
+      // attach（P8.2）：两个面贴合 —— 面名是 P2 的 ConnectionEdge 词汇，
+      // 坐标仍然由引擎算；这里只做"面名/对齐/缝隙"的形状与取值检查。
+      if (relation === 'attach') {
+        const tf = String(p.targetFace ?? '');
+        const rf = String(p.referenceFace ?? '');
+        if (!tf || !rf) {
+          return { ok: false, error: 'cabinet.place 的 attach 必须给出 targetFace 与 referenceFace（哪两个面贴合：left / right / front / back）' };
+        }
+        const a = p.alignment === undefined || p.alignment === null ? undefined : String(p.alignment);
+        if (a !== undefined && !ATTACH_ALIGNMENTS.includes(a as never)) {
+          return { ok: false, error: `cabinet.place 的 attach alignment 只能是 ${ATTACH_ALIGNMENTS.join(' / ')}，收到「${a}」` };
+        }
+        if (p.offset !== undefined && p.offset !== null) {
+          const off = Number(p.offset);
+          if (!Number.isFinite(off) || off < 0) {
+            return { ok: false, error: `cabinet.place 的 attach offset 必须是 ≥ 0 的缝隙毫米数，收到「${String(p.offset)}」` };
+          }
+        }
+        const attachIntent: PlacementIntent = {
+          relation: 'attach',
+          targetId: cab.id,
+          referenceId: refCab.id,
+          targetFace: tf as PlacementFace,
+          referenceFace: rf as PlacementFace,
+          ...(a !== undefined ? { alignment: a as AttachAlignment } : {}),
+          ...(p.offset !== undefined && p.offset !== null ? { offset: Number(p.offset) } : {}),
+        };
+        const ra = resolvePlacement(attachIntent, sceneFromProject(project));
+        if (!ra.ok) return { ok: false, error: ra.error.message };
+        const faceZh: Record<string, string> = { left: '左端', right: '右端', front: '正面', back: '背面' };
+        return {
+          ok: true,
+          command: CMD.placeCabinet(cab, ra.placement, src, `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面 → (${ra.placement.x}, ${ra.placement.y})`),
+          summary: `落位「${cab.name}」：${faceZh[tf] ?? tf}面贴「${refCab.name}」的${faceZh[rf] ?? rf}面`,
+        };
+      }
       const intent: PlacementIntent =
         relation === 'adjacent'
           ? {

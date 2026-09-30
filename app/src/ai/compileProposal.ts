@@ -1,6 +1,6 @@
 import type { Issue, Project, RuleSet } from '../core/types.ts';
 import type { AiAction } from './compile.ts';
-import { ADJACENT_DEFAULT_ALIGNMENT, PLACEMENT_SIDES } from '../core/placement.ts';
+import { ADJACENT_DEFAULT_ALIGNMENT, ATTACH_DEFAULT_ALIGNMENT, PLACEMENT_SIDES } from '../core/placement.ts';
 import { defaultSizes, proposalBlocked, validateProposal, type DesignProposal, type ProposalRow, type ProposalUnit } from './proposal.ts';
 
 /**
@@ -169,6 +169,9 @@ export function compileProposal(p: DesignProposal, project: Project, rules: Rule
     }
     const sideZh: Record<string, string> = { left: '左侧', right: '右侧', front: '前侧', back: '后侧' };
     const alignZh: Record<string, string> = { left: '左缘', right: '右缘', front: '前缘', back: '背缘', center: '中心' };
+    // attach 的面名沿用 P2 的 ConnectionEdge 词义：左右是"端"，前后是"面"
+    const faceZh: Record<string, string> = { left: '左端', right: '右端', front: '正面', back: '背面' };
+    const alignAttachZh: Record<string, string> = { start: '起始端', center: '中心', end: '末端' };
     for (const k of order) {
       const c = placing[k];
       const pl = c.placement!;
@@ -180,15 +183,24 @@ export function compileProposal(p: DesignProposal, project: Project, rules: Rule
         reference: inProposal ? `$ref:${pl.reference}` : String(pl.reference),
         ...(pl.side ? { side: pl.side } : {}),
         ...(pl.alignment ? { alignment: pl.alignment } : {}),
+        ...(pl.targetFace ? { targetFace: pl.targetFace } : {}),
+        ...(pl.referenceFace ? { referenceFace: pl.referenceFace } : {}),
+        ...(pl.offset !== undefined && pl.offset !== null ? { offset: pl.offset } : {}),
       };
       // 缺省对齐必须写进 notes：系统替模型按惯例取了什么，界面要显示（悄悄补齐＝骗人）
       if (pl.relation === 'adjacent' && pl.side && !pl.alignment && PLACEMENT_SIDES.includes(pl.side)) {
         notes.push(`「${name}」没说对齐方式，按惯例取「${ADJACENT_DEFAULT_ALIGNMENT[pl.side]}」（并排背面齐、前后左缘齐）`);
       }
+      if (pl.relation === 'attach' && !pl.alignment) {
+        notes.push(`「${name}」没说接触面怎么对齐，按起始端对齐（${ATTACH_DEFAULT_ALIGNMENT}：左右面背面齐、前后端面左端齐）`);
+      }
       const reason =
         pl.relation === 'adjacent'
           ? `设计方案：把「${name}」贴到「${pl.reference}」的${sideZh[String(pl.side)] ?? String(pl.side)}`
-          : `设计方案：把「${name}」与「${pl.reference}」按${alignZh[String(pl.alignment)] ?? String(pl.alignment)}对齐`;
+          : pl.relation === 'attach'
+            ? `设计方案：把「${name}」的${faceZh[String(pl.targetFace)] ?? String(pl.targetFace)}贴到「${pl.reference}」的${faceZh[String(pl.referenceFace)] ?? String(pl.referenceFace)}` +
+              `（${alignAttachZh[String(pl.alignment ?? ATTACH_DEFAULT_ALIGNMENT)] ?? ''}对齐${pl.offset ? `，留 ${pl.offset}mm 缝` : ''}）`
+            : `设计方案：把「${name}」与「${pl.reference}」按${alignZh[String(pl.alignment)] ?? String(pl.alignment)}对齐`;
       // target 用 $ref 占位：真 id 在 planRunner 执行该柜 create 的瞬间才存在
       actions.push(mkAction('cabinet.place', { cabinetId: `$ref:${ref}` }, params, reason, index++));
     }

@@ -265,7 +265,10 @@ section('I 多柜导入 + 组合：ref 在建成的那一刻换成真 id');
       { ref: 'a', name: '长臂', width: 1800, height: 2400, depth: 600, units: [{ kind: 'hanging', width: 1800, rodHeight: 1700 }] },
       { ref: 'b', name: '短臂', width: 900, height: 2400, depth: 600, units: [{ kind: 'shelves', width: 900, count: 4 }], rotation: 90 },
     ],
-    assemblies: [{ ref: 'g', name: '玄关 L 型', members: ['a', 'b'], connections: [{ a: 'a', b: 'b', kind: 'corner' }] }],
+    // kind 按**实际落位**声明为 butt（与 proposal-acceptance §E 同一条理由）：
+    // 系统落出来的这两柜是 600mm 的**面接触**（续接），不是只共用角点的角接。
+    // P8.2 修掉 edgesFlush 的"点到线段"缺陷后，这里必须照实声明，否则严格模式拒收。
+    assemblies: [{ ref: 'g', name: '玄关柜组', members: ['a', 'b'], connections: [{ a: 'a', b: 'b', kind: 'butt' }] }],
   });
   const nd = parseImport('json', json);
   const compiled = compileImport(nd, bus.getState(), rules);

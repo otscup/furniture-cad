@@ -356,10 +356,16 @@ for (const i of swing) {
 }
 ok('同一对柜不会被报两次', dup === 0, JSON.stringify(swing.map((i) => i.target)));
 ok('声明了 corner 的组合，其成员对一定进入检查队列（不依赖推断容差）', (() => {
-  // 把两臂拉开一点点（超过相接容差），声明仍在 → 检查队列仍包含它，
-  // 但几何上不相接，所以不会误报"门扫到邻居"（那是"没连上"，由关系层报错）
+  // 把副臂**背离接触面**拉开 40mm（超过相接容差 2mm），声明仍在 → 检查队列仍包含它，
+  // 但几何上不相接，所以报"没连上"（ASSEMBLY-NOT-TOUCHING）。
+  //
+  // 为什么是拉 X 不是拉 Y（判据随实现修法演进过一次）：沿接触面**滑动**并不会把
+  // 两臂分开 —— 副臂沿主臂侧面滑 40mm，两个面仍然共面且重叠 40mm，那是**真的**
+  // 续接（butt），报的是 KIND-MISMATCH 而不是 NOT-TOUCHING。想让两臂真的不接触，
+  // 必须背离接触面拉。旧夹具用 y+40 曾是"看似拉开、其实还贴着"，而旧的
+  // edgesFlush（点到**线段**距离）把它错判成没连 —— 缺陷修好后这条判据必须换。
   const pulled: Project = structuredClone(withAsm);
-  pulled.cabinets = pulled.cabinets.map((c) => (c.id === 'cab_b' ? { ...c, placement: { ...c.placement, y: c.placement.y + 40 } } : c));
+  pulled.cabinets = pulled.cabinets.map((c) => (c.id === 'cab_b' ? { ...c, placement: { ...c.placement, x: c.placement.x - 40 } } : c));
   const rel = validateAssemblies(pulled);
   return has(rel, 'ASSEMBLY-NOT-TOUCHING', 'ERROR');
 })());
@@ -456,8 +462,9 @@ ok('有组合：快照里如实列出，并把 kind 翻成人话', (() => {
 })());
 ok('推断出来的关系不进报错（放得近 ≠ 你说连着）', (() => {
   const near: Project = structuredClone(pA);
-  // 两柜不相接、也不重叠，只是放得近
-  near.cabinets = near.cabinets.map((c) => (c.id === 'cab_b' ? { ...c, placement: { ...c.placement, y: c.placement.y + 300 } } : c));
+  // 两柜不相接、也不重叠，只是**背离接触面**挪了 300mm 放得近。
+  // （不能沿接触面滑：那样两个面仍然共面且重叠 300mm，那是真接触 —— 见 §G 那条注。）
+  near.cabinets = near.cabinets.map((c) => (c.id === 'cab_b' ? { ...c, placement: { ...c.placement, x: c.placement.x - 300 } } : c));
   return validateAssemblies(near).length === 0 && deriveContacts(near).length === 0;
 })());
 // 占位断言等于没断言（恒真），这里换成真的：推断必须带 origin='inferred'，且绝不进报错

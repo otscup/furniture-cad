@@ -1,5 +1,10 @@
-import type { Project } from './types.ts';
-import { bboxOf, polyLocalToWorld, rectPts } from './geometry/transform.ts';
+import type { ConnectionEdge, Project, Vec2 } from './types.ts';
+import { bboxOf, localToWorld, polyLocalToWorld, rectPts } from './geometry/transform.ts';
+// 面名 ↔ 几何边的映射**只从 relations.ts 借**：P2 已经为 Connection 声明
+// 定死了"第几条边叫 back/right/front/left"（EDGE_ORDER）。Attach 的面语义若
+// 再抄一份，就会出现"声明的 right"与"几何的 right"各指一条边 —— 那正是
+// relations.ts 文件头记着的第二类真相源。这里只借常量，不借它的接触算法。
+import { EDGE_ORDER } from './relations.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -23,7 +28,9 @@ import { bboxOf, polyLocalToWorld, rectPts } from './geometry/transform.ts';
  *    · authored absolute：用户显式给出的绝对坐标（界面拖动 / 属性面板 /
  *      MCP 显式输入 / 既有 `cabinet.move`）。这是**授权输入**，引擎只做
  *      取整与校验，不做"解析"。
- *    · resolved placement：由关系（adjacent / align）确定性算出。
+ *    · resolved placement：由关系（adjacent / align / attach）确定性算出。
+ *      attach（P8.2）说清"哪两个面贴在一起"——两个面各有其名、参与计算，
+ *      朝向对不上就是贴合不了（报 FACE-NOT-OPPOSING），不会退化成相邻。
  *      AI 的新接口（cabinet.place）只收语义关系，**不收坐标**；
  *      旧 `cabinet.move` 保留为兼容路径，但它属于 authored，不属于 resolved。
  *    两者在类型上就分开了（`origin: 'authored'` 是 absolute 分支的必填字段），
@@ -42,8 +49,27 @@ import { bboxOf, polyLocalToWorld, rectPts } from './geometry/transform.ts';
  * ══════════════════════════════════════════════════════════════════════
  */
 
-/** 落位关系（封闭词汇表，P8.1 只做确定性最强的三种） */
-export type PlacementRelation = 'absolute' | 'adjacent' | 'align';
+/**
+ * 落位关系（封闭词汇表）
+ * · P8.1：absolute / adjacent / align
+ * · P8.2：attach —— **面接触**：target 的指定面与 reference 的指定面贴合
+ */
+export type PlacementRelation = 'absolute' | 'adjacent' | 'align' | 'attach';
+
+/**
+ * 可参与贴合的面 = P2 的 `ConnectionEdge`（back/front/left/right）—— 同一套语义面，
+ * 不另起一套面词汇。P8.2 只做 XY 四个**垂直面**：top / bottom 需要 Z，本阶段没有。
+ */
+export type PlacementFace = ConnectionEdge;
+
+/**
+ * 接触面上的对齐（沿面自身的自然方向）：
+ *   `start`  = 两端里起始端对齐（左右面＝背面端，前后端面＝左端）
+ *   `center` = 面中心对齐
+ *   `end`    = 末端对齐
+ * 缺省是 `start`（与 adjacent 的"并排背面齐 / 前后左缘齐"同惯例）—— **不是**隐式 center。
+ */
+export type AttachAlignment = 'start' | 'center' | 'end';
 
 /**
  * 相邻方向 —— target 落在 reference 的哪一侧。
@@ -109,6 +135,23 @@ export type PlacementIntent =
       targetId: string;
       referenceId: string;
       alignment: PlacementAlignment;
+    }
+  | {
+      /**
+       * attach（P8.2）：target 的 `targetFace` 面 与 reference 的 `referenceFace` 面
+       * **真正贴合** —— 不是"相邻 + 缝隙 0"的另一个说法：两个面各自有名有姓，
+       * 解析按"两个面所在平面重合"来算，面朝向对不上（比如 right ↔ right）
+       * 是几何上不可能贴合，直接报 FACE-NOT-OPPOSING，不静默退化成相邻。
+       */
+      relation: 'attach';
+      targetId: string;
+      referenceId: string;
+      targetFace: PlacementFace;
+      referenceFace: PlacementFace;
+      /** 沿接触面自然方向的对齐；缺省 start（不隐式取 center） */
+      alignment?: AttachAlignment;
+      /** 缝隙（mm）：只沿 reference 外法线方向偏移，0 = 真正贴合；负数（重叠）拒收 */
+      offset?: number;
     };
 
 /** 解析结果：整数 mm 的世界坐标 + 旋转角（deg）。可直接交给 `cabinet.place` 命令 */
@@ -127,6 +170,7 @@ export type PlacementErrorCode =
   | 'PLACEMENT-GEOMETRY-MISSING'
   | 'PLACEMENT-SIZE-INVALID'
   | 'PLACEMENT-INTENT-INVALID'
+  | 'PLACEMENT-FACE-NOT-OPPOSING'
   | 'PLACEMENT-UNRESOLVED';
 
 export interface PlacementError {
@@ -161,6 +205,12 @@ export const ADJACENT_DEFAULT_ALIGNMENT: Record<PlacementSide, PlacementAlignmen
 };
 export const ALIGN_ALIGNMENTS: PlacementAlignment[] = ['left', 'right', 'front', 'back', 'center'];
 export const PLACEMENT_SIDES: PlacementSide[] = ['left', 'right', 'front', 'back'];
+
+/** 可贴合的面：**直接取 P2 的 EDGE_ORDER** —— 面词汇与面↔边映射都不许有第二份 */
+export const PLACEMENT_FACES: PlacementFace[] = [...EDGE_ORDER];
+export const ATTACH_ALIGNMENTS: AttachAlignment[] = ['start', 'center', 'end'];
+/** attach 的缺省对齐：起始端齐（与 adjacent 的并排背面齐 / 前后左缘齐同惯例） */
+export const ATTACH_DEFAULT_ALIGNMENT: AttachAlignment = 'start';
 
 const fail = (code: PlacementErrorCode, message: string, targetId?: string, referenceId?: string): PlacementResolve => ({
   ok: false,
@@ -222,9 +272,39 @@ function validateIntentShape(intent: PlacementIntent): PlacementError | null {
     }
     return null;
   }
-  if (intent.relation === 'adjacent' || intent.relation === 'align') {
+  if (intent.relation === 'adjacent' || intent.relation === 'align' || intent.relation === 'attach') {
     if (typeof intent.referenceId !== 'string' || intent.referenceId === '') {
       return { code: 'PLACEMENT-INTENT-INVALID', message: `${intent.relation} 落位缺 referenceId（参照哪个柜体）`, targetId: intent.targetId };
+    }
+    if (intent.relation === 'attach') {
+      for (const [who, val] of [['targetFace', intent.targetFace], ['referenceFace', intent.referenceFace]] as const) {
+        if (!PLACEMENT_FACES.includes(val)) {
+          return {
+            code: 'PLACEMENT-INTENT-INVALID',
+            message: `attach 的 ${who} 只能是 ${PLACEMENT_FACES.join(' / ')} 四个垂直面（top / bottom 需要 Z 坐标，本阶段不做），收到「${String(val)}」`,
+            targetId: intent.targetId,
+            referenceId: intent.referenceId,
+          };
+        }
+      }
+      const a = intent.alignment ?? ATTACH_DEFAULT_ALIGNMENT;
+      if (!ATTACH_ALIGNMENTS.includes(a)) {
+        return {
+          code: 'PLACEMENT-INTENT-INVALID',
+          message: `attach 的 alignment 只能是 ${ATTACH_ALIGNMENTS.join(' / ')}，收到「${String(intent.alignment)}」`,
+          targetId: intent.targetId,
+          referenceId: intent.referenceId,
+        };
+      }
+      if (intent.offset !== undefined && (!isFiniteNum(intent.offset) || intent.offset < 0)) {
+        return {
+          code: 'PLACEMENT-INTENT-INVALID',
+          message: `attach 的 offset 必须是 ≥ 0 的数字（缝隙 mm；负数是重叠，重叠属于碰撞不由落位层造），收到 ${String(intent.offset)}`,
+          targetId: intent.targetId,
+          referenceId: intent.referenceId,
+        };
+      }
+      return null;
     }
     if (intent.relation === 'adjacent') {
       if (!PLACEMENT_SIDES.includes(intent.side)) {
@@ -260,7 +340,7 @@ function validateIntentShape(intent: PlacementIntent): PlacementError | null {
   }
   return {
     code: 'PLACEMENT-INTENT-INVALID',
-    message: `落位关系只支持 absolute / adjacent / align，收到「${String((intent as { relation?: unknown }).relation)}」`,
+    message: `落位关系只支持 absolute / adjacent / align / attach，收到「${String((intent as { relation?: unknown }).relation)}」`,
     targetId: typeof (intent as { targetId?: unknown }).targetId === 'string' ? (intent as { targetId: string }).targetId : undefined,
   };
 }
@@ -282,6 +362,101 @@ function checkGeometry(it: PlacementSceneItem): PlacementError | null {
     };
   }
   return null;
+}
+
+const dot2 = (a: Vec2, b: Vec2): number => a.x * b.x + a.y * b.y;
+const fmtVec = (v: Vec2): string => `${Math.round(v.x * 1000) / 1000}, ${Math.round(v.y * 1000) / 1000}`;
+
+/**
+ * 一个空间面在世界坐标下的事实：外法线 + 自然方向上的起点/终点。
+ *
+ * ── 为什么"自然方向"要规定 ──
+ *   start / end 对齐必须有唯一读法：左右面沿进深读（背面→正面），
+ *   前后端面沿宽读（左端→右端）。这个方向**从边自身的轴向推出来**
+ *   （|dx| ≥ |dy| ⇒ 沿宽），不写第二张"哪个面朝哪"的表。
+ *
+ * ── 为什么外法线也推 ──
+ *   面中点 − 体中心，矩形局部边轴对齐，减出来就是纯法向。旋转仍走
+ *   transform.ts 的 `localToWorld`（全项目唯一旋转实现），这里没有第二套三角函数。
+ */
+function faceGeometry(it: PlacementSceneItem, face: PlacementFace): { normal: Vec2; start: Vec2; end: Vec2 } {
+  const local = rectPts(0, 0, it.width, it.depth);
+  const i = EDGE_ORDER.indexOf(face);
+  const p0 = local[i]!;
+  const p1 = local[(i + 1) % 4]!;
+  const axis: Vec2 = Math.abs(p1.x - p0.x) >= Math.abs(p1.y - p0.y) ? { x: 1, y: 0 } : { x: 0, y: 1 };
+  const t0 = dot2(p0, axis);
+  const t1 = dot2(p1, axis);
+  const startLocal = t0 <= t1 ? p0 : p1;
+  const endLocal = t0 <= t1 ? p1 : p0;
+  const mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
+  const center = { x: it.width / 2, y: it.depth / 2 };
+  const nl = { x: mid.x - center.x, y: mid.y - center.y };
+  const len = Math.hypot(nl.x, nl.y) || 1;
+  const origin = { x: it.x, y: it.y };
+  return {
+    normal: localToWorld({ x: nl.x / len, y: nl.y / len }, { x: 0, y: 0 }, it.rotation),
+    start: localToWorld(startLocal, origin, it.rotation),
+    end: localToWorld(endLocal, origin, it.rotation),
+  };
+}
+
+/**
+ * attach 解析（纯函数）：两个**有名有姓的面**贴合。
+ *
+ * ① 两面必须朝向相对（外法线反向平行）—— right ↔ right 这种在几何上不可能贴合，
+ *    报 FACE-NOT-OPPOSING，绝不退化成"那就相邻着放吧"。
+ * ② 法向：target 的面平面 = reference 的面平面 + offset（沿 reference 外法线外推）。
+ * ③ 切向：沿接触面自然方向做 start / center / end 对齐。
+ * 一切表达成**位移增量**（平移原点必平移整只柜），对任意合法 rotation 都成立，
+ * 不需要按角度分情况讨论。
+ */
+function resolveAttach(
+  target: PlacementSceneItem,
+  reference: PlacementSceneItem,
+  targetFace: PlacementFace,
+  referenceFace: PlacementFace,
+  align: AttachAlignment,
+  offset: number
+): PlacementResolve {
+  const T = faceGeometry(target, targetFace);
+  const R = faceGeometry(reference, referenceFace);
+  const facing = dot2(T.normal, R.normal);
+  if (facing > -1 + 1e-9) {
+    const angle = Math.round((Math.acos(Math.min(1, Math.max(-1, -facing))) * 180) / Math.PI);
+    return fail(
+      'PLACEMENT-FACE-NOT-OPPOSING',
+      `柜体 ${target.id} 的 ${targetFace} 面（世界朝向 ${fmtVec(T.normal)}）与柜体 ${reference.id} 的 ${referenceFace} 面（世界朝向 ${fmtVec(R.normal)}）不是相对的两个面 —— 两面夹角 ${angle}°，贴合不了（可贴合的相对面：left↔right、right↔left、front↔back、back↔front，且两柜相对旋转须是 90° 的整数倍）`,
+      target.id,
+      reference.id
+    );
+  }
+
+  const nR = R.normal;
+  const along = dot2(R.start, nR) + offset - dot2(T.start, nR);
+
+  const tv = { x: T.end.x - T.start.x, y: T.end.y - T.start.y };
+  const tl = Math.hypot(tv.x, tv.y) || 1;
+  const tHat = { x: tv.x / tl, y: tv.y / tl };
+  const pT0 = dot2(T.start, tHat);
+  const pT1 = dot2(T.end, tHat);
+  const pR0 = dot2(R.start, tHat);
+  const pR1 = dot2(R.end, tHat);
+  const loT = Math.min(pT0, pT1);
+  const hiT = Math.max(pT0, pT1);
+  const loR = Math.min(pR0, pR1);
+  const hiR = Math.max(pR0, pR1);
+  const shift =
+    align === 'start' ? loR - loT : align === 'end' ? hiR - hiT : (loR + hiR) / 2 - (loT + hiT) / 2;
+
+  return {
+    ok: true,
+    placement: {
+      x: Math.round(target.x + along * nR.x + shift * tHat.x),
+      y: Math.round(target.y + along * nR.y + shift * tHat.y),
+      rotation: target.rotation,
+    },
+  };
 }
 
 /**
@@ -330,6 +505,19 @@ export function resolvePlacement(intent: PlacementIntent, scene: PlacementScene)
 
   const geomErr = checkGeometry(target) ?? checkGeometry(reference);
   if (geomErr) return { ok: false, error: geomErr };
+
+  // attach 走真实面平面（不走包围盒）：bbox 对旋转过的柜是放大了的近似，
+  // 而"两个面贴合"要的是精确的面平面 —— 轴对齐时两者一致，旋转时只有面平面是对的。
+  if (intent.relation === 'attach') {
+    return resolveAttach(
+      target,
+      reference,
+      intent.targetFace,
+      intent.referenceFace,
+      intent.alignment ?? ATTACH_DEFAULT_ALIGNMENT,
+      intent.offset ?? 0
+    );
+  }
 
   const tb = footprintBox(target);
   const rb = footprintBox(reference);

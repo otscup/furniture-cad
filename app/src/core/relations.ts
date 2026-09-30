@@ -78,12 +78,23 @@ const sub = (a: Vec2, b: Vec2): Vec2 => ({ x: a.x - b.x, y: a.y - b.y });
 const dot = (a: Vec2, b: Vec2): number => a.x * b.x + a.y * b.y;
 const len = (a: Vec2): number => Math.hypot(a.x, a.y);
 
-/** 点到线段所在直线的距离（用于"共线"判定） */
+/**
+ * 点到线段**所在直线**的距离（用于"共面"判定）。
+ *
+ * ⚠ 这里刻意**不做** [0,1] 夹取 —— 夹取了就变成"点到线段"，那会把
+ * "两个面共面、但其中一面比另一面长"判成不共面。实测缺陷（P8.2 撞出来的）：
+ *   深度 550 与 600 的两柜**背面齐**并排侧贴，两个侧面共面且重叠 550mm，
+ *   属于实打实的相接；而较短那条的端点落在较长那条外面 50mm ——
+ *   点到**线段**距离 = 50 > 容差 2 ⇒ 判成"没连着"，于是 Placement 说
+ *   "贴上了"、Relations 说"没连着"，两层当场说不同的话。
+ *   "到底重不重叠"由 `overlapLen` 单独判（重叠为 0 就不算相接），
+ *   共面判定不该顺手把"伸出去了"也当成"没连着"。
+ */
 function distPointToLine(p: Vec2, a: Vec2, b: Vec2): number {
   const ab = sub(b, a);
-  const l = len(ab);
-  if (l === 0) return len(sub(p, a));
-  const t = Math.max(0, Math.min(1, dot(sub(p, a), ab) / (l * l)));
+  const l2 = dot(ab, ab);
+  if (l2 === 0) return len(sub(p, a));
+  const t = dot(sub(p, a), ab) / l2;
   return len(sub(p, { x: a.x + ab.x * t, y: a.y + ab.y * t }));
 }
 

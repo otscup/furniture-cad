@@ -77,6 +77,8 @@ DWG 付费/SDK 须先确认授权(ODA 无 Web/SaaS 权)。MCP 白名单不暴露
 - **verify:ui 见过的间歇性红**：B15「服务端 .env 里确实存着完整 key」「保存是替换而不是追加」——`/api/settings` 落盘与探针读取的时序抖动（文件仍是旧 key）。判据：服务端不引用 `src/core`，与本轮改动无因果 → **复跑一次**再下结论，别急着改代码。
 - **长输出别用 `| tail -N` 收尾**：会把失败断言列表截掉，只剩退出码。要么写文件（`> log 2>&1`）再 grep，要么直接看完整输出——本轮因此白跑了一遍 5 分钟的 verify:ui。
 - **DXF**：主交付 R2007(原生UTF-8)；R2000 须 encoding='gbk'+$DWGCODEPAGE=ANSI_936(兼容备用)。EZDXF dimstyle dimlfac=100→须设1.0。ACI 7 白底隐形→用CTB/STB。模型空间1:1，打印靠图纸空间。
+- **"点到直线"别写成"点到线段"**（P8.2 撞出来的 P2 真缺陷）：`relations.ts` 的 `distPointToLine` 文档写直线、实现却把参数 clamp 到 [0,1] → 深度不同的两柜背面齐并排（面共面、重叠 550mm、实打实相接）被判"没连着"。后果：Placement 说贴上了、Relations 说没连着，两层说不同的话。修=去掉 clamp（重不重叠由 `overlapLen` 单独判）。连带教训：**沿接触面滑动并不会把两柜分开**（角接会变成 40mm 续接，报 KIND-MISMATCH 而非 NOT-TOUCHING）——"拉开一点"的夹具必须背离接触面拉。
+- **几何事实：两矩形要面贴合 ⇒ 相对旋转必是 90° 的整数倍**（面外法线 R(Δ)u 要等于 -v，u/v 轴向 ⇒ Δ≡0/90/180/270）。所以 attach 报"两面贴合不了"时要带夹角数字，而不是换个放法。
 - **结构性命令必带 changes:[]**：记忆门读 cmd.changes，漏了 uncaught 崩门；createCabinetFromTemplate 必传 takenIds。
 - **同一能力只许一份实现**：跑验收与出图共用 verify/mock-openai.mjs。
 
@@ -90,18 +92,19 @@ AI 网关6位key非占位符、宿主机测000是DNS假故障(容器内 node 测
 docs/ 下：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15 P0 / §16 P1 / §17 P2 / §18 P3 / §19 P4 / §23 P7+P7.1 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（P0→P7，逐步推进，每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353` → P7 Manufacturing Semantics 一阶段（manufacturing/ 纯派生层：尺寸只读几何、verified 仅封边+背板、其余 unverified 不脑补；bridge 无损回投影接 BOM/DXF；只读制造页签；32 条验收）✅ `2552072` → P7.1 Manufacturing Rule Hardening + Test Integrity（层板托孔升格 verified、numOrUndef/countText 堵"缺失=0"假绿、derive/rules/model 扩展、ManufacturingRuleSet 分类定稿、39+27 验收）✅ `0ec9c77` → P7.2 Manufacturing Rule Architecture Review + Shelf Pin Rule Hardening（equalSpacing 定性为几何辅助/层板标高=几何事实、VERIFIED_RULE_EVALUATORS 注册表派发、verified 升格 9 条落 VERIFIED_PROMOTION_CHECKLIST、shelfPinOps 参数闸门、manufacturing 39→62 验收）✅ `a867f98` → P7.3 箱体连接孔 Manufacturing Rule（caseConnectorOps 注册进 VERIFIED_RULE_EVALUATORS、外壳主连接 verified 三合一/木榫、manufacturing 39→101 验收）✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→cabinet.place 唯一写入口、canonical= Cabinet.placement 不变、adjacent/align/absolute(authored) 三关系、方案级语义落位+静态成环检测、placement 82 验收）✅ `4290a3a`。**停在 P8.1，不自动进 P8.2/P8.3。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows（Case1/2/4）✅ `12e1290` → P2 Assembly/Connection（Case5/6）✅ `66da2b5` → P3 AI DesignProposal（需求级中间产物，确认后编译为动作）✅ `26a7639` → P4 Import 骨架（kujiale/图片仅占位，不绕过链路）✅ `6f5541b` → P5 图片识别闭环（VisionProvider 抽象 + 诚实映射 + caveat 确认门，mock 先行/真实 API 待 key）✅ `8aecd76` → P6 设计知识系统（三层分离 hardRule/designKnowledge/userPreference，观察→candidate→确认，冲突不静默）✅ `a556353` → P7 Manufacturing Semantics 一阶段（manufacturing/ 纯派生层：尺寸只读几何、verified 仅封边+背板、其余 unverified 不脑补；bridge 无损回投影接 BOM/DXF；只读制造页签；32 条验收）✅ `2552072` → P7.1 Manufacturing Rule Hardening + Test Integrity（层板托孔升格 verified、numOrUndef/countText 堵"缺失=0"假绿、derive/rules/model 扩展、ManufacturingRuleSet 分类定稿、39+27 验收）✅ `0ec9c77` → P7.2 Manufacturing Rule Architecture Review + Shelf Pin Rule Hardening（equalSpacing 定性为几何辅助/层板标高=几何事实、VERIFIED_RULE_EVALUATORS 注册表派发、verified 升格 9 条落 VERIFIED_PROMOTION_CHECKLIST、shelfPinOps 参数闸门、manufacturing 39→62 验收）✅ `a867f98` → P7.3 箱体连接孔 Manufacturing Rule（caseConnectorOps 注册进 VERIFIED_RULE_EVALUATORS、外壳主连接 verified 三合一/木榫、manufacturing 39→101 验收）✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→cabinet.place 唯一写入口、canonical= Cabinet.placement 不变、adjacent/align/absolute(authored) 三关系、方案级语义落位+静态成环检测、placement 82 验收）✅ `4290a3a` → P8.2 语义面接触落位（attach：两柜**具名面**贴合、复用 P2 EDGE_ORDER+ConnectionEdge、FACE-NOT-OPPOSING、attach 105 验收）✅ `P82HASH`。**停在 P8.2，不自动进 P8.3。**
 - **P2 关系层三条纪律**（`core/relations.ts` 是唯一实现）：① 关系层**不产生几何**（建组合前后 BOM/stats/plan/views/中立导出逐字节不变）；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开 —— **只校验声明，推断只用于 UI 表达，不据此报错**。`stack` 因柜体没有 Z 无法核对，允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`（INFO，给两柜高与"若真叠放总高约 N"）—— 宁可说"没核"，不可假装核过。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容 / 关键架构决策 / 测试结果 / 遗留问题 / commit hash）。
 
-## 本会话进行中（P8.1 · 确定性落位基础设施，已完成验收）
-- **基线 `67f6764`（P7.3 已验收）**，本阶段只做确定性空间落位基础设施，不做 AI 自动摆柜。
-- **① 审查结论（canonical source）**：`Cabinet.placement {x,y,rotation}`（types.ts:320）就是空间位置唯一真相源——柜体背面左角世界坐标 + 逆时针旋转角；2D/3D 经 `generateProject` 一次派生天然同源；**不新造坐标系统**，ResolvedPlacement 只是管道中间产物（提交后与模型字段同值，非两份真相）。
-- **② PlacementIntent**（`core/placement.ts`）：三关系 union——absolute（`origin:'authored'` 必填，人话拒 AI）/ adjacent（side + 可选 alignment）/ align（单轴或 center 双轴）。authored 与 resolved 类型层分界（ResolvedPlacement{integer x,y,rotation}）。
-- **③ Engine 纯函数**：validate→resolve→ResolvedPlacement，五不（不改 Model/不调 AI/不依赖 UI/不生成 DXF/不改 Geometry）；`footprintBox` 复用 transform.ts 原语（bboxOf+rectPts，**无第二份旋转实现**）；位移增量法使 adjacent/align 对任意 rotation 成立。`resolvePlacements` 批量解析：Kahn 稳定拓扑 + 依赖序 + 全成或全不成 + 成环 `PLACEMENT-CYCLE` 全批拒。结构化错误 8 码，严禁 silently fallback (0,0,0)。
-- **④ 唯一写入口**：`cabinet.place` 命令一条原子写三字段（WRITABLE 白名单 `/^placement\.(x|y|rotation)$/`）。
-- **⑤ Proposal 接入**：编译序=全部 create 在前、place 按依赖序在后；`$ref:` 判据用**全部**柜 ref（首版只看 placing 柜漏了方案内非落位参照→执行期找不到参照柜、链式落位全错，82 断言抓到修掉）；validateProposal 加静态成环检测 `PROPOSAL-PLACE-CYCLE`（执行期逐条解析会各自"成功"→结果靠执行顺序碰运气）；封闭词汇表（ADJACENT_ALIGNMENTS 等）由 proposal.ts 直接 import core/placement.ts 不抄第二份。
-- **⑥ 判据演进纪律**：P3 的 G 断言"整词禁 placement"（当时必然是坐标）已随修法失效→精确禁 atX/atY/position* 与裸 `x:`/`y:` 字段 + 新增形状门拦 placement 夹带 x（更严非更宽）。
-- **⑦ 验收**：tsc 0 错；`verify:placement` 82/82（基础 20/连续 4/错误 13/纯函数 6/CommandBus 8/Proposal 27/2D3D 一致 3，含独立 footprintBox 复核）；manufacturing 101/101；fixhint 27/27；verify:all VERIFY_ALL_EXIT=0、UI 686/686、console 0。
-- 文档加 §23.9（9 小节：审查/模型/引擎/关系取舍/接入/Geometry 零改动/文件/验收/P8.2+ 提示）；主 commit hash 待回填路线行 `P81HASH`。
-- **不做清单（P8.1 明确划界）**：全屋自动布局、AI 自动规划房间、Vision 自动定位、碰撞优化、自动吸附、路径规划、套料、attach 关系、Z 轴。**停在 P8.1，不自动进 P8.2/P8.3。**
+## 本会话进行中（P8.2 · 语义面接触落位，已完成验收）
+- **基线 `4290a3a`（P8.1 已验收）**，把"相邻"提升为"具名的面接触"，停在 P8.2 不进 P8.3。
+- **① 审查结论（复用优先）**：面语义与面几何都已存在——`ConnectionEdge`（types.ts）就是具名面、`EDGE_ORDER`（relations.ts）是面名↔几何边唯一映射、`rectPts`+`localToWorld`（transform.ts）是唯一旋转、`deriveContacts` 是唯一接触判定。P8.2 只借常量与反向验证，**不写第二张面表/第二套旋转/第二套接触算法**（验收用源码扫描钉住：placement.ts 无 Math.cos/sin、无字面量面表、无 deriveContacts/edgesFlush/CONTACT_TOL）。
+- **② AttachIntent**：`{relation:'attach', targetId, referenceId, targetFace, referenceFace, alignment?: start|center|end, offset?}`。面=ConnectionEdge 四垂直面；`PLACEMENT_FACES=[...EDGE_ORDER]`；缺省对齐 **start**（不是隐式 center）；offset 只沿外法线留缝、负数（重叠）拒收。
+- **③ 面语义真实现**：`faceGeometry()` 从几何推三件事——端点（EDGE_ORDER 取边）、自然方向（边轴向：左右面沿进深、前后端面沿宽）、外法线（面中点−体中心，再 localToWorld 旋转）。解析=① 两面外法线必须反向平行（否则 `PLACEMENT-FACE-NOT-OPPOSING` 带夹角数字，不退化成 adjacent）② 法向：面平面 + offset ③ 切向：start/center/end；全位移增量，任意合法 rotation 成立。
+- **④ 几何事实**：两矩形要面贴合 ⇒ **相对旋转必是 90° 的整数倍**（0/90/180/270 全覆盖；45°/45° 可解析但 P2 deriveContacts 不覆盖非轴对齐 → 验收显式写"不声称已验证"）。
+- **⑤ 边界**：Relations=有什么关系 / Placement=该在哪 / Geometry=算几何 / Manufacturing=派生制造。attach 不写 Connection（贴上≠声明连接）；deriveContacts 只做反向验证且不改 placement。
+- **⑥ CommandBus/Proposal/AI**：**不新增写入命令**，最终仍写 `Cabinet.placement`，命令仍是 `cabinet.place`；契约加 attach+targetFace/referenceFace/offset（仍无 x/y，夹带 x=999 与没夹带逐值相同）；新增 `PROPOSAL-PLACE-FACE`/`-OFFSET` 两码（带数字，进 fixhint NUM_CTX）。
+- **⑦ 抓到的 P2 真缺陷**：`relations.ts` 的 `distPointToLine` 文档写"直线"实现 clamp 成"线段"→ 深度不同的两柜背面齐并排（真·面接触 550mm）被判"没连着"。修=去 clamp；连带把 relations-acceptance 两条**前提已失效**的夹具改成"真的分开"（沿接触面滑动不分开，只会把角接变 40mm 续接），proposal-acceptance §E 的声明按实际落位从 corner 改为 butt。
+- **⑧ 验收**：tsc 0；`verify:attach` 105/105；placement 82/82；relations 82/82；manufacturing 101/101；fixhint 27/27；proposal 90/90；全量 verify:all 见 §23.10。
+- 文档 §23.10（10 小节）；主 commit hash 待回填路线行 `P82HASH`。
+- **明确不做**：Z 轴、top/bottom 面、上下叠放（明确阻塞于 Z）、贴墙、房间边界、门窗、碰撞优化、自动吸附、全屋布局、AI 自动布局、P8.3。

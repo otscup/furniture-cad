@@ -1182,3 +1182,104 @@ resolvePlacements(intents, scene) → 依赖拓扑排序 → 全成或全不成�
 - 自动碰撞优化 / 全屋布局属 P8.2+；判据仍只有 `detectCollisions` 一份，候选生成方可复用 snapPlace 的候选+过滤范式。
 
 - 本阶段停在 P8.1，未自动进入 P8.2 / P8.3 或其他阶段。
+
+### 23.10 P8.2 实施记录：语义面接触落位（Semantic Attach / Contact Placement，已完成）
+
+**基线 `4290a3a`（P8.1 已验收）。本阶段目标：把"空间相邻"提升为"明确的面接触关系"——`AttachIntent → 确定性面/接触解析 → ResolvedPlacement`。attach 不是 `adjacent + gap=0` 的别名：两个面各有其名、参与计算，面朝向对不上就是贴合不了（报结构化错误，不退化成相邻）。不引入 Z 轴，不做自动碰撞优化，停在 P8.2，不进 P8.3。**
+
+#### 23.10.1 审查结论：可直接复用的 contact 几何事实
+
+动手前审查了 placement.ts（P8.1）/ relations.ts（P2）/ deriveContacts / transform.ts / Geometry Panel / Cabinet.placement / L·U·跨柜变深场景，结论是**面语义与面几何都已经存在，只需借，不需重建**：
+
+| 已有事实 | 位置 | P8.2 怎么用 |
+| --- | --- | --- |
+| 面词汇 `ConnectionEdge = back\|front\|left\|right` | types.ts | attach 的 `targetFace/referenceFace` **直接复用同一套语义面**（不另起面词汇） |
+| 面名 ↔ 几何边的唯一映射 `EDGE_ORDER` | relations.ts | placement.ts 直接 import（源码扫描断言：本文件不得出现字面量面表） |
+| 矩形足迹点序 `rectPts` | transform.ts | 面的两个端点从点序取，面法线由"面中点 − 体中心"推出 |
+| 唯一旋转实现 `localToWorld` | transform.ts | 端点与法线都经它旋转（验收断言 placement.ts 里没有 Math.cos/sin） |
+| 唯一接触判定 `deriveContacts()` | relations.ts | **反向验证** attach 的结果（不复制、不让其改 placement） |
+
+**审查中发现的 P2 真实缺陷（已修）**：`relations.ts` 的 `distPointToLine` 文档写的是"点到直线"，实现却把参数夹取到 `[0,1]`（等于点到**线段**）。于是**深度不同的两柜背面齐并排**（两面共面且重叠 550mm、实打实相接）被判成"没连着"——P8.2 的 attach 第一次系统性踩中它（attach 允许目标面比参照面长）。表现是 Placement 说"贴上了"、Relations 说"没连着"，两层说不同的话。修法：去掉夹取（重叠与否由 `overlapLen` 单独判，共面判定不该顺手把"伸出去了"当成"没连着"）。连带把 relations-acceptance 里两条**前提已失效**的夹具改成"真的分开"（沿接触面滑动并不会分开两柜，反而把角接变成 40mm 续接）——判据随修法演进，不删不放宽。
+
+#### 23.10.2 AttachIntent 模型（core/placement.ts）
+
+```ts
+| { relation: 'attach';
+    targetId; referenceId;
+    targetFace: PlacementFace;      // = ConnectionEdge
+    referenceFace: PlacementFace;
+    alignment?: 'start'|'center'|'end';   // 缺省 start
+    offset?: number;                       // 缝隙 mm，≥0，缺省 0
+  }
+```
+
+- 面词汇 = `ConnectionEdge`（四个垂直面 `left/right/front/back`）；`PLACEMENT_FACES` 直接取 `[...EDGE_ORDER]`，**面词汇与面↔边映射都不许有第二份**。
+- `top/bottom` 在类型层就不存在（需要 Z，本阶段不做）。
+- 与 `adjacent` 的关系：`adjacent` 说"往哪一侧放"（方向语义、包围盒法），`attach` 说"哪两个面贴在一起"（面语义、面平面法）。轴对齐时两者给出同一个数，但 attach 走的是精确面平面（旋转过的柜 bbox 是放大近似，面平面才是真的）。
+
+#### 23.10.3 面语义必须是真实语义（不是字符串 → adjacent）
+
+`faceGeometry(item, face)` 从几何推出面的三件事，**没有第二张"哪个面朝哪"的表**：
+
+1. **端点**：局部足迹 `rectPts(0,0,W,D)`，边序号 = `EDGE_ORDER.indexOf(face)`（P2 唯一映射）。
+2. **自然方向**（start/end 的唯一读法）：从边自身轴向推出——左右面沿进深（背面→正面），前后端面沿宽（左端→右端）。
+3. **外法线**：`面中点 − 体中心` 归一化（矩形局部边轴对齐，减出来就是纯法向），再经 `localToWorld` 旋转。
+
+解析 = ① 两面朝向必须**反向平行**（否则 `PLACEMENT-FACE-NOT-OPPOSING`，message 带夹角数字）→ ② 法向：target 的面平面 = reference 的面平面 + `offset`（沿 reference 外法线外推）→ ③ 切向：沿接触面自然方向做 start/center/end 对齐。全部表达为**位移增量**，对任意合法 rotation 成立。
+
+#### 23.10.4 alignment 与 offset 语义
+
+- **`start`（缺省）/ `center` / `end`**：沿面的自然方向——左右面的 start 是背面端、end 是正面端；前后端面的 start 是左端、end 是右端。缺省 **不是**隐式 center（与 adjacent 的"并排背面齐、前后左缘齐"同惯例），系统替模型取值时写进 notes。
+- **面接触 ≠ 整条边重合**：600 深贴 550 深、start 对齐时长的那头必然伸出 50mm——这仍然是真实贴合（验收的独立复核用"共面 + 投影有正重叠"，不用"两端点都落在对方线段内"）。
+- **`offset`**：沿接触面外法线的缝隙（mm），0 = 真正贴合；**负数（重叠）拒收**——重叠是碰撞，落位层不造。offset 只改变解析结果，不进模型、不改几何（验收：offset=20 时 P2 `deriveContacts` 如实不算接触）。
+
+#### 23.10.5 Rotation：复用 P8.1 的唯一旋转实现
+
+端点与法线都走 `transform.ts` 的 `localToWorld`（含 90° 三角吸附），**没有新增任何三角函数**。验收覆盖 0° / 90° / 180° / 270° 的精确数值 + 独立重算的两面共面复核；45°/45°（非 90°）也可解析且确定（相对旋转为 0 时两面恒能共面）。
+
+**几何事实（写入报错文案）**：两个矩形要面贴合，两者的**相对旋转必须是 90° 的整数倍**——因为 target 面外法线 `R(θt)u` 与 reference 面外法线 `R(θr)v` 必须反向平行，而 `u/v` 是轴向单位向量，`R(Δ)u` 仍是轴向的充要条件就是 Δ ≡ 0/90/180/270。所以"0° ↔ 45°"报的是 `PLACEMENT-FACE-NOT-OPPOSING`（不是静默换个放法）。
+
+诚实边界：非轴对齐（如双柜 45°）的贴合**几何上精确**，但 P2 的 `deriveContacts` 只覆盖轴对齐柜体——验收里把它写成显式断言（"不声称已验证"），不假装验过。
+
+#### 23.10.6 与 P2 Relations 的边界（复用，不复制）
+
+```
+P2 Relations  = 对象之间有什么关系（FurnitureAssembly / Connection / deriveContacts）
+P8 Placement  = 根据关系，确定对象应该在哪里（PlacementIntent → ResolvedPlacement）
+Geometry      = 确定性计算实际空间几何
+Manufacturing = 从最终几何派生制造信息
+```
+
+- 只借常量（`EDGE_ORDER`）与唯一接触判定（`deriveContacts` 反向验证），**不复制接触算法**（源码扫描断言 placement.ts 里没有 deriveContacts / edgesFlush / CONTACT_TOL）。
+- `deriveContacts` 是只读派生：验收断言它验证 attach 结果时没有反过来改任何 placement。
+- attach 不写 Connection：贴上了不等于声明了连接（那是用户的语义决定，属于 P2）。
+
+#### 23.10.7 CommandBus / Proposal / AI 接入
+
+- **不新增写入命令**：attach 只是"一种解析方式"，最终仍写 `Cabinet.placement`，命令仍然是 P8.1 的 `cabinet.place`（一条原子写 x/y/rotation，白名单不变）。验收断言 `cmd.op === 'cabinet.place'`。
+- **契约**：`cabinet.place.relation` 加 `attach`；新增 `targetFace / referenceFace`（枚举四垂直面）与 `offset`（≥0）；仍然**没有 x/y 参数**。
+- **compileAction**：新增 attach 分支——先按既有规则解析参照（id → 唯一名字），再校验面/对齐/缝隙词汇，最后交给引擎解析；产物是带整数坐标的 `cabinet.place`。契约里没有 x，AI 夹带的坐标对解析结果零影响（验收断言"夹带 x=999 与没夹带逐值相同"）。
+- **DesignProposal**：`ProposalPlacement` 支持 `relation:'attach'` + `targetFace/referenceFace/alignment/offset`；新增 `PROPOSAL-PLACE-FACE`（缺面 / 面名不认识，报 4 种取值）与 `PROPOSAL-PLACE-OFFSET`（缝隙非法，报上限数字），成环/自参照/参照不存在复用 P8.1 的既有码；编译顺序与 `$ref` 机制零改动（create 全部在前、place 按依赖序）。缺省对齐（start）写进 notes。
+
+#### 23.10.8 核心文件
+
+- `app/src/core/placement.ts`：PlacementFace / AttachAlignment / attach 意图分支 / `faceGeometry` / `resolveAttach` / `PLACEMENT_FACES`·`ATTACH_ALIGNMENTS`·`ATTACH_DEFAULT_ALIGNMENT` / 新增错误码 `PLACEMENT-FACE-NOT-OPPOSING`
+- `app/src/core/relations.ts`：**修** `distPointToLine` 的夹取缺陷（点到直线而非线段）
+- `app/src/ai/compile.ts`：case 'cabinet.place' 的 attach 分支
+- `app/src/ai/proposal.ts` / `compileProposal.ts`：ProposalPlacement 扩展 + 两个新校验码 + notes
+- `app/src/core/rules/issueCatalog.ts`：`PROPOSAL-PLACE-FACE` / `PROPOSAL-PLACE-OFFSET`
+- `app/shared/aiContract.mjs`：ACTIONS 参数 + proposalShapeError（面/缝隙词汇、坐标仍拒收）
+- `app/verify/attach-acceptance.ts`（新增，105 断言）+ `verify/relations-acceptance.ts`（两条前提失效的夹具改为"真的分开"）+ `verify/fixhint-acceptance.ts`（新码进 NUM_CTX）+ package.json（`verify:attach` 接入 verify:all）
+
+#### 23.10.9 明确不支持（本阶段划界）
+
+Z 轴 / top·bottom 面 / 柜体上下叠放 / 贴墙 / 房间边界 / 门窗 / 自动碰撞优化 / 自动吸附 / 全屋布局 / AI 自动布局 / P8.3 —— 全部不做。其中 top·bottom 与叠放**明确阻塞于 Z**：模型 `Cabinet.placement` 只有 (x, y, rotation)，没有 Z 就无法表达"谁在谁上面"（与 P2 的 `ASSEMBLY-STACK-UNVERIFIED` 同一条边界），本阶段没有偷偷加 Z。
+
+#### 23.10.10 验收结果（P8.2）
+
+- `tsc --noEmit`：0 错。
+- `verify:attach`（新增）：**105/105**（§1 四向基础贴合 15 + §2 尺寸/朝向/互换/0·90·180·270·45° 共 14 + §3 混合关系链 attach+adjacent / attach+align / attach+attach / 成环 5 + §4 错误 12（含"绝不 fallback (0,0,0)"总检）+ §5 架构 15（纯函数/不改输入/无第二套旋转·bbox·面表·接触算法/唯一写入口/deriveContacts 反向验证且只读/preview===commit/2D·3D 同位移）+ §6 Proposal·AI 边界 24）。
+- `verify:placement`：82/82（P8.1 旧断言一条未动）；`verify:relations`：82/82；`verify:proposal`：90/90；`verify:manufacturing`：101/101；`verify:fixhint`：27/27（两个新码进 NUM_CTX，喂进去的 4 / 2000 真出现在 message 里）。
+- 全量 `verify:all`（node + UI）：**VERIFY_ALL_EXIT=0**，UI 686/686、零 console error。未删旧测试、未放宽旧断言；两条"前提已被缺陷掩盖"的 P2 夹具与两处 `kind:'corner'` 声明改为**按实际落位如实声明**（判据随修法演进，见 23.10.1）。
+
+- 本阶段停在 P8.2，未自动进入 P8.3。

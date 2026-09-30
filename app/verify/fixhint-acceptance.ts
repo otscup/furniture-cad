@@ -184,6 +184,9 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'PROPOSAL-CONN-KIND': { ref: 'L 型组', kind: 'glue', count: 3, kinds: 'corner / butt / stack' },
   'PROPOSAL-CONN-REF': { ref: 'L 型组', side: 'a 端', member: 'cab9', count: 2 },
   'PROPOSAL-OPEN-QUESTIONS': { count: 2, first: '柜深按 350 还是 600？' },
+  // ── P8.2 落位意图：面贴合（面词表长度 / 缝隙上限都得真写进 message）──
+  'PROPOSAL-PLACE-FACE': { ref: '贴合柜', why: '缺 targetFace（attach 必须说明是哪两个面贴在一起）', face: '', faces: 'left / right / front / back', count: 4 },
+  'PROPOSAL-PLACE-OFFSET': { ref: '贴合柜', offset: '-20', max: 2000 },
   // ── P4 导入家族（外部数据带进来的数量：真有数 → 真显示；缺失 → 必须说"无法识别"）──
   'IMPORT-EMPTY': { count: 0 },
   'IMPORT-OPEN-QUESTIONS': { count: 3, first: '门板要不要通顶' },

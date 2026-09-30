@@ -255,7 +255,13 @@ section('E 组合：方案里的 ref 在建成的那一刻换成真 id');
       { ref: 'a', name: '长臂', width: 1800, height: 2400, depth: 600, units: [{ kind: 'hanging', width: 1800, rodHeight: 1700 }] },
       { ref: 'b', name: '短臂', width: 900, height: 2400, depth: 600, units: [{ kind: 'shelves', width: 900, count: 4 }], rotation: 90 },
     ],
-    assemblies: [{ ref: 'g', name: '玄关 L 型', members: ['a', 'b'], connections: [{ a: 'a', b: 'b', kind: 'corner' }] }],
+    // 连接 kind 按**实际落位**声明为 butt（续接）：
+    // 这两柜是系统按空位落出来的，副臂（rotation 90）与主臂之间形成的是 600mm 的
+    // **面接触**，属于续接而不是角接（角接是只共用角点、面重叠为 0 的那种）。
+    // 早期 deriveContacts 的 edgesFlush 用"点到线段"判定，会把这种"一面比另一面长、
+    // 伸出去一截"的真实贴合判成没连，于是退化到角接分支 —— 缺陷在 P8.2 修好后，
+    // 这里必须照实声明。角接的端到端覆盖在 relations-acceptance 的 Case 5。
+    assemblies: [{ ref: 'g', name: '玄关柜组', members: ['a', 'b'], connections: [{ a: 'a', b: 'b', kind: 'butt' }] }],
   };
   const r = compileProposal({ ...prop, room: roomOf(p) }, p, rules);
   ok('L 型方案编译成功', r.ok, r.blockedReason ?? '');

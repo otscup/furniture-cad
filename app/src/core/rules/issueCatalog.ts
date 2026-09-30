@@ -790,6 +790,20 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: () => `并排（side=left/right）用 back/front/center；前后叠（side=front/back）用 left/right/center。缺省时系统按行业惯例取（并排背面齐、前后左缘齐）。`,
     manual: '对齐集合与 core/placement.ts 的 ADJACENT_ALIGNMENTS 同源。',
   },
+  'PROPOSAL-PLACE-FACE': {
+    title: '贴合的面缺失或不认识',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的 attach 落位${str(c, 'why')}（能贴合的面只有 ${num(c, 'count')} 个垂直面：${str(c, 'faces')}${str(c, 'face') !== '' ? `，收到的是「${str(c, 'face')}」` : ''}）。`,
+    hint: (c) => `attach 要说清哪两个面贴在一起：${num(c, 'count')} 个垂直面 ${str(c, 'faces')} 选两个，且两面必须朝向相对（left↔right、front↔back）。top / bottom 需要 Z 坐标，本阶段不做。`,
+    manual: '面词汇与 P2 的 ConnectionEdge 同源（core/placement.ts 直接取 relations.ts 的 EDGE_ORDER，不抄第二份）。',
+  },
+  'PROPOSAL-PLACE-OFFSET': {
+    title: '贴合缝隙不是合法毫米数',
+    severity: 'ERROR',
+    message: (c) => `柜体「${str(c, 'ref')}」的 attach 缝隙「${str(c, 'offset')}」不能用 —— 缝隙只能是 0 到 ${num(c, 'max')}mm 之间的数（0 = 真正贴合）。`,
+    hint: (c) => `offset 只沿贴合面的外法线留缝（${num(c, 'max')}mm 以内）；要重叠请改尺寸或位置 —— 重叠是碰撞，落位层不造。`,
+    manual: 'offset 只改变解析结果，不写进几何、不进模型。',
+  },
   'PROPOSAL-PLACE-CYCLE': {
     title: '落位意图互相参照成环',
     severity: 'ERROR',

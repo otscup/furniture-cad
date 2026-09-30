@@ -235,18 +235,22 @@ export const ACTIONS = {
     required: ['deg'],
   },
   'cabinet.place': {
-    label: '语义落位（相邻 / 对齐）',
+    label: '语义落位（相邻 / 对齐 / 面贴合）',
     target: 'cabinet',
     params: {
-      relation: { type: 'enum', values: ['adjacent', 'align'], desc: 'adjacent = 贴着参照柜放（面贴合）；align = 与参照柜的边/中心齐平' },
+      relation: { type: 'enum', values: ['adjacent', 'align', 'attach'], desc: 'adjacent = 贴着参照柜放（面贴合）；align = 与参照柜的边/中心齐平；attach = 指定两个面贴合（例如本柜右端贴参照柜左端）' },
       reference: { type: 'string', max: MAX_STRING, desc: '参照柜体的名字（不要编 id）' },
       side: { type: 'enum', values: ['left', 'right', 'front', 'back'], desc: '仅 adjacent：贴在参照柜哪一侧（left/right 并排，front/back 前后叠）', optional: true },
-      alignment: { type: 'enum', values: ['left', 'right', 'front', 'back', 'center'], desc: '对齐方式；缺省按惯例（并排背面齐、前后左缘齐）', optional: true },
+      alignment: { type: 'enum', values: ['left', 'right', 'front', 'back', 'center', 'start', 'end'], desc: '对齐方式：adjacent / align 用 left / right / front / back / center；attach 用 start / center / end（沿接触面方向：起始端 / 中心 / 末端）。缺省按惯例（adjacent 并排背面齐、前后左缘齐；attach 起始端齐）', optional: true },
+      targetFace: { type: 'enum', values: ['left', 'right', 'front', 'back'], desc: '仅 attach（必填）：本柜参与贴合的那个面。只有四个垂直面，top / bottom 不做', optional: true },
+      referenceFace: { type: 'enum', values: ['left', 'right', 'front', 'back'], desc: '仅 attach（必填）：参照柜参与贴合的那个面，必须与 targetFace 相对（left↔right、front↔back）', optional: true },
+      offset: { type: 'number', min: 0, max: 2000, unit: 'mm', desc: '仅 attach：沿贴合面留的缝隙，0 = 真正贴合；负数（重叠）会被拒收', optional: true },
     },
     required: ['relation', 'reference'],
     detail:
       '你只表达"想怎么放"，最终坐标由系统按参照柜的实际位置与两柜尺寸**确定性计算** —— 这个动作不收任何坐标。' +
-      '绝对坐标（x/y）是用户授权输入，走 cabinet.move；不要用 cabinet.place 夹带坐标，系统会直接拒收。',
+      '绝对坐标（x/y）是用户授权输入，走 cabinet.move；不要用 cabinet.place 夹带坐标，系统会直接拒收。' +
+      'attach 要说清"哪两个面贴在一起"：两个面必须朝向相对（left↔right、front↔back），且两柜的相对旋转是 90° 的整数倍，否则系统报"两面贴合不了"而不是替你换个放法。',
   },
 
   // ───────── 柜体：分区 ─────────
@@ -1218,8 +1222,8 @@ export function proposalShapeError(raw) {
       if (pl.x !== undefined || pl.y !== undefined || pl.z !== undefined) {
         return `柜体「${c.ref}」的 placement 不接受坐标（x/y/z）—— 落位只表达关系（贴着谁/对齐谁），坐标由系统计算`;
       }
-      if (!['adjacent', 'align'].includes(pl.relation)) {
-        return `柜体「${c.ref}」的 placement.relation 只能是 adjacent / align，收到的是「${String(pl.relation)}」`;
+      if (!['adjacent', 'align', 'attach'].includes(pl.relation)) {
+        return `柜体「${c.ref}」的 placement.relation 只能是 adjacent / align / attach，收到的是「${String(pl.relation)}」`;
       }
       if (typeof pl.reference !== 'string' || pl.reference.trim() === '') {
         return `柜体「${c.ref}」的 placement.reference 必须是参照柜（方案内 ref 或已有柜体名）`;
@@ -1229,9 +1233,19 @@ export function proposalShapeError(raw) {
       }
       if (
         pl.alignment !== undefined && pl.alignment !== null &&
-        !['left', 'right', 'front', 'back', 'center'].includes(pl.alignment)
+        !['left', 'right', 'front', 'back', 'center', 'start', 'end'].includes(pl.alignment)
       ) {
-        return `柜体「${c.ref}」的 placement.alignment 只能是 left / right / front / back / center，收到的是「${String(pl.alignment)}」`;
+        return `柜体「${c.ref}」的 placement.alignment 只能是 left / right / front / back / center（adjacent / align）或 start / center / end（attach），收到的是「${String(pl.alignment)}」`;
+      }
+      // attach 的两个面：形状门只挡类型与封闭词汇表（top / bottom 本阶段不存在）；
+      // 缺面 / 两面不相对留给语义校验给带人话的 PROPOSAL-PLACE-FACE。
+      for (const f of ['targetFace', 'referenceFace']) {
+        if (pl[f] !== undefined && pl[f] !== null && !['left', 'right', 'front', 'back'].includes(pl[f])) {
+          return `柜体「${c.ref}」的 placement.${f} 只能是 left / right / front / back，收到的是「${String(pl[f])}」`;
+        }
+      }
+      if (pl.offset !== undefined && pl.offset !== null && (!finite(pl.offset) || pl.offset < 0)) {
+        return `柜体「${c.ref}」的 placement.offset 必须是 ≥ 0 的缝隙毫米数，收到的是「${String(pl.offset)}」`;
       }
       // adjacent 缺 side 不在形状门拦：语义校验（validateProposal）会给带人话的
       // PROPOSAL-PLACE-SIDE（"缺 side（adjacent 必须说明贴在参照柜哪一侧）"），

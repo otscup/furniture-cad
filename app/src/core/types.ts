@@ -78,9 +78,43 @@ export interface Wall {
   openings?: Opening[];
 }
 
-/** 洞口类型（P8.7）：door = 门洞，window = 窗洞。第一版二者都是"墙上的洞"，不做门扇开启包络。 */
+/** 洞口类型（P8.7）：door = 门洞，window = 窗洞。 */
 export type OpeningKind = 'door' | 'window';
 
+/**
+ * 门扇铰链在哪一侧（P8.9）。
+ *   `start` = 铰链在洞口靠**墙起点**的那一端；`end` = 靠墙终点的那一端。
+ * 语义完全由墙自身的 start→end 定义，界面必须把起终点坐标摆出来，
+ * **不许自己替用户解释成"左/右"**（同一面墙从屋里屋外看左右是反的）。
+ */
+export type DoorHinge = 'start' | 'end';
+
+/**
+ * 门扇朝哪一侧开（P8.9）。
+ *   `into-room`  = 朝房间内侧开（由墙与房间回路确定性判定，不是猜的）
+ *   `out-of-room`= 朝房间外侧（走廊/相邻空间）开
+ */
+export type DoorSwingDirection = 'into-room' | 'out-of-room';
+
+/**
+ * 门扇开启语义（P8.9，authored）。
+ *
+ * ── 只存这两个字段，别的全是派生 ──
+ *   hinge（铰链在哪端）+ swingDirection（往哪一侧开）是**用户的设计意图**，
+ *   系统算不出来也不许替用户选（§十一：禁止从柜体位置反推开门方向）。
+ *   而"开启包络多边形 / 门扇矩形 / 扫过面积 / 开启半径"全部是确定性派生
+ *   （见 core/spatial/door.ts），绝不写回模型 —— 派生数据写进模型就等于
+ *   给同一个事实留了两份真相，改了 width 忘了改包络，系统会自相矛盾。
+ *
+ * ── 为什么是"两个可独立缺省的字段"而不是一个必须成对的对象 ──
+ *   真实状态里存在"我知道铰链在哪侧，但还没想好往哪边开"——
+ *   用成对对象就得强迫用户在设铰链时顺手选一个方向，那正是
+ *   "系统替用户选了开门方向"。两个字段各自可缺省，"没说的就是没说"。
+ *
+ * ── 未知的处理（硬要求）──
+ *   hinge / swingDirection 任一缺失 ⇒ 判不出开启区域 ⇒ 事实为 unknown，
+ *   **绝不默认向内开**，也不产生任何结论。
+ */
 export interface Opening {
   id: string;
   kind: OpeningKind;
@@ -90,6 +124,16 @@ export interface Opening {
   width: number;
   /** 显示名（可选；缺省时界面按 kind 显示「门洞 / 窗洞」） */
   name?: string;
+  /**
+   * 门扇铰链侧（P8.9，可选；仅 kind='door' 有意义）。
+   * 缺失 = 未指定 —— 不是"默认起点"，而是"用户没说"。
+   */
+  hinge?: DoorHinge;
+  /**
+   * 门扇开启朝向（P8.9，可选；仅 kind='door' 有意义）。
+   * 缺失 = 未指定 —— 判不出开启区域，系统保持沉默（不猜方向）。
+   */
+  swingDirection?: DoorSwingDirection;
 }
 
 // ─────────────────────── 组合关系（v0.3，P2）───────────────────────

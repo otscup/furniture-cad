@@ -913,6 +913,8 @@ const RULE_CARDS: Record<string, RuleCard> = {
   //     DESIGN-CABINET-WALL-CONFLICT 是**设计验证视角**的同一事实（来源是
   //     P8.7 的 crossing 事实，不是第二次几何判定），只出现在设计验证报告里，
   //     不进 CommandBus.deriveFor 的主问题链。
+  //     （例外：DESIGN-CABINET-DOOR-SWING（P8.9）的实现就在空间层，
+  //      与 SPATIAL-CABINET-OPENING 同类，因此**进**主问题链 —— 见该条的归口说明。）
   //
   //  ③ **一律不给"自动移柜/自动贴墙/自动转朝向"的按钮**：怎么解是设计决定
   //     （§P8.7/P8.8 明确禁止自动修复）。每条都给得出具体数字与 manual。
@@ -996,6 +998,29 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) =>
       `沿墙面法线方向把柜体移动 ${Math.abs(num(c, 'actual') - num(c, 'declared'))}mm，让实际缝隙变成声明的 ${num(c, 'declared')}mm；本来就不留缝的话，把声明改成 0。`,
     manual: '留不留缝属于设计决定（踢脚线、收口条的厚度会让它必须留）。',
+  },
+
+  // ── 门扇开启（v0.3，P8.9）─────────────────────────────────────────────
+  //
+  // ⚠ 归口说明（读之前先看这条，免得以为是放错了族）：
+  //   本条的 **实现** 在空间层（core/spatial）：它的来源是确定性几何事实
+  //   ——"柜体 footprint 与门扇 90° 扫过的扇区内部重叠"，与 P8.7 的
+  //   SPATIAL-CABINET-OPENING 是同一类判断，所以它**随空间校验进主问题链**
+  //   （和 SPATIAL-CABINET-OPENING 一样，会出现在状态栏 / 问题列表里）。
+  //   而 P8.8 那批 DESIGN-* 是"设计语义解释"，只出现在统一设计验证报告里。
+  //   前缀 DESIGN- 表达的是"这是设计可用性问题"，不是"属于哪个模块"。
+  //
+  //   `touch`（只贴到扇区边界，≤ SPATIAL_TOL.TOUCH）不报 —— 与 P8.7 的
+  //   "贴着不算穿墙"同一把尺子；`unknown`（没指定铰链/方向、房间不闭合、
+  //   洞口非法）也不报 —— 判不出来就不说话。
+  'DESIGN-CABINET-DOOR-SWING': {
+    title: '柜子挡在门扇开启范围内（门开不了）',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${str(c, 'cabName')}」落在「${str(c, 'wallName', '未命名墙')}」上${str(c, 'openingName', '门洞')}（净宽 ${num(c, 'width')}mm）的门扇开启范围内 —— 门扇绕${str(c, 'hingeZh', '起点侧')}铰链向${str(c, 'dirZh', '室内')}转 90° 会扫到它（柜体从墙面往${str(c, 'dirZh', '室内')}探出 ${num(c, 'intrusion')}mm，门扇半径 ${num(c, 'width')}mm）。`,
+    hint: (c) =>
+      `门扇扫过的是以铰链为心、半径 ${num(c, 'width')}mm 的 90° 扇形：把柜体挪出这个扇形，或者改用另一侧铰链、或者让门朝另一侧开，它就不会被撞到。`,
+    manual: '挪柜 / 换铰链侧 / 改开启方向都是设计决定（也可能"门就该朝这边开、柜本来就该挪"）—— 系统只报事实，不自动改。',
   },
 
   // ═══════════════ Import 外部数据（v0.3，P4）══════════════

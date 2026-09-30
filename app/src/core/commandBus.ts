@@ -1,4 +1,4 @@
-import type { Cabinet, Connection, FurnitureAssembly, Issue, Opening, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
+import type { Cabinet, Connection, DoorHinge, DoorSwingDirection, FurnitureAssembly, Issue, Opening, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
 import type { PlacementIntentDecl } from './placement.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
@@ -86,8 +86,19 @@ export interface CommandPayload {
   opening?: Opening;
   /** opening.delete / update 的洞口 id */
   openingId?: string;
-  /** opening.update 的字段补丁（只含要改的字段） */
-  openingPatch?: { offset?: number; width?: number; name?: string };
+  /**
+   * opening.update 的字段补丁（只含要改的字段）。
+   *
+   * 门扇开启两字段（P8.9）用三态：`undefined` 不改 / `null` 改成"未指定" /
+   * 给定值 = 设成它。缺了 `null` 这一态，"未指定"就永远回不去。
+   */
+  openingPatch?: {
+    offset?: number;
+    width?: number;
+    name?: string;
+    hinge?: DoorHinge | null;
+    swingDirection?: DoorSwingDirection | null;
+  };
 }
 
 export interface Command {
@@ -184,6 +195,23 @@ export interface DiffEntry {
 }
 
 /**
+ * 洞口 authored 字段的快照（P8.7 位置/宽/名 + P8.9 门扇开启）。
+ *
+ * 单独成型的理由：它同时出现在 sideEffect 的 prev/next、落盘键序规范化
+ * 与 diff 生成三处 —— 三处各写一份形状，"新加了字段忘了同步某一处"
+ * 就会变成 undo 后字段诡异残留。类型放在一处，编译器替我们盯。
+ */
+export interface OpeningAuthored {
+  offset: number;
+  width: number;
+  name?: string;
+  /** 门扇铰链侧（P8.9；缺省 = 未指定） */
+  hinge?: DoorHinge;
+  /** 门扇开启朝向（P8.9；缺省 = 未指定） */
+  swingDirection?: DoorSwingDirection;
+}
+
+/**
  * 结构性变更的逆运算描述 —— 声明式，便于 undo/redo 统一处理。
  * 用数组而不是单个：一条命令可能同时创建"房间 + 墙"（首次画墙时自动建房间），
  * 撤销必须整体回退，不能留下半个空房间。
@@ -220,8 +248,8 @@ export type SideEffect =
       roomId: string;
       wallId: string;
       openingId: string;
-      prev: { offset: number; width: number; name?: string };
-      next: { offset: number; width: number; name?: string };
+      prev: OpeningAuthored;
+      next: OpeningAuthored;
     }
   /**
    * 镜像柜体（MI）：分区序列左右反序。反序的自逆就是自身（reverse 两次还原），
@@ -644,13 +672,35 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
     }
     case 'updateOpening': {
       const wall = findWallById(project, se.wallId);
-      const o = wall?.openings?.find((x) => x.id === se.openingId);
-      if (!o) return;
+      if (!wall?.openings) return;
+      const index = wall.openings.findIndex((x) => x.id === se.openingId);
+      if (index < 0) return;
+      const cur = wall.openings[index]!;
       const v = forward ? se.next : se.prev;
-      o.offset = v.offset;
-      o.width = v.width;
-      if (v.name === undefined) delete o.name;
-      else o.name = v.name;
+      /**
+       * **整对象重建、键序固定**（不是逐字段赋值）。
+       *
+       * 为什么必须重建：新增的 hinge / swingDirection 是可缺省的，
+       * 若用 `delete` + 赋值，同一个逻辑状态会因为"用户先后点的是哪个按钮"
+       * 得到不同的键序 —— 于是存盘字节不同、diff 里冒出假变化。
+       * 键序在这里一次性钉死：id → kind → offset → width → name → hinge → swingDirection。
+       * id/kind 是洞口的身份与类型（本命令不改），照抄。
+       *
+       * 未知字段**原样带走**（排在已知字段之后）：将来给洞口加了新 authored 字段
+       * 而忘了改这里，也不能让一条"改缝宽"的命令把它悄悄删掉。
+       */
+      const KNOWN = new Set(['id', 'kind', 'offset', 'width', 'name', 'hinge', 'swingDirection']);
+      const extras = Object.fromEntries(Object.entries(cur).filter(([k]) => !KNOWN.has(k)));
+      wall.openings[index] = {
+        id: cur.id,
+        kind: cur.kind,
+        offset: v.offset,
+        width: v.width,
+        ...(v.name !== undefined ? { name: v.name } : {}),
+        ...(v.hinge !== undefined ? { hinge: v.hinge } : {}),
+        ...(v.swingDirection !== undefined ? { swingDirection: v.swingDirection } : {}),
+        ...extras,
+      };
       return;
     }
     case 'mirrorUnits': {
@@ -1552,11 +1602,25 @@ export class CommandBus {
         for (const wall of room.walls) {
           const o = wall.openings?.find((x) => x.id === openingId);
           if (!o) continue;
-          const prev = { offset: o.offset, width: o.width, ...(o.name !== undefined ? { name: o.name } : {}) };
-          const next = {
+          const prev: OpeningAuthored = {
+            offset: o.offset,
+            width: o.width,
+            ...(o.name !== undefined ? { name: o.name } : {}),
+            ...(o.hinge !== undefined ? { hinge: o.hinge } : {}),
+            ...(o.swingDirection !== undefined ? { swingDirection: o.swingDirection } : {}),
+          };
+          // 三态补丁：undefined = 不改 / null = 清成"未指定" / 值 = 设成它
+          const pick = <T>(next: T | null | undefined, cur: T | undefined): T | undefined =>
+            next === undefined ? cur : next === null ? undefined : next;
+          const nextName = pick(patch.name, prev.name);
+          const nextHinge = pick(patch.hinge, prev.hinge);
+          const nextDir = pick(patch.swingDirection, prev.swingDirection);
+          const next: OpeningAuthored = {
             offset: patch.offset !== undefined ? Math.round(patch.offset) : prev.offset,
             width: patch.width !== undefined ? Math.round(patch.width) : prev.width,
-            ...(patch.name !== undefined ? { name: patch.name } : prev.name !== undefined ? { name: prev.name } : {}),
+            ...(nextName !== undefined ? { name: nextName } : {}),
+            ...(nextHinge !== undefined ? { hinge: nextHinge } : {}),
+            ...(nextDir !== undefined ? { swingDirection: nextDir } : {}),
           };
           return {
             sideEffects: [{ kind: 'updateOpening', roomId: room.id, wallId: wall.id, openingId, prev, next }],
@@ -1564,6 +1628,10 @@ export class CommandBus {
               ...(next.offset !== prev.offset ? [{ path: `openings[${openingId}].offset`, from: prev.offset, to: next.offset }] : []),
               ...(next.width !== prev.width ? [{ path: `openings[${openingId}].width`, from: prev.width, to: next.width }] : []),
               ...(next.name !== prev.name ? [{ path: `openings[${openingId}].name`, from: prev.name ?? null, to: next.name ?? null }] : []),
+              ...(next.hinge !== prev.hinge ? [{ path: `openings[${openingId}].hinge`, from: prev.hinge ?? null, to: next.hinge ?? null }] : []),
+              ...(next.swingDirection !== prev.swingDirection
+                ? [{ path: `openings[${openingId}].swingDirection`, from: prev.swingDirection ?? null, to: next.swingDirection ?? null }]
+                : []),
             ],
           };
         }

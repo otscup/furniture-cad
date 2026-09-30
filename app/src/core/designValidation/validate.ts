@@ -128,6 +128,8 @@ export function validateDesign(project: Project, opts?: { attach?: WallAttachDec
     status: worst(findings),
     placement,
     spatial,
+    // 门扇开启（P8.9）：**原样**引用空间层的派生结果，组合层不重判一次。
+    doorSwing: { doors: spatial.doors, clearances: spatial.clearances },
     findings,
     counts: {
       error: findings.filter((f) => f.status === 'error').length,

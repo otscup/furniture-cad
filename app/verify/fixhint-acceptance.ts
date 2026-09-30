@@ -217,6 +217,8 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'DESIGN-ATTACH-NOT-TOUCHING': { cabName: '声明贴墙柜', wallName: '北墙', gap: 317 },
   'DESIGN-ATTACH-FACE-MISMATCH': { cabName: '贴错面柜', declaredZh: '背面', actualZh: '左端', rotation: 270 },
   'DESIGN-ATTACH-OFFSET-MISMATCH': { cabName: '缝不符柜', declared: 17, actual: 317 },
+  // ── P8.9 门扇开启（净宽 / 探出墙面的 mm 必须真写进 message，不能被兜底 0 顶替）──
+  'DESIGN-CABINET-DOOR-SWING': { cabName: '挡扇柜', wallName: '北墙', openingName: '门洞', width: 917, hingeZh: '终点侧', dirZh: '室外', intrusion: 613 },
 };
 
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];

@@ -240,6 +240,12 @@ a.tb-btn { text-decoration: none; }
 }
 .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+/**
+ * 分段按钮的选中态（P8.9 门开启：铰链侧 / 开启方向）。
+ * 为什么必须有：这一格是"同一件事的几种取值"里选一个，
+ * 没有可见的当前值，用户根本分不清"现在到底是起点侧还是没选"。
+ */
+.btn.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
 .btn-xs { padding: 2px 7px; font-size: 11px; }
 .btn-danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 .btn-row { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 0 2px; }

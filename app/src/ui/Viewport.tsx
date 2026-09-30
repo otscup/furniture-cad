@@ -3,6 +3,7 @@ import type { Dispatch, PointerEvent as RPointerEvent, SetStateAction, MouseEven
 import type { Cabinet, Project, Vec2, Wall } from '../core/types.ts';
 import type { Command, CommandBus } from '../core/commandBus.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { doorSwingPrimsOf } from '../viewport/doorSwingPrims.ts';
 import { DEFAULT_WALL_THICKNESS } from '../core/docFactory.ts';
 import type { Camera } from '../viewport/camera.ts';
 import { fitBBox, niceGridStep, panByScreen, screenToWorld, zoomAt } from '../viewport/camera.ts';
@@ -309,6 +310,7 @@ export function Viewport(props: ViewportProps) {
       marquee: drag?.kind === 'marquee' ? { a: drag.a, b: drag.b } : null,
       draftWall: draft ? { a: draft.a, b: draft.b, thickness: DEFAULT_WALL_THICKNESS } : null,
       explodePrims: explodeSet?.prims ?? [],
+      doorSwingPrims: props.mode === 'plan' ? doorSwingPrimsOf(scene.project) : [],
       sheetHover: sheetHoverPl ? { pts: sheetHoverPl.pts, draggable: dragPlanOf(sheetHoverPl).ok } : null,
     });
   }, [size, cam, version, preview, selection, hover, hoverGrip, activeGrip, hiddenLayers, showGrid, snap, drag, draft, bus, props.mode, explodeSet, sheetHoverPl]);

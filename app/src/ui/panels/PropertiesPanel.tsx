@@ -1,9 +1,29 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import type { Cabinet, CabinetGeometry, Project, ProjectGeometry, RowHeight, RuleSet, UnitSpec, Wall } from '../../core/types.ts';
+import type {
+  Cabinet,
+  CabinetGeometry,
+  DoorHinge,
+  DoorSwingDirection,
+  Opening,
+  Project,
+  ProjectGeometry,
+  RowHeight,
+  RuleSet,
+  UnitSpec,
+  Wall,
+} from '../../core/types.ts';
 import type { Command, CommandBus } from '../../core/commandBus.ts';
 import * as CMD from '../../core/commands.ts';
 import { NumField, Pill, Row, Section, Text, TextField } from './common.tsx';
 import { ROW_HEIGHT_FILL, layoutRows, unitPathPrefix, unitsAtPath } from '../../core/layoutModel.ts';
+import {
+  DOOR_DIRECTION_ZH,
+  DOOR_HINGE_ZH,
+  DOOR_UNKNOWN_ZH,
+  clearancesOfDoor,
+  deriveDoorSwing,
+  doorFactOf,
+} from '../../core/spatial/index.ts';
 import {
   ALIGN_ALIGNMENTS,
   ATTACH_ALIGNMENTS,
@@ -58,7 +78,7 @@ export function PropertiesPanel(props: PropertiesPanelProps): ReactNode {
   if (cab) return <CabinetProps bus={bus} cab={cab} project={project} rules={rules} geom={derived.geom.cabinets[cab.id]} onRun={run} onToast={props.onToast} />;
 
   const wall = findWall(project, id);
-  if (wall) return <WallProps wall={wall} onRun={run} />;
+  if (wall) return <WallProps project={project} wall={wall} onRun={run} />;
 
   return <div className="panel-scroll empty-hint">对象已不存在（可能被撤销删除）。</div>;
 }
@@ -617,7 +637,7 @@ function UnitEditor(props: {
 
 // ─────────────────────────── 墙 ───────────────────────────
 
-function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
+function WallProps(props: { project: Project; wall: Wall; onRun: Run }): ReactNode {
   const { wall } = props;
   const len = Math.round(Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y));
   return (
@@ -651,7 +671,7 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
 
       {/** 门窗洞口（P8.7）：offset/width 是沿墙量的 authored 语义值，不输入世界坐标 */}
       <Section title={`门窗洞口（${wall.openings?.length ?? 0}）`}>
-        {(wall.openings ?? []).length === 0 ? <div className="hint-line">这面墙还没有洞口。加一个后，空间校验会自动检查柜体是否盖住它。</div> : null}
+        {(wall.openings ?? []).length === 0 ? <div className="hint-line">这面墙还没有洞口。加一个后，空间校验会自动检查柜体是否盖住它；门洞还可以设铰链侧与开启方向，用来检查门扇打开会不会撞柜。</div> : null}
         {(wall.openings ?? []).map((o) => (
           <div key={o.id} className="opening-row" style={{ borderBottom: '1px solid var(--line, #ddd)', paddingBottom: 6, marginBottom: 6 }}>
             <Row label={o.kind === 'door' ? '门洞' : '窗洞'} derived>
@@ -663,6 +683,8 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
             <Row label="净宽">
               <NumField value={o.width} min={100} max={len} suffix="mm" onCommit={(v) => props.onRun(CMD.updateOpening(wall.id, wall.name, o.id, o.kind, o.width, { width: v }))} />
             </Row>
+            {/** 门扇开启语义（P8.9）：只有门洞有；窗洞没有门扇，不给这一格 */}
+            {o.kind === 'door' ? <DoorSwingBlock project={props.project} wall={wall} opening={o} onRun={props.onRun} /> : null}
             <div className="btn-row">
               <button type="button" className="btn btn-danger" onClick={() => props.onRun(CMD.deleteOpening(wall.id, wall.name, o.id, o.kind, o.width))}>
                 删除此洞口
@@ -690,6 +712,87 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
       </Section>
       <div className="hint-line">拖动墙端点的方形夹点即可改起点/终点 —— 改的是 wall.start / wall.end 语义字段，不是"移动一条线"。</div>
     </div>
+  );
+}
+
+// ─────────────────── 门开启语义（P8.9：authored 设定 + 只读判定） ───────────────────
+
+/**
+ * 一扇门的「门开启」区。
+ *
+ * 版面铁律同上：**上面可写（铰链 / 开启方向），下面只读（开启范围判定）**。
+ * 为什么铰链与方向是两组独立的可选项、各自都有「未指定」：
+ *   "我知道铰链在哪侧，但还没想好往哪边开"是真实状态 —— 强迫用户一次选完，
+ *   等于系统替他选了开门方向（P8.9 §十一 明令禁止）。
+ * 为什么下面没有任何"自动移柜 / 自动改方向"的按钮：
+ *   怎么解是设计决定，系统只说明事实。
+ */
+function DoorSwingBlock(props: { project: Project; wall: Wall; opening: Opening; onRun: Run }): ReactNode {
+  const { project, wall, opening } = props;
+  const der = useMemo(() => deriveDoorSwing(project), [project]);
+  const fact = doorFactOf(der.doors, opening.id);
+  const hits = clearancesOfDoor(der.clearances, opening.id).filter((c) => c.status === 'overlap');
+  const names = hits.map((c) => project.cabinets.find((x) => x.id === c.cabinetId)?.name ?? c.cabinetId);
+
+  const set = (patch: { hinge?: DoorHinge | null; swingDirection?: DoorSwingDirection | null }): void => {
+    props.onRun(CMD.updateOpening(wall.id, wall.name, opening.id, opening.kind, opening.width, patch));
+  };
+  const opt = (active: boolean): string => `btn btn-xs${active ? ' on' : ''}`;
+
+  let verdict: [string, string];
+  if (!fact || fact.status === 'unknown') {
+    verdict = ['○', DOOR_UNKNOWN_ZH[fact?.unknownReason ?? 'no-swing']];
+  } else if (hits.length > 0) {
+    verdict = ['✕', `当前柜体「${names.join('」「')}」会挡住门扇开启（共 ${hits.length} 只）`];
+  } else {
+    verdict = ['✓', '当前柜体都不在门扇开启范围内'];
+  }
+
+  return (
+    <>
+      <Row label="铰链在哪端" hint="起点/终点是**这面墙自身**的定义（= 几何区里的起点/终点坐标），不是屏幕上的左右">
+        <div className="btn-row tight">
+          <button type="button" className={opt(opening.hinge === 'start')} onClick={() => set({ hinge: 'start' })}>
+            起点侧
+          </button>
+          <button type="button" className={opt(opening.hinge === 'end')} onClick={() => set({ hinge: 'end' })}>
+            终点侧
+          </button>
+          <button type="button" className={opt(opening.hinge === undefined)} onClick={() => set({ hinge: null })}>
+            未指定
+          </button>
+        </div>
+      </Row>
+      <Row label="门往哪开" hint="室内侧由房间边界确定性判定；未指定时判不出开启范围，系统保持沉默（不猜方向）">
+        <div className="btn-row tight">
+          <button type="button" className={opt(opening.swingDirection === 'into-room')} onClick={() => set({ swingDirection: 'into-room' })}>
+            向室内
+          </button>
+          <button type="button" className={opt(opening.swingDirection === 'out-of-room')} onClick={() => set({ swingDirection: 'out-of-room' })}>
+            向室外
+          </button>
+          <button type="button" className={opt(opening.swingDirection === undefined)} onClick={() => set({ swingDirection: null })}>
+            未指定
+          </button>
+        </div>
+      </Row>
+      {fact?.status === 'ok' && fact.envelope ? (
+        <Row label="开启范围" derived>
+          <Text mono>
+            半径 {fact.envelope.radius}mm · 门扇绕
+            {DOOR_HINGE_ZH[fact.hinge ?? 'start']}向{DOOR_DIRECTION_ZH[fact.direction ?? 'into-room']}开 90°
+          </Text>
+        </Row>
+      ) : null}
+      <Row label="判定" derived>
+        <Text>
+          <span className="mono">{verdict[0]}</span> {verdict[1]}
+        </Text>
+      </Row>
+      <div className="hint-line">
+        这一格只说明门扇扫过哪里、哪些柜子挡着 —— 挪柜 / 换铰链侧 / 改开启方向都是设计决定，系统不自动改。
+      </div>
+    </>
   );
 }
 

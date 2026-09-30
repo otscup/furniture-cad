@@ -1,9 +1,10 @@
-import type { Cabinet, Connection, FurnitureAssembly, Room, RowHeight, UnitSpec, Wall } from './types.ts';
+import type { Cabinet, Connection, DoorHinge, DoorSwingDirection, FurnitureAssembly, Room, RowHeight, UnitSpec, Wall } from './types.ts';
 import type { Change, Command, CommandSource } from './commandBus.ts';
 import type { PlacementIntentDecl } from './placement.ts';
 import { newCommandId } from './ids.ts';
 import { ROW_HEIGHT_FILL, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 import { KIND_ZH } from './relations.ts';
+import { DOOR_DIRECTION_ZH, DOOR_HINGE_ZH } from './spatial/door.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -563,20 +564,37 @@ export function deleteOpening(wallId: string, wallName: string, openingId: strin
   };
 }
 
-/** 改洞口的位置/宽度/名字：一条命令一处语义补丁，撤销一步到位 */
+/**
+ * 改洞口的位置/宽度/名字/门扇开启语义：一条命令一处语义补丁，撤销一步到位。
+ *
+ * 门扇开启（P8.9）的两个字段各自可**清空**：`undefined` = 这次不改，
+ * `null` = 改成"未指定"。为什么要区分 —— "没提到这个字段"和"用户把方向清掉了"
+ * 是两件事：前者要保留原值，后者必须真的回到未知（否则界面上的"未指定"
+ * 会变成一个改不掉的假状态）。
+ */
 export function updateOpening(
   wallId: string,
   wallName: string,
   openingId: string,
   kind: 'door' | 'window',
   width: number,
-  patch: { offset?: number; width?: number; name?: string },
+  patch: {
+    offset?: number;
+    width?: number;
+    name?: string;
+    hinge?: DoorHinge | null;
+    swingDirection?: DoorSwingDirection | null;
+  },
   source: CommandSource = 'ui'
 ): Command {
   const parts: string[] = [];
   if (patch.offset !== undefined) parts.push(`位置→${Math.round(patch.offset)}`);
   if (patch.width !== undefined) parts.push(`宽→${Math.round(patch.width)}`);
   if (patch.name !== undefined) parts.push(`名→${patch.name}`);
+  if (patch.hinge !== undefined) parts.push(`铰链→${patch.hinge === null ? '未指定' : DOOR_HINGE_ZH[patch.hinge]}`);
+  if (patch.swingDirection !== undefined) {
+    parts.push(`开启→${patch.swingDirection === null ? '未指定' : DOOR_DIRECTION_ZH[patch.swingDirection]}`);
+  }
   return {
     id: newCommandId('opening.update'),
     op: 'opening.update',

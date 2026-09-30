@@ -20,6 +20,14 @@ export interface LayerDef {
 export const LAYERS: LayerDef[] = [
   { name: 'A-WALL', label: '墙体', color: '#334155', lw: 1.8, defaultVisible: true, plot: true, group: '建筑' },
   { name: 'A-TEXT', label: '墙长标注', color: '#64748b', lw: 1, defaultVisible: true, plot: true, group: '建筑' },
+  /**
+   * 门扇开启范围（P8.9）。
+   *
+   * 为什么单独一个图层而不是并进 A-WALL：它是**可关掉的参考线**
+   * —— 出图时要不要画门扇开启弧，是绘图规范问题，不该逼着用户
+   * "要墙体就连弧一起要"。默认可见（看不见就等于没有这个功能）。
+   */
+  { name: 'A-DOOR-SWING', label: '门扇开启范围', color: '#0ea5e9', lw: 1.2, defaultVisible: true, plot: true, group: '建筑' },
 
   { name: 'F-CAB', label: '柜体外框', color: '#2563eb', lw: 2, defaultVisible: true, plot: true, group: '家具' },
   { name: 'F-CAB-STRUCT', label: '结构板', color: '#0d9488', lw: 1.6, defaultVisible: true, plot: true, group: '家具' },

@@ -1,12 +1,32 @@
 /**
- * 空间语义层（P8.7）—— Room / Wall / Opening 的确定性事实与校验。
+ * 空间语义层（P8.7 Room/Wall/Opening + P8.9 门扇开启）—— 确定性事实与校验。
  *
- * 对外只暴露三个入口：
- *  - deriveSpatial(project)  → SpatialReport { facts, issues }（供派生管线与 UI）
+ * 对外只暴露：
+ *  - deriveSpatial(project)  → SpatialReport { facts, doors, clearances, issues }（供派生管线与 UI）
  *  - SpatialFacts 及三个关系枚举（CabRoom/CabWall/CabOpeningRelation）
+ *  - 门扇开启（P8.9）：deriveDoorSwing / doorEnvelopeOf / 事实与容差常量
  *  - model.ts 的容差常量 SPATIAL_TOL 与几何助手（测试/上层复用）
  */
 export { deriveSpatial, type SpatialReport } from './validate.ts';
+export {
+  deriveDoorSwing,
+  doorEnvelopeOf,
+  doorFactOf,
+  doorFactsOfWall,
+  clearancesOfDoor,
+  classifyDoorClearance,
+  subdivideArc,
+  DOOR_SWING,
+  DOOR_UNKNOWN_ZH,
+  DOOR_HINGE_ZH,
+  DOOR_DIRECTION_ZH,
+  type DoorSwingFact,
+  type DoorSwingEnvelope,
+  type DoorSwingUnknownReason,
+  type DoorSwingDerivation,
+  type DoorClearanceFact,
+  type DoorClearanceStatus,
+} from './door.ts';
 export {
   deriveSpatialFacts,
   classifyCabWall,

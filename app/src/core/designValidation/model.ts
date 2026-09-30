@@ -1,6 +1,6 @@
 import type { PlacementFace } from '../placement.ts';
 import type { DesignAlternative, DesignPlacementFinding, DesignPlacementReport } from '../placementDesign.ts';
-import type { CabRoomRelation, CabWallRelation, SpatialReport } from '../spatial/index.ts';
+import type { CabRoomRelation, CabWallRelation, DoorClearanceFact, DoorSwingFact, SpatialReport } from '../spatial/index.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -149,12 +149,30 @@ export interface DesignValidationReport {
   placement: DesignPlacementReport;
   /** P8.7 的输出，**原样**透传（同源证据：见验收 §3） */
   spatial: SpatialReport;
+  /**
+   * 门扇开启（P8.9）：P8.7/P8.9 空间层的派生结果**原样**透传。
+   *
+   * 为什么不塞进 findings 就算了：门扇开启是**结构性事实**（铰链在哪、
+   * 扇区多边形长什么样、哪只柜压在扇区里），界面要拿它画 2D 包络、
+   * 要按门分组显示"当前柜体冲不冲突"。findings 只装"结论"，
+   * 事实与结论分开 —— 与 P8.7 的 facts/issues 分离是同一条纪律。
+   */
+  doorSwing: DoorSwingReport;
   /** 统一结论：placement + spatial + 设计语义解释，三层各自的码都保留 */
   findings: DesignValidationFinding[];
   counts: { error: number; warning: number };
   /** 柜 ↔ 墙的设计语义（结构化事实，界面画 ✓ 用） */
   wallContacts: WallContactFact[];
   cabinets: CabinetDesignView[];
+}
+
+/**
+ * 门扇开启的只读视图（= spatial 层 doors/clearances 的原样引用，**不复制判定**）。
+ * 组合层对它只做一件事：把 facts 分组给界面用，不重新判一次"撞没撞"。
+ */
+export interface DoorSwingReport {
+  doors: DoorSwingFact[];
+  clearances: DoorClearanceFact[];
 }
 
 /** 把 P8.3 的结论折叠成统一条目（不改文案、不改状态，只补 layer/sourceCode） */

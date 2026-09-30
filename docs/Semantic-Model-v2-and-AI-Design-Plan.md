@@ -1974,3 +1974,329 @@ verifyWallAttachment(project, decl, facts?) → { ok, fact, findings[] }
 
 不进 P8.9。P8.8 明确不做：自动布局、自动贴墙、自动优化位置、AI 改布局、门扇开启模拟、
 人流分析、DXF 建筑导入、图片识别户型、BIM/IFC、Z 轴、CNC。
+
+---
+
+### 23.18 P8.9 实施记录：Door Swing / Clearance Semantics（门扇开启 / 净空语义）
+
+#### 23.18.1 目标：补齐 Door 的核心事实链
+
+P8.7 能回答"柜子挡住门洞了吗"（洞口影响带 600mm 通行带），P8.8 能把空间事实翻译成设计语义。
+但**这两条都回答不了真正会让人吃灰的那个问题**：
+
+> 这个柜子虽然没有挡住门洞，但**门打开以后会不会撞柜？**
+
+P8.9 补的就是这条链：
+
+```text
+Door Opening ──→ Door Leaf（铰链 + 净宽 + 室内外方向）──→ 90° 开启包络（swept envelope）
+                                                              │
+                                              Cabinet footprint ∩ Envelope → clear / touch / overlap
+```
+
+**先审查后新增**：动手前把 `types.ts` / `spatial/*` / `designValidation/*` / `geometry/*` /
+`placement.ts` / `relations.ts` / `projectFile` / `CommandBus` / `PropertiesPanel` / AI 契约
+通读了一遍，确认**既没有任何 hinge / swing / 开启方向 / 门扇 / 净空概念**，也没有可复用的
+"门"对象（`Opening` 只有 `id/kind/offset/width/name`）。所以这不是"再加一个字段"，
+而是补一条全新的确定性事实链 —— 但**只加两个 authored 字段**，其余全是派生。
+
+#### 23.18.2 真相源原则：authored 只有两个字段，且**各自可缺省**
+
+```ts
+// core/types.ts
+export type DoorHinge = 'start' | 'end';
+export type DoorSwingDirection = 'into-room' | 'out-of-room';
+
+export interface Opening {
+  id: string; kind: OpeningKind; offset: number; width: number; name?: string;
+  hinge?: DoorHinge;                   // 缺失 = 未指定 —— 不是"默认起点"
+  swingDirection?: DoorSwingDirection; // 缺失 = 判不出，系统保持沉默
+}
+```
+
+**为什么是两个独立可缺省字段、而不是一个必须成对的对象**：
+"我知道铰链装在哪侧，但还没想好门往哪边开"是**真实状态**。做成成对对象就等于强迫用户
+一次选完 —— 系统替他选了一半。验收 5b 把这条钉住：只设 `hinge` 时仍是 `unknown`。
+
+**绝不存进模型的东西**：`swingArc` / `swingPolygon` / `leafPolygon` / `boundingBox` /
+`radius` / `doorAngle`。**90° 是规则，不是 authored 几何**（`DOOR_SWING.OPEN_ANGLE_DEG = 90`）。
+
+#### 23.18.3 零新增旋转数学：两个边界方向来自墙自身
+
+门扇在关节上有两个方向：**关闭位置沿墙**、**开启 90° 后垂直墙**。关键观察：
+
+- 墙单位方向 `u = (end − start)/|end − start|`；
+- 墙单位法线 `n = wallNormalUnit(wall)`（由 `wallPolygon` 的角点差派生）；
+- **"墙法线 ⊥ 墙方向"是构造性恒等关系**，不是算出来的。
+
+于是扇区的两条半径直接是 `closedDir`（= ±`u`）与 `m`（= ±`nRoom`）—— 一个三角函数都不用。
+弧的中间方向用**向量加法二分**：`normalize(a + b)` 就是 `a` 与 `b` 的角平分线，
+连续二分即得 45° / 22.5° / 11.25°…
+
+```ts
+export function subdivideArc(from: Vec2, to: Vec2, segments: number): Vec2[] {
+  let dirs: Vec2[] = [from, to];
+  while (dirs.length - 1 < segments) {
+    const next: Vec2[] = [dirs[0]!];
+    for (let i = 0; i < dirs.length - 1; i++) next.push(unit(add(dirs[i]!, dirs[i + 1]!)), dirs[i + 1]!);
+    dirs = next;
+  }
+  return dirs;
+}
+```
+
+`DOOR_SWING.ARC_SEGMENTS = 8`（8 段折线 = 每 11.25° 一段）。折线是**内接近似**，
+最大内缩 ≈ `r·(1 − cos 5.625°)` ≈ 0.48% 半径（900mm 门约 4.3mm）—— 文档与报告如实说明**这是近似**，
+不假装是精确圆弧（验收把 `poly.length === ARC_SEGMENTS + 2` 钉住）。
+
+`Math.sin` / `Math.cos` 在 `core/spatial/door.ts` 里**一次都没出现**（验收 30/31 直接扫源码钉死）。
+
+#### 23.18.4 铰链点：门垛位置 + 开启侧墙厚一半
+
+```ts
+const along = opening.hinge === 'start' ? opening.offset : opening.offset + opening.width;
+const jamb  = { x: wall.start.x + u.x * along, y: wall.start.y + u.y * along };
+const hinge = add(jamb, scale(m, wall.thickness / 2));   // m = 开启方向（含室内外符号）
+const closedDir = opening.hinge === 'start' ? u : neg(u);
+const poly = [hinge, ...subdivideArc(closedDir, m, 8).map(d => add(hinge, scale(d, radius)))];
+```
+
+`hinge` 是"**start / end**"，语义是**门洞起点侧 / 终点侧**，而这个起点/终点是**墙自身**的定义
+（= 几何区里那面墙的起点/终点），**不是屏幕上的左右**。界面上明写这句（`DOOR_HINGE_ZH` 是唯一人话出口）。
+
+#### 23.18.5 室内侧：复用 P8.7 的回路判定，不重算
+
+`swingDirection` 是 `into-room` / `out-of-room`，而"哪边是室内"**由房间边界确定性判定**：
+
+```ts
+const side = loopOk ? wallInteriorSide(loop.poly, wall) : null;   // 1 | -1 | null
+const nRoom = { x: n.x * side, y: n.y * side };                   // 墙法线，指向室内
+const m = opening.swingDirection === 'into-room' ? nRoom : neg(nRoom);
+```
+
+**不假设 `wall.start → wall.end` 恒代表某个房间方向**（验收 §2 用 0°/90°/180°/270° 四面墙
+各自验一遍铰链坐标与开启端坐标）。`side === null` ⇒ 判不出 ⇒ `unknown / open-room`。
+
+#### 23.18.6 unknown 门禁：四种原因，一律保持沉默
+
+| reason | 触发条件 |
+|---|---|
+| `no-swing` | 缺 `hinge` 或缺 `swingDirection`（缺一个就算） |
+| `open-room` | 房间的墙没连成闭合回路，判不出哪侧是室内 |
+| `bad-wall` | 墙退化（零长），画不出墙几何 |
+| `bad-span` | 洞口 `offset` / `width` 不在墙内（先由 P8.7 的 `SPATIAL-OPENING-SPAN` 报） |
+
+unknown 时：**不画包络、不发任何 issue、不产 clearance**（验收 5 / 25 / 26 / 27 / 28 / 29 逐条钉）。
+**绝对禁止 `unknown → 默认向内开`**，也**绝不从柜体位置反推开门方向**。
+
+`doorSwingPrimsOf()` 对 unknown 的门**一个图元都不画** —— 没判出来就不假装有范围。
+
+#### 23.18.7 柜 ↔ 门扇判定：与 P8.7 同一把尺子
+
+```ts
+if (polysOverlapInterior(fp, envelope.poly)) → overlap（含 hitRadius / intrusion）
+const distance = Math.round(polyDistance(fp, envelope.poly));
+if (distance <= SPATIAL_TOL.TOUCH) → touch（贴到扇区边界，不算撞）
+else → clear
+```
+
+**函数内不写 epsilon**：容差只从 `SPATIAL_TOL.TOUCH`（= 1mm）取，与"贴着"同一把尺子。
+
+两个派生数字（都只在 overlap 时有意义）：
+
+- `hitRadius` = 柜体离**铰链**最近多少 mm（"门扇转到这个角度时，从铰链算起有 `radius − hitRadius`
+  那么长会打在柜上"）；
+- **`intrusion`** = 柜体从**洞口所在墙面**朝开启侧**探出多少 mm**（沿开启方向中轴 `m` 量柜体各角到
+  "过铰链的墙面"的最大距离，**与柜体是否旋转无关**）。
+
+`intrusion` 是文案里真正报的数 —— 一开始只报 `hitRadius`，探针发现贴墙柜的 `hitRadius = 0`
+（铰链点就在地板上、柜角含该点），文案变成"柜体离铰链最近处只有 0mm"，**完全没有信息量**。
+换成 `intrusion` 后："柜体从墙面往室内探出 600mm，门扇半径 900mm" —— 用户一眼能判断严重程度。
+
+**两只柜对所有已判出的门逐扇判定，不限房间**：朝外开时扇区正落在隔壁空间里，
+只在自己房间里找柜反而会漏掉真正会撞上的那一只。
+
+#### 23.18.8 两条判定互不替代（`CABINET-OPENING` vs `CABINET-DOOR-SWING`）
+
+| | `SPATIAL-CABINET-OPENING`（P8.7） | `DESIGN-CABINET-DOOR-SWING`（P8.9） |
+|---|---|---|
+| 判什么 | 柜占住洞口本体 + 室内侧 **600mm 通行带** | 柜落在**门扇真正扫过的 90° 扇区**里 |
+| 概念 | **人流通道** | **门扇扫过的面积** |
+| 阈值 | `SPATIAL_TOL.OPENING_ZONE = 600` | 扇区 = 铰链 + 半径（= 洞口净宽） |
+| 归口 | 空间层 → **进主问题链** | 空间层 → **进主问题链** |
+
+**600mm 通行带与门扇扇区是两个不同概念，各用各的阈值，绝不复用同一个数**（指令 §十七）。
+验收 44 用两只专门构造的柜钉住："只在扇区里"→ 只有 `DOOR-SWING`；"只挡通道"→ 只有 `CABINET-OPENING`；
+同犯两条则两条都报（各自说的是不同的事）。
+
+**归口说明**：`DESIGN-CABINET-DOOR-SWING` 虽然带 `DESIGN-` 前缀（因为它归 P8.8 那一族命名空间），
+但实现落在**空间层**（它是几何事实，不是设计解释），所以**随空间校验进主问题链** ——
+与 `SPATIAL-CABINET-OPENING` 同类，而不是像 `DESIGN-CABINET-WALL-CONFLICT` 那样只出现在统一报告里。
+这条"例外"已在 `issueCatalog` 注释里显式写明（`DESIGN-CABINET-DOOR-SWING` 条目上方 + P8.8 族注释里）。
+
+#### 23.18.9 P8.8 接入：加 `doorSwing`，不破坏同源不变量
+
+```ts
+export interface DesignValidationReport {
+  status; placement; spatial;
+  doorSwing: DoorSwingReport;   // { doors: DoorSwingFact[]; clearances: DoorClearanceFact[] }
+  findings; counts; wallContacts; cabinets;
+}
+```
+
+`validateDesign` 里 `doorSwing: { doors: spatial.doors, clearances: spatial.clearances }` ——
+**原样引用，不重判一次**。为什么单独一个字段而不是塞进 `findings`：门扇开启是**结构性事实**
+（铰链在哪、扇区多边形长什么样），界面要拿它画 2D 包络；`findings` 只装"结论"。**事实与结论分开**。
+
+`report.placement` / `report.spatial` 与单独调用仍**逐字节相同**（验收 39b 深比较钉死）——
+P8.8 的同源不变量没有被 P8.9 破坏。
+
+#### 23.18.10 CommandBus：三态补丁 + 键序规范化
+
+**没有新建任何 `door.swing.set` / `door.rotate` 平行命令系统**，只把两个字段挂进既有的
+`opening.update`（结构性 op，`changes: []` + sideEffect，最小可逆）：
+
+```ts
+patch: { offset?; width?; name?; hinge?: DoorHinge | null; swingDirection?: DoorSwingDirection | null }
+```
+
+**三态**：`undefined` = 这次不改 / `null` = 改成"未指定" / 值 = 设成它。
+缺了 `null` 这一态，"未指定"就**永远回不去**（界面上的"未指定"会变成一个改不掉的假状态）。
+
+落地时**整对象重建 + 键序钉死**（`id → kind → offset → width → name → hinge → swingDirection`，
+未知字段用 `extras` 原样带在末尾）。为什么要这么较真：不钉键序的话，
+"先设方向再设铰链"与"先设铰链再设方向"会得到**内容相同、字节不同**的两份文件 ——
+diff 里凭空多出一条改动。验收 7 直接比较两次存盘的**字符串是否完全相等**。
+
+**持久化宽容策略**（与 P8.5-B 的 `placementProvenance` 同一条纪律）：非法 `hinge` / `swingDirection`
+值 → **抹成"未指定" + 警告**，不因一个注解打不开项目；窗洞带了门扇字段 → 也抹掉 + 警告。
+**抹掉而不是原样留下**：留着一个系统认不出的值，会在存盘时把垃圾写回文件。
+
+#### 23.18.11 UI：上面可写、下面只读
+
+`Properties → 墙 → 门窗洞口 → 门开启`（只有 `kind === 'door'` 才渲染，窗没有门扇）：
+
+- **可写**：两组各三段的分段按钮 ——「铰链在哪端」起点侧 / 终点侧 / 未指定；
+  「门往哪开」向室内 / 向室外 / 未指定。**界面上没有任何 x/y 坐标输入**（验收 45 钉住）。
+- **只读**：「开启范围（半径 Nmm · 门扇绕起点侧向室内开 90°）」、「判定 ✓ 当前柜体都不在门扇开启范围内 /
+  ✕ 当前柜体「X」会挡住门扇开启（共 N 只）/ ○ 未指定…」。
+- **不做**：拖门动画、3D 开门、自动改 hinge / swing / 自动移柜。下面明写
+  "挪柜 / 换铰链侧 / 改开启方向都是设计决定，系统不自动改"。
+
+判定文案里的"为什么判不出"取自 `DOOR_UNKNOWN_ZH`（**界面不许自己翻译判定结果**）。
+
+#### 23.18.12 2D 与判定同源
+
+`src/viewport/doorSwingPrims.ts` 是**纯函数** `doorSwingPrimsOf(project) → Prim[]`，
+直接消费 `deriveDoorSwing` 的同一份结果（`fill` alpha 0.1 + 虚线 `poly`，图层 `A-DOOR-SWING`）。
+为什么单独一个文件而不是写在 `Viewport.tsx` 里：`Viewport.tsx` 是 JSX，node 跑不了，
+验收**只能扫源码、验不出"同源"这件事**；抽成纯函数就能直接 import 断言
+"图上画的 `poly` === 校验用的 `poly`"（验收 50c）。
+
+图层 `A-DOOR-SWING`（`'门扇开启范围'`，默认可见、可关闭）登记在 `LAYERS` 表里，
+经 `RenderInput.doorSwingPrims` → `drawDoorSwing`（画在墙之上、柜之下）。**渲染器只负责画**。
+
+3D **不动**：不做动态门扇，也没有为 Door Swing 重构任何 3D 代码。
+
+#### 23.18.13 不进 DXF / BOM / Manufacturing
+
+Door Swing 是 **design / spatial validation**，不是制造语义。
+`core/spatial/*` 不 import 清单 / 甲购 / 板件层、不 import 制造层、不 import 导出 / DXF 层
+（验收 36 / 37 / 38 扫 import 行钉住）。不进 `ManufacturingPart`、不进 CNC、不进 DXF machining。
+
+#### 23.18.14 核心文件
+
+| 文件 | 说明 |
+|---|---|
+| `core/types.ts`（M） | `DoorHinge` / `DoorSwingDirection` + `Opening` 两个可选字段 |
+| `core/spatial/door.ts`（NEW，~330 行） | 门扇派生核心：`DOOR_SWING` / `subdivideArc` / `doorEnvelopeOf` / `classifyDoorClearance` / `deriveDoorSwing` / 事实查询 / 三张人话表 |
+| `core/spatial/validate.ts`（M） | `SpatialReport` 加 `doors` / `clearances`；门扇报错段（只报 `overlap`） |
+| `core/spatial/index.ts`（M） | 导出新 API 与类型 |
+| `core/rules/issueCatalog.ts`（M） | 新增 `DESIGN-CABINET-DOOR-SWING`（ERROR + 归口说明注释） |
+| `core/commands.ts`（M） | `updateOpening` patch 支持三态 `hinge` / `swingDirection` + label 人话 |
+| `core/commandBus.ts`（M） | `OpeningAuthored` 类型 + `pick()` 三态规划 + 整对象重建 / 键序钉死 / `extras` |
+| `core/projectFile.ts`（M） | 洞口解析：非法值抹除 + 窗洞带门扇字段抹除（均警告，不阻断） |
+| `core/designValidation/{model,validate,index}.ts`（M） | `DesignValidationReport.doorSwing` |
+| `ui/panels/PropertiesPanel.tsx`（M） | `DoorSwingBlock`（可写两段 + 只读判定） |
+| `ui/Viewport.tsx`（M） / `viewport/{renderer,layers}.ts`（M） / `viewport/doorSwingPrims.ts`（NEW） | 2D 包络图元同源 |
+| `styles.css`（M） | `.btn.on` 分段按钮选中态 |
+| `verify/door-swing-acceptance.ts`（NEW，~700 行） | 65 条验收 |
+| `verify/fixhint-acceptance.ts`（M） | 新码补 `NUM_CTX`（`width: 917` / `intrusion: 613` 有辨识度） |
+
+#### 23.18.15 `project.json` 里的样子
+
+```json
+{
+  "rooms": [{ "id": "r1", "walls": [
+    { "id": "r1_w3", "name": "r1墙3",
+      "start": { "x": 4000, "y": 3000 }, "end": { "x": 0, "y": 3000 },
+      "thickness": 120, "height": 2700,
+      "openings": [
+        { "id": "open_001", "kind": "door", "offset": 1000, "width": 900,
+          "hinge": "start", "swingDirection": "into-room" }
+      ] }
+  ] }]
+}
+```
+
+`openings` 里**只有意图**：没有扇区、没有半径、没有多边形、没有角度。
+`schemaVersion` **不变**（仍 `0.3`，且 `resolveSchemaVersion()` 的口径仍只由 多行柜 / 组合 决定，
+门扇开启不影响它、不加 migration）。
+
+#### 23.18.16 验收：`verify:door-swing` 65 条
+
+七组：语义 1~9（含 5b 只给铰链）+ 几何 10~18 + 扇区 19~24 + unknown 25~29b +
+架构 30~38b + 关系 39~44b + UI·持久化 45~50d。**已接入 `verify:all`**（`verify:design-validation` 之后）。
+
+**写断言时被自己逮住的错**（都记下来，因为每一条都是"断言自己写错"的典型）：
+
+1. **夹具共享房间对象**：`withNorthDoor` 最初直接改传入的 `Room`，所有用例共用同一个对象 →
+   **最后一个用例的 `openings` 覆盖掉前面所有用例的**。第一版探针因此报了"同一批数"，
+   差点把一堆断言做成假绿。修法：`withNorthDoor` 内部 `clone(room)`。
+2. **`x === 3000 === false`**：想断言"铰链不在起点侧"，写成了链式比较（`(x === 3000) === false`），
+   语义含糊且掩盖了真正的判据。改成显式断言"字段真的不存在 + 判定退回 unknown"。
+3. **`withResolvedPlacements` 参数形状写错**：传了 `{ id, x, y, rotation }`，
+   实际签名是 `{ intent, placement }`。改成与 P8.8 参考写法一致。
+4. **断言 18 的夹具选错**：原本想让"0° 贴边 → clear、其余入扇区"，实测发现该落点下
+   0°/270° 才是 overlap。**数字来自实测**：改成 0°/270° overlap、90° clear(100mm)、180° clear(177mm)。
+5. **断言 21 的 `intrusion` 写错**：我记的是 400，实测 800。改按实测值钉，并加
+   "文案里的数 === 派生出的实测值"双重断言（防兜底值顶替）。
+6. **断言 44 的两只夹具都同时踩两条**：`c_swing`（想"只进扇区"）其实也压住了 600mm 通行带。
+   重新按几何算出**既在扇区里、又在 600mm 带之外**的落点（`(2900,2300) 300×200`），
+   以及**既在带里、又够不到扇区**的落点（`(2200,2440) 200×200`）。
+7. **断言 45 里有个恒真表达式**：`!/…/.test('')` 测的是空串，永远通过 —— 典型的假绿。
+   换成真实的结构断言：门开启区里恰好 6 个 `<button>`、**没有 `<NumField>`**、**没有自动移柜命令**。
+8. **断言 33b 用 `&& true` 凑数**：改成显式比较 `derive` 前后的总线版本号。
+
+**发现的一条真实遗留**（写进验收 39c，不在 P8.9 修）：
+
+> 柜宽**恰好等于**洞口净宽、且背面贴着墙内表面齐平时，柜体 footprint 与"洞口影响带"矩形
+> 在 x 方向**逐边重合**、上沿也重合 —— P8.7 判定用的 `polysOverlapInterior`
+> （"任一顶点严格落入对方内部，或任一对边正交穿过"）两条都不成立，于是**检不出**"柜子挡住门口"。
+
+为什么不修：这个谓词是 P8.7 的地基（`verify:spatial` 钉着它的行为），改它会一并改写 P8.7 的结论，
+越过了本阶段边界。**把现状钉住并记录为遗留**（谁将来修好它，这条断言会变红，就会被迫回来看注释）。
+附带事实：同一只柜在 P8.9 的门扇判定里**仍会被报**（扇区是圆弧包出来的多边形，
+不可能与柜体逐边重合）—— 两条判定在这个边角上恰好互补。
+
+#### 23.18.17 回归与纪律
+
+- `GOMEMLIMIT=1500MiB npx tsc --noEmit` → **0**（本机 `tsc` 会因 TS 7 Go 编译器提交内存 OOM，
+  `VirtualAlloc … errno=1455`，加 `GOMEMLIMIT` 即过，**未改任何代码**）。
+- `verify:spatial` **60/60**、`verify:design-validation` **77/77**、`verify:fixhint` 27/27 ——
+  `SpatialReport` 与 `DesignValidationReport` 加了字段但**旧断言一条没删、一条没放宽**。
+- P8.x 同链回归全绿：placement 82、attach 105、placement-design 107、placement-preference 96、
+  provenance 61、provenance-persistent 63、placement-intent-ui 62、manufacturing、import 59、
+  rows 106、projectfile 27、migration 56、relations 82、assembly 78。
+- **AI 契约未变**：不开放 `hinge` / `swingDirection` 给 AI，AI 仍不许输出 `swingPolygon`
+  或 cabinet placement（`shared/aiContract.mjs` 一字未改）。
+- **Knowledge 未变**：本阶段**不做** Door Swing Preference 自动学习
+  （房间限制 / 建筑习惯 / 家具位置 / 人流 / 安全，语义复杂度远高于现有谓词，
+  需要单独一阶段设计）。
+
+#### 23.18.18 停在 P8.9
+
+不进 P9.0。P8.9 明确不做：自动布局、自动移柜、自动选门开启方向、自动选铰链、AI 自动改布局、
+人流模拟、多人协作、BIM/IFC、DXF 建筑导入、图片户型识别、Z 轴、3D 动态开门、门开启动画、
+Door Swing Preference 自动学习、全屋布局、45°/120°/任意角度开启、门扇动画。
+

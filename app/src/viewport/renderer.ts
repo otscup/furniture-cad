@@ -67,6 +67,15 @@ export interface RenderInput {
    */
   explodePrims: Prim[];
   /**
+   * 门扇开启范围的图元（P8.9）。
+   *
+   * 与 explodePrims 同一条理由：它是**独立的一份派生结果**（来自
+   * core/spatial/door.ts 的确定性包络，不是 UI 自己画的），所以不塞进
+   * `geom.plan`。渲染器只负责画，包络怎么算、算出来是不是 unknown，
+   * 全在空间层说了算 —— 界面不许自己再画一条弧。
+   */
+  doorSwingPrims?: Prim[];
+  /**
    * 图纸模式下鼠标悬停到的可点线段（PickLine）。
    *
    * 为什么要画它：**"看不出来能点"等于没有这个功能。**
@@ -98,6 +107,7 @@ export function renderScene(inp: RenderInput): void {
 
   if (inp.showGrid) drawGrid(inp, to);
   drawWalls(inp, to);
+  drawDoorSwing(inp, to);
   drawCabinets(inp, to);
   drawSelectionHighlight(inp, to);
   drawGrips(inp, to);
@@ -344,6 +354,19 @@ function drawWalls(inp: RenderInput, to: P2S): void {
       }
     }
   }
+}
+
+/**
+ * 门扇开启范围（P8.9）：把空间层算好的包络图元画出来，画在墙**之上**、柜**之下**。
+ *
+ * 这里只做"画"—— 包络是扇区还是 unknown、铰链在哪、半径多少，
+ * 全由 core/spatial/door.ts 决定。渲染器一旦自己动手算弧，
+ * 图上看到的就未必是校验用的那一个了。
+ */
+function drawDoorSwing(inp: RenderInput, to: P2S): void {
+  const prims = inp.doorSwingPrims ?? [];
+  if (prims.length === 0) return;
+  drawPrims(inp.ctx, prims, to, inp.hiddenLayers, inp.cam.scale);
 }
 
 function drawCabinets(inp: RenderInput, to: P2S): void {

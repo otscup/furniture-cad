@@ -188,6 +188,33 @@ export function parseProjectFile(raw: string): ParseResult {
           if (!isInt(op.width) || (op.width as number) <= 0) {
             return { ok: false, error: `洞口 ${op.id} 的 width 必须是正整数（mm）` };
           }
+          /**
+           * 门扇开启语义（P8.9，可选）：hinge / swingDirection。
+           *
+           * 与 offset/width 的处理口径**故意不同**：那两个是洞口的身份属性，
+           * 非法就该拒绝整个文件；而这两个是"注解"（缺了只意味着"还没指定"），
+           * 非法值一律**抹掉当未指定**并给出警告 —— 与 P8.5-B 的 placementProvenance
+           * 同一条纪律："缺了顶多不知道这扇门往哪开"远好于"因为一个坏字段打不开项目"。
+           * 抹掉而不是原样留下：留着一个系统认不出的值，会在存盘时把垃圾写回文件。
+           */
+          {
+            const raw = o as Record<string, unknown>;
+            if (raw.hinge !== undefined && raw.hinge !== 'start' && raw.hinge !== 'end') {
+              warnings.push(`洞口 ${op.id} 的 hinge 不是 "start" / "end"（收到 ${JSON.stringify(raw.hinge)}），已按「未指定」处理`);
+              delete raw.hinge;
+            }
+            if (raw.swingDirection !== undefined && raw.swingDirection !== 'into-room' && raw.swingDirection !== 'out-of-room') {
+              warnings.push(
+                `洞口 ${op.id} 的 swingDirection 不是 "into-room" / "out-of-room"（收到 ${JSON.stringify(raw.swingDirection)}），已按「未指定」处理`
+              );
+              delete raw.swingDirection;
+            }
+            if (op.kind === 'window' && (raw.hinge !== undefined || raw.swingDirection !== undefined)) {
+              warnings.push(`洞口 ${op.id} 是窗洞，却带了门扇开启语义（hinge / swingDirection），已按「未指定」处理`);
+              delete raw.hinge;
+              delete raw.swingDirection;
+            }
+          }
         }
       }
     }

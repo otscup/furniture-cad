@@ -85,7 +85,13 @@ export function splitEqual(
   return out;
 }
 
-/** 沿高度方向等分点（用于层板定位）：返回 count 个"距底部的高度"。 */
+/**
+ * 沿高度方向等分点（用于层板定位）：返回 count 个"距底部的高度"。
+ *
+ * ⚠️ 分类（P7.2 架构审查）：这是**几何辅助算法**——生成器/视图/3D 用它把层板摆到这些
+ * 高度，制造层也用它**读取已派生的层板标高事实**。它**不是制造规则**；制造规则（如层板
+ * 托孔的孔型参数）是另一回事。任何"这是工厂工艺规则"的归因都是误读。
+ */
 export function equalSpacing(total: number, count: number): number[] {
   if (count <= 0) return [];
   const step = total / (count + 1);

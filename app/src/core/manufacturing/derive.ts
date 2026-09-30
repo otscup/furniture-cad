@@ -13,6 +13,8 @@
  *    · 背板工艺（verified）：来自语义 cab.params.backPanel.method。
  *    · 钻孔 / 连接孔 / 五金安装孔：**当前规则无法确认** → 生成
  *      verification='unverified' 的操作，**绝不编造孔位/坐标**。
+ *    · 已确认的 verified 钻孔（层板托孔）走「确定性制造规则」：孔位标高读几何事实、
+ *      孔型参数来自制造规则集（工厂参数），且只在 ManufacturingRuleSet 注册后才升格。
  *    · 组合（Assembly）的声明连接：**不自动生成 verified 加工**，
  *      只标一条 unverified 的 connector-hole（诚实说「未确认」）。
  *    · 纯函数、无副作用、无随机/无时间 → 同输入必得同输出（验收可钉）。
@@ -97,7 +99,9 @@ function parseSource(panel: Panel, cab: Cabinet): MfgPartSource {
 }
 
 /** 封边操作（verified）：来自几何 panel.edge，制造层照单收 */
-function edgeBandingOps(panel: Panel, rules: RuleSet): ManufacturingOperation[] {
+function edgeBandingOps(ctx: MfgRuleEvalCtx): ManufacturingOperation[] {
+  const { panel, rules, mfgRules } = ctx;
+  if (!mfgRules.edgeBanding.enabled) return [];
   const e = panel.edge;
   if (!e) return [];
   const edges: string[] = [];
@@ -120,8 +124,10 @@ function edgeBandingOps(panel: Panel, rules: RuleSet): ManufacturingOperation[] 
   ];
 }
 
-/** 背板工艺（verified）：来自语义 cab.params.backPanel.method */
-function backPanelOps(cab: Cabinet): ManufacturingOperation[] {
+/** 背板工艺（verified）：来自语义 cab.params.backPanel.method。仅作用于背板件。 */
+function backPanelOps(ctx: MfgRuleEvalCtx): ManufacturingOperation[] {
+  const { cab, role } = ctx;
+  if (role !== 'BackPanel') return [];
   const bp = cab.params.backPanel;
   if (bp.method === 'groove') {
     return [
@@ -174,15 +180,48 @@ function unverifiedOps(role: MfgPartRole, inAuthoredAssembly: boolean): Manufact
 /**
  * 层板托孔（第一条真实制造规则，verified）—— 只在侧板（Left/Right）上钻。
  *
- * 标高来源 = 几何 equalSpacing 派生的层板标高，基准为柜内底（innerBottomZ =
- * bodyLift + boardT），与生成器板件 edgeLabel「距柜内底 Nmm」同源。制造层只读这里，
- * **不重算、不猜**。横向留量（inset / 每标高孔数）来自 mfgRules.shelfPins（工厂参数）。
+ * ── 性质澄清（P7.2 架构审查结论）──
+ *    `equalSpacing()` 位于 allocate.ts，是**几何辅助算法**（生成器/视图/3D 用它把层板摆到
+ *    这些高度），**不是制造规则**。层板标高（孔位 Z）是**几何事实**：层板物理上就坐在
+ *    这些高度。本规则做的是「在层板标高处钻孔」这个**确定性工艺决策**，因此：
+ *      · 标高 = 读几何事实（基准 innerBottomZ = bodyLift + boardT，与生成器 edgeLabel 同源），
+ *        制造层**只读、不另算一份布局**，不产生第二尺寸真相源；
+ *      · 孔型参数（holesPerElevationPerSide / insetFrontMm / insetBackMm）才是**制造规则
+ *        自己的工厂参数**——来自 mfgRules.shelfPins，不是几何、不是语义；
+ *      · 「是否钻」的决策（enabled + 本柜存在带 shelves 的分区）是规则的确定性触发条件。
+ *    满足 verified 升格 9 条（见 rules.ts VERIFIED_PROMOTION_CHECKLIST）。
  *
- * 触发条件（verified 升格）：mfgRules.shelfPins.enabled 且本柜存在带 shelves 的分区。
- * 没有 shelves → 不钻（保持 unverified 由 unverifiedOps 负责其余）。
+ * ── 参数合法性（verified 升格条件④：参数来源明确、可确定性推导）──
+ *    mfgRules.shelfPins 的工厂参数缺失/非法 → 规则无法给出确定孔位，**降级为 unverified**
+ *    （open question：需工厂校准真实参数），**绝不补默认值、绝不脑补坐标**。
  */
-function shelfPinOps(cab: Cabinet, g: CabinetGeometry, mfgRules: ManufacturingRuleSet): ManufacturingOperation[] {
-  if (!mfgRules.shelfPins.enabled) return [];
+function shelfPinOps(ctx: MfgRuleEvalCtx): ManufacturingOperation[] {
+  const { cab, g, mfgRules, role } = ctx;
+  const pin = mfgRules.shelfPins;
+  if (!pin.enabled) return [];
+  // 托孔只在侧板（Left/Right）上钻；注册表对每块板都调用本 evaluator，这里自判适用面
+  if (role !== 'LeftSidePanel' && role !== 'RightSidePanel') return [];
+
+  // 工厂参数必须完整且合法，否则无法确定性推导孔位
+  const paramsValid =
+    typeof pin.holesPerElevationPerSide === 'number' && pin.holesPerElevationPerSide >= 1 &&
+    typeof pin.insetFrontMm === 'number' && pin.insetFrontMm >= 0 &&
+    typeof pin.insetBackMm === 'number' && pin.insetBackMm >= 0;
+  if (!paramsValid) {
+    return [
+      {
+        role: 'drilling',
+        nameZh: '层板托孔',
+        source: 'manufacturing-rule:unverified',
+        confidence: 'none',
+        verification: 'unverified',
+        detail: `层板托孔：制造规则 shelfPins 参数非法（holesPerElevationPerSide=${pin.holesPerElevationPerSide}, insetFrontMm=${pin.insetFrontMm}, insetBackMm=${pin.insetBackMm}），无法确定性推导孔位，需工厂校准真实参数`,
+      },
+    ];
+  }
+
+  // 标高 = 几何事实：generate.ts 用同一 equalSpacing 把层板放到这些高度。
+  // equalSpacing 是「几何辅助算法」，制造层在这里只是「读」这些已派生的层板标高作为钻孔位置。
   const L = g.layout;
   const innerBottomZ = cab.params.bodyLift + L.boardT;
   const set = new Set<number>();
@@ -200,7 +239,6 @@ function shelfPinOps(cab: Cabinet, g: CabinetGeometry, mfgRules: ManufacturingRu
   }
   if (!hasShelf) return [];
   const elevations = [...set].sort((a, b) => a - b);
-  const pin = mfgRules.shelfPins;
   return [
     {
       role: 'drilling',
@@ -220,6 +258,31 @@ function shelfPinOps(cab: Cabinet, g: CabinetGeometry, mfgRules: ManufacturingRu
   ];
 }
 
+/**
+ * verified 制造规则求值器统一上下文。
+ * 每条真实制造规则（封边 / 背板 / 层板托孔 / 未来的铰链孔 / 三合一 / 木榫 / 背板槽 …）
+ * 都是一个纯函数 evaluator：只读几何/语义/规则集，**绝不另算尺寸、绝不脑补坐标**，
+ * 自己判断「是否适用于本板/本柜」并返回操作列表（不适用返回空）。
+ */
+interface MfgRuleEvalCtx {
+  panel: Panel;
+  role: MfgPartRole;
+  cab: Cabinet;
+  g: CabinetGeometry;
+  rules: RuleSet;
+  mfgRules: ManufacturingRuleSet;
+}
+
+type VerifiedEvaluator = (ctx: MfgRuleEvalCtx) => ManufacturingOperation[];
+
+/**
+ * 已确认的 verified 制造规则注册表（P7.2 架构审查落点）。
+ * 新增一条真实制造规则 = 在此注册一个 evaluator（在 rules.ts 加接口+默认、在 derive.ts 加
+ * 纯函数），**不必在 buildPart 里堆针对加工类型的 if/else**；列表式派发天然可扩展。
+ * 顺序无关（各 evaluator 独立、不互相覆盖）。
+ */
+const VERIFIED_RULE_EVALUATORS: VerifiedEvaluator[] = [edgeBandingOps, backPanelOps, shelfPinOps];
+
 function buildPart(
   panel: Panel,
   cab: Cabinet,
@@ -229,11 +292,8 @@ function buildPart(
   inAuthoredAssembly: boolean,
 ): ManufacturingPart {
   const role = panel.role as MfgPartRole;
-  const verifiedOps: ManufacturingOperation[] = [];
-  if (mfgRules.edgeBanding.enabled) verifiedOps.push(...edgeBandingOps(panel, rules));
-  if (role === 'BackPanel') verifiedOps.push(...backPanelOps(cab));
-  // 侧板：层板托孔（verified，标高来自几何）
-  if (role === 'LeftSidePanel' || role === 'RightSidePanel') verifiedOps.push(...shelfPinOps(cab, g, mfgRules));
+  const ctx: MfgRuleEvalCtx = { panel, role, cab, g, rules, mfgRules };
+  const verifiedOps = VERIFIED_RULE_EVALUATORS.flatMap((ev) => ev(ctx));
 
   const unverified = unverifiedOps(role, inAuthoredAssembly);
   const allOps = [...verifiedOps, ...unverified];

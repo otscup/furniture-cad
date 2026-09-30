@@ -958,3 +958,70 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 - 不做：完整五金库、铰链全套、三合一全套、抽屉五金库、CNC、套料排版、自动优化、AI 直出坐标、自动 Placement、P8。
 - 4 类 unverified 加工（铰链/抽屉五金/箱体连接/组合连接）仍诚实标 unverified，待真实工厂规则接入后逐项升格。
 - 本阶段停在 P7.1，未自动进入 P8。
+
+### 23.7 P7.2 实施记录：制造规则架构审查 + 层板托孔硬化（Manufacturing Rule Architecture Review + Shelf Pin Rule Hardening，已完成）
+
+> 基线 `0ec9c77`（P7.1 已验收）。本阶段**不新增任何 verified 加工**（铰链孔/三合一/木榫/背板槽等仍 unverified），目标是**验证 P7.1 建立的 Manufacturing Rule 架构是否真的足以承载后续真实制造规则**，并把边界钉死，而非继续堆功能。
+
+#### 23.7.1 层板托孔规则的性质判定（审查结论 ①）
+
+- `equalSpacing()`（位于 `allocate.ts`）是**几何辅助算法**——生成器/视图/3D 用它把层板摆到这些高度，**它并不是制造规则**。
+- 层板标高（孔位 Z）是**几何事实**：层板物理上就坐在这些高度。
+- 因此 `shelfPinOps` 这条规则做的是「在层板标高处钻孔」这个**确定性工艺决策**，由三部分组成：
+  1. **标高（位置）** = 读几何事实（基准 `innerBottomZ = bodyLift + boardT`，与生成器 `edgeLabel`「距柜内底 Nmm」同源）；制造层**只读、不另算一份布局**，不产生第二尺寸真相源；
+  2. **孔型参数**（holesPerElevationPerSide / insetFrontMm / insetBackMm）= **本规则的工厂参数**，来自 `mfgRules.shelfPins`，不是几何、不是语义；
+  3. **「是否钻」的决策**（enabled + 本柜存在带 shelves 的分区）= 规则的确定性触发条件。
+- **判定**：当前实现是**名副其实的确定性层板托孔制造规则**（满足 verified 9 条），不是临时占位算法——前提是必须清楚「`equalSpacing` 是几何事实的载体、而非规则本身」。已在 `allocate.ts` 与 `rules.ts`/`derive.ts` 注释中明确这一分类，避免后续把几何辅助误读成工厂规则。
+
+#### 23.7.2 架构可扩展性（审查结论 ②）
+
+- `buildPart` 原对每条 verified 规则写一处 `if/else` 调用。本阶段改为 **`VERIFIED_RULE_EVALUATORS` 注册表**（`derive.ts`）：每条真实制造规则 = 一个纯函数 evaluator（`edgeBandingOps` / `backPanelOps` / `shelfPinOps` …），统一签名 `MfgRuleEvalCtx`，列表式 `flatMap` 派发。
+- **新增一条规则（铰链孔 / 三合一 / 木榫 / 背板槽）的扩展路径已固定且最小**：① 在 `rules.ts` 加接口 + `DEFAULT_MANUFACTURING_RULES` 默认；② 在 `derive.ts` 加一个纯函数 evaluator（自己判断适用面、只读几何/语义/规则）；③ 在 `VERIFIED_RULE_EVALUATORS` 注册。不必在 `buildPart` 堆针对加工类型的 `if/else`。
+- 每个 evaluator **必须自判适用面**（例如 `shelfPinOps` 内判 `role === 'LeftSidePanel'|'RightSidePanel'`、`backPanelOps` 内判 `role === 'BackPanel'`）——注册表对每块板都会调用它，不能依赖调用方过滤。本阶段最初漏掉自判导致 ShelfPanel/每块板都被错误挂上托孔，**被既有 ⑥ 测试捕获**，已修正。
+- **未过度设计**：未引入抽象基类/工厂模式；注册表 + 统一 ctx 已是满足"可扩展且不堆 if/else"的最小结构。
+
+#### 23.7.3 verified 升格 9 条标准（审查结论 ③，已落代码+测试）
+
+- `rules.ts` 新增导出常量 `VERIFIED_PROMOTION_CHECKLIST`（9 条）：① 输入语义事实明确 ② 制造规则确定 ③ 参数来源明确 ④ 加工结果可确定性推导 ⑤ 不依赖 AI ⑥ 不依赖 Vision ⑦ 不依赖 Import ⑧ 不产生第二尺寸真相源 ⑨ 可被自动化测试验证。
+- 必须**同时满足全部 9 条**才标 `verified`；否则保持 `unverified`（当前规则无法确认）或 `unsupported`（本阶段不支持）。
+- `shelfPinOps` 增加**参数合法性闸门**：`holesPerElevationPerSide < 1` 或任一只留量非数/为负 → 视为「工厂参数未就绪」，降级为 `unverified`（detail 明说"参数非法，需工厂校准"），**绝不补默认值、绝不脑补坐标**。
+
+#### 23.7.4 层板托孔测试硬化（审查结论 ④，新增 §13，39 → 62 条）
+
+`verify:manufacturing` 新增 **§13 层板托孔规则硬化**，证明规则"正确"而非只证明"有孔位"：
+
+- 结构性判据：verified 坐标加工 `source` 绝不来自 `manufacturing-rule:unverified`；unverified 加工绝不携带 `holes`（不脑补坐标）；verified 钻孔必有结构化坐标。
+- 不同柜高（1800/2400/3000）：标高随之变化且逐值 === 几何 `equalSpacing`。
+- 多行柜：仅带 shelves 的行贡献标高（挂衣行不钻）；双行都带 shelves → 两行标高合并。
+- 不同 `shelfPins` 参数（1/3 孔、20/50mm 留量）：孔型参数逐字段反映，标高不变（参数不影响位置）。
+- 边界高度（矮柜 700）：标高皆为正且 ≤ 侧板长（物理合理、单一来源）。
+- 参数缺失 / 参数非法（holes=0 / inset 为负）：降级 unverified，不产生 verified 托孔。
+- 不应打孔：无 shelves 语义的柜（open / drawerBank）→ 侧板不钻。
+- 左右侧板来源：两侧板都带 verified 托孔且标高一致；层板自身不钻。
+- 制造尺寸与 Geometry Panel 一致（侧板长 === 几何侧板长）、provenance 正确、托孔标高 ≤ 侧板长（无第二尺寸真相源）。
+
+#### 23.7.5 尺寸真相源复核（审查结论 ⑤）
+
+- Manufacturing 全程只读 `CabinetGeometry` 的 Panel 尺寸与 `g.layout`（行净高/标高/Z）。`shelfPinOps` 的标高由 `g.layout.rows` 的 `equalSpacing` 派生，与生成器放层板用**同一公式、同一几何输入**——属"读几何事实"，不是"重算一份尺寸"。
+- 制造件长/宽/厚/数量逐字段 === 几何 Panel（§④ 断言钉死）。Manufacturing 不回写 Semantic Model。
+- 已知边界（留待 P8+，非本阶段问题）：当前 shelves 语义仅 `count`（等分布局），故 `equalSpacing` 与几何一致；若未来支持"自定义层板位置"，应让几何直接暴露层板标高结构化字段、制造层读取，而非各自算——已在 `derive.ts` 注释标注。
+
+#### 23.7.6 本阶段明确不做（⑥）
+
+- 禁止主动扩展：铰链孔 verified、三合一 verified、木榫 verified、抽屉五金、完整五金库、CNC、套料、自动优化、自动 Placement、P8。
+- 审查发现需调整的基础设施已做最小必要修改（注册表派发 + 参数闸门 + 注释分类），未引入新功能。
+
+#### 23.7.7 验收结果（P7.2）
+
+- `tsc --noEmit`：0 错。
+- `verify:manufacturing`：62/62（§13 新增 23 条全过；§12 及 P7 旧断言全部保留、未放宽）。
+- `verify:fixhint`：27/27（Test Integrity C2 保留）。
+- `verify:all`（node + UI）：全绿，console 0，未删测试、未放宽断言。
+- 架构边界全部保持。
+
+#### 23.7.8 对下一阶段（P7.3+）的建议
+
+- 升格铰链孔/三合一/木榫时，**复用本阶段的注册表 + `MfgRuleEvalCtx` + 参数闸门 + §13 测试模板**，按"几何事实(位置) vs 工厂参数(孔型)"二分法拆解每条规则。
+- 每条新规则落地前先回答：孔位标高从哪个几何事实读？孔型参数是哪个工厂参数？语义事实是否明确？九条是否全满足？任一不满足 → 先保持 unverified。
+- 建议下一阶段优先做**箱体连接孔（三合一/木榫）**：其"位置"可由几何板件边/中板交点确定性派生（类似层板托孔的几何事实法），最易走通"几何事实 + 工厂参数"范式；铰链孔则需语义携带铰杯位置或工厂排孔方案，依赖更强，建议稍后。
+- 本阶段停在 P7.2，未自动进入 P7.3 / P8 或其他阶段。

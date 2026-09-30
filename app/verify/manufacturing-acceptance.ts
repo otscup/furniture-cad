@@ -368,6 +368,171 @@ console.log('P7 · Manufacturing Semantics 验收');
 }
 
 // ─────────────────────────────────────────────────────────────────
+// ⑬ 层板托孔规则硬化（P7.2）：证明规则正确，而非只证明「有孔位」
+// ═════════════════════════════════════════════════════════════════
+{
+  const base = sampleProject(rules);
+  const findPin = (part: ManufacturingPart): ManufacturingOperation | undefined =>
+    part.operations.find((o) => o.role === 'drilling' && o.source === 'deterministic.shelfElevations');
+  const expectedElevations = (geom: ReturnType<typeof generateProject>, cab: Cabinet): number[] => {
+    const L = geom.cabinets[cab.id]!.layout;
+    const innerBottomZ = cab.params.bodyLift + L.boardT;
+    const set = new Set<number>();
+    for (const r of L.rows) for (const u of r.units) {
+      const s = u.shelves;
+      if (s && s.count > 0) for (const pos of equalSpacing(r.netH, s.count)) set.add(Math.round(r.z0 - innerBottomZ + pos));
+    }
+    return [...set].sort((a, b) => a - b);
+  };
+
+  // A. verified 升格结构性判据（verified 9 条的可测代理）：
+  //    verified 的坐标加工绝不来自 'manufacturing-rule:unverified'；
+  //    unverified 的加工绝不携带结构化孔位（不脑补坐标）；verified 钻孔必有坐标。
+  const mfgAll = deriveManufacturing(base, generateProject(base, rules), rules);
+  let structOk = true;
+  for (const p of mfgAll.parts) for (const o of p.operations) {
+    const coordRole = ['drilling', 'connector-hole', 'hardware-mount', 'groove'].includes(o.role);
+    if (o.verification === 'verified' && coordRole && o.source === 'manufacturing-rule:unverified') structOk = false;
+    if (o.verification === 'unverified' && coordRole && o.holes) structOk = false;
+    if (o.role === 'drilling' && o.verification === 'verified' && !o.holes) structOk = false;
+  }
+  ok('⑬ verified 结构性判据：verified 坐标加工 source 非 unverified；unverified 不携带 holes', structOk);
+
+  // B. 不同柜高 → 标高随之变化且逐值 === 几何 equalSpacing（单一来源）
+  for (const H of [1800, 2400, 3000]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabH_${H}`, height: H });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side);
+    ok(`⑬ 柜高 ${H}：侧板 verified 托孔标高 === 几何层板标高`, !!pin && pin.verification === 'verified' && deepEqual(pin.holes!.elevations, expectedElevations(geom, cab)), `H=${H}`);
+  }
+
+  // C. 多行柜：只有带 shelves 的行贡献标高；无 shelves 的行（挂衣）不贡献
+  {
+    const twoMix = mkCab([
+      { h: 'fill', units: [mkUnit('hanging', 1200)] },
+      { h: 600, units: [mkUnit('shelves', 1200)] },
+    ], { id: 'cabMix' });
+    const proj: Project = { ...base, cabinets: [twoMix] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets['cabMix']!.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side);
+    ok('⑬ 多行柜：仅带 shelves 的行贡献标高（挂衣行不钻）', !!pin && deepEqual(pin.holes!.elevations, expectedElevations(geom, twoMix)), `got=${JSON.stringify(pin?.holes?.elevations)}`);
+  }
+  // 双行都带 shelves → 两行标高合并
+  {
+    const twoShelf = mkCab([
+      { h: 'fill', units: [mkUnit('shelves', 1200)] },
+      { h: 600, units: [mkUnit('shelves', 1200)] },
+    ], { id: 'cabTwoShelf' });
+    const proj: Project = { ...base, cabinets: [twoShelf] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets['cabTwoShelf']!.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side);
+    ok('⑬ 双行都带 shelves：两行标高合并进侧板托孔', !!pin && deepEqual(pin.holes!.elevations, expectedElevations(geom, twoShelf)), `got=${JSON.stringify(pin?.holes?.elevations)}`);
+  }
+
+  // D. 不同 shelfPins 参数 → 孔型参数逐字段反映，标高不变
+  for (const variant of [
+    { holesPerElevationPerSide: 1, insetFrontMm: 20, insetBackMm: 20 },
+    { holesPerElevationPerSide: 3, insetFrontMm: 50, insetBackMm: 50 },
+  ]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabVar_${variant.holesPerElevationPerSide}` });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, shelfPins: { ...DEFAULT_MANUFACTURING_RULES.shelfPins, ...variant } });
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side);
+    ok(`⑬ 参数变体 holes=${variant.holesPerElevationPerSide}/inset=${variant.insetFrontMm}：孔型参数来自规则`, !!pin && pin.holes!.holesPerElevationPerSide === variant.holesPerElevationPerSide && pin.holes!.insetFrontMm === variant.insetFrontMm && pin.holes!.insetBackMm === variant.insetBackMm);
+    ok(`⑬ 参数变体 holes=${variant.holesPerElevationPerSide}：标高仍 === 几何（参数不影响位置）`, !!pin && deepEqual(pin.holes!.elevations, expectedElevations(geom, cab)));
+  }
+
+  // E. 边界高度（矮柜）：标高仍为正且 ≤ 侧板长（物理合理，单一来源）
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabShort', height: 700 });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets['cabShort']!.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side);
+    const sideLen = geom.cabinets['cabShort']!.panels.find((p) => p.role === 'LeftSidePanel')!.length;
+    const allInRange = !!pin && pin.holes!.elevations.length > 0 && pin.holes!.elevations.every((e) => e > 0 && e <= sideLen);
+    ok('⑬ 矮柜（700）：标高皆为正且 ≤ 侧板长（单一来源、物理合理）', allInRange, `elev=${JSON.stringify(pin?.holes?.elevations)} sideLen=${sideLen}`);
+  }
+
+  // F. 参数缺失（工厂参数未就绪）→ 降级 unverified，绝不脑补/补默认值
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabMiss' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const missing: typeof DEFAULT_MANUFACTURING_RULES = { ...DEFAULT_MANUFACTURING_RULES, shelfPins: { enabled: true, source: 'deterministic.shelfElevations', holesPerElevationPerSide: 2 } as unknown as typeof DEFAULT_MANUFACTURING_RULES['shelfPins'] };
+    const mfg = deriveManufacturing(proj, geom, rules, missing);
+    const side = mfg.cabinets['cabMiss']!.find((p) => p.role === 'LeftSidePanel')!;
+    const unv = side.operations.find((o) => o.role === 'drilling' && o.verification === 'unverified');
+    ok('⑬ 参数缺失：侧板托孔降级 unverified（不脑补、不补默认值）', !!unv && unv.source === 'manufacturing-rule:unverified' && (unv.detail ?? '').includes('参数非法'));
+    ok('⑬ 参数缺失：不产生 verified 托孔', !findPin(side));
+  }
+
+  // G. 参数非法（holesPerElevationPerSide=0 / inset 为负）→ 降级 unverified
+  for (const bad of [
+    { ...DEFAULT_MANUFACTURING_RULES.shelfPins, holesPerElevationPerSide: 0 },
+    { ...DEFAULT_MANUFACTURING_RULES.shelfPins, insetFrontMm: -5 },
+  ]) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: `cabBad_${bad.holesPerElevationPerSide}_${bad.insetFrontMm}` });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules, { ...DEFAULT_MANUFACTURING_RULES, shelfPins: bad });
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    ok(`⑬ 参数非法（holes=${bad.holesPerElevationPerSide},insetF=${bad.insetFrontMm}）：降级 unverified`, !findPin(side) && !!side.operations.find((o) => o.role === 'drilling' && o.verification === 'unverified'));
+  }
+
+  // H. 不应打孔：无 shelves 语义的柜（开放格 / 抽屉柜）→ 侧板不钻托孔
+  // （注：hanging 挂衣区按 docFactory 约定自带 1 块顶层层板，应钻；故不列入此处）
+  for (const kind of ['open', 'drawerBank'] as const) {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit(kind, 1200)] }], { id: `cabNoShelf_${kind}` });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const side = mfg.cabinets[cab.id]!.find((p) => p.role === 'LeftSidePanel')!;
+    ok(`⑬ 无 shelves 语义（${kind} 柜）：侧板不钻托孔（不应打孔）`, !findPin(side));
+  }
+
+  // J. 左右侧板来源：两侧板都带 verified 托孔且标高一致；层板自身不钻
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabLR' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfg = deriveManufacturing(proj, geom, rules);
+    const L = mfg.cabinets['cabLR']!.find((p) => p.role === 'LeftSidePanel')!;
+    const R = mfg.cabinets['cabLR']!.find((p) => p.role === 'RightSidePanel')!;
+    const lPin = findPin(L), rPin = findPin(R);
+    ok('⑬ 左右侧板都带 verified 托孔', !!lPin && !!rPin && lPin.verification === 'verified' && rPin.verification === 'verified');
+    ok('⑬ 左右侧板托孔标高一致', !!lPin && !!rPin && deepEqual(lPin.holes!.elevations, rPin.holes!.elevations));
+    const shelf = mfg.cabinets['cabLR']!.find((p) => p.role === 'ShelfPanel')!;
+    ok('⑬ 层板件本身不钻托孔（托孔在侧板）', !shelf.operations.some((o) => o.role === 'drilling'));
+  }
+
+  // K. 制造尺寸与 Geometry Panel 一致 + provenance + 无第二尺寸真相源
+  {
+    const cab = mkCab([{ h: 'fill', units: [mkUnit('shelves', 1200)] }], { id: 'cabProv' });
+    const proj: Project = { ...base, cabinets: [cab] };
+    const geom = generateProject(proj, rules);
+    const mfgRules = DEFAULT_MANUFACTURING_RULES;
+    const mfg = deriveManufacturing(proj, geom, rules, mfgRules);
+    const side = mfg.cabinets['cabProv']!.find((p) => p.role === 'LeftSidePanel')!;
+    const gSide = geom.cabinets['cabProv']!.panels.find((p) => p.role === 'LeftSidePanel')!;
+    const pin = findPin(side)!;
+    ok('⑬ 侧板长 === 几何侧板长（制造只读几何，不重算）', side.length === gSide.length, `mfg=${side.length} geom=${gSide.length}`);
+    ok('⑬ 托孔标高 ≤ 侧板长（物理合理，单一尺寸来源）', pin.holes!.elevations.every((e) => e >= 0 && e <= side.length));
+    ok('⑬ provenance.manufacturingRuleSetId === 所用规则集', side.provenance.manufacturingRuleSetId === mfgRules.id, `${side.provenance.manufacturingRuleSetId} vs ${mfgRules.id}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 console.log(`\n${'─'.repeat(66)}`);
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 if (fail > 0) {

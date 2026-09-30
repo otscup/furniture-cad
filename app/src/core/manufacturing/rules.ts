@@ -18,6 +18,24 @@
  */
 
 /**
+ * verified 升格标准（P7.2 落定，铁律）。
+ * 一条制造加工要进入 `verified`，必须**同时满足**以下全部 9 条；否则保持
+ * `unverified`（当前规则无法确认）或 `unsupported`（本阶段不支持）。
+ * 任何一条不满足都不得标 verified，更不得让 AI / Vision / Import 的输出替它升格。
+ */
+export const VERIFIED_PROMOTION_CHECKLIST: readonly string[] = [
+  '① 输入语义事实明确（如 shelves.count > 0）',
+  '② 制造规则确定（加工逻辑是确定性规则，非启发式）',
+  '③ 参数来源明确（孔型/留量等参数来自 ManufacturingRuleSet 的工厂参数，可追）',
+  '④ 加工结果可确定性推导（同输入必得同输出，可被自动化测试钉）',
+  '⑤ 不依赖 AI 猜测',
+  '⑥ 不依赖 Vision 猜测',
+  '⑦ 不依赖 Import 猜测',
+  '⑧ 不产生第二尺寸真相源（制造尺寸只读几何 Panel，不重算）',
+  '⑨ 能够被自动化测试验证',
+] as const;
+
+/**
  * 哪些几何板件角色需要封边。
  * 真正的封边边位来自几何 Panel.edge（设计规则决定），制造层只「照单收」并确认。
  */
@@ -36,15 +54,21 @@ export interface MfgBackPanelRule {
 }
 
 /**
- * 层板托孔（第一条真实制造规则，P7.1）。
+ * 层板托孔（第一条真实制造规则，P7.1）。满足 VERIFIED_PROMOTION_CHECKLIST 全部 9 条。
  *
- * ── verified 升格条件（缺一不可）──
+ * ── 性质澄清（P7.2 架构审查）──
+ *   `equalSpacing()`（allocate.ts）是**几何辅助算法**，不是制造规则；层板标高（孔位 Z）
+ *   是**几何事实**（层板物理就坐在这些高度）。本规则 = 「在层板标高处钻孔」这个确定性工艺决策：
+ *     · 标高读几何事实（基准 innerBottomZ = bodyLift + boardT，与生成器 edgeLabel 同源），
+ *       制造层只读、不产生第二尺寸真相源；
+ *     · holesPerElevationPerSide / insetFrontMm / insetBackMm 才是**本规则的工厂参数**，
+ *       不是语义、不是几何。
+ *
+ * ── verified 升格触发（确定性，缺一不可）──
  *   ① mfgRules.shelfPins.enabled = true；
  *   ② 柜体存在带 shelves 的分区（shelves.count > 0）；
- *   ③ 孔位标高**全部来自几何**（equalSpacing(row.netH, count) 的层板标高，
- *      基准为柜内底，与生成器板件 edgeLabel 同源）—— 不重算、不猜；
- *   ④ 横向留量（insetFrontMm / insetBackMm / holesPerElevationPerSide）
- *      是**工厂工艺参数**（来自本规则），不是语义、不是几何。
+ *   ③ 孔位标高全部来自几何（equalSpacing 的层板标高，柜内底基准）—— 不重算、不猜；
+ *   ④ 工厂参数合法且来源明确（见 derive.ts 参数校验；缺失/非法 → 降级 unverified）。
  *
  * ── 铁律 ──
  *   孔位坐标**绝不**由 AI / Vision / Import 提供；它们只表达语义，

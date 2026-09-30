@@ -4,6 +4,15 @@ import type { Command, CommandBus } from '../../core/commandBus.ts';
 import * as CMD from '../../core/commands.ts';
 import { NumField, Pill, Row, Section, Text, TextField } from './common.tsx';
 import { ROW_HEIGHT_FILL, layoutRows, unitPathPrefix, unitsAtPath } from '../../core/layoutModel.ts';
+import {
+  ALIGN_ALIGNMENTS,
+  ATTACH_ALIGNMENTS,
+  PLACEMENT_FACES,
+  type PlacementAlignment,
+  type PlacementFace,
+  type AttachAlignment,
+} from '../../core/placement.ts';
+import { buildAlignIntent, buildAttachIntent, commitPlacementIntent } from '../placementIntent.ts';
 import type { ToastKind } from '../types.ts';
 
 /**
@@ -45,7 +54,7 @@ export function PropertiesPanel(props: PropertiesPanelProps): ReactNode {
 
   const id = selection[0];
   const cab = project.cabinets.find((c) => c.id === id);
-  if (cab) return <CabinetProps bus={bus} cab={cab} rules={rules} geom={derived.geom.cabinets[cab.id]} onRun={run} />;
+  if (cab) return <CabinetProps bus={bus} cab={cab} project={project} rules={rules} geom={derived.geom.cabinets[cab.id]} onRun={run} onToast={props.onToast} />;
 
   const wall = findWall(project, id);
   if (wall) return <WallProps wall={wall} onRun={run} />;
@@ -165,11 +174,13 @@ function MultiProps(props: { project: Project; selection: string[]; setSelection
 function CabinetProps(props: {
   bus: CommandBus;
   cab: Cabinet;
+  project: Project;
   rules: RuleSet;
   geom: CabinetGeometry | undefined;
   onRun: Run;
+  onToast: (kind: ToastKind, text: string) => void;
 }): ReactNode {
-  const { cab, rules, geom } = props;
+  const { cab, rules, geom, project } = props;
   const p = cab.params;
   const L = geom?.layout;
   /** 是否多行柜 —— 只影响“要不要画行头与行高输入”；单行柜输出与 v0.2 逐节点相同 */
@@ -227,6 +238,14 @@ function CabinetProps(props: {
           <NumField value={cab.placement.rotation} min={-360} max={360} suffix="°" onCommit={(v) => props.onRun(CMD.rotateCabinet(cab, v))} />
         </Row>
       </Section>
+
+      {/*
+        * 语义落位意图（P8.6）：用户点的是"对齐/贴合"，不是坐标。
+        * 全部复用唯一 Resolver（core/placement.ts）与 cabinet.place 命令，
+        * 拿到的是真实 PlacementIntent（authority=user-authored）——
+        * 这正是 Knowledge alignment 偏好唯一合法的证据来源。
+        */}
+      <PlacementIntentSection bus={props.bus} cab={cab} project={project} onToast={props.onToast} />
 
       <Section title="材质">
         <Row label="柜体板">
@@ -606,5 +625,149 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
       </Section>
       <div className="hint-line">拖动墙端点的方形夹点即可改起点/终点 —— 改的是 wall.start / wall.end 语义字段，不是"移动一条线"。</div>
     </div>
+  );
+}
+
+// ─────────────────────────── 语义落位意图（P8.6） ───────────────────────────
+
+const ALIGN_ZH: Record<PlacementAlignment, string> = { left: '左缘', right: '右缘', front: '前缘', back: '后缘', center: '中心' };
+const FACE_ZH: Record<PlacementFace, string> = { back: '背面', front: '前脸', left: '左端', right: '右端' };
+const ATTACH_ZH: Record<AttachAlignment, string> = { start: '起点', center: '中心', end: '终点' };
+
+/**
+ * 语义落位意图区（P8.6）。用户点"对齐到 / 贴合到"，界面上没有 x/y 输入框；
+ * 构造的是真实 PlacementIntent，坐标由唯一 Resolver 算，提交走唯一 cabinet.place。
+ * 校验结果直接消费 P8.3 的 DesignPlacementReport（只提示，不拦截、不替用户选朝向）。
+ */
+function PlacementIntentSection(props: {
+  bus: CommandBus;
+  cab: Cabinet;
+  project: Project;
+  onToast: (kind: ToastKind, text: string) => void;
+}): ReactNode {
+  const { bus, cab, project } = props;
+  const others = project.cabinets.filter((c) => c.id !== cab.id);
+  const [refId, setRefId] = useState<string>('');
+  const [targetFace, setTargetFace] = useState<PlacementFace>('back');
+  const [referenceFace, setReferenceFace] = useState<PlacementFace>('front');
+  const [attachAlign, setAttachAlign] = useState<AttachAlignment>('start');
+  const [offset, setOffset] = useState<number>(0);
+  const [report, setReport] = useState<{ status: string; first: string } | null>(null);
+
+  // 参照柜下拉：默认选第一只别的柜；参照柜被删/撤销后收敛到仍存在的
+  const effRefId = others.some((c) => c.id === refId) ? refId : (others[0]?.id ?? '');
+  const ref = others.find((c) => c.id === effRefId);
+
+  const commit = (intent: ReturnType<typeof buildAlignIntent>): void => {
+    if (!ref) {
+      props.onToast('info', '场景里还没有别的柜体可以作为参照 —— 先创建第二只柜。');
+      return;
+    }
+    const r = commitPlacementIntent(bus, cab, ref, intent);
+    if (!r.ok) {
+      setReport(null);
+      props.onToast('error', r.error);
+      return;
+    }
+    const f = r.report.findings[0];
+    setReport({ status: r.report.status, first: f ? f.message : '落位合理，未发现设计语义问题' });
+    props.onToast('ok', '已按语义落位');
+  };
+
+  if (others.length === 0) {
+    return (
+      <Section title="落位意图（对齐 / 贴合）">
+        <div className="hint-line">场景里只有这一只柜 —— 语义对齐/贴合需要参照柜体。</div>
+      </Section>
+    );
+  }
+
+  return (
+    <Section title="落位意图（对齐 / 贴合）">
+      <Row label="参照柜" hint="语义操作的目标：这只柜要对齐/贴合到参照柜上">
+        <select className="input" value={effRefId} onChange={(e) => setRefId(e.target.value)}>
+          {others.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </Row>
+
+      <Row label="对齐到" hint="只动一条轴（中心动两条），与参照柜指定边缘/中心齐平">
+        <div className="btn-row">
+          {ALIGN_ALIGNMENTS.map((a) => (
+            <button
+              key={a}
+              type="button"
+              className="btn"
+              onClick={() => commit(buildAlignIntent(cab.id, effRefId, a))}
+            >
+              {ALIGN_ZH[a]}
+            </button>
+          ))}
+        </div>
+      </Row>
+
+      <Row label="贴合到" hint="两个面有名有姓：本柜的面 与 参照柜的面 真正贴合；朝向对不上会被 Resolver 拒绝">
+        <div className="btn-row">
+          <select className="input" value={targetFace} onChange={(e) => setTargetFace(e.target.value as PlacementFace)} aria-label="本柜面">
+            {PLACEMENT_FACES.map((f) => (
+              <option key={f} value={f}>
+                本柜{FACE_ZH[f]}
+              </option>
+            ))}
+          </select>
+          <select
+            className="input"
+            value={referenceFace}
+            onChange={(e) => setReferenceFace(e.target.value as PlacementFace)}
+            aria-label="参照柜面"
+          >
+            {PLACEMENT_FACES.map((f) => (
+              <option key={f} value={f}>
+                参照{FACE_ZH[f]}
+              </option>
+            ))}
+          </select>
+          <select
+            className="input"
+            value={attachAlign}
+            onChange={(e) => setAttachAlign(e.target.value as AttachAlignment)}
+            aria-label="沿面对齐"
+          >
+            {ATTACH_ALIGNMENTS.map((a) => (
+              <option key={a} value={a}>
+                {ATTACH_ZH[a]}
+              </option>
+            ))}
+          </select>
+          <NumField value={offset} min={0} suffix="mm" onCommit={(v) => setOffset(Math.max(0, v))} />
+          <button
+            type="button"
+            className="btn"
+            onClick={() =>
+              commit(buildAttachIntent(cab.id, effRefId, targetFace, referenceFace, attachAlign, offset > 0 ? offset : undefined))
+            }
+          >
+            贴合
+          </button>
+        </div>
+      </Row>
+
+      {report ? (
+        <Row label="设计校验" derived>
+          <Text>
+            <Pill kind={report.status === 'error' ? 'ERROR' : report.status === 'warning' ? 'WARNING' : 'ok'}>
+              {report.status === 'error' ? '不合理' : report.status === 'warning' ? '有提示' : '合理'}
+            </Pill>{' '}
+            {report.first}
+          </Text>
+        </Row>
+      ) : null}
+      <div className="hint-line">
+        这里只表达"怎么对齐/贴合"，坐标由确定性解析器计算；拖拽或直接改 X/Y 不产生落位意图（不会把坐标猜成对齐偏好）。
+      </div>
+    </Section>
   );
 }

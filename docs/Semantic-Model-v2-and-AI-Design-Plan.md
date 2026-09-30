@@ -1662,3 +1662,64 @@ save（App / ExportPanel / draftStore）
 #### 23.14.9 停在 P8.5-B
 
 本期只落地方案 A（柜体级 live provenance 持久化）。不做：完整命令历史落盘、独立 history 文件、Resolver 读 provenance、从坐标反推 intent、UI alignment 编辑器、云端同步、P8.6 及以后。
+
+## 23.15 P8.6 实施记录：语义落位意图 UI（User-authored Alignment）
+
+#### 23.15.1 目标与边界
+
+解决 P8.5-B 留下的缺口：用户此前只能拖拽（intent=null）或靠 AI 提案表达落位意图。P8.6 给用户一个**语义入口**——点「对齐到 / 贴合到」而不是输入 x/y——产出的真实 `PlacementIntent`（authority=user-authored）由此可被 Knowledge 安全观察为 alignment preference candidate。
+
+硬边界：不修改 Resolver / placement 几何定义 / P8.3 校验；不新增 uiPlace/uiAlign/uiAttach 平行执行路径；不做全屋自动布局、自动选朝向、自动重贴合；拖拽永远 intent=null，绝不从坐标反推意图。
+
+#### 23.15.2 UI 入口（PropertiesPanel → PlacementIntentSection）
+
+- 挂载点：属性面板柜体属性「位置」区之后，新增「落位意图（对齐 / 贴合）」Section。
+- **对齐到**：参照柜下拉（其余所有柜）+ 五个按钮（左缘/右缘/前缘/后缘/中心）——对应 `align` 的 `ALIGN_ALIGNMENTS` 全集。
+- **贴合到**：参照柜 + 本柜面（back/front/left/right）+ 参照柜面 + 沿面对齐（start/center/end）+ 缝隙 mm（0=真贴合）——对应 `attach` 全词表。
+- 界面上**没有 x/y 输入**；校验结果直接显示 P8.3 `DesignPlacementReport`（只提示不拦截）。
+- 无参照柜时诚实提示"语义对齐/贴合需要参照柜体"。
+
+#### 23.15.3 链路（UI → Intent → Resolver → CommandBus → provenance → Knowledge）
+
+```
+用户点击「对齐到·右缘」
+  → buildAlignIntent（词表与 PlacementIntent 逐字同一份）
+  → commitPlacementIntent（src/ui/placementIntent.ts，UI 层唯一提交路径）：
+      resolvePlacement（core/placement.ts，唯一 Resolver，纯函数）
+      → designCheckPlacement（P8.3 报告，只提示）
+      → CMD.placeCabinet(cab, resolved, 'ui', label, toPlacementIntentDecl(intent))
+      → bus.execute（source='ui' → derivePlacementAuthority = user-authored）
+      → LogEntry.placementProvenance（intent 真实保存）
+      → App 观察回路（P8.5 已接）：observeCommand 从 intent 提 alignment candidate
+      → 用户在知识面板确认 → active → knowledgeDigest（AI 设计可见）
+```
+
+关键点：`commitPlacementIntent` 是纯逻辑模块（无 React），UI 组件只是它的皮；坐标计算、声明生成、提交全部复用既有单点实现，UI 层零第二套实现（§8 源码扫描断言钉死）。
+
+#### 23.15.4 preview === commit 保持
+
+provenance 只住总线（P8.5-B 结构裁定），UI 意图命令在干跑沙盒与提交两端的模型状态逐字节相同、文件内容（含 provenance）逐值相同（序列化的 `savedAt` 是墙钟元数据，比较以 parse 回的 project 为准）。
+
+#### 23.15.5 Knowledge 观察结果
+
+- user-authored UI 对齐 → 1 条 alignment candidate（值=用户选的对齐、source=user-observed、带 PlacementContext、不挂柜名）；
+- candidate 阶段同类观察累积 evidence、不自动升级；确认后 active 进 digest；
+- 负样本全部钉死：拖拽移动 / AI 未确认（unknown）/ system-resolved / absolute 授权坐标 一律不产生 alignment candidate；
+- undo / redo / reload 不重复制造 evidence（seq 消费 + reload 日志为空 + 观察不回放）。
+
+#### 23.15.6 核心文件
+
+- `src/ui/placementIntent.ts`（NEW）：buildAlignIntent / buildAttachIntent / placementIntentLabel / commitPlacementIntent。
+- `src/ui/panels/PropertiesPanel.tsx`：PlacementIntentSection（语义 UI）+ CabinetProps 透传 project/onToast。
+- `verify/placement-intent-ui-acceptance.ts`（NEW，62 断言）+ `package.json`（`verify:placement-intent-ui` 接入 `verify:all`）。
+
+#### 23.15.7 验收
+
+- `tsc --noEmit` 0 错；`verify:placement-intent-ui` **62/62**（8 章节：align 五向坐标逐值 / attach 两面+offset / 非法面诚实拒绝不改状态 / provenance user-authored+intent 逐值 / 拖拽 intent=null / preview===commit / Knowledge 闭环含 4 类负样本 / undo-redo-reload 不重复 evidence / 报告同源+Resolver 不读 provenance / 源码扫描）。
+- 关键回归全绿：placement-preference / provenance / provenance-persistent / placement / attach / placement-design / knowledge；全量非 UI 回归链见 verify:all。
+- 旧测试零删除、零放宽；schemaVersion 不变（内容驱动）；不动 Semantic Model 与 Resolver。
+
+#### 23.15.8 停在 P8.6
+
+不进 P8.7。后续候选（需明确指令）：知识面板对 alignment candidate 的展示细化、attach 的图形化交互、全屋布局等。
+

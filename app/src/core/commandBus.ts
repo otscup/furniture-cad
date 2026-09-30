@@ -1,10 +1,11 @@
-import type { Cabinet, Connection, FurnitureAssembly, Issue, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
+import type { Cabinet, Connection, FurnitureAssembly, Issue, Opening, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
 import type { PlacementIntentDecl } from './placement.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
 import { validateCornerInterference } from './rules/corner.ts';
 import { pairKey, validateAssemblies } from './relations.ts';
+import { deriveSpatial } from './spatial/index.ts';
 import { createRoom, defaultCabinetParams, defaultUnits } from './docFactory.ts';
 import { nextId } from './ids.ts';
 import { allUnits, layoutRows, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
@@ -78,6 +79,15 @@ export interface CommandPayload {
   rowIndex?: number;
   /** 允许调用方覆盖名字等 */
   name?: string;
+  /** ── opening.*（P8.7：门窗洞口）── */
+  /** opening.create / delete / update：洞口挂在哪面墙（target 也可以指，payload 显式更防呆） */
+  wallId?: string;
+  /** opening.create 的洞口内容 */
+  opening?: Opening;
+  /** opening.delete / update 的洞口 id */
+  openingId?: string;
+  /** opening.update 的字段补丁（只含要改的字段） */
+  openingPatch?: { offset?: number; width?: number; name?: string };
 }
 
 export interface Command {
@@ -199,6 +209,21 @@ export type SideEffect =
   | { kind: 'insertWall'; roomId: string; wall: Wall; index: number }
   | { kind: 'removeWall'; roomId: string; wall: Wall; index: number }
   /**
+   * 门窗洞口（P8.7）：与墙同构的最小可逆三件套。
+   * 洞口挂在 `wall.openings`（roomId/wallId 由结构回答）；insert/remove 带 index
+   * 才能精确回位；update 记字段前后值（offset/width/name 是洞口仅有的 authored 字段）。
+   */
+  | { kind: 'insertOpening'; roomId: string; wallId: string; opening: Opening; index: number }
+  | { kind: 'removeOpening'; roomId: string; wallId: string; opening: Opening; index: number }
+  | {
+      kind: 'updateOpening';
+      roomId: string;
+      wallId: string;
+      openingId: string;
+      prev: { offset: number; width: number; name?: string };
+      next: { offset: number; width: number; name?: string };
+    }
+  /**
    * 镜像柜体（MI）：分区序列左右反序。反序的自逆就是自身（reverse 两次还原），
    * 所以 undo/redo 走同一个动作 —— 不需要快照前后两份。
    */
@@ -294,6 +319,9 @@ const STRUCTURAL_OPS = new Set([
   'room.resize',
   'wall.create',
   'wall.delete',
+  'opening.create',
+  'opening.delete',
+  'opening.update',
   'assembly.create',
   'assembly.delete',
   'assembly.addMember',
@@ -481,6 +509,15 @@ function findRoom(project: Project, id: string): number {
   return project.rooms.findIndex((r) => r.id === id);
 }
 
+/** 按 id 找墙（洞口挂在墙下，洞口操作需要定位到具体墙） */
+function findWallById(project: Project, wallId: string): Wall | undefined {
+  for (const r of project.rooms) {
+    const w = r.walls.find((x) => x.id === wallId);
+    if (w) return w;
+  }
+  return undefined;
+}
+
 /** forward=true 表示"重做/应用"，false 表示"撤销" */
 function applySideEffect(project: Project, se: SideEffect, forward: boolean): void {
   switch (se.kind) {
@@ -580,6 +617,40 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       } else if (i < 0) {
         room.walls.splice(Math.min(se.index, room.walls.length), 0, structuredClone(se.wall));
       }
+      return;
+    }
+    case 'insertOpening': {
+      const wall = findWallById(project, se.wallId);
+      if (!wall) return;
+      wall.openings ??= [];
+      const i = wall.openings.findIndex((o) => o.id === se.opening.id);
+      if (forward) {
+        if (i < 0) wall.openings.splice(Math.min(se.index, wall.openings.length), 0, structuredClone(se.opening));
+      } else if (i >= 0) {
+        wall.openings.splice(i, 1);
+      }
+      return;
+    }
+    case 'removeOpening': {
+      const wall = findWallById(project, se.wallId);
+      if (!wall || !wall.openings) return;
+      const i = wall.openings.findIndex((o) => o.id === se.opening.id);
+      if (forward) {
+        if (i >= 0) wall.openings.splice(i, 1);
+      } else if (i < 0) {
+        wall.openings.splice(Math.min(se.index, wall.openings.length), 0, structuredClone(se.opening));
+      }
+      return;
+    }
+    case 'updateOpening': {
+      const wall = findWallById(project, se.wallId);
+      const o = wall?.openings?.find((x) => x.id === se.openingId);
+      if (!o) return;
+      const v = forward ? se.next : se.prev;
+      o.offset = v.offset;
+      o.width = v.width;
+      if (v.name === undefined) delete o.name;
+      else o.name = v.name;
       return;
     }
     case 'mirrorUnits': {
@@ -1437,6 +1508,69 @@ export class CommandBus {
       return null;
     }
 
+    // ── 门窗洞口（P8.7）：与墙同构的结构性三操作 ──
+    if (cmd.op === 'opening.create') {
+      const wall = cmd.payload?.wallId ? findWallById(draft, cmd.payload.wallId) : undefined;
+      const opening = cmd.payload?.opening ? structuredClone(cmd.payload.opening) : null;
+      if (!wall || !opening) return null;
+      const room = draft.rooms.find((r) => r.walls.some((w) => w.id === wall.id));
+      if (!room) return null;
+      wall.openings ??= [];
+      if (!opening.id) opening.id = nextId('open', wall.openings.map((o) => o.id));
+      if (wall.openings.some((o) => o.id === opening.id)) return null;
+      const index = wall.openings.length;
+      return {
+        sideEffects: [{ kind: 'insertOpening', roomId: room.id, wallId: wall.id, opening, index }],
+        diff: [{ path: `rooms[${room.id}].walls[${wall.id}].openings[${index}]`, from: null, to: `${opening.id} ${opening.kind}@${opening.offset}+${opening.width}` }],
+      };
+    }
+
+    if (cmd.op === 'opening.delete') {
+      const openingId = cmd.payload?.openingId;
+      if (!openingId) return null;
+      for (const room of draft.rooms) {
+        for (const wall of room.walls) {
+          const list = wall.openings;
+          if (!list) continue;
+          const index = list.findIndex((o) => o.id === openingId);
+          if (index < 0) continue;
+          const opening = structuredClone(list[index]);
+          return {
+            sideEffects: [{ kind: 'removeOpening', roomId: room.id, wallId: wall.id, opening, index }],
+            diff: [{ path: `rooms[${room.id}].walls[${wall.id}].openings[${index}]`, from: `${opening.id} ${opening.kind}`, to: null }],
+          };
+        }
+      }
+      return null;
+    }
+
+    if (cmd.op === 'opening.update') {
+      const openingId = cmd.payload?.openingId;
+      const patch = cmd.payload?.openingPatch;
+      if (!openingId || !patch) return null;
+      for (const room of draft.rooms) {
+        for (const wall of room.walls) {
+          const o = wall.openings?.find((x) => x.id === openingId);
+          if (!o) continue;
+          const prev = { offset: o.offset, width: o.width, ...(o.name !== undefined ? { name: o.name } : {}) };
+          const next = {
+            offset: patch.offset !== undefined ? Math.round(patch.offset) : prev.offset,
+            width: patch.width !== undefined ? Math.round(patch.width) : prev.width,
+            ...(patch.name !== undefined ? { name: patch.name } : prev.name !== undefined ? { name: prev.name } : {}),
+          };
+          return {
+            sideEffects: [{ kind: 'updateOpening', roomId: room.id, wallId: wall.id, openingId, prev, next }],
+            diff: [
+              ...(next.offset !== prev.offset ? [{ path: `openings[${openingId}].offset`, from: prev.offset, to: next.offset }] : []),
+              ...(next.width !== prev.width ? [{ path: `openings[${openingId}].width`, from: prev.width, to: next.width }] : []),
+              ...(next.name !== prev.name ? [{ path: `openings[${openingId}].name`, from: prev.name ?? null, to: next.name ?? null }] : []),
+            ],
+          };
+        }
+      }
+      return null;
+    }
+
     return null;
   }
 
@@ -1694,6 +1828,10 @@ export class CommandBus {
     issues.push(...validateCornerInterference(p, this.rules));
     // 组合关系（v0.3，P2）：只校验**声明过**的关系；无组合时返回空数组（v0.2 逐位等价）
     issues.push(...validateAssemblies(p));
+    // 空间语义（v0.3，P8.7）：Room/Wall/Opening 的事实层校验。
+    // 只报空间层独有问题（房间形状/洞口 span/柜在房间外/柜盖洞口）；
+    // 穿墙硬错误仍归 geometry 层 RULE-CABINET-IN-WALL，不重复报。
+    issues.push(...deriveSpatial(p).issues);
     return { geom, issues };
   }
 

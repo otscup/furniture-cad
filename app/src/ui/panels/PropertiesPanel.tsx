@@ -623,6 +623,46 @@ function WallProps(props: { wall: Wall; onRun: Run }): ReactNode {
           <Text mono>{wall.height} mm</Text>
         </Row>
       </Section>
+
+      {/** 门窗洞口（P8.7）：offset/width 是沿墙量的 authored 语义值，不输入世界坐标 */}
+      <Section title={`门窗洞口（${wall.openings?.length ?? 0}）`}>
+        {(wall.openings ?? []).length === 0 ? <div className="hint-line">这面墙还没有洞口。加一个后，空间校验会自动检查柜体是否盖住它。</div> : null}
+        {(wall.openings ?? []).map((o) => (
+          <div key={o.id} className="opening-row" style={{ borderBottom: '1px solid var(--line, #ddd)', paddingBottom: 6, marginBottom: 6 }}>
+            <Row label={o.kind === 'door' ? '门洞' : '窗洞'} derived>
+              <Text mono>{o.width} mm</Text>
+            </Row>
+            <Row label="位置（距墙起点）">
+              <NumField value={o.offset} min={0} max={len} suffix="mm" onCommit={(v) => props.onRun(CMD.updateOpening(wall.id, wall.name, o.id, o.kind, o.width, { offset: Math.min(v, len - o.width) }))} />
+            </Row>
+            <Row label="净宽">
+              <NumField value={o.width} min={100} max={len} suffix="mm" onCommit={(v) => props.onRun(CMD.updateOpening(wall.id, wall.name, o.id, o.kind, o.width, { width: v }))} />
+            </Row>
+            <div className="btn-row">
+              <button type="button" className="btn btn-danger" onClick={() => props.onRun(CMD.deleteOpening(wall.id, wall.name, o.id, o.kind, o.width))}>
+                删除此洞口
+              </button>
+            </div>
+          </div>
+        ))}
+        <div className="btn-row">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => props.onRun(CMD.createOpening(wall.id, wall.name, 'door', Math.max(0, Math.round(len / 2 - 450)), Math.min(900, len)))}
+          >
+            + 门洞 900
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => props.onRun(CMD.createOpening(wall.id, wall.name, 'window', Math.max(0, Math.round(len / 2 - 600)), Math.min(1200, len)))}
+          >
+            + 窗洞 1200
+          </button>
+        </div>
+        <div className="hint-line">洞口位置沿墙从起点量起（offset），世界坐标由墙几何派生 —— 不直接输入 x/y。</div>
+      </Section>
       <div className="hint-line">拖动墙端点的方形夹点即可改起点/终点 —— 改的是 wall.start / wall.end 语义字段，不是"移动一条线"。</div>
     </div>
   );

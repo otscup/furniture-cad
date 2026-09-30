@@ -140,6 +140,7 @@ export function parseProjectFile(raw: string): ParseResult {
 
   const roomIds = new Set<string>();
   const wallIds = new Set<string>();
+  const openingIds = new Set<string>();
   const cabIds = new Set<string>();
   const unitIds = new Set<string>();
   /** 柜体 → 房间（组合缺 roomId 时用它从成员反推，可确定、不是猜） */
@@ -167,6 +168,28 @@ export function parseProjectFile(raw: string): ParseResult {
       }
       if (!isPosInt(w.thickness)) return { ok: false, error: `墙 ${String(w.id)} 的 thickness 必须是正整数` };
       if (!isPosInt(w.height)) return { ok: false, error: `墙 ${String(w.id)} 的 height 必须是正整数` };
+      // 门窗洞口（P8.7，可选字段）：旧文件没有它；有则校验**形状**（id/kind/整数）。
+      // span 是否落在墙内属于语义校验 → 空间校验器报 SPATIAL-OPENING-SPAN issue，
+      // 不在这里拒绝整个文件 —— 让用户能在界面里把洞口调回来，而不是打不开项目。
+      if (w.openings !== undefined) {
+        if (!Array.isArray(w.openings)) return { ok: false, error: `墙 ${String(w.id)} 的 openings 不是数组` };
+        for (const o of w.openings as unknown[]) {
+          if (typeof o !== 'object' || o === null) return { ok: false, error: `墙 ${String(w.id)} 的洞口有非法成员` };
+          const op = o as { id: unknown; kind: unknown; offset: unknown; width: unknown };
+          if (typeof op.id !== 'string' || op.id === '') return { ok: false, error: `墙 ${String(w.id)} 的洞口缺少 id` };
+          if (openingIds.has(op.id)) return { ok: false, error: `洞口 id 重复：${op.id}` };
+          openingIds.add(op.id);
+          if (op.kind !== 'door' && op.kind !== 'window') {
+            return { ok: false, error: `洞口 ${op.id} 的 kind 必须是 "door" 或 "window"（收到 ${JSON.stringify(op.kind)}）` };
+          }
+          if (!isInt(op.offset) || (op.offset as number) < 0) {
+            return { ok: false, error: `洞口 ${op.id} 的 offset 必须是 ≥0 的整数（沿墙从起点量起，mm）` };
+          }
+          if (!isInt(op.width) || (op.width as number) <= 0) {
+            return { ok: false, error: `洞口 ${op.id} 的 width 必须是正整数（mm）` };
+          }
+        }
+      }
     }
   }
 

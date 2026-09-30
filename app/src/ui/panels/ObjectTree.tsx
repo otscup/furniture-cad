@@ -37,17 +37,24 @@ export function ObjectTree(props: {
             {r.walls.map((w) => {
               const len = Math.round(Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y));
               return (
-                <button
-                  key={w.id}
-                  type="button"
-                  className={`tree-leaf ${isSel(w.id) ? 'sel' : ''}`}
-                  onClick={() => sel(w.id)}
-                >
-                  <span className="tree-name">{w.name}</span>
-                  <span className="tree-meta mono">
-                    {len}mm · 厚{w.thickness}
-                  </span>
-                </button>
+                <div key={w.id}>
+                  <button
+                    type="button"
+                    className={`tree-leaf ${isSel(w.id) ? 'sel' : ''}`}
+                    onClick={() => sel(w.id)}
+                  >
+                    <span className="tree-name">{w.name}</span>
+                    <span className="tree-meta mono">
+                      {len}mm · 厚{w.thickness}
+                      {(w.openings?.length ?? 0) > 0 ? ` · 洞${w.openings!.length}` : ''}
+                    </span>
+                  </button>
+                  {(w.openings ?? []).map((o) => (
+                    <div key={o.id} className="tree-empty" style={{ paddingLeft: 16 }}>
+                      {o.kind === 'door' ? '门洞' : '窗洞'} {o.width}mm @{o.offset}
+                    </div>
+                  ))}
+                </div>
               );
             })}
           </div>

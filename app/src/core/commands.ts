@@ -523,6 +523,71 @@ export function renameRoomCommand(roomIndex: number, fromName: string, toName: s
   };
 }
 
+// ─────────────────────────── 门窗洞口（P8.7） ───────────────────────────
+
+const KIND_ZH_OPENING = { door: '门洞', window: '窗洞' } as const;
+
+/**
+ * 在墙上开门/窗洞。offset/width 是 authored 语义值（沿墙量），id 由总线补；
+ * 世界坐标是派生的 —— 这里绝不接收 x/y。
+ */
+export function createOpening(
+  wallId: string,
+  wallName: string,
+  kind: 'door' | 'window',
+  offset: number,
+  width: number,
+  source: CommandSource = 'ui'
+): Command {
+  const o = { id: '', kind, offset: Math.round(offset), width: Math.round(width) };
+  return {
+    id: newCommandId('opening.create'),
+    op: 'opening.create',
+    source,
+    target: { kind: 'wall', id: wallId },
+    changes: [],
+    payload: { wallId, opening: o },
+    label: `「${wallName}」加${KIND_ZH_OPENING[kind]} ${Math.round(width)}mm @${Math.round(offset)}`,
+  };
+}
+
+export function deleteOpening(wallId: string, wallName: string, openingId: string, kind: 'door' | 'window', width: number, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('opening.delete'),
+    op: 'opening.delete',
+    source,
+    target: { kind: 'wall', id: wallId },
+    changes: [],
+    payload: { wallId, openingId },
+    label: `「${wallName}」删除${KIND_ZH_OPENING[kind]} ${Math.round(width)}mm`,
+  };
+}
+
+/** 改洞口的位置/宽度/名字：一条命令一处语义补丁，撤销一步到位 */
+export function updateOpening(
+  wallId: string,
+  wallName: string,
+  openingId: string,
+  kind: 'door' | 'window',
+  width: number,
+  patch: { offset?: number; width?: number; name?: string },
+  source: CommandSource = 'ui'
+): Command {
+  const parts: string[] = [];
+  if (patch.offset !== undefined) parts.push(`位置→${Math.round(patch.offset)}`);
+  if (patch.width !== undefined) parts.push(`宽→${Math.round(patch.width)}`);
+  if (patch.name !== undefined) parts.push(`名→${patch.name}`);
+  return {
+    id: newCommandId('opening.update'),
+    op: 'opening.update',
+    source,
+    target: { kind: 'wall', id: wallId },
+    changes: [],
+    payload: { wallId, openingId, openingPatch: patch },
+    label: `「${wallName}」的${KIND_ZH_OPENING[kind]} ${Math.round(width)}mm ${parts.join(' ')}`,
+  };
+}
+
 // ───────────── 项目 ─────────────
 
 export function renameProject(from: string, to: string, source: CommandSource = 'ui'): Command {

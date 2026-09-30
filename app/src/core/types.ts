@@ -62,6 +62,34 @@ export interface Wall {
   end: Vec2;
   thickness: number;
   height: number;
+  /**
+   * 门窗洞口（P8.7，可选）：这面墙上开的洞。
+   *
+   * 为什么挂在墙下而不是项目根下独立列表：
+   *   洞口只能开在某一面墙上 —— 挂在墙上，roomId / wallId 由结构本身回答，
+   *   不存在"指向已删除墙"的悬空引用要校验，也不会出现
+   *   "洞口坐标与墙坐标两套真相"（洞口在墙上的位置由 offset 沿墙量出，
+   *   世界坐标是派生的，绝不 authored 保存）。
+   *
+   * 位置语义：offset = 沿墙中心线从 start 到洞口起点边缘的距离（mm 整数）；
+   * width = 洞口沿墙方向的净宽（mm 整数）。二者都是 authored 语义值，
+   * 不与任何世界坐标重复保存。
+   */
+  openings?: Opening[];
+}
+
+/** 洞口类型（P8.7）：door = 门洞，window = 窗洞。第一版二者都是"墙上的洞"，不做门扇开启包络。 */
+export type OpeningKind = 'door' | 'window';
+
+export interface Opening {
+  id: string;
+  kind: OpeningKind;
+  /** 沿墙中心线从 start 到洞口起点边缘的距离（mm 整数，≥0） */
+  offset: number;
+  /** 洞口沿墙方向的净宽（mm 整数，>0） */
+  width: number;
+  /** 显示名（可选；缺省时界面按 kind 显示「门洞 / 窗洞」） */
+  name?: string;
 }
 
 // ─────────────────────── 组合关系（v0.3，P2）───────────────────────

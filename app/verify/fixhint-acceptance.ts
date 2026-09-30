@@ -144,6 +144,12 @@ const NO_NUMBER_OK = new Set([
   'IMPORT-UNCERTAINTY',
   'IMPORT-CAVEAT',
   'IMPORT-LOW-CONFIDENCE',
+  // ── P8.7 空间语义：结构/语义矛盾类（无"差多少 mm"概念；都有 manual「要你定」）──
+  // 带数字的空间码（OPENING-SPAN / CABINET-OPENING）不在此列，走 NUM_CTX 强断言。
+  'SPATIAL-WALL-ZERO',
+  'SPATIAL-ROOM-OPEN',
+  'SPATIAL-ROOM-SHAPE',
+  'SPATIAL-CABINET-OUTSIDE',
 ]);
 
 /**
@@ -196,6 +202,9 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'IMPORT-UNCERTAINTY': { count: 3, first: '柜体深度未知' },
   'IMPORT-CAVEAT': { count: 3, first: '柜体深度未见' },
   'IMPORT-LOW-CONFIDENCE': { count: 2, sources: '酷家乐,图片识别' },
+  // ── P8.7 空间语义（offset/width/wallLen 等派生值必须真写进 message）──
+  'SPATIAL-OPENING-SPAN': { roomName: '书房', wallName: '北墙', openingName: '门洞', offset: 3500, width: 900, wallLen: 4000, over: 400 },
+  'SPATIAL-CABINET-OPENING': { cabName: '遮挡柜', roomName: '书房', wallName: '北墙', openingName: '门洞', kindZh: '门洞', width: 900 },
 };
 
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];

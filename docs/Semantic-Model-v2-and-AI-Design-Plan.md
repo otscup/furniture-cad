@@ -1723,3 +1723,99 @@ provenance 只住总线（P8.5-B 结构裁定），UI 意图命令在干跑沙�
 
 不进 P8.7。后续候选（需明确指令）：知识面板对 alignment candidate 的展示细化、attach 的图形化交互、全屋布局等。
 
+### 23.16 P8.7 实施记录：Spatial Semantics Foundation（Room / Wall / Opening）
+
+#### 23.16.1 现状审查结论（先复用，后新建）
+
+项目里 **Room / Wall 已存在且就是边界本身**：`Room { id, name, walls: Wall[] }`、
+`Wall { id, name, start, end, thickness, height }`（中心线+厚度）。指令里"Room polygon 与
+墙坐标两套真相互相矛盾"的风险在现有模型中**结构性不存在**——房间边界 = 墙中心线回路，
+唯一来源就是 `Room.walls`。因此 P8.7 只新增 **Opening** 一块拼图，不重造房间模型、
+不引入独立 polygon、不定义新 Point 类型（复用 `Vec2`）。
+
+#### 23.16.2 Opening 语义模型
+
+```ts
+export interface Opening {
+  id: string;
+  kind: 'door' | 'window';
+  offset: number;  // 沿墙中心线从 start 到洞口起点边缘（mm 整数，≥0）
+  width: number;   // 洞口沿墙净宽（mm 整数，>0）
+  name?: string;
+}
+// Wall.openings?: Opening[]
+```
+
+关键决策——**洞口挂在墙下**（`wall.openings`），不建项目根下的独立列表：
+roomId/wallId 由结构回答，无悬空引用可校验、无世界坐标可重复保存（洞口世界位置 =
+沿墙 offset 的派生值，绝不 authored）。不存宽度与 start/end 双份、不存朝向。
+
+#### 23.16.3 空间派生模块（`core/spatial/`）
+
+- `model.ts`：容差唯一出处 `SPATIAL_TOL { TOUCH:1, NEAR:50, OPENING_ZONE:600 }`（mm，
+  集中定义、严格分段不互吞）+ 确定性几何助手（点在多边形/正交穿越/多边形距离/回路构造
+  `roomLoop`/洞口影响带 `openingZoneRect`）。**零三角函数**——旋转几何全部复用
+  geometry 层的 `getCabinetFootprint`（唯一旋转实现）与 `wallPolygon`。
+- `derive.ts`：事实层 `deriveSpatialFacts` → 柜↔房间（inside/outside/crossing/unknown）、
+  柜↔墙（touching/near/crossing/none，footprint 多边形判定，bbox 只做剪枝）、
+  柜↔洞口（clear/overlap/unknown）。
+- `validate.ts`：issue 组装（经 `buildIssue` 唯一出口），`deriveSpatial(project): SpatialReport { facts, issues }`。
+- `index.ts`：公共面。
+
+**洞口影响带（OPENING_ZONE=600mm）的必要性**：洞口本体是墙体厚度里的一段空腔，
+贴墙摆放的柜体与它只有"贴线"接触——按纯空腔几何**永远检不出柜子挡门**。
+影响带 = 洞口 span × [墙外侧 −t/2 … 室内侧 t/2+600]，"柜站在洞口正前方"由此成为
+可判定的平面重叠。室内侧方向由房间回路 + 中点采样点确定性判定（不是猜）。
+
+#### 23.16.4 与既有规则的分工（不重复报、不抢归属）
+
+- **柜体嵌墙硬错误仍是 geometry 层 `RULE-CABINET-IN-WALL`**（bbox ⊇ footprint，
+  凡 footprint 穿墙它必报）——空间层不发重复 issue，只在 facts 里给更细分类。
+- 空间层独有码（已登记 issueCatalog）：`SPATIAL-WALL-ZERO`、`SPATIAL-ROOM-OPEN`（WARNING）、
+  `SPATIAL-ROOM-SHAPE`（ERROR：dup/branch/selfx）、`SPATIAL-OPENING-SPAN`（ERROR）、
+  `SPATIAL-CABINET-OUTSIDE`（WARNING）、`SPATIAL-CABINET-OPENING`（ERROR）。
+- 全部不给"自动移柜"式修复：怎么解是设计决定。
+- 接线：`commandBus.deriveFor()` 追加 `deriveSpatial(p).issues`——空间 issue 进入
+  项目 issue 流，与 RULE-* 同一界面、同一审计。
+
+#### 23.16.5 命令与持久化
+
+- 命令三件套（结构性 op，镜像 wall 同构）：`opening.create / opening.delete / opening.update`，
+  sideEffect `insertOpening/removeOpening/updateOpening` 带 index/前后值，undo/redo 最小可逆。
+- 持久化：`wall.openings` 随 structuredClone 透传（toFileProject 不点名它）；**不升
+  schemaVersion**（内容驱动只看 rows/assemblies，openings 与 provenance 同策略）。
+- `projectFile.parseProjectFile` 校验**形状**（id 唯一/kind 封闭词汇/整数 mm）；span 是否
+  落在墙内属语义校验 → 空间校验器报 issue，不在文件层拒绝——用户能在界面里调回来，
+  而不是打不开项目。
+
+#### 23.16.6 UI / AI / Import 边界
+
+- UI 最小入口：墙属性面板新增「门窗洞口」区（列表/加门洞 900/加窗洞 1200/改 offset 与
+  width/删除），对象树墙节点下展示洞口。不做户型编辑器/拖墙/吸附/门窗智能定位。
+- **AI 契约本阶段不开放**空间实体创建（room/wall/opening 的 create 不进 AI 词汇表）——
+  AI 不产墙体坐标/碰撞结论；验收断言钉死契约词表不变。
+- Import：P4/P5 管线不产空间实体；不确定项照旧阻断（IMPORT-UNCERTAINTY），
+  unknown 不变假确定性。
+
+#### 23.16.7 核心文件
+
+`core/spatial/{model,derive,validate,index}.ts`（NEW）、`core/types.ts`（Opening+Wall.openings）、
+`core/rules/issueCatalog.ts`（6 个 SPATIAL 码）、`core/commandBus.ts`（三 op + 三 sideEffect + derive 接线）、
+`core/commands.ts`（opening 三构造器）、`core/projectFile.ts`（openings 形状校验）、
+`ui/panels/PropertiesPanel.tsx`（洞口区）、`ui/panels/ObjectTree.tsx`（展示）、
+`verify/spatial-acceptance.ts`（NEW）。
+
+#### 23.16.8 验收
+
+- `verify:spatial` **60/60**（覆盖指令 45 项 + 容差边界负样本），接入 `verify:all`。
+- 实现期抓出的真缺陷：① `pointInPoly` 射线法交叉乘不等号方向依赖 `(yj−yi)` 符号，
+  初版写成依赖 `xj>xi` → 全部 inside/outside 判反（探针抓出，修正后全绿）；
+  ② `roomLoop` 闭合时起点重复入列（poly 首尾重复）→ 修正为纯环；
+  ③ 贴墙挡门在纯空腔几何下检不出 → 引入集中定义的 OPENING_ZONE 影响带。
+- `tsc --noEmit` 0；全量非 UI 回归 42/42；旧测试零删除零放宽；schemaVersion 不变。
+
+#### 23.16.9 停在 P8.7
+
+不进 P8.8。不做：门扇开启包络、自动贴墙/移柜、AI 空间意图、DXF 墙体导入、图片户型识别、
+Z 轴、BIM/IFC。后续候选（需明确指令）见 §20 禁止清单反向。
+

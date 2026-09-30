@@ -496,6 +496,61 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `把柜子沿墙推到贴墙面（挪出约 ${num(c, 'need')}mm），或换个位置放。`,
     manual: '往墙的哪一侧挪、挪多少，属于设计决定。',
   },
+  // ═══════════════ 空间语义（v0.3，P8.7：Room / Wall / Opening）═══════════════
+  //
+  // 这一族回答"柜与空间实体的关系是什么"。分工红线：
+  //   柜体嵌墙的硬错误仍是 RULE-CABINET-IN-WALL（geometry 层，唯一归属）——
+  //   空间层不重复报穿墙，只报空间实体自身的问题与"柜盖洞口/在房间外"这类
+  //   geometry 层看不见的事实。全部不给"自动移柜"式修复：怎么解是设计决定。
+  'SPATIAL-WALL-ZERO': {
+    title: '这段墙没有长度',
+    severity: 'ERROR',
+    message: (c) => `房间「${str(c, 'roomName')}」的墙「${str(c, 'wallName')}」起点和终点重合 —— 长度为 0 的墙拼不进房间边界，洞口和贴墙判断都会被它搅乱。`,
+    hint: () => '拖动它的端点让墙有实际长度，或直接删除这段墙。',
+    manual: '这面墙要去要去留属于设计决定。',
+  },
+  'SPATIAL-ROOM-OPEN': {
+    title: '房间边界没有闭合',
+    severity: 'WARNING',
+    message: (c) => `房间「${str(c, 'roomName')}」的墙没有连成闭合回路 —— "柜体在房间内/外"这类判断需要闭合边界才有确定答案，现在只能标为未知。`,
+    hint: () => '把缺口处的墙补上（端点接到相邻墙的端点上），或接受这些判断暂时未知。',
+    manual: '边界画到哪算画完，属于设计决定 —— 系统不猜缺口该封在哪。',
+  },
+  'SPATIAL-ROOM-SHAPE': {
+    title: '房间边界形状有问题',
+    severity: 'ERROR',
+    message: (c) => `房间「${str(c, 'roomName')}」的墙回路有问题：${str(c, 'what')} —— 边界不合法时「柜在房间内/外」的答案会自相矛盾。`,
+    hint: () => '检查这间房的每面墙：端点要首尾相接成一条单一回路，不能有重复顶点、分支或互相穿过。',
+    manual: '怎么改墙属于设计决定；系统不会静默替你修边界。',
+  },
+  'SPATIAL-OPENING-SPAN': {
+    title: '洞口开到了墙外',
+    severity: 'ERROR',
+    message: (c) => {
+      const neg = c.negOffset;
+      const where = typeof neg === 'number' ? `从起点往回 ${Math.abs(neg)}mm 处才开始` : `从起点 ${num(c, 'offset')}mm 处开始、宽 ${num(c, 'width')}mm`;
+      return `「${str(c, 'roomName')}」的墙「${str(c, 'wallName')}」上的${str(c, 'openingName')}${where}，但这面墙总长只有 ${num(c, 'wallLen')}mm —— 洞口超出了墙身${num(c, 'over') > 0 ? ` ${num(c, 'over')}mm` : ''}。`;
+    },
+    hint: (c) =>
+      `洞口必须完整落在墙内：offset ≥ 0、width > 0、offset + width ≤ ${num(c, 'wallLen')}mm。把 offset 或 width 调回这个范围内（比如 width ≤ ${Math.max(0, num(c, 'wallLen') - num(c, 'offset'))}mm）。`,
+    manual: '洞口开在哪个位置、开多宽，属于设计决定。',
+  },
+  'SPATIAL-CABINET-OUTSIDE': {
+    title: '柜子在房间外',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」整个落在房间「${str(c, 'roomName')}」的边界之外 —— 它归属这个房间，却不在房间里。`,
+    hint: () => '把柜子挪回房间内，或检查房间边界是不是画错了（柜体确实该在"屋外"的话，忽略这条即可）。',
+    manual: '挪柜还是改墙属于设计决定，系统不自动移柜。',
+  },
+  'SPATIAL-CABINET-OPENING': {
+    title: '柜子盖住了门窗洞口',
+    severity: 'ERROR',
+    message: (c) =>
+      `「${str(c, 'cabName')}」压在了「${str(c, 'roomName')}」墙「${str(c, 'wallName')}」的${str(c, 'kindZh')}（宽 ${num(c, 'width')}mm）上 —— 这个位置要留给人/光/风通过，被柜子挡住就失效了。`,
+    hint: () => '把柜子沿墙挪开这段洞口，或缩小柜宽；门扇开合范围本阶段不检查，但人站的位置先要腾出来。',
+    manual: '往哪挪、挪多少属于设计决定，系统不自动移柜。',
+  },
+
   'CORNER-DOOR-SWING': {
     title: '转角门会扫到邻居',
     severity: 'WARNING',

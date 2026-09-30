@@ -37,7 +37,6 @@ import {
 import { withResolvedPlacements } from '../src/core/placementDesign.ts';
 import { sceneFromProject as sceneOf, resolvePlacement as resolve, type PlacementIntent } from '../src/core/placement.ts';
 import * as CMD from '../src/core/commands.ts';
-import { placeCabinet } from '../src/core/commands.ts';
 import { observeCommand } from '../src/ai/knowledge/observe.ts';
 import { recordObservation } from '../src/ai/knowledge/index.ts';
 

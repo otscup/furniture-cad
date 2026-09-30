@@ -1579,3 +1579,86 @@ interface PlacementProvenance {           // 会话内，不进 project.json
 #### 23.13.9 停在 P8.5
 
 本期只落地方案 C1（命令层 provenance）。条件性第二阶段 B（柜体级落盘 / 跨会话可见）与"用户可选 alignment 入口"均为后续候选，不在本期范围。
+
+### 23.14 P8.5-B 实施记录：落位 provenance 持久化（Persistent Placement Provenance，方案 A 已落地）
+
+> 前置：`docs/Placement-Intent-Provenance-Persistent-Architecture-Review.md`（审查阶段产物，方案 A 经拍板采纳）。三个拍板点结论：① 方案 A 采纳（`Cabinet.placementProvenance?` 随柜体进 project.json）；② `invalidated` 不持久化（由 `Cabinet.placement + placementProvenance + 当前 resolver` 确定性重算，派生态绝不存成第二份真相）；③ `PlacementAuthority` **不迁入** placement.ts（保持 `core/commandBus.ts` 为落位权威生命周期唯一归口；types.ts 以 `import type` 引用，编译期擦除无运行时环）。
+
+#### 23.14.1 数据模型（落盘形态，最小字段）
+
+```ts
+// core/types.ts
+export interface PersistedPlacementProvenance {
+  intent: PlacementIntentDecl | null;  // null = 来源未知（导入/手摆），不伪造
+  authority: PlacementAuthority;       // user-authored / user-confirmed / system-resolved / unknown
+  byOp: string;                        // cabinet.place / move / rotate / nudge / resize / assembly.move
+  atVersion: number;                   // 提交时模型版本（可复现指针，不是时间戳）
+}
+// Cabinet 新增可选字段：
+placementProvenance?: PersistedPlacementProvenance;
+```
+
+刻意**不落盘**：`status` / `targetId` / `supersededBy`（会话派生态）、resolved 坐标、contact/turnSide、完整命令日志、undo/redo 历史。**不含任何 x/y/z/rotation/几何快照**——`Cabinet.placement` 仍是唯一几何真相，provenance 只解释、不决定。
+
+#### 23.14.2 生命周期（种子 → 会话维护 → 保存时物化）
+
+```
+load（构造 CommandBus / replaceProject 整批载入）
+  └─ seedProvenanceFromProject：每柜 placementProvenance → baselineProv + provById（status=live）
+  └─ stripProvenanceFields：把该字段从内存模型剥掉 —— 模型里永远干净
+execute / undo / redo
+  └─ recomputeProvenance（只动 provById，不动模型）：
+       ① activeLog() 分桶，同柜最后一条 = live、之前全 = superseded（C1 规则不变）
+       ② provById = new Map(baselineProv) ← 先回到加载基线
+       ③ 用 activeLog 的 live 覆盖（无会话记录的柜保留基线）
+save（App / ExportPanel / draftStore）
+  └─ bus.toFileSnapshot()：clone 状态、把每柜当前 live 物化成 Cabinet.placementProvenance，
+     再交 serializeProjectFile —— 只有这里有 provenance 进模型形状
+```
+
+**为什么 provenance 不进会话内存模型（本阶段最关键的架构裁定）**：本项目核心不变量「预览 === 提交」「干跑终点 === 提交终点逐字节相同」（bus-acceptance §4 ×8、ai-acceptance F3）。干跑在沙盒总线上执行同一批命令，此时**未打** `confirmedPlan` → authority=`unknown`；真提交已确认 → `user-confirmed`。这是**真实的语义差异**（干跑本来就不知道用户会确认），不是缺陷——provenance 一旦进模型状态，这两条逐字节断言就在结构上永远不可能成立。所以 provenance 只住总线（`provById/baselineProv`），保存时经 `toFileSnapshot()` 物化成文件形状，加载时种子化回来。第一版实现曾把 live 镜像进 Cabinet（syncProvenanceToCabinets），全量回归立刻红掉 6 条逐字节断言，据此改为物化方案。
+
+**"先回基线再覆盖"**：撤销某条落位命令后，该柜自然回到"加载时"状态 → provenance 回到基线（基线为空则清空），从结构上杜绝"placement 已 undo 但 provenance 还停在旧 live"。`replaceProject` 的 undo/redo 同样原子：快照两侧都带 provenance（prev 侧经 `toFileSnapshot()` 物化、next 侧原样），revert 时按方向重新种子化+剥字段。
+
+#### 23.14.3 四态语义（持久化后）
+
+| 态 | 来源 |
+|---|---|
+| live | 落盘记录（reload 种子）或会话内 activeLog 末条 |
+| superseded | 会话内瞬时态（不落盘；save 只写 live） |
+| invalidated | **不持久化、不计算进库**：派生判定由 `Cabinet.placement` + intent 重解析比对得出（审查 §四），留待消费方（如 P8.3 校验）需要时现算 |
+| unknown | `placementProvenance === undefined`（老项目 / 导入 / 无记录柜），等价 `intent=null`，**绝不回填伪造** |
+
+#### 23.14.4 reload 规则（不做的事比做的事更重要）
+
+- reload **只**恢复 provenance 状态（种子进总线），**绝不回放 `observeCommand`**——App 的 `observedSeqRef` 闸门 + reload 后 `bus.log()` 为空，双重保证"保存→打开"不产生任何 Knowledge candidate，杜绝自我强化循环。
+- `recordObservation` 内容合并（kind+op+value+contextKey+scope 相同只涨置信不新建）作为次保险。
+- `getPlacementProvenance(cabinetId)` 为新增公共读取口（会话记录优先、否则加载基线）。
+
+#### 23.14.5 Import / AI / Undo-Redo 的诚实边界
+
+- **Import / 载入（replaceProject）**：统一语义"整批载入 = provenance 状态整体重置"——旧映射先清（旧柜绝不残留），再按载入内容重新种子化。自家格式（项目文件 / 草稿恢复）里带 provenance = **恢复**（user-confirmed 不退化）；外来来源（P4/P5 适配器构造的柜）从不带该字段 = 天然 **unknown**。恢复的是"我们自己持久化过的事实"，unknown 是"确实不知道"，两种都诚实、都不伪造。
+- **增量导入**：不带 `placementIntent` 的落位 → `intent=null`，绝不从最终坐标反推 alignment/attach。
+- **AI Proposal**：`markConfirmed()` → `user-confirmed` 显式落盘，reload 后读到的就是 `user-confirmed`，不可能退化成 ai-inferred（C1 根因 A3 的跨会话兑现）；未确认 AI → `unknown`。
+
+#### 23.14.6 schemaVersion / migration
+
+**不升、不加 migration**（与审查结论一致）：可选字段 + 旧读者忽略 + 内容驱动 `resolveSchemaVersion` 不受影响，存量文件读存逐字节兼容。`parseProjectFile` 对字段非法（非对象/缺 authority）的防御：静默降级为缺失（unknown），不阻断打开——"缺了顶多不知道这柜怎么来的"比"因一个坏字段拒绝整个文件"安全。
+
+#### 23.14.7 核心文件
+
+- `core/types.ts`：`PersistedPlacementProvenance` + `Cabinet.placementProvenance?`（`PlacementAuthority` 以 `import type` 引自 commandBus）。
+- `core/commandBus.ts`：`baselineProv/provById` 双 Map、`seedProvenanceFromProject` / `stripProvenanceFields` / `toFileSnapshot()` / `getPlacementProvenance`、`recomputeProvenance` 扩展（回基线→覆盖，不动模型）、`replaceProject` 重置+种子化、revert 的 replaceProject 分支双向种子化、构造函数种子化+剥字段。
+- `core/projectFile.ts`：字段非法防御性降级。
+- `ui/App.tsx` / `ui/panels/ExportPanel.tsx`：保存出口改走 `bus.toFileSnapshot()`。
+- `verify/placement-provenance-persistent-acceptance.ts`（NEW，63 断言）。
+
+#### 23.14.8 验收
+
+- `tsc --noEmit` 0 错；`verify:provenance-persistent` **63/63**（持久化 round-trip / 无坐标无几何 / **内存模型不带 provenance** / 老项目兼容 / AI 未确认 unknown·确认 user-confirmed 跨会话不退化 / user 修改产生新 live / undo-redo 原子含分支不复活·replaceProject 双向原子 / reload 不回放观察·evidence 去重 / import intent=null·外来 unknown·自家恢复 / resolver 几何不受 provenance 影响 / schemaVersion 带-不带 provenance 相等 / 源码扫描 51 项）。
+- C1 `verify:provenance` **61/61**（§8 扫描随架构更新：允许集扩为 总线+types+App，派生层禁止集不变）；`verify:placement-preference` **96/96**；bus-acceptance **127/127**（含 §4 预览===提交 ×8）；ai-acceptance **70/70**（含 F3 干跑===提交逐字节）。
+- 全量非 UI 回归（40 脚本）全绿；旧测试零删除（C1 §8 扫描允许集随新架构更新属"判据跟着事实走"，非放宽——派生层禁读的红线原样保留并有断言）。
+
+#### 23.14.9 停在 P8.5-B
+
+本期只落地方案 A（柜体级 live provenance 持久化）。不做：完整命令历史落盘、独立 history 文件、Resolver 读 provenance、从坐标反推 intent、UI alignment 编辑器、云端同步、P8.6 及以后。

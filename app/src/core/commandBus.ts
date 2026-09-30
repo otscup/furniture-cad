@@ -672,6 +672,26 @@ export class CommandBus {
    * 所以"你说过的话"既拦得住 AI，也拦得住你自己的手滑；而且不需要 AI 在线。
    */
   private gate: Gate | null = null;
+  /**
+   * 落位 provenance 的 live 存储（P8.5-B，会话内权威）。
+   * 每次 execute/undo/redo 后由 `recomputeProvenance` 从「加载基线 baselineProv」
+   * 重置、再用 activeLog 里的 live 覆盖。
+   *
+   * ── 为什么 provenance 不写进会话内存模型（Cabinet）──
+   * 「预览 === 提交」与「干跑终点 === 提交终点逐字节相同」是本项目的核心不变量，
+   * 而干跑（沙盒）与真提交对同一条 AI 命令的 authority 判定天然不同（沙盒未打
+   * confirmedPlan → unknown；提交已确认 → user-confirmed）——这是**真实的语义差异**，
+   * 不是 bug。provenance 一旦进模型，这个差异就会让逐字节比对永远变红。
+   * 所以 provenance 只住总线（这里），保存时经 `toFileSnapshot()` 物化成文件形状，
+   * 加载时经 `seedProvenanceFromProject` 种子化回来——模型里永远干净。
+   */
+  private provById = new Map<string, PlacementProvenance>();
+  /**
+   * 加载基线（P8.5-B）：构造/整批载入时从文件里每柜 `placementProvenance` 种子化。
+   * 撤销某条落位命令后，该柜回到"加载时"的状态 → provenance 自然回到基线（或基线为空则清空，
+   * 不会残留已被撤销的命令的 live）。
+   */
+  private baselineProv = new Map<string, PlacementProvenance>();
 
   constructor(project: Project, rules: RuleSet) {
     /**
@@ -687,6 +707,11 @@ export class CommandBus {
     }
     this.project = structuredClone(project);
     this.rules = rules;
+    // P8.5-B：把文件里每柜的 placementProvenance 种子为本会话的 live 基线，
+    // 使跨会话来源可见、user-confirmed 不退化、后续命令能正确 supersede。
+    // 随后把该字段从内存模型剥掉——模型里永远干净（预览===提交的结构保证）。
+    this.seedProvenanceFromProject(this.project);
+    this.stripProvenanceFields(this.project);
   }
 
   /** 设置/清除记忆门。传 null 表示关闭（例如回放旧会话时不想被新规矩拦住） */
@@ -1458,6 +1483,12 @@ export class CommandBus {
       if (e.sideEffects.length === 1 && e.sideEffects[0].kind === 'replaceProject') {
         const se = e.sideEffects[0];
         this.project = structuredClone(forward ? se.next : se.prev);
+        // P8.5-B：provenance 与模型原子同步 —— 两侧快照都带 provenance，
+        // 恢复哪个方向就从哪个方向重新种子化，再把字段从内存模型剥掉。
+        this.provById.clear();
+        this.baselineProv.clear();
+        this.seedProvenanceFromProject(this.project);
+        this.stripProvenanceFields(this.project);
         return;
       }
       applySideEffects(this.project, e.sideEffects, forward);
@@ -1498,7 +1529,69 @@ export class CommandBus {
   }
 
   /**
-   * 重算每只柜 provenance 的 live / superseded（P8.5-C1）。
+   * 落位 provenance 的 live 存储种子化（P8.5-B 加载路径）。
+   * 把每柜文件里的 `placementProvenance`（落盘 live 形态）转成会话态 PlacementProvenance，
+   * 作为本会话的基线（baselineProv）与初始 live（provById）：后续 execute/undo/redo
+   * 会用 activeLog 里的真实记录覆盖 live，撤销后回到基线。
+   */
+  private seedProvenanceFromProject(project: Project): void {
+    for (const cab of project.cabinets) {
+      const pp = cab.placementProvenance;
+      if (!pp) continue;
+      const p: PlacementProvenance = {
+        targetId: cab.id,
+        intent: pp.intent,
+        authority: pp.authority,
+        byOp: pp.byOp,
+        atVersion: pp.atVersion,
+        status: 'live',
+      };
+      this.baselineProv.set(cab.id, p);
+      this.provById.set(cab.id, p);
+    }
+  }
+
+  /**
+   * 把内存模型里的 placementProvenance 字段剥掉（P8.5-B）。
+   * provenance 只住总线（provById/baselineProv），模型里永远干净——
+   * 这是「预览 === 提交」「干跑终点 === 提交终点」逐字节不变量的结构保证。
+   */
+  private stripProvenanceFields(project: Project): void {
+    for (const c of project.cabinets) {
+      if (c.placementProvenance !== undefined) c.placementProvenance = undefined;
+    }
+  }
+
+  /**
+   * 当前状态的**文件形状**快照（P8.5-B 保存出口）：clone 状态、把每柜当前 live
+   * provenance 物化成 `Cabinet.placementProvenance`，再交给调用方序列化。
+   *
+   * 只物化有 live 的柜（无 live = 无来源 = 不写字段，绝不伪造 undefined 以外的值）；
+   * 不写 status / supersededBy（派生态不落盘，加载后由总线重算）。
+   */
+  toFileSnapshot(): Project {
+    const snapshot = structuredClone(this.getState());
+    for (const cab of snapshot.cabinets) {
+      const live = this.provById.get(cab.id);
+      if (live) {
+        cab.placementProvenance = {
+          intent: live.intent,
+          authority: live.authority,
+          byOp: live.byOp,
+          atVersion: live.atVersion,
+        };
+      }
+    }
+    return snapshot;
+  }
+
+  /** 读取某柜当前 live provenance（会话内记录优先，否则加载基线）；reload 后也可读 */
+  getPlacementProvenance(cabinetId: string): PlacementProvenance | undefined {
+    return this.provById.get(cabinetId);
+  }
+
+  /**
+   * 重算每只柜 provenance 的 live / superseded（P8.5-C1），并同步持久化 live（P8.5-B）。
    *
    * 规则：同一只柜的 provenance 记录里，**最后一条（按提交顺序）为 live，
    * 之前的全为 superseded**（保留为历史来源，不再产生偏好证据）。
@@ -1509,6 +1602,9 @@ export class CommandBus {
    * 为什么集中重算而不是"写新时手动标旧"：撤销/重做会改变 active 集合，集中重算
    * 让 provenance 与模型状态**原子同步**，不存在"模型回去了、provenance 没回去"。
    * activeLog 只含 applied 且未丢弃的条目，所以被撤销的分支自然不参与。
+   *
+   * P8.5-B：重算后把 live 写进 `provById`（覆盖加载基线），再镜像到 `Cabinet.placementProvenance`。
+   * 无会话记录的柜保留加载基线（provById 不动），因此 reload 后不丢、且无记录柜不伪造。
    */
   private recomputeProvenance(): void {
     const active = this.activeLog();
@@ -1537,12 +1633,30 @@ export class CommandBus {
         }
       }
     }
+    // P8.5-B：维护持久化 live 存储。先回到加载基线，再用 activeLog 的 live 覆盖——
+    // 撤销某条落位命令后，该柜自然回到基线（或基线为空则清空，不残留 stale live）。
+    // 注意：这里**只动 provById，不动模型**——provenance 物化到文件形状只在 toFileSnapshot()。
+    this.provById = new Map(this.baselineProv);
+    for (const bucket of byCab.values()) {
+      const live = bucket[bucket.length - 1]!.prov;
+      this.provById.set(live.targetId, { ...live, status: 'live', supersededBy: undefined });
+    }
   }
 
-  /** 直接替换整个项目（导入 / 恢复版本）—— 也走日志，可撤销 */
+  /** 直接替换整个项目（导入 / 打开文件 / 恢复草稿）—— 也走日志，可撤销 */
   replaceProject(next: Project, label: string): void {
-    const prev = this.project;
-    this.project = structuredClone(next);
+    // prev 侧快照带 provenance（物化当前 live）：撤销本次替换时才能原样恢复旧 provenance。
+    const prev = this.toFileSnapshot();
+    const nextInMemory = structuredClone(next);
+    // P8.5-B：整批载入 = provenance 状态整体重置。旧映射先清（旧柜绝不残留），
+    // 再按【载入内容】重新种子化——自家格式（项目文件 / 草稿）里带 provenance = 恢复，
+    // 外来来源（P4/P5 适配器构造的柜）从不带该字段 = 天然 unknown。两种都诚实：
+    // 恢复的是"我们自己持久化过的事实"，unknown 是"确实不知道"，都不伪造。
+    this.provById.clear();
+    this.baselineProv.clear();
+    this.seedProvenanceFromProject(nextInMemory);
+    this.stripProvenanceFields(nextInMemory);
+    this.project = nextInMemory;
     if (this.pointer + 1 < this.entries.length) this.entries = this.entries.slice(0, this.pointer + 1);
     this.modelVersion++;
     this.geomCache = null;
@@ -1554,14 +1668,15 @@ export class CommandBus {
       label,
       diff: [{ path: '(project)', from: prev.name, to: next.name }],
       inverse: [],
-      sideEffects: [{ kind: 'replaceProject', prev: structuredClone(prev), next: structuredClone(next) }],
+      // 快照两侧都保留 provenance（next 原样、prev 已物化）：撤销/重做时按原样恢复，
+      // provenance 与模型原子同步 —— 与 execute/undo/redo 的总纪律一致。
+      sideEffects: [{ kind: 'replaceProject', prev, next: structuredClone(next) }],
       derived: this.sumDerived(this.derive().geom),
       issueDelta: { errors: 0, warnings: 0, added: [] },
       applied: true,
       discarded: false,
     });
-    // 导入 = 整批替换模型：导入来源由既有 `cabinet.origin` 回答，provenance 不写
-    // （缺省即 unknown，绝不伪造意图）。清空历史 provenance，避免指向已不存在的柜。
+    // 会话日志里指向旧模型的 provenance 一并清空（新会话从载入内容起步）。
     for (const e of this.entries) e.placementProvenance = undefined;
     this.pointer = this.entries.length - 1;
     this.notify();

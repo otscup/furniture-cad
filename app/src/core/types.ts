@@ -10,6 +10,13 @@
  * 注：`import type` 是纯类型引用，编译期被擦除，不会形成运行时循环依赖。
  */
 import type { ProjectViewSet } from './geometry/views.ts';
+/**
+ * `PlacementAuthority` 定义在 `core/commandBus.ts`（落位权威生命周期的唯一归口，
+ * P8.5-B 决定不迁入 placement.ts）：这里用 `import type` 引用，编译期擦除，
+ * 不会形成运行时循环依赖。
+ */
+import type { PlacementAuthority } from './commandBus.ts';
+import type { PlacementIntentDecl } from './placement.ts';
 
 export interface Vec2 {
   x: number;
@@ -331,6 +338,35 @@ export interface Cabinet {
    * 它描述"这个柜是怎么来的"这一事实，与板件/坐标/清单无关，也不污染几何。
    */
   origin?: ImportOrigin;
+  /**
+   * 落位 provenance（P8.5-B，可选）。只存「当前 live」记录，随柜体进 project.json。
+   *
+   * 它**只是解释** `placement` 是怎么来的（谁、什么来源、什么落位意图、是否用户确认），
+   * **永远不能成为第二个位置真相**——任何派生层（几何/清单/DXF/P8.3）一律不读它。
+   * undefined = 无来源信息（等同 unknown，绝不伪造）。
+   *
+   * 落盘形态刻意剥掉会话派生态（status / targetId / supersededBy）：
+   * 加载后由命令总线从 activeLog 重算，或保留加载时的基线。本字段不升
+   * schemaVersion、不加 migration——老文件无此键，读出来 undefined，逐字节兼容。
+   */
+  placementProvenance?: PersistedPlacementProvenance;
+}
+
+/**
+ * 落盘形态（P8.5-B）。只存每柜当前 live provenance 的最小事实；
+ * status / targetId / supersededBy 是会话派生态，不落盘（加载后由总线重算）。
+ *
+ * 不含任何坐标 / 几何快照（x/y/rotation 是 `placement` 的事，重复存一份 = 第二套真相）。
+ */
+export interface PersistedPlacementProvenance {
+  /** 当时的落位意图声明；null = 来源未知（导入 / 手摆），不伪造 */
+  intent: PlacementIntentDecl | null;
+  /** 落位权威：user-authored / user-confirmed / system-resolved / unknown */
+  authority: PlacementAuthority;
+  /** 产生它的命令 op（cabinet.place / move / rotate / nudge / resize / assembly.move） */
+  byOp: string;
+  /** 提交时的模型版本（可复现指针，不是时间戳） */
+  atVersion: number;
 }
 
 // ── 导入来源归属（v0.3，P4）──

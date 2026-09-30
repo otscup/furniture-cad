@@ -368,15 +368,24 @@ section('§8 源码扫描：provenance 只住命令总线，派生层一律不�
   ok('observe.ts 不逆向 import 几何/导出/制造（观察者不依赖派生层）',
     !/from '\.\.\/\.\.\/core\/geometry/.test(observeSrc) && !/from '\.\.\/\.\.\/export/.test(observeSrc));
 
-  // 全仓反向核对：placementProvenance 只应出现在「定义处（命令总线）」与「读 authority 处（UI）」
-  const hit: string[] = [];
-  for (const f of ['src/core/commandBus.ts', 'src/ui/App.tsx', 'src/ai/knowledge/observe.ts']) {
-    if (/placementProvenance/.test(readFileSync(join(APP, f), 'utf8'))) hit.push(f);
+  // 全仓反向核对（P8.5-B 后）：placementProvenance 允许出现在「定义/生命周期（命令总线）」、
+  // 「模型字段（types.ts）」「UI 读 authority（App.tsx）」；派生层一律禁止。
+  const allowed: string[] = ['src/core/commandBus.ts', 'src/core/types.ts', 'src/ui/App.tsx'];
+  const forbidden: string[] = [
+    'src/core/placement.ts',
+    'src/core/geometry/project.ts',
+    'src/core/placementDesign.ts',
+    'src/export/roomBook.ts',
+    'src/export/neutralSheet.ts',
+  ];
+  for (const f of allowed) {
+    ok(`placementProvenance 允许出现在 ${f}（定义/模型/UI）`, /placementProvenance/.test(readFileSync(join(APP, f), 'utf8')), f);
   }
-  ok('placementProvenance 只出现在 命令总线(定义) + UI(读 authority)，全仓仅这两处',
-    hit.length === 2 && hit.includes('src/core/commandBus.ts') && hit.includes('src/ui/App.tsx'), JSON.stringify(hit));
+  for (const f of forbidden) {
+    ok(`placementProvenance 不出现在 ${f}（派生层不读落位来源）`, !/placementProvenance/.test(readFileSync(join(APP, f), 'utf8')), f);
+  }
   ok('observe.ts 不引用 placementProvenance（观察者只吃 authority 参数，职责分离）',
-    !hit.includes('src/ai/knowledge/observe.ts'));
+    !/placementProvenance/.test(observeSrc));
 }
 
 // ═════════════════ 汇总 ═══════════════════

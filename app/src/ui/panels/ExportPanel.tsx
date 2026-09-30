@@ -73,7 +73,7 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
   // ── 项目存档 ──
   function exportProject(): void {
     const name = `${bus.getState().name || '项目'}.json`;
-    const blob = new Blob([serializeProjectFile(bus.getState())], { type: 'application/json' });
+    const blob = new Blob([serializeProjectFile(bus.toFileSnapshot())], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;

@@ -181,6 +181,14 @@ export function parseProjectFile(raw: string): ParseResult {
       params: unknown;
       layout: unknown;
     };
+    // 落位 provenance（P8.5-B，可选）：字段非法 → 视为缺失（unknown），不阻断打开。
+    // 它只是「来源说明」，缺了顶多不知道这柜怎么来的，比因一个坏字段拒绝整个文件安全。
+    {
+      const pp = (c as Record<string, unknown>).placementProvenance;
+      if (pp !== undefined && (typeof pp !== 'object' || pp === null || !('authority' in (pp as object)))) {
+        delete (c as Record<string, unknown>).placementProvenance;
+      }
+    }
     if (typeof cab.id !== 'string' || cab.id === '') return { ok: false, error: `柜体缺少 id` };
     if (cabIds.has(cab.id)) return { ok: false, error: `柜体 id 重复：${cab.id}` };
     cabIds.add(cab.id);

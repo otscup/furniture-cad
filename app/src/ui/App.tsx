@@ -152,7 +152,8 @@ export function App() {
   // 模型一变就排一次自动保存（去抖 800ms：连拖几个夹点只写一次）
   useEffect(() => {
     const t = window.setTimeout(() => {
-      const at = saveDraft(bus.getState());
+      // toFileSnapshot()：保存出口物化落位 provenance（内存模型不带，见 CommandBus.toFileSnapshot）
+      const at = saveDraft(bus.toFileSnapshot());
       if (at) setSavedAt(at);
       // 存不进去（隐私模式 / 超配额）就不更新时间 —— 界面不说"已保存"的谎
     }, 800);
@@ -162,7 +163,7 @@ export function App() {
   // 关标签页前把没来得及去抖的那份冲进 localStorage
   useEffect(() => {
     const flush = () => {
-      saveDraft(bus.getState());
+      saveDraft(bus.toFileSnapshot());
     };
     window.addEventListener('beforeunload', flush);
     return () => window.removeEventListener('beforeunload', flush);

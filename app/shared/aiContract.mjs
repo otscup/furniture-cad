@@ -983,10 +983,20 @@ export function buildUserMessage(text, snapshot, history = []) {
     for (const h of history.slice(-6)) lines.push(`${h.role === 'user' ? '用户' : '你'}：${String(h.text).slice(0, 300)}`);
     lines.push('');
   }
-  lines.push('【当前模型状态】（这是系统给你的**只读**快照，只有语义参数，没有几何）');
+  lines.push('【当前模型状态】（这是系统给你的**只读**快照，只有语义参数与空间事实，没有几何）');
   lines.push('```json');
   lines.push(JSON.stringify(snapshot, null, 2));
   lines.push('```');
+  lines.push('');
+  /**
+   * 空间上下文的读法（P9.1）。为什么写在这里而不是系统提示：**它紧挨着那份数据**，
+   * 换了快照形状也不会漏改；而且规划通道与设计方案通道用的是同一个模板，
+   * 两边都能看到这段话（模型不必猜 `spatialContext` 是什么）。
+   * 措辞刻意与系统提示第 1 条同调：可以**用**，不能**改**，坐标仍然由系统算。
+   */
+  lines.push(
+    '快照里的 `spatialContext` 是**只读空间事实**：每个房间的边界与包围范围、每面墙的名字/长度/走向、门窗洞口的位置与宽度、每只柜与墙·洞口·门扇开启范围的关系。你可以用它判断空间（"这面墙多长""这扇门往里开"），但**不能改它** —— 不能改墙、不能改洞口、不能给坐标；要挪柜用语义落位（`cabinet.place` 的 relation），坐标由系统算。'
+  );
   lines.push('');
   lines.push('【用户这一句要求】');
   lines.push(String(text).slice(0, 2000));

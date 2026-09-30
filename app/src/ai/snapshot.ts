@@ -1,6 +1,7 @@
 import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import { KIND_ZH } from '../core/relations.ts';
 import { canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
+import { buildSpatialContext, type AiSpatialContext } from './spatialContext.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -86,6 +87,28 @@ export interface AiSnapshot {
     /** 每条连接都翻成人话（"L 型角接"），模型不必去猜 kind 的意思 */
     connections: Array<{ id: string; kind: string; kindZh: string; a: string; b: string; edgeA?: string; edgeB?: string }>;
   }>;
+  /**
+   * 空间上下文（P9.1）—— **只读派生块**，与上面的 authored 快照分开摆。
+   *
+   * ── 为什么必须有 ──
+   *   在这之前，AI 对空间的全部认知是 `rooms[].wallCount` 一个数字：
+   *   它不知道房间多大、墙叫什么、洞口多宽、门往哪边开、这只柜贴着哪面墙。
+   *   也就是"在看不见房间的情况下被要求做室内设计"。补上这块之后它才看得见空间。
+   *
+   * ── 与 authored 快照的关系（P9.0 §11.3 的要求：派生事实必须与 authored 分开）──
+   *   它不是把空间"加进" rooms/cabinets，而是**独立一块**：
+   *   上面的 `rooms`/`cabinets` 仍是纯 authored 语义参数，这里只放派生事实。
+   *   块内 `readOnly: true` 是给模型看的显式声明 —— 这些是事实，不是可改的对象。
+   *
+   * ── 零坐标（与 I3 一致）──
+   *   没有任何 `{x,y}`、任何长度为 2/6 的数字数组、任何 polygon：
+   *   墙只有 `length` 与 `axis`，房间只有 `extent` 的两个标量，
+   *   门扇只有"判得出/判不出"，**没有包络多边形**。
+   *   坐标依旧只属于 Geometry Truth，AI 依旧不许输出坐标。
+   *
+   * 由 `spatialContext.ts` 唯一实现（纯投影：不新增判定，全部读 `deriveSpatial` 的输出）。
+   */
+  spatialContext: AiSpatialContext;
 }
 
 export interface AiCabinetView {
@@ -183,6 +206,16 @@ export function buildSnapshot(project: Project, rules: RuleSet): AiSnapshot {
       remainderPolicy: rules.policy.remainderPolicy,
     },
     cabinets: project.cabinets.map((cab, i) => cabinetView(cab, i)),
+    /**
+     * 空间上下文（P9.1）：**永远出现**（空项目就是四个空数组）。
+     *
+     * 与 `assemblies` 的"没组合就不出现"**刻意相反**：那里不出现是为了不让模型
+     * 凭空写出 assembly.create 去引用不存在的组合；这里没有那个风险 ——
+     * 空间事实的空数组只表示"这个项目还没有房间/墙/柜"。
+     * 而快照形状稳定有个实际好处：同一提示词前缀在多轮之间逐字节一致，
+     * 不会因为"这次多了一个键"把缓存与对比全部打乱。
+     */
+    spatialContext: buildSpatialContext(project),
     ...(project.assemblies && project.assemblies.length > 0
       ? {
           assemblies: project.assemblies.map((asm, i) => ({

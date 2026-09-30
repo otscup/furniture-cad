@@ -2300,3 +2300,152 @@ Door Swing 是 **design / spatial validation**，不是制造语义。
 人流模拟、多人协作、BIM/IFC、DXF 建筑导入、图片户型识别、Z 轴、3D 动态开门、门开启动画、
 Door Swing Preference 自动学习、全屋布局、45°/120°/任意角度开启、门扇动画。
 
+---
+
+### 23.19 P9.1 实施记录：Spatial Context for AI（让 AI 看见空间）
+
+> 完整审查报告（实现前的逐项核对）见 `docs/P9.1-Spatial-Context-for-AI.md` §一。
+
+#### 23.19.1 阶段目标与边界
+
+P9.0 审查把"**AI 看不见空间**"列为阻塞级缺口（风险 R1）：
+`AiSnapshot.rooms` 只有 `{index,id,name,wallCount}` 四个字段 ——
+AI 不知道房间多大、墙叫什么、洞口多宽、门往哪边开、这柜贴着哪面墙。
+本阶段**只补输入侧**：让快照从"只知道房间名字"升级为"知道能用于设计推理的空间事实"。
+
+遵循 P9.0 §11.3 对 P9.1 的建议：**纯投影**，派生事实**独立成块**（不与 authored 混摆）。
+不改模型、不改 `schemaVersion`、不改 Placement Resolver、不动 Spatial Truth、
+不接 LLM Planner、不引入 Candidate Layout / Constraint Graph。
+
+#### 23.19.2 实现前的审查结论（要点）
+
+逐字段核对后确认：AI 侧**没有任何** hinge / swing / 墙 / 洞口 / 房间形状概念。
+缺失的 13 项空间事实，每一项在既有派生层里都已经有唯一确定性来源：
+
+| 需求项 | 唯一确定性来源 |
+|---|---|
+| 房间边界基础语义 | `roomLoop(walls).status`（P8.7，唯一口径） |
+| 房间尺寸 | `bboxOf(loop.poly)`（既有原语；**无 area 实现** → 只给"包围范围"，如实叫 extent） |
+| 墙名（北墙/东墙这类人话） | `Wall.name`（**authored**，`docFactory.rectRoom` 生成的正是 南/东/北/西墙）→ 投影即可，**不新造方位推断** |
+| 墙长 / 走向 | 端点差：`hypot` 与 `|dx|`/`|dy|` 比较（**无三角函数**） |
+| 洞口 id/kind/width/offset | `Opening` |
+| 门扇开启语义 | P8.9 `DoorSwingFact`（hinge / direction / status / unknownReason） |
+| 柜↔房间 / 柜↔墙 / 柜↔洞口 | P8.7 `SpatialFacts.cabinets[]` |
+| 柜↔门扇净空 | P8.9 `DoorClearanceFact` |
+
+**必须保持 derived-only**（绝不进快照）：`DoorSwingEnvelope`（含坐标与多边形）、
+`wall.start/end`、`openingRect/openingZoneRect/wallPolygon`、facts 里的多边形与 bbox 形状、
+`designValidation` 的 findings 文案与规则码、`deriveSpatial().issues`。
+
+#### 23.19.3 交付物：`src/ai/spatialContext.ts`
+
+`buildSpatialContext(project): AiSpatialContext`，纯函数，挂在 `AiSnapshot.spatialContext`。
+
+```
+AiSpatialContext {
+  readOnly: true,                     // 给模型看的显式声明：事实，不是可改的对象
+  rooms:  [{ id, name, boundary{closed,status,wallCount,cornerCount}, extent?{width,depth} }]
+  walls:  [{ id, roomId, name, length, axis: 'horizontal'|'vertical'|'diagonal'|'degenerate', openingCount }]
+  openings: [{ id, wallId, roomId, kind, name?, offset, width, swing?{status,hinge?,direction?,unknownReason?} }]
+  cabinetFacts: [{ cabinetId, name, roomId, roomRelation,
+                   wallContacts[{wallId,relation,gap}],      // 只在有关系时列
+                   openingProximity[{openingId,kind,relation}], // 只在非 clear 时列
+                   doorClearances[{openingId,status,intrusion?}],// 只在 overlap/touch 时列
+                   concerns[] }]                              // 10 个闭集 token
+}
+```
+
+`concerns` 是事实枚举的**直接投影**（不是新判定）：
+`room-not-closed / outside-room / crossing-room / crossing-wall / touching-wall / near-wall /
+floating / blocks-opening / in-door-swing / door-swing-unknown`。
+
+**为什么不投影规则码与文案**：`deriveSpatial().issues` 属于"问题列表"，
+是明确规定不给 AI 的一类。给闭集 token，AI 知道"哪里不对劲"，却学不到一套
+可以复述或当参数用的规则词汇。
+
+#### 23.19.4 三条纪律
+
+1. **纯投影，不新增判定**：本文件没有一处自己的几何/容差判定，
+   全部读 `deriveSpatial(project)` 的 `facts / doors / clearances`；`roomLoop` 只用来取
+   回路顶点（与 `deriveSpatial` 内部同一个函数，验收断言两者一致）。
+   唯一的算术是长度/包围范围的标量化与走向比较。
+2. **派生事实与 authored 分开**：独立顶层块 + `readOnly: true`。
+   authored 部分（房间名 / 墙名 / 洞口尺寸 / 门扇意图）只是**照抄**，不产生第二份真相。
+3. **零坐标**：没有 `{x,y}`、没有长度 2/6 的数字数组、没有任何 polygon；
+   墙给 `length`+`axis`，房间给 `extent` 两个标量，门扇只给"判得出/判不出"，
+   **不给 envelope**。坐标仍只属于 Geometry Truth。
+
+#### 23.19.5 unknown 与退化态的处理
+
+- 门未指定 hinge/direction → `swing.status='unknown'` + `reason='no-swing'`，
+  **不填 into-room 默认值**；不产任何 clearance；同时在同一房间的柜上加
+  `door-swing-unknown`（**"判不出"本身要说出来**，沉默会被误读成"没问题"）。
+- 洞口 span 越界 → `status='unknown'` + `reason='bad-span'`，但 **authored 的 hinge/direction 照实给出**
+  （意图是知道的，判不出的是包络 —— 两件事不混）。该洞口的柜 relation 是 `unknown` 而非 `clear`。
+- 房间不闭合 → `boundary.closed=false` / `status='open'` / **不给 extent**；
+  柜 `roomRelation='unknown'` + `room-not-closed`。
+- 零长墙 → `axis='degenerate'`（**不编一个方向**）。这一条是实测发现的：
+  初版按"dy===0 → horizontal"会为零长墙报一个不存在的走向。
+- **`floating` 的门槛收紧到 `roomRelation === 'inside'`**：P8.8 解释层用的是
+  `facts.rooms[].closed`，在"房间里全是零长墙"这种退化态下 `roomLoop` 会返回
+  `status='ok'` 而 `poly` 为空（既有口径），于是 `closed=true` —— 若照搬就会出现
+  "房间判不出"与"这柜悬空"同时成立的自相矛盾结论。P9.1 只在"确实知道它在屋里"时才报悬空。
+  这条差异**被验收显式钉住**（§5 第 58/59 条），不是悄悄分叉。
+
+#### 23.19.6 提示词侧（一处，紧挨数据）
+
+`buildUserMessage` 在快照 JSON 之后加**一句**读法说明：`spatialContext` 是只读空间事实、
+可以**用**不能**改**、要挪柜用语义落位（`cabinet.place`）。写在 user 消息而不是系统提示，
+原因：它紧挨着那份数据，换了快照形状也不会漏改；且规划通道与设计方案通道共用这个模板，
+两边都能看到。**AI 契约的动作清单一个字没动**（仍 21 个动作）。
+
+#### 23.19.7 验收：`verify:spatial-context-ai` 72 条
+
+| 组 | 条 | 内容 |
+|---|---|---|
+| §1 快照含空间事实 | 1~18 | 房间/墙/洞口/柜体逐字段覆盖；touching/near/floating、洞口 proximity、门扇净空与 concerns |
+| §2 与派生/统一验证一致 | 19~31 | 与 `facts` 逐条相同、与 `designValidation` findings 集合一致、`report.spatial` 逐字节同源、确定性、不写回模型 |
+| §3 没有坐标写入口 | 32~41 | 全快照与只扫本块都 0 命中（含负样本）、无图元字段、无 envelope、整数、体积预算、无三角函数 |
+| §4 契约边界 | 42~50 | 动作清单逐字一致（漂移哨兵）、`wall.move`/`opening.update`/`door.swing.set` 全 UNKNOWN_ACTION、target 塞 wallId 整条作废、形状门仍拒坐标但放行面名 |
+| §5 unknown 保持 unknown | 51~59 | 未指定门 / 越界洞口 / 未闭合房间 / 零长墙 四类退化态 |
+| §6 未确认事实不进确定事实 | 60~64 | 单一输入源、rooms 清空即为空、无未确认标记、`IMPORT-UNCERTAINTY` 阻断的行为证据 |
+| §7 架构与不变量 | 65~72 | 依赖方向（恰好 3 个来源）、无时钟无随机、B1 派生字段名、旧出口不变、形状稳定、已接进 `verify:all` |
+
+#### 23.19.8 变异测试（绿了不算数，要证明断言会红）
+
+四个变异各自跑一遍、确认变红后还原：
+
+| 变异 | 变红的断言 |
+|---|---|
+| 把 `unknown` 门改成"默认向内开" | 51、55 |
+| 墙走向一律报 `horizontal` | 7、59 |
+| 往房间 boundary 里塞 `{x,y}` | 32、33 |
+| 放宽 `floating` 门槛 | 58、59 |
+
+顺带修掉两条**我自己写错的断言**：① 依赖方向断言只扫"以 `import` 开头的行"，
+漏掉了多行 import（`} from '…'` 在续行）→ 改成先剥注释行再全局匹配 `from '…'`；
+② "契约不认识 spatialContext" 写成了"源码里不出现这个词"，而实际它在提示词文案里出现 ——
+改成行为断言（参数白名单 + 塞 `hinge` 得 `EXTRA_PARAM`）。
+
+#### 23.19.9 回归
+
+`GOMEMLIMIT=1500MiB npx tsc --noEmit` → **0**；
+`verify:all` **一次跑通（EXIT=0，0 失败）**，含 `verify:ui`；
+`verify:spatial-context-ai` 72/72；`verify:ai` 70/70、`verify:proposal` 90/90、
+`verify:draft` 37/37、`verify:workflow` 30/30、`verify:aigen` 60/60、`verify:lshape` 18/18；
+P8.x 同链全绿。**旧测试零删除、零放宽**。
+
+#### 23.19.10 红线核查 / 停在 P9.1
+
+- Semantic Model 唯一真相 ✅（本阶段**没有**新增任何模型字段，`schemaVersion` 不变）
+- Manufacturing 不反写 ✅（`spatialContext` 不 import 制造层；快照本就不进制造链）
+- AI 不直接修改模型 ✅（动作清单未变；没有任何写墙/写洞口/写铰链的动作）
+- Resolver 不生成偏好 ✅（未触碰 `placement.ts` / `placementDesign.ts`）
+- Validation 不自动修复 ✅（未触碰）
+- Knowledge 不学习系统行为 ✅（未触碰）
+- Import 不伪造确定事实 ✅（§6 用 `IMPORT-UNCERTAINTY` 的行为证据锁住）
+
+**停在 P9.1**，不进入 P9.2。P9.1 明确不做：Candidate Layout、Constraint Graph、
+Design Score、LLM Planner、空间设计意图词汇（P9.2）、自动布局/自动移柜、
+人流模拟、Z 轴、3D 动态开门、BIM/IFC、图片户型识别（P10）、Door Swing Preference 自动学习。
+

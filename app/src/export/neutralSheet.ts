@@ -145,7 +145,10 @@ export function toNeutralExport(
   project: Project,
   rules: RuleSet,
   which: Array<'plan' | 'sheet'>,
-  modelVersion: string
+  modelVersion: string,
+  /** 兼容层（P7）：直接喂入已派生好的板件（如制造层回投影的板件），跳过从 geom 取板件。
+   *  不传 = 旧行为（从 generateProject 取）。DXF 由此可消费 Manufacturing 的确定性结果。 */
+  panelsOverride?: Panel[]
 ): NeutralExport {
   const geom = generateProject(project, rules);
   // cabinets 是 { [cabinetId]: CabinetGeometry }，不是数组 —— 取出值再聚合
@@ -197,7 +200,7 @@ export function toNeutralExport(
       warnings: blocking.map((i) => `[${i.code}] ${i.message}`),
     },
     sheets,
-    panels: cabinetGeoms.flatMap((c) => c.panels.map(panelRow)),
+    panels: (panelsOverride ?? cabinetGeoms.flatMap((c) => c.panels)).map(panelRow),
     purchased: cabinetGeoms.flatMap((c) => c.purchased.map(purchasedRow)),
     issues: geom.issues,
     stats: {

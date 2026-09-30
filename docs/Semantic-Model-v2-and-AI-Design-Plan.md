@@ -865,3 +865,46 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 | 全部 32 个 node verify 脚本（verify:all 全链） | 全部 exit=0 |
 | `verify:ui` | **686 / 686**（console error 0，故意 4xx 48 条单独归类） |
 | 旧断言 | 一条未删、未放宽 |
+
+---
+
+## 23. P7 实施记录：制造语义第一阶段（Manufacturing Semantics，已完成）
+
+> 目标：在不动 Semantic Model / Rules / Geometry / CommandBus 的前提下，建立"设计语义 → 结构语义 → 制造语义 → Manufacturing Parts → BOM/DXF"的确定性派生链路。制造层**只派生、零写入口**；尺寸单一来源；不能确定性给出的加工诚实标 unverified，绝不脑补。
+
+### 23.1 交付物
+
+| 文件 | 变更 |
+|---|---|
+| `app/src/core/manufacturing/model.ts` | **新建**。制造语义类型：`ManufacturingPart`（role/category/尺寸/材质/数量/纹向/封边/溯源 `MfgPartSource`/加工 `ManufacturingOperation[]`/warnings/verification/provenance）、`ManufacturingProject`。每条操作带 role/source/confidence/verification 四件套。 |
+| `app/src/core/manufacturing/rules.ts` | **新建**。`ManufacturingRuleSet` 与设计规则 `RuleSet` 分层；默认 `mfg_factory_default_v1`：封边来源=`geometry.edge`、背板工艺来源=`semantic.backPanel.method`、五类 unverified 方面显式登记（层板托孔/铰链孔/抽屉五金孔/箱体连接孔/组合连接加工孔）。 |
+| `app/src/core/manufacturing/derive.ts` | **新建**。`deriveManufacturing(project, geom, rules, mfgRules)`：纯函数派生。尺寸**只读几何 Panel**（generateProject 已派生的 `CabinetGeometry.panels`），Manufacturing 不重算一个 mm；verified 加工仅封边+背板工艺；其余按角色生成 unverified 操作；authored 组合成员只追加 unverified 组合连接孔备注。 |
+| `app/src/core/manufacturing/bridge.ts` | **新建**。三座兼容桥：`manufacturingToPanels`（无损回投影）、`bomFromManufacturing`（BOM 行带 `sourcePanelId` 溯源）、`manufacturingToNeutralExport`（DXF 经制造层出图，输出与旧路径逐字段相等）。 |
+| `app/src/export/neutralSheet.ts` | `toNeutralExport` 增加第 5 参数 `panelsOverride?`（兼容参数，旧调用不变）；override 也走 `panelRow` 投影，保证与旧路径 shape 一致。 |
+| `app/src/ui/panels/ManufacturingPanel.tsx` | **新建**。只读"制造"页签：统计/全局提示/逐柜制造件卡（尺寸·材质·封边·已确认加工·未确认警示）。零按钮改模型。 |
+| `app/src/ui/Toolbar.tsx` / `App.tsx` | `RightTab` 加 `'manufacturing'`，页签按钮 + 按需挂载。 |
+| `app/verify/manufacturing-acceptance.ts` | **新建**，32 条断言（§23.4）。 |
+| `app/verify/fixhint-acceptance.ts` | 修复一处**基线既有红**（与 P7 无关，干净 worktree 复现在 `84df960`）：`IMPORT-SHAPE` 是形状门/结构矛盾，本无"差多少 mm"概念 → 加入 `NO_NUMBER_OK` 例外集（带 manual 出口），26/0。§22.5"全部 exit=0"对这条不准确，以本轮为准。 |
+| `app/package.json` | 新增 `verify:manufacturing`，并入 `verify:all`。 |
+
+### 23.2 关键架构决策
+
+1. **制造尺寸单一来源 = 几何 Panel。** Manufacturing 的长/宽/厚/数量/纹向/材质全部照搬 `CabinetGeometry.panels`，不重算。理由：重算 = 第二份尺寸真相源 =「图上 2400、料单 2399」的结构性风险。制造件 `id` 与几何 `Panel.id` 相等，1:1 可追溯。
+2. **verified 白名单极小。** 当前只承认两类 verified 加工：封边（来自几何 `panel.edge`，边位由设计规则定）与背板工艺（来自语义 `cab.params.backPanel.method`）。drilling / connector-hole / groove / hardware-mount 一律 `verification:'unverified' + confidence:'none'`，不产孔位坐标 —— 「不能可靠确定的明确输出 unverified/openQuestion，不脑补」。
+3. **Assembly 不自动产生加工。** authored 组合连接只给成员件追加 unverified 的「组合连接加工孔」操作与 `MFG-ASSEMBLY-CONN-UNVERIFIED` 级提示，绝不生成 verified 孔。
+4. **兼容桥而非重写 exporter。** DXF/BOM 继续消费既有出口：制造件无损回投影为几何 Panel（字段全保留）→ 经 `panelsOverride` 进中立导出。验收钉死「经制造层的 DXF panels 与旧路径逐字段相等」—— 图 = 料 不变。
+5. **制造规则独立分层。** `ManufacturingRuleSet`（工厂工艺口径）与 `RuleSet`（设计约束口径）分开；派生结果 `provenance` 同时带两个 ruleSetId，交付三件套口径不变。
+6. **UI 零写入口。** 制造页签只读；这把「Manufacturing 不得成为新写入入口」摆到界面上。
+
+### 23.3 真实闭环（同源验证）
+
+选稳定柜型跑完整链：Semantic Model → `generateProject` → `deriveManufacturing` → 2D / 3D / BOM / DXF / Manufacturing Parts 五个出口。验收断言：制造侧板长 === 几何 bodyH === 3D 体块高度之一；BOM 行 `sourcePanelId` === 制造件 id === 几何板件 id；DXF 经制造层与旧路径逐字段相等 —— 五出口同源于一个 Semantic Model。
+
+### 23.4 验收判据（verify:manufacturing，32 条）
+
+确定性（同输入两次派生 JSON 逐字节相等）；数量（板件数===制造件数===BOM 行数）；尺寸一致+溯源；多行柜角色/行隔板/行溯源（rowId 回指正确行）；未验证不脑补（无坐标类字段、封边/背板 verified 带来源）；组合不自动 verified 但标 unverified；BOM 来源一致；DXF 经制造层与旧路径逐字段相等；改柜宽重派生（顶板长变化量===改量、侧板不变）；真实闭环五出口同源。
+
+### 23.5 限制与扩展点
+
+- **不做**（按 P7 边界）：CNC 完整支持、工厂定制、自动排版/套料、复杂五金库、AI 决定工艺、重写 DXF、重构 Semantic Model。
+- **扩展点已留**：`MfgOperationRole` 枚举（groove/hardware-mount/machining 已占位）；未来排孔/套料加枚举+对应 derive 规则即可，不动几何与 Semantic Model；真实孔位需先在 `ManufacturingRuleSet` 给出可判定规则，才允许 unverified → verified。

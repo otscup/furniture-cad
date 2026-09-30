@@ -18,6 +18,7 @@ export type RightTab =
   | 'ai'
   | 'import'
   | 'knowledge'
+  | 'manufacturing'
   | 'account';
 
 export function Toolbar(props: {

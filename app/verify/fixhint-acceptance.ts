@@ -126,8 +126,13 @@ const VAGUE = ['检查一下', '调整一下', '自行处理', '请确认后处�
  * 报不出数字的例外：这几条是**语义/结构矛盾**，根本没有"差多少 mm"这个概念
  * （电器洞口本就不该有门、双面柜本就该有背面、单面柜本就不该有背面）。
  * 对它们硬要求数字反而是塞水；但要求它们明说"这是你要定的事"。
+ *
+ * IMPORT-SHAPE 同类：形状门（"这不是柜体清单的形状"）是结构矛盾，
+ * 真实 detail 来自 aiContract.proposalShapeError（字段名，不含 mm）；
+ * 硬造一个数字反而是在形状报错里塞水。它带 manual（形状门复用契约实现），
+ * 满足"本就报不出数字就明说"的出口。
  */
-const NO_NUMBER_OK = new Set(['RULE-APPLIANCE-DOOR', 'RULE-DOUBLE-NO-BACK', 'RULE-ROW-WITH-BACK']);
+const NO_NUMBER_OK = new Set(['RULE-APPLIANCE-DOOR', 'RULE-DOUBLE-NO-BACK', 'RULE-ROW-WITH-BACK', 'IMPORT-SHAPE']);
 
 /**
  * 数字型 ctx：这几条卡的"差多少"来自派生（间隙 mm / 夹角 / 成员数 / 高度），

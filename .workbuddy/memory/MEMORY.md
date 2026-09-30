@@ -1,9 +1,12 @@
-# 项目长期记忆（已压缩）
+# 项目长期记忆（骨架版·2026-10-01 压缩）
 
 ## 项目
-浏览器端参数化定制家具设计与生产系统。语义模型为真相源，2D/3D/DXF/清单同源派生。自然语言入口，可被 MCP 驱动。**主文档** `docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md`；**v0.3 路线与阶段实施记录** `docs/Semantic-Model-v2-and-AI-Design-Plan.md`（§23）。**git 仓在项目根**（不是 `app/`）。公开仓库 `otscup/furniture-cad`（默认分支 `master`）。
+浏览器端参数化定制家具设计与生产系统。**语义模型=真相源**，2D/3D/DXF/清单同源派生。自然语言入口，可被 MCP 驱动。
+- 主文档 `docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md`；v0.3 路线与逐阶段实施记录 `docs/Semantic-Model-v2-and-AI-Design-Plan.md`（§23.x）；架构审查 `docs/P9.0-Architecture-Review.md`。
+- **git 仓在项目根**（不是 `app/`）。公开仓库 `otscup/furniture-cad`（默认分支 `master`）。
+- 阶段细节一律落 `docs/…Plan.md` 与 `.workbuddy/memory/YYYY-MM-DD.md`；本文件只留骨架与高频坑。
 
-## 不可违背的设计原则（骨架，逐条都是踩坑换来的）
+## 不可违背的设计原则（每条都是踩坑换来的）
 1. 真相源=语义参数化模型(JSON)，非几何；2D/3D/DXF/清单同源派生。
 2. 派生数据(Panel/几何/清单)永不写项目文件，`model.json` 只存 authored。
 3. AI 只输出 Command 永不输出几何；不能写 derived、不能删项目、不能改规则集。
@@ -23,67 +26,62 @@
 17. "是否需模型"与"用哪个模型"是两层→路由抽象要有 `none`(根本不发请求)。
 18. 模型无"线"对象→"改线"须译"改语义部件"；AI 只收 {cabinetId,part,paramPath} 永不收坐标。
 19. 多方案对比中间产物=候选语义方案(非派生视图)，选定才落地。
-20. 一键修复=承诺→只对修法唯一可判定者开放；设计决定只给诚实话术不给假按钮。
-21. "点了错还在"比"没按钮"更糟→一键修复后用真实几何复核。
-22. 报错文案唯一真相源 `issueCatalog.buildIssue()`；未登记码直接抛错；设计类给数字、程序缺陷类明说"这是程序缺陷"且不给按钮。
-23. **一种形状只许一处判断**：柜体布局 `units`(单行)/`rows`(分层)两形，**只有 `core/layoutModel.ts` 能判谁在**（读折成≥1行；写单行塌 `units`、多行只写 `rows`）。漏一处=该路径静默只看到第一行。
-24. 多行柜文件刻意不写 `units` 镜像（旧读者会按全高算板件→不报错地出错误尺寸）→宁可让旧读者明确拒绝。行序**自上而下**，`'fill'` 落最后一行；`schemaVersion` 跟内容走。
-25. **验收判据要看"因对的原因失败"**：负样本只断言"被拒了"会被别处检查顶替而假绿 → `rejectWhy(raw, 正则)` 精确到原因。**脚本没接进 `verify:all` 等于不存在**。
+20. 一键修复=承诺→只对修法唯一可判定者开放；**"点了错还在"比"没按钮"更糟**→修复后用真实几何复核；设计决定只给诚实话术不给假按钮。
+21. 报错文案唯一真相源 `issueCatalog.buildIssue()`；未登记码直接抛错；设计类给数字、程序缺陷类明说"这是程序缺陷"且不给按钮。
+22. **一种形状只许一处判断**：柜体布局 `units`(单行)/`rows`(分层)两形，**只有 `core/layoutModel.ts` 能判谁在**（读折成≥1行；写单行塌 `units`、多行只写 `rows`）。漏一处=该路径静默只看到第一行。多行柜文件**刻意不写 `units` 镜像**（旧读者会按全高算板件→不报错地出错误尺寸）→宁可让旧读者明确拒绝。行序**自上而下**，`'fill'` 落最后一行；`schemaVersion` 跟内容走。
+23. **验收判据要看"因对的原因失败"**：负样本只断言"被拒了"会被别处检查顶替而假绿 → `rejectWhy(raw, 正则)` 精确到原因。**脚本没接进 `verify:all` 等于不存在**。
+24. **注解/来源类数据要持久化，先问它与 dry-run/commit 逐字节不变量是否相容**；不相容的只能住状态旁路(总线)，在保存/加载边界物化。（P8.5-B 教训）
 
 ## 技术栈
 React+TS+Vite；2D=Canvas2D 自研；3D=Three.js。后端 Node20+/Fastify(前后端共享类型)。导出=Python+ezdxf(几何 TS 算好传中立 JSON)。`shared/aiContract.mjs`=AI 契约唯一真源(服务/前端/验收三方 import)。不用 opencascade.js。
 
 ## 产品决策
 - 先自用后商业化；MVP 只出 DXF 不出 DWG；DWG 须先确认授权(ODA 无 Web/SaaS 权)。
-- AI 走 OpenAI 兼容(`POST {baseUrl}/chat/completions` + `response_format:json_object`)→换服务商=填 baseUrl 不改码。
+- AI 走 OpenAI 兼容(`POST {baseUrl}/chat/completions` + `response_format:json_object`)→换服务商=填 baseUrl 不改码。AI 对话通道只问答不产 Command；对话与规划两按钮；历史落 sessionStorage。
 - 账号两模式单向 local-open→accounts；订阅按自然月 token：free20万/pro500万/team3000万/unlimited(PLANS 待拍板)。
-- AI 对话通道只问答不产 Command；对话与规划两按钮；历史落 sessionStorage。
 - 局域网模型 `HOST=127.0.0.1` 管入站不管出站。分层配置 4 层(platform/factory-tenant/project/user)无 team 层。
 
 ## 硬约束/红线
 MCP 白名单不暴露 SQL/路径/shell/规则集。交付带"模型+生成器+规则集版本"三件套。首批生产人工全检。所有 factory 默认值显式覆盖(踩过 dimlfac=100)。
 
 ## 实测踩坑（高频必看）
-- **所有 nextId 必传 takenIds**：撞 id 不报错只静默共用记录→批量造对象第一个动作建 takenIds Set 并累加。
-- **环境代理假失败**：HTTP_PROXY 把局域网地址当外网→502；服务端/探针 delete 六个代理变量。Node22 fetch 不读代理、Node24 起 NODE_USE_ENV_PROXY=1。
-- **推理模型(R1 系)**：回 reasoning_content 非回答；思考吃输出预算；max_tokens 显式下发 DEFAULT 4096、必带回 reasoning_content；空正文按 finish_reason=length。
-- **max_tokens 必须夹取**到 `[1,65536]`（本环境 gpt-load 实测硬上限）；"无限/0/非法"映射到 PRACTICAL_MAX_TOKENS=16384；显式数字仍夹 65536。`AI_TIMEOUT_MS` 默认 120000，**生产配 300000**。改这俩值每请求重读，不需重建镜像。
+- **nextId 必传 takenIds**：撞 id 不报错只静默共用记录→批量造对象第一个动作建 takenIds Set 并累加。结构性命令必带 `changes:[]`。
+- **环境代理假失败**：HTTP_PROXY 把局域网地址当外网→502；服务端/探针 delete 六个代理变量。Node22 fetch 不读代理、Node24 起 `NODE_USE_ENV_PROXY=1`。
+- **AI 网关三坑**：推理模型(R1 系)回 reasoning_content 非回答、思考吃输出预算、空正文按 `finish_reason=length`；`max_tokens` 必须夹取到 `[1,65536]`（本环境 gpt-load 实测硬上限），"无限/0/非法"→`PRACTICAL_MAX_TOKENS=16384`；`AI_TIMEOUT_MS` 默认 120000、**生产配 300000**（改这俩值每请求重读，不需重建镜像）。
 - **markdown `**` 不进 JSX/toast**：加文本卫生断言(.side-right 叶子 textContent 不含 `**`)。
 - **命令构造函数防呆**：`new CommandBus(project,rules)` 参数写反照样跑→构造函数做形状校验。
 - **undo 也是状态变更(版本+1)**：版本不复原；撤销后执行新命令丢重做尾巴。
 - **面板按需挂载→state 卸载**：跨页签留物落 sessionStorage，整份会话一起落；落盘前剪重(每轮 run.draft 是完整 project)；存失败要显示告警。Section 折叠整块不渲染→主入口勿放默认折叠区。
 - **★ 不许要求模型输出它拿不到的几何**：模型只出语义意图(rotation/语义关系)，坐标由系统定；AI 硬给坐标撞墙时沿最小位移推到相切(`nudgeOutOfWalls`)并写进 label。
-- **负样本断言会随修法失效**：修完回头看这条负例现在证明什么，判据该换就换，别留假绿。
-- **断言不可信比失败更危险**：失败时先 JSON.stringify 原始值、先假定自己错、几何 0/±1 须精确(sin(π)=1.22e-16 旋转180°误判干涉)、每个视觉缺陷转永久断言、新增回归断言须临时关修复确认真失败。
-- **"带数字"会被兜底值顶替成假绿**：`num()` 缺值返 0→判据必须是喂进去的值真出现在 message(给有辨识度 ctx：gap=137/angle=45/count=3)，不能只断言 `/\d/`。
+- **断言不可信比失败更危险**：失败时先 `JSON.stringify` 原始值、先假定自己错、几何 0/±1 须精确(sin(π)=1.22e-16 旋转180°误判干涉)、每个视觉缺陷转永久断言、新增回归断言须临时关修复确认真失败。**负样本断言会随修法失效**，判据该换就换，别留假绿。
+- **"带数字"会被兜底值顶替成假绿**：`num()` 缺值返 0→判据必须是喂进去的值真出现在 message(给有辨识度 ctx：gap=137/angle=45/count=3)，不能只断言 `/\d/`。**恒真表达式＝假绿**：`!/…/.test('')`、`&& true`、`x===1===false` 当场改掉。
+- **验收夹具必须深拷贝对象**：共享 `Room`/`Project` 引用会让后建用例覆盖先建用例。
+- **依赖方向断言要扫"整文件"而不是"以 import 开头的行"**：多行 import 的 `from '…'` 在**续行**上→只扫首行会**漏检并假绿**。修法=先剥注释行，再全局匹配 `from\s+'([^']+)'`，断言**来源数量**而不只是"包含"。
+- **`npm run <不存在的脚本>` = 退出码 1 且无输出**：回归循环里看到 exit=1 先确认脚本名存在（实际名：`verify:draft`/`verify:workflow`/`verify:aigen`/`verify:lshape`），再怀疑代码。
+- **给快照加新块前先过旧不变量**：B1 派生字段名黑名单（**`derived` 是禁用键名**）、B3 除 `cabinets[*].placement` 外不许 `{x,y}` 且不许长度 2/6 数组、B4 整数、B5 体积 <40KB。
+- **结论性 token 的门槛必须绑"前置事实是否可判"**：`floating`（没靠墙）只应在前置事实可判定时给出，否则出现"房间判不出内外"与"这柜悬空"**同时成立**的自相矛盾；退化几何（零长墙/顶点不足）**不许编默认值**（`axis='degenerate'`、不给 `extent`）。
 - **批量改文案别用"顺序 replace + 断言"脚本**：第 N 项对不上整批抛、一字节不写→先 Read 再 Edit 整块替换。
 - **verify:ui 是分钟级链**：不加短超时；跑前清手动 dev server(占 5273)；提交前 `git checkout -- app/verify/out/`(PNG tracked)；**长输出别 `| tail -N`**(截掉失败断言列表)。
-- **verify:ui 间歇性红**(B15 .env key 时序抖动)：与本轮改动无因果→复跑一次再下结论。
-- **★ verify 运行期间禁改 `app/` 源文件**：Vite HMR 会整页重载→应用从 sessionStorage 自动恢复草稿(`project.replace`)→历史重置/模型回退→**后续断言连环假红**(P8.9 实测 66 条：B7 起 resize/拖拽/模板/AI 生成/一键修复全线崩)。判据：源文件 mtime ≈ 日志里"恢复本地草稿"的时间。UI 大量假红先查这条，别急着改代码。
-- **DXF**：主交付 R2007(原生 UTF-8)；R2000 须 encoding='gbk'+$DWGCODEPAGE=ANSI_936。EZDXF dimstyle dimlfac=100→设 1.0。ACI 7 白底隐形→用 CTB/STB。模型空间 1:1。
-- **"点到直线"别写成"点到线段"**(P8.2 撞出的 P2 真缺陷)：`distPointToLine` 曾 clamp 参数→深 550/600 两柜背面齐并排被判"没连着"。修=去 clamp(重叠由 overlapLen 单独判)；沿接触面滑动不会分开→"拉开"夹具必须背离接触面拉。
-- **几何事实：两矩形面贴合⇒相对旋转必是 90° 整数倍**；45°/45° 可解析但 deriveContacts 不覆盖非轴对齐→验收显式"不声称已验证"。
-- **结构性命令必带 changes:[]**；createCabinetFromTemplate 必传 takenIds。
-- **同一能力只许一份实现**：跑验收与出图共用 verify/mock-openai.mjs。
-- **偏好/知识 scope 别挂具体对象名**：观察器顺手存 `scope.cabinet=柜名`→退化成一次性记录且被 scopeMatches 挡掉(静默假失败)。可复用偏好挂"情形/上下文"，哪个对象改的交给 evidence 留痕。
+- **★ verify 运行期间禁改 `app/` 源文件**：Vite HMR 整页重载→应用从 sessionStorage 自动恢复草稿(`project.replace`)→历史重置/模型回退→**后续断言连环假红**(P8.9 实测 66 条)。判据：源文件 mtime ≈ 日志"恢复本地草稿"时间。UI 大片红先查这条。
+- **`npm run typecheck` 本机可能 OOM**（TS 7 是 Go 编译器，VirtualAlloc errno=1455）→ `GOMEMLIMIT=1500MiB npx tsc --noEmit` 即通过；verify:all 同样前缀。
+- **几何**：`distPointToLine` 曾 clamp 参数→两柜背面齐并排被判"没连着"（修=去 clamp，重叠由 overlapLen 单独判）；两矩形面贴合⇒相对旋转必是 90° 整数倍，非轴对齐 `deriveContacts` 不覆盖→验收显式"不声称已验证"；90° 柜贴东墙=背 x=3940、身沿 −x（placement=背面左角约定），直觉放错不是代码错；射线法 `pointInPoly` 交叉乘不等号方向由 (yj−yi) 符号决定；环闭合时起点不重复入列（poly 是纯环）；`serializeProjectFile` 带 `savedAt` 参数，逐字节比较必须显式固定。
+- **DXF**：主交付 R2007(原生 UTF-8)；R2000 须 `encoding='gbk'`+`$DWGCODEPAGE=ANSI_936`。EZDXF dimstyle `dimlfac=100`→设 1.0。ACI 7 白底隐形→用 CTB/STB。模型空间 1:1。
+- **同一能力只许一份实现**：跑验收与出图共用 `verify/mock-openai.mjs`。
+- **偏好/知识 scope 别挂具体对象名**：观察器顺手存 `scope.cabinet=柜名`→退化成一次性记录且被 `scopeMatches` 挡掉(静默假失败)。可复用偏好挂"情形/上下文"，具体对象交给 evidence 留痕。
 
 ## 部署（NAS 群晖）
 AI 网关 6 位 key 非占位符、宿主机测 000 是 DNS 假故障(容器内 node 测 200)、docker cp /tmp 静默失败用 stdin 法、openrouter/free 504=抖动非提示词。AI_TIMEOUT_MS 默认 120s(改 data/.env 加 60000 不重建镜像)。
 
 ## 协作方式（2026-09-29 起）
-用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只给产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容/关键架构决策/测试结果/遗留问题/commit hash）。**停在阶段不自动进下一阶段**——除非用户明确"继续"。
+用户不逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只给产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容/关键架构决策/测试结果/遗留问题/commit hash）。**停在阶段不自动进下一阶段**——除非用户明确"继续"。
 
 ## v0.3 路线（每阶段验收后再进下一阶段）
-P0→P1→P2(Assembly/Connection `66da2b5`)→P3(AI DesignProposal `26a7639`)→P4(Import `6f5541b`)→P5(图片识别 `8aecd76`)→P6(设计知识 `a556353`)→P7(P7/P7.1/P7.2/P7.3 Manufacturing Semantics `67f6764`)→P8.1(确定性落位基础设施 `4290a3a`)→P8.2(语义面接触 attach `7850046`)→P8.3(设计语义验证 `53f20a8`)→P8.4(落位偏好接入 `bc8284c`)。
-- **P2 关系层三纪律**（`core/relations.ts` 唯一实现）：① 不产生几何；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开——只校验声明。
-- **P8 落位四纪律**：① canonical=`Cabinet.placement{x,y,rotation}`，ResolvedPlacement 只是管道中间产物；② 引擎纯函数(不改 Model/不调 AI/不依赖 UI/不出 DXF/不改 Geometry)；③ attach 不是 adjacent+gap=0(两面各有其名、朝向对不上即报错不退化)；④ 设计语义层只判断不重算、只提示不拦截、不替用户选朝向。
-- **P8.5 已完成**（C1 命令层 provenance，commit `ec3565b`）：`PlacementIntentDecl`(DistributiveOmit)+`Command.placementIntent`/`confirmedPlan`+总线单点 `derivePlacementAuthority`(四态)+`recomputeProvenance`(live/superseded 与 undo/redo 原子)+导入清空；观察者改读 authority、`alignment` 谓词可学；`placementProvenance` 全仓仅 commandBus.ts+App.tsx，派生层零读取。
-- **P8.5-B 已完成**（Persistent Provenance 方案 A，commit `99db98e`）：`Cabinet.placementProvenance?{intent,authority,byOp,atVersion}` 随柜体进 project.json，不升 schemaVersion 不加 migration，缺失=unknown 不伪造。**provenance 只住总线（provById/baselineProv），内存模型永远干净**——干跑沙盒未确认(unknown) vs 真提交(user-confirmed) 是真实语义差异，进模型必破「预览===提交」「F3 干跑===提交逐字节」两条核心不变量；保存经 `bus.toFileSnapshot()` 物化、加载/replaceProject 种子化后剥字段。replaceProject=「整批载入重置」：自家格式恢复、外来天然 unknown，undo/redo 快照双向带 provenance 原子恢复。`invalidated` 不持久化（重解析几何现算）；reload 不回放观察（防 Knowledge 自我强化）。`verify:provenance-persistent` 63 断言已入 verify:all。基线审查报告 `docs/Placement-Intent-Provenance-Persistent-Architecture-Review.md`。
-- **踩坑教训（P8.5-B）**：凡"注解/来源类"数据要持久化，先问它与 dry-run/commit 的逐字节不变量是否相容——dry-run 与 commit 对同一命令的语义注解可能天然不同（authority），这类数据只能住状态旁路（总线/独立存储），在保存/加载边界物化，绝不能进被比对的模型状态。
-- **P8.6 已完成**（语义落位意图 UI，基线 `99db98e`）：属性面板「落位意图（对齐/贴合）」Section（align 五向 + attach 两面/对齐/缝隙，界面无 x/y 输入）；`src/ui/placementIntent.ts` 纯逻辑层 `commitPlacementIntent`=唯一 Resolver→P8.3 报告→`CMD.placeCabinet(...,'ui',decl)`（user-authored intent 真实进 provenance）；Knowledge 闭环打通（UI 意图→alignment candidate→确认→active→digest；拖拽/unknown/system/absolute 一律不产）。`verify:placement-intent-ui` 62 断言入 verify:all；tsc 0；非 UI 回归 41/41 绿；schemaVersion 不变；旧测试零删除零放宽。**停在 P8.6**。
-- **P8.7 已完成**（Spatial Semantics Foundation，基线 `c8c01c3`）：Room/Wall 已存在且**墙即边界**（Room.walls=中心线回路），只新增 `Opening{id,kind:'door'|'window',offset,width,name?}` 挂 `Wall.openings?`（世界坐标纯派生不落盘，不升 schemaVersion）。新层 `core/spatial/`：容差唯一出处 `SPATIAL_TOL{TOUCH:1,NEAR:50,OPENING_ZONE:600}`；facts 三类关系（柜↔房间/墙/洞口）+6 个 SPATIAL-* 码经 buildIssue；**零三角函数**（复用 footprint/wallPolygon）；穿墙硬错误仍归 RULE-CABINET-IN-WALL 不重复报；deriveFor 接线。**洞口影响带**：纯空腔几何检不出贴墙挡门（只贴线）→ span×室内侧 600mm 通行带，室内侧由回路采样点确定性判定。opening 三命令（结构性 op+sideEffect 最小可逆）；parse 校形状、span 越界由空间校验报 issue 不拒文件；AI 契约不开放空间实体。`verify:spatial` 60 断言入 verify:all；tsc 0；非 UI 回归 42/42；零删除零放宽。**停在 P8.7**。
-- **踩坑（P8.7）**：① 射线法 pointInPoly 交叉乘不等号方向由 (yj−yi) 符号决定，写成 xj>xi 全盘判反；② 环闭合时起点不重复入列（poly 是纯环）；③ 90° 柜贴东墙=背 x=3940、身沿 −x（placement=背面左角约定），直觉放错不是代码错；④ serializeProjectFile 带 savedAt 参数，逐字节比较必须显式固定。
-- **P8.8 已完成**（Unified Design Validation，基线 `f64882f`，commit `d892845`）：新层 `core/designValidation/` **只组合** P8.3 placementDesign 与 P8.7 spatial —— `report.placement`/`report.spatial` 与单独调用**逐字节相同**（断言钉死），本层唯一新增判断＝把事实翻译成设计语义。柜↔墙 `back/side/front-wall-contact·wall-near·floating·wall-conflict`（正面两类不发结论；"哪一面抵墙"=面法线 ∥ 墙法线且与 s·n 反向，斜向回退最近面并置 `rotated:true`）；洞口只解释 `clear` 且室内侧判得出的（NEAR-DOOR/WINDOW-BEHIND，overlap 仍归 P8.7）。`WallAttachDecl{cabId,face?,offset?}` **故意没有 wallId**（哪面墙是派生事实），"只校验声明过的"与 P2 同纪律；**不新增模型字段/不升 schemaVersion**（声明是调用参数）。9 个 DESIGN 码进 issueCatalog，等级唯一真相源仍在目录（ERROR=穿墙+声明与事实不符；WARNING=门脸朝墙/缝/没靠墙/门前余量/窗被挡，全 manual 零一键修复）；判不出来就沉默。**不进 deriveFor**（不污染 blockingErrors）、不 import AI/knowledge/commandBus/export/manufacturing。UI 只读「空间检查」区，零自动修复按钮。`verify:design-validation` 77 断言入 verify:all。
-- **踩坑（P8.8）**：① **`npm run typecheck` 本机会 OOM**（TS 7 是 Go 编译器，VirtualAlloc errno=1455 fatal error）→ `GOMEMLIMIT=1500MiB npm run verify:all` 即通过；② 自己写的断言先错：声明贴墙没贴上时报的数是最近墙距（840 不是我以为的下墙 1440）→ 改成"文案里的数＝`nearestWallDistance` 实测值且 >0"，不写死数字；③ `buildIssue` 返回的 Issue 自带 `code`，展开后再手写 `code:` 触发 TS2783 → 统一 `mkFinding()` 只挑 message/hint；④ 断言"系统解析不产偏好"必须**同命令同 diff 只改 authority**（换一个本来就产不出谓词的 diff = 假绿）；⑤ 新增断言一律做变异测试（改坏 → 必须变红 → 还原）。
-- **P8.9 已完成**（Door Swing / Clearance Semantics，基线 `2aeecb0`）：补 Door 事实链 `Opening → 门扇(铰链+净宽+室内外) → 90° 开启包络 → 柜体净空`，回答"没挡门洞但门打开会撞柜吗"。authored 只加 `Opening.hinge?('start'|'end')` + `Opening.swingDirection?('into-room'|'out-of-room')`，**两个独立可缺省字段而非成对对象**（"知道铰链在哪、还没想好往哪开"是真状态）；绝不存 swingArc/leafPolygon/radius/doorAngle（90° 是规则不是几何）。**零三角函数**：两个弧边界方向直接取 ±墙方向 `u` 与 ±墙法线 `nRoom`（"法线⊥方向"是构造性恒等），弧用**向量加法二分** `normalize(a+b)`=角平分线 + `hypot`。铰链点=`jamb + m*(thickness/2)`，`jamb=wall.start+u*along`。室内侧复用 P8.7 `wallInteriorSide`。unknown 四因 `no-swing/open-room/bad-wall/bad-span` → **不画包络、不发 issue、不产 clearance**，绝不默认向内开、绝不从柜位反推方向。判定与 P8.7 同一把尺子（`polysOverlapInterior` / `polyDistance ≤ SPATIAL_TOL.TOUCH`），**函数内不写 epsilon**；报数字段 `intrusion`（沿开启中轴量"柜体从墙面探出多少 mm"，与旋转无关；hitRadius 对贴墙柜=0 没信息量故不进文案）。柜对门**不限房间**逐扇判（朝外开时扇区在隔壁）。**两条判定互不替代**：`SPATIAL-CABINET-OPENING`(600mm 通行带=人流) vs `DESIGN-CABINET-DOOR-SWING`(90° 扇区=门扇扫过的面积)，后者虽带 DESIGN- 前缀但实现在**空间层**故**进主问题链**（issueCatalog 里写明这条"例外"）。CommandBus 不新建平行命令系统，只扩 `opening.update` patch 三态（undefined 不改 / null 清成未指定 / 值设定）+ **整对象重建 + 键序钉死**（id→kind→offset→width→name→hinge→swingDirection）+ 未知字段 extras 原样带走 → 两种设置顺序**存盘逐字节相同**；projectFile 对非法值/窗洞带门扇字段**抹除+警告**不拒文件。P8.8 接入 `report.doorSwing = {doors, clearances}` 原样引用，`report.placement`/`report.spatial` **仍逐字节相同**。UI 仅在 `kind==='door'` 出「门开启」区（两组三段按钮，**无 x/y 输入**，只读判定 ✓/✕/○，零自动修复）；2D 图元抽纯函数 `viewport/doorSwingPrims.ts` + 新图层 `A-DOOR-SWING`（Viewport.tsx 是 JSX，node 跑不了 → 抽出来才能断言"图上 poly === 判定用 poly"）。不进 DXF/BOM/Manufacturing；AI 契约与 Knowledge **均未变**（Door Swing Preference 学习明确不做）。`verify:door-swing` **65 断言**入 verify:all；tsc 0；spatial 60/60、design-validation 77/77、fixhint 27/27、P8.x 同链全绿、verify:ui **686/686**；零删除零放宽。
-- **踩坑（P8.9）**：① **验收夹具必须深拷贝对象**：`withNorthDoor` 最初直接改传入的 `Room` → 后建用例把先建用例的 `openings` 覆盖 → 一批断言差点假绿（探针第一版就是这么错的）；② **数字一律来自实测**：断言 21 的 `intrusion` 我记成 400、实测 800；断言 18 我以为 0° 贴边 clear、实测 0°/270° 才是 overlap；③ 别写 `x === 3000 === false` 这种链式比较；④ `withResolvedPlacements(project, [{intent, placement}])` 不是 `{id,x,y,rotation}`；⑤ 构造"只踩一条"的夹具要真算清 600mm 通行带与 90° 扇区的相对位置（我第一次的两只柜都同时踩两条）；⑥ **恒真表达式＝假绿**：`!/…/.test('')`、`&& true` 都当场改成真断言；⑦ **★ verify 运行期间绝不改 `app/` 源文件**：verify:ui 跑到一半我改了一处缩进 → Vite HMR 整页重载 → 应用从 sessionStorage **自动恢复草稿**（`project.replace`）→ 历史重置、模型回退 → **后续 66 条断言连环假红**（源文件 mtime 与应用日志草稿恢复时间同一秒）。**UI 假红先查"运行期间有没有人动过文件"，别急着改代码**；干净重跑 686/686。⑧ **发现一条真实遗留（P8.7 边角，未越界修）**：柜宽恰等于洞口净宽且贴墙齐平时 footprint 与洞口影响带**逐边重合** → `polysOverlapInterior` 检不出"挡门口"；已在验收 39c 钉住现状并写进注释，且记录"P8.9 扇区判定在此边角仍会报，两条互补"。
+P0→P1→P2(`66da2b5`)→P3(`26a7639`)→P4(`6f5541b`)→P5(`8aecd76`)→P6(`a556353`)→P7(`67f6764`)→P8.1(`4290a3a`)→P8.2(`7850046`)→P8.3(`53f20a8`)→P8.4(`bc8284c`)→P8.5(`ec3565b`)→P8.5-B(`99db98e`)→P8.6→P8.7(`c8c01c3`)→P8.8(`d892845`)→P8.9(`0cba2ef`+`b4c62f4`)→P9.0(只审查 `985c78b`)→**P9.1 Spatial Context for AI（`4c50608`）**。**当前停在 P9.1，等待验收。** 详见 `docs/Semantic-Model-v2-and-AI-Design-Plan.md` §23.x。
+
+- **层次纪律（P2 起逐层加固）**：关系层 `core/relations.ts`（不产几何 / 接触只有 `deriveContacts()` 一处 / authored 与 inferred 分开、只校验声明）；空间层 `core/spatial/` 只出事实；设计语义层 `core/designValidation/` **只组合不重判**（`report.placement`/`report.spatial` 与单独调用逐字节相同）；落位引擎 `placement.ts`/`placementDesign.ts` 纯函数(不改 Model/不调 AI/不依赖 UI/不出 DXF)。
+- **provenance（P8.5/P8.5-B/P8.6）**：`PlacementIntentDecl` + 总线单点 authority 四态 + live/superseded 与 undo/redo 原子。`Cabinet.placementProvenance?{intent,authority,byOp,atVersion}` 随柜体进 project.json，**只住总线旁路**，保存经 `bus.toFileSnapshot()` 物化、加载后剥字段；replaceProject=整批载入重置；`invalidated` 不持久化（现算）。P8.6 属性面板「落位意图」Section = 唯一 Resolver 入口（`src/ui/placementIntent.ts` → `CMD.placeCabinet(...,'ui',decl)`）；Knowledge 闭环：UI 意图→alignment candidate→确认→active→digest（拖拽/unknown/system/absolute 一律不产）。
+- **P8.7**：`Room.walls`=中心线回路即边界；`Opening` 挂 `Wall.openings?`（世界坐标纯派生不落盘）；`SPATIAL_TOL{TOUCH:1,NEAR:50,OPENING_ZONE:600}` 是容差唯一出处（**洞口影响带 ≠ 柜间通道**）；穿墙硬错误仍归 `RULE-CABINET-IN-WALL` 不重复报；零三角函数。
+- **P8.8**：`DesignValidationReport` 只把事实翻译成设计语义（不改事实、**不进 deriveFor**、零一键修复、判不出就沉默）。`WallAttachDecl` **故意没有 wallId**（哪面墙是派生事实）。
+- **P8.9**：门扇两字段 `Opening.hinge?` + `Opening.swingDirection?`（**各自可缺省**——"知道铰链在哪、还没想好往哪开"是真状态）；绝存包络/半径/开启角度（90° 是规则不是几何）；零三角函数（弧=±墙方向 u 与 ±法线 n 的**向量加法二分角平分线**）；unknown 四因 `no-swing/open-room/bad-wall/bad-span` → 不画不发不产，**绝不默认向内开、绝不从柜位反推**；`SPATIAL-CABINET-OPENING`(600mm 通行带=人流) 与 `DESIGN-CABINET-DOOR-SWING`(90° 扇区=门扇扫过的面积)**互不替代**。**遗留（已钉在 `verify:door-swing`，未越界修）**：柜宽**恰等于**洞口净宽且贴墙齐平时 footprint 与洞口影响带**逐边重合**→`polysOverlapInterior` 检不出"挡门口"；同一只柜在扇区判定里仍会被报 —— 两条判定在此边角**互补**。
+- **P9.0（只审查，不改码）**：结论=骨架已具备六条不变量，**缺的不是算法，是输入与载体**；`AiSnapshot.rooms` 只有 `{index,id,name,wallCount}` = **AI 看不见空间**（阻塞级）；**不需要 ConstraintGraph**（现有三层是函数 `f(Project)→facts` 非图；耦合约束应放**候选枚举器**不放 `resolvePlacement`）；候选布局=**临时运行对象**（先例 `core/variants.ts` 的 `VariantDraft`："候选不是模型，选定才成为模型"）；**LLM 不作评分裁判**（三源=Blocking⊗Facts⊗PreferenceMatch）；"Geometry Truth"应从一级改为**事实层/判定层的分割线**；`MAX_ACTIONS=12` 与整屋布局冲突。→ **先做 P9.1，再谈接 LLM**。
+- **P9.1**（`4c50608`）：`AiSnapshot` 增**独立顶层块** `spatialContext`（`readOnly:true`），实现 `src/ai/spatialContext.ts` —— **纯投影**：全部读 `deriveSpatial()` 的 `facts`/`doors`/`clearances` + `roomLoop`，**零新判定、零新模型字段、`schemaVersion` 不变、Resolver 未触碰**。内容：rooms(`boundary{closed,status,wallCount,cornerCount}`+`extent{width,depth}`，**无 area 实现故只给包围范围**)/walls(`name` 投影 authored 人话 + `length`/`axis` 派生)/openings(`kind/offset/width` + 门 `swing{status,hinge?,direction?,unknownReason?}`)/cabinetFacts(`roomRelation`+`wallContacts`+`openingProximity`+`doorClearances`+`concerns`)。**零坐标**（无 {x,y}、无长度 2/6 数组、无 envelope，门扇只给"判得出/判不出"）；`concerns`=10 个**闭集 token**（不搬规则码与文案，"问题列表"仍不给 AI）；零长墙 `axis='degenerate'`；`floating` 门槛收紧到 `roomRelation==='inside'`。契约动作 21 条一字未改，只在 `buildUserMessage` 加一句读法说明。

@@ -681,3 +681,57 @@ src/import/
 | `verify:ui` | **661 / 661**（导入页签复用 PlanRunView，无新差异） |
 | 其余受 `defaultUnits` 修复牵连的脚本 | `verify`(127) / `proposal`(89) / `variants`(58) / `cabinets`(64) / `rows`(106) / `relations`(82) / `room`(28) / `migration`(56) / `projectfile`(27) / `special`(38) / `glass`(30) 全绿 |
 | 旧断言 | 一条未删、未放宽 |
+
+---
+
+## §20 P5 实施记录：图片识别闭环（VisionProvider → 诚实映射 → 候选 → 确认 → Semantic Model）
+
+> commit `8aecd76`（代码）。目标不是"让 AI 猜出一张完整 CAD"，而是建立可靠的人机协作识别链路。
+
+### 20.1 交付物
+
+**新增 `src/ai/vision/`（与 core 解耦的 Provider 层）**：
+
+| 文件 | 职责 |
+|---|---|
+| `types.ts` | `VisionProvider` 接口（`analyze(VisionInput) → VisionResult`）；`VisionResult` 携带 `scale`（图片是否有可靠尺寸标注）、逐柜逐维 `width/height/depth {value, confidence, source: 'annotation'\|'estimate'}`、`rows/units/components`（可见结构）、`relations`（可观察组合关系）、`notVisible`（看不见的生产结构）、`ambiguous`（模型自己都说不清的） |
+| `providers/mock.ts` | `MockVisionProvider`：确定性 fixture（main=三柜衣柜墙无标注 / annotated=带尺寸标注 / ambiguous=模糊图），无网络无 key，验收与离线演示用；**返回形状与真实 Provider 完全一致** |
+| `providers/remote.ts` | `RemoteVisionProvider`：OpenAI 兼容 `/chat/completions`（image_url 走 data URL），**经服务端 `/api/ai/vision` 路由**复用既有 `AI_BASE_URL/AI_API_KEY/AI_MODEL` 网关配置——不硬编码任何厂商/模型名，换服务商 = 换网关配置 |
+| `visionResultToNormalized.ts` | **诚实映射层（P5 纪律所在）**，见 20.2 |
+| `factory.ts` | `createVisionProvider('mock'|'remote')` + `analyzeImageToNormalized()` 一条龙；新增服务商 = 写一个 Provider 实现并登记，Semantic Model / Geometry / Rules 零改动 |
+
+**复用既有链路（不造第二套写入）**：Vision → `NormalizedDesign` → `validateNormalized` → `compileImport` → `dryRunPlan` → PlanRunView 预览 → 用户确认 → `commitPlan` → CommandBus。与 P4 的 JSON/DXF 导入、P3 的 AI 设计通道**同权同位**。
+
+**UI（ImportPanel 扩展）**：来源切「图片识别」→ 选图（或「示例图（离线 Mock）」）→ 识别 → 归一化结果（逐柜置信度 + caveats）→ **caveat 确认门**（未勾选「已知晓」禁用编译按钮）→ 复用 PlanRunView 预览 → 应用。补齐了 P4 遗漏的全部 `import-*` 样式（面板此前是无样式裸渲染）。
+
+**服务端**：`server.mjs` 新增 `POST /api/ai/vision`（复用 AI 网关配置与超时/错误处理）；`aiClient.ts` 新增 `requestVision()`。真实 API 通路需有 key 环境验证（`/api/ai/vision` 已就位，Mock fixture 先行跑通闭环——按用户指示不因 API 问题卡住 P5）。
+
+### 20.2 诚实映射纪律（不编造看不见的生产结构）
+
+| 信息 | 来源 | 处理 |
+|---|---|---|
+| 柜体数 / rows / units / 门抽屉开放格 / 并排·L 型组合 | 图片**可见** | 翻译成 NormalizedDesign（候选） |
+| 尺寸 | 图片有标注（`scale.known` / `source: 'annotation'`） | 高可信采用，仍过规则校验 |
+| 尺寸 | 无标注（`source: 'estimate'`） | **保留数值但标 caveats**「视觉估计，下料前请确认」；用户给了参考尺寸可升格 scale |
+| 真实深度 / 板厚 / 隐藏隔板 | `notVisible` | caveats（用户逐项确认后才允许生成，确认后随 `Cabinet.origin` 留痕审计） |
+| 柜体物理连接方式（贴合/留缝/收口条） | 图片不可见 | **组合只做纯分组（assembly 不带 connections）+ caveat 明示**；用户确认后用既有「按当前落位补全连接」建立真实连接。不硬声明 butt/corner——图片只显示"看起来挨着"；且编译期落位快照里没有前序柜体，硬声明续接必被严格邻接校验正确拒收 |
+| 模型自己说不清（柜数歧义/连接歧义） | `ambiguous` | questions（**硬阻断**，`IMPORT-OPEN-QUESTIONS` 前置于形状/空判定暴露） |
+| 识别不到任何尺寸的柜体 | — | 必答问题（阻断） |
+
+关键架构决策：`validateNormalized` 的 questions 检查**提到形状/空判定之前**——模糊图识别出 0 柜时，用户看到的是"模型问了什么"而不是一个干巴巴的"导入为空"。
+
+### 20.3 验收（实测 2026-09-30）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| `verify:vision`（新建，接入 `verify:all`） | **49 / 49**：多柜/rows/units/组件/组合识别、逐维置信度、不编造断言（内部可见柜不出现"内部隔板不可见"caveat、标注图不出现"视觉估计"caveat）、questions 硬阻断、scale.known 高可信、参考尺寸升格、闭环落库 origin 留痕 + `computeCabinetLayout` 派生几何/净宽可读（2D/3D/DXF/BOM 同源可消费） |
+| `verify:ui` | **678 / 678**（新增 B43 共 17 条：导入页签 → Mock 识别 → 3 柜归一化 → caveat 确认门禁编译 → 勾选后编译预览 → 应用回执 + 版本 +4；console error 仍为 0） |
+| 全量 node 链（`verify:all` 除 `verify:ui`） | 全部 exit=0（含 `verify:import` 59/59——normalized 扩展向后兼容） |
+| 旧断言 | 一条未删、未放宽 |
+
+### 20.4 遗留问题与决策事项
+
+- **真实 Vision API 通路未实测**（本机无可用 key 的视觉模型）：`/api/ai/vision` 路由 + `RemoteVisionProvider` 已按 OpenAI 兼容协议就位，语法校验通过；接通验证与提示词调优留到有 key 环境（gpt-load 网关后挂视觉模型即可，无需改码）。
+- **「声明续接 → 系统自动贴合落位」是既有缺口**（非 P5 引入）：编译期 `pickFreeSpot` 基于编译时快照，多动作序列中后建柜看不到先建柜，故声明 butt 必被严格邻接校验拒收。P5 的处理是诚实绕开（组合=纯分组，连接由用户确认后用 P2 既有命令补）；若未来要"AI/Vision 直接声明并排续接"，需在干跑期逐动作推进落位快照——已记为独立架构项，不在 P5 范围内动。
+- B43 同时补上了 **P4 的 UI 覆盖缺口**（P4 报告称"导入页签已覆盖"，实测 661 条中并无 ImportPanel 断言——本轮已修正并新增 17 条）。

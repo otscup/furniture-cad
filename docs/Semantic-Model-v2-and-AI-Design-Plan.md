@@ -684,7 +684,7 @@ src/import/
 
 ---
 
-## §20 P5 实施记录：图片识别闭环（VisionProvider → 诚实映射 → 候选 → 确认 → Semantic Model）
+## 20. P5 实施记录：图片识别闭环（VisionProvider → 诚实映射 → 候选 → 确认 → Semantic Model）
 
 > commit `8aecd76`（代码）。目标不是"让 AI 猜出一张完整 CAD"，而是建立可靠的人机协作识别链路。
 
@@ -738,7 +738,7 @@ src/import/
 
 ---
 
-## §21 P6 实施记录：设计知识系统第一版（三层分离）
+## 21. P6 实施记录：设计知识系统第一版（三层分离）
 
 > commit `a556353`。目标：把「硬规则 / 设计知识 / 用户偏好」从架构上分层，为「根据设计师历史修改持续优化」打地基。不做大模型记忆库。
 
@@ -804,3 +804,64 @@ candidate **永远不进** Resolver 的 applicable —— 没确认的知识不�
 - 谓词维度目前 6 种（有限可靠集）。更多维度（分格风格比例、五金品牌偏好等）= 在 `PredicateKind` 加枚举 + `observe.ts` 加翻译 + 冲突检测——扩展点集中，不需要动架构。
 - Design Knowledge 目前只有用户观察/AI 推测两个来源，尚无「从案例库归纳」的自动通道（那是后续版本的活）。
 - 知识暂为浏览器 localStorage（跨项目用户资产）；多人/多设备同步需上云，属商业化阶段。
+
+---
+
+## 22. P0–P6 架构审查（Architecture Audit / Stabilization）
+
+> 审查目的：P0–P6 收官后建立稳定基线——确认单一真相源、单一写入链路、清晰模块边界仍然成立。只做小修，不做重构，不改稳定行为，不删测试。
+
+### 22.1 逐项审查结论
+
+| # | 审查点 | 结论 | 证据 |
+|---|---|---|---|
+| 1 | Semantic Model 唯一真相源 | ✅ | 全仓无 `cabinets.push`/直接赋值捷径（core/ 之外零命中）；持久化只有 `serializeProjectFile`→`toFileProject`（authored-only，structuredClone 后仅规范化 layout 形状） |
+| 2 | Geometry/Rules/2D/3D/DXF/BOM 确定性派生 | ✅ | `computeCabinetLayout` 单一派生口；relations-acceptance 有"建组合前后 BOM/plan/views 逐字节不变"断言 |
+| 3 | AI/Vision/Import/Knowledge 不碰坐标 | ✅ | src/ai 只引只读助手（detectCollisions/pickFreeSpot/layoutModel 折叠）；import/vision 验收断言动作无 `atX/atY`；落位由系统定 |
+| 4 | P3/P4/P5 同链 | ✅ | 三条通道全部收口 `dryRunPlan→PlanRunView→commitPlan→bus.execute`；AIPanel×2 / ImportPanel×1 / draftSession 同一 commitPlan |
+| 5 | 无第二套写入/提交/编译 | ✅ | `bus.execute` 是唯一写原语；sandbox（planRunner/draftSession）为干跑草稿纸，不落主模型 |
+| 6 | rows/assembly/connection/knowledge 无重复语义 | ✅ | 形状判定只在 `layoutModel.ts`；"接不接触"只在 `deriveContacts()`；knowledge 是独立域（建议性），不复制柜体模型 |
+| 7 | Hard Rule > Design Knowledge > User Preference | ✅ | `LAYER_RANK` 确定性排序；450 vs 400 用例在 verify:knowledge 压制并暴露冲突 |
+| 8 | Resolver 确定性、AI 不能改优先级 | ✅ | 纯函数（验收深比较输入不变）；AI 只收 digest 文本，无任何写路径 |
+| 9 | 一次修改不自动升级 | ✅ | observe 只产 candidate；同值重复观察合并证据、置信上限 0.9；唯一升级通道=用户确认 |
+| 10 | Vision observed/estimated/authored/uncertainty 语义一致 | ✅ | `source: 'annotation'|'estimate'` + `Confidence` + `notVisible`→caveats/questions 单一口径；annotation 不触发"视觉估计"caveat（验收断言） |
+| 11 | Import/Vision 诚实表达不确定 | ✅ | DXF 标 uncertainty（阻断）不静默建柜；模糊图 questions 硬阻断且先于形状判定暴露 |
+| 12 | Proposal 与正式模型分离 | ✅ | `ProposalCabinet`/`NormalizedDesign` 独立类型；只有 compile 产出 AiAction 后经 CommandBus 落地 |
+| 13 | Preview 与 Commit 同源 | ✅ | 面板持有同一个 `run: PlanRun` 状态，预览渲染它、提交也提交它 |
+| 14 | schema/version/migration 无断裂 | ✅ | format 信封 + formatVersion 双版本门；P0 迁移验收逐字节；P4/P5/P6 新增字段全为 additive（origin/caveats 可选，旧读者忽略） |
+| 15 | 旧项目兼容 | ✅ | verify:import 断言导入前旧柜一条不少；verify:migration 存量文件不动 |
+| 16 | 临时兼容层/重复 helper/dead code | ✅（1 处小修） | 删除 `ids.ts` 的 `slugId`（全仓零引用）；`defaultVariant` 有验收引用（保留）；auth.mjs legacy 哈希解析为有意的密码哈希迁移兼容 |
+| 17 | 测试覆盖架构边界 | ✅ | 边界断言在位：动作无坐标、origin 留痕、uncertainty/questions 阻断、Resolver 深比较、观察器负样本（位置/改名/撤销/同值）、关系层字节不变、未登记错误码抛错 |
+| 18 | UI 旧入口/旧语义 | ✅ | 全部 16 面板均挂载（RoomsPanel/VariantPanel 在条件分支内渲染）；RightTab 联合类型由 tsc 把关 |
+| 19 | 文档与代码一致 | ✅（格式统一） | §15–§21 与实现核对一致（断言数、链路、决策）；标题格式 `## §N`→`## N.` 统一 |
+| 20 | 未来扩展点可加性 | ✅ | 真实 Vision：`/api/ai/vision` + RemoteVisionProvider 已就位，gpt-load 挂视觉模型即用；案例归纳：`PredicateKind`/`OBSERVABLE_KINDS` 枚举集中；知识同步：store 函数化（loadKnowledge/saveKnowledge 可换后端）；自动贴合落位：见 §20 决策记录 |
+
+### 22.2 修复记录
+
+1. 删除 `src/core/ids.ts` 的 `slugId()` —— 全仓（src/verify/server/shared）零引用的 dead export。
+2. 文档章节标题格式统一（`## §20/§21` → `## 20./21.`，与 §15–§19 一致）。
+
+### 22.3 确认无需修改（易误报项）
+
+- `verify:lan` 不进 `verify:all`：**有意设计**（脚本头写明——它依赖具体局域网机器，并进常驻验收会让"代码对不对"取决于"机器开没开机"）。
+- `defaultVariant` 未在 src 业务路径引用：它是方案候选的规范构造器，verify:variants 验收覆盖，保留。
+- `compile.ts` 引用几何助手（detectCollisions/nudgeOutOfWalls 等）：这是"系统替 AI 定落位"的执行点，属原则 18 的正例而非越界。
+- auth.mjs 的 `legacySalt` 密码哈希解析：账号哈希格式迁移的有意兼容，有注释与测试。
+
+### 22.4 未来架构 Decision（记录，不擅自选择）
+
+| Decision | 现状 | 触发条件 |
+|---|---|---|
+| D1 自动贴合落位 | 编译期落位快照不含前序动作产物，"声明续接"被严格邻接校验拒收；Vision 走"纯分组+用户确认补连接"诚实绕开 | 若要"AI/Vision 直接声明并排续接"，需干跑期逐动作推进落位快照——动 planRunner 核心，需专门设计 |
+| D2 知识多设备同步 | 知识存浏览器 localStorage（JSONL，函数化封装） | 多人/多设备协作时换云存储——接口已收敛，换实现不动调用方 |
+| D3 真实 Vision 通路 | 路由+Provider 按 OpenAI 兼容协议就位，未实测（无 key 环境） | gpt-load 网关挂视觉模型即可验证，无需改码 |
+| D4 案例库归纳 | Design Knowledge 只有观察/推测两个来源 | 需要批量案例归纳时加第三来源，`PredicateKind` 扩枚举 |
+
+### 22.5 审查时全量测试（2026-09-30）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| 全部 32 个 node verify 脚本（verify:all 全链） | 全部 exit=0 |
+| `verify:ui` | **686 / 686**（console error 0，故意 4xx 48 条单独归类） |
+| 旧断言 | 一条未删、未放宽 |

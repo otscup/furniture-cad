@@ -23,9 +23,3 @@ export function newCommandId(op: string): string {
   cmdSeq++;
   return `cmd_${op.replace(/\W+/g, '_')}_${Date.now().toString(36)}_${cmdSeq.toString(36)}`;
 }
-
-/** 把 "主卧衣柜" → "cabinet_001" 这类稳定短名（用于 DXF 块名/图层名） */
-export function slugId(raw: string): string {
-  const s = raw.trim().replace(/[^\w\u4e00-\u9fa5]+/g, '_').replace(/^_+|_+$/g, '');
-  return s.length ? s : 'item';
-}

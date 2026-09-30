@@ -64,6 +64,7 @@ DWG 付费/SDK 须先确认授权(ODA 无 Web/SaaS 权)。MCP 白名单不暴露
 - **系统自动落位不许覆盖 AI 的朝向**：`pickFreeSpot` 曾丢掉 AI 给的 rotation→两臂并排贴同一面墙。给了 rotation 必须优先挑同朝向的墙。
 - **负样本断言会随修法失效**：修完回头看这条负例现在证明什么，判据该换就换，别留假绿。
 - **会话按房间分格存**：共用历史时"这个柜子再高一档"失去指代。
+- **偏好/知识的 scope 别挂具体对象名**：观察器顺手存 `scope.cabinet=柜名`，结果变成"这只柜喜欢 270°"——换柜子就不算数，还在真正该生效时被 `scopeMatches` 挡掉（表现为"确认了却读不到"，静默假失败）。**可复用偏好挂在"情形/上下文"上，挂对象名就退化成一次性记录**；哪个对象改的交给 evidence 留痕。
 - **缩略图画正视图**：画整项目平面图会把新柜挤成细边(像"复制了房间图形")；只画本房间、不画本次不改的对象(墙)；本房间没有要明说"在别的房间"。
 - **"有没有并进草案"要留在消息上**：画面与上一轮相同时 **toast 不算数**（会消失）。
 - **`.panel-scroll` 三属性缺一不可**：flex:1;overflow:auto;min-height:0。
@@ -88,7 +89,7 @@ AI 网关 6 位 key 非占位符、宿主机测 000 是 DNS 假故障(容器内 
 docs/：Master-Plan-v0.1、Phase0-Spike-Report、Phase1/2/3-Delivery-Report、Architecture-Review-Routing-Correction-Loop、Design-Local-Pick-Edit-and-Staged-Generation、**Semantic-Model-v2-and-AI-Design-Plan（v0.3 路线图 + §15~§19 + §23 P7/P7.1/P7.2/P7.3/P8.1/P8.2/P8.3 实施记录）**、Special-Cabinets-and-Sales-Drawing-Plan。spike/ 一键复现 `bash spike/run.sh`。
 
 ## v0.3 路线（每阶段验收后再进下一阶段）
-P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembly/Connection ✅ `66da2b5` → P3 AI DesignProposal ✅ `26a7639` → P4 Import 骨架 ✅ `6f5541b` → P5 图片识别闭环 ✅ `8aecd76` → P6 设计知识系统 ✅ `a556353` → P7 Manufacturing Semantics ✅ `2552072` → P7.1 Rule Hardening+Test Integrity ✅ `0ec9c77` → P7.2 Rule 架构审视+层板托孔 ✅ `a867f98` → P7.3 箱体连接孔 ✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→`cabinet.place`；canonical= `Cabinet.placement` 不变；adjacent/align/absolute(authored)；静态成环检测）✅ `4290a3a` → P8.2 语义面接触落位（attach 具名面贴合、复用 P2 `EDGE_ORDER`、FACE-NOT-OPPOSING）✅ `7850046` → P8.3 设计语义验证（见下）✅ `53f20a8`。**停在 P8.3，不自动进 P8.4。**
+P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembly/Connection ✅ `66da2b5` → P3 AI DesignProposal ✅ `26a7639` → P4 Import 骨架 ✅ `6f5541b` → P5 图片识别闭环 ✅ `8aecd76` → P6 设计知识系统 ✅ `a556353` → P7 Manufacturing Semantics ✅ `2552072` → P7.1 Rule Hardening+Test Integrity ✅ `0ec9c77` → P7.2 Rule 架构审视+层板托孔 ✅ `a867f98` → P7.3 箱体连接孔 ✅ `67f6764` → P8.1 确定性落位基础设施（PlacementIntent→纯函数引擎→`cabinet.place`；canonical= `Cabinet.placement` 不变；adjacent/align/absolute(authored)；静态成环检测）✅ `4290a3a` → P8.2 语义面接触落位（attach 具名面贴合、复用 P2 `EDGE_ORDER`、FACE-NOT-OPPOSING）✅ `7850046` → P8.3 设计语义验证（见下）✅ `53f20a8` → P8.4 落位偏好接入（见下）✅ `P84HASH`。**停在 P8.4，不自动进 P8.5。**
 - **P2 关系层三条纪律**（`core/relations.ts` 唯一实现）：① 关系层**不产生几何**；② "接不接触"只有 `deriveContacts()` 一处；③ 声明 `authored` 与推断 `inferred` 分开——**只校验声明**。`stack` 无 Z 可核→允许声明但报 `ASSEMBLY-STACK-UNVERIFIED`(INFO)。
 - **P8 落位四条纪律**：① canonical 仍是 `Cabinet.placement{x,y,rotation}`，ResolvedPlacement 只是管道中间产物；② 引擎纯函数(不改 Model/不调 AI/不依赖 UI/不出 DXF/不改 Geometry)；③ attach 不是 adjacent+gap=0(两面各有其名、朝向对不上即报错不退化)；④ **设计语义层只判断不重算、只提示不拦截、不替用户选朝向**。
 - **协作方式（2026-09-29 起）**：用户不再逐条指定文件/函数/步骤，由我自主拆解、实现、测试、提交；他只把产品方向、架构边界与阶段验收。每阶段给一份报告（完成内容/关键架构决策/测试结果/遗留问题/commit hash）。
@@ -103,4 +104,17 @@ P0 冻结形状+迁移护栏 ✅ → P1 垂直 rows ✅ `12e1290` → P2 Assembl
 - **⑥ 接入**：`CompileResult.design`、`PlanRun.design`（干跑预览即带结论）；**不新增写入命令**、**warning 不拦截提交**、preview===commit 照旧。**刻意不进主规则链**（设计语义是提示，进了主链会把"可能合理"报成项目错误，也会挤掉 P6 的 Hard Rule > Design Knowledge > User Preference）。
 - **⑦ 验收**：tsc 0；`verify:placement-design` 107/107；placement 82/82、attach 105/105、relations 82/82、proposal 90/90、import 59/59、manufacturing 101/101、fixhint 27/27（两新码进 NUM_CTX）；全量 verify:all EXIT=0。
 - 文档 §23.11；commit `53f20a8`。
+
+## 本会话进行中（P8.4 · 落位偏好与设计知识接入，已完成验收）
+- **基线 `6d46812`（P8.3）**。目标：观察→candidate→确认→active→提案上下文→语义意图→确定性解析→P8.3 校验。**边界一句话：偏好只影响"建议什么"，绝不影响"几何怎么算"。**
+- **① 审查结论**：P6 `PredicateKind` 维度名够用但**上下文不够**——`{kind,op,value}`+`KnowledgeScope{cabinet,room}` 表达不了"corner/右转角"，裸 `{orientation:270}` 正是被禁止的"corner 永远 270"。最小扩展=在 `KnowledgePredicate` 上加**封闭** `context?: PlacementContext{contact,turnSide}`（不新增 scope、不另造知识系统）。层=**userPreference**。注入口**已存在且唯一**：AIPanel→`knowledgeDigest(resolveKnowledge())`→aiContract。
+- **② 不新增语义字段**：`ProposalCabinet.rotation`（"朝向意图，落位由系统定"）P3 就有并编译进 create 参数，直接复用。模型零新增（`Cabinet.placement` 仍 `{x,y,rotation}`，无 facing/orientation 第二真相）。
+- **③ 观察门禁极严**：仅 op∈{rotate,update,create} 且路径 `placement.rotation` 且 source 是**人**（ui/mcp）且值真变（-90≡270 不算）且**拿得到上下文**，才产生 candidate。AI(source='ai') 一条都不产生；system(撤销) 不产生；**`cabinet.place` 整类排除**（Resolver 输出当证据=自我强化闭环）；纯 x/y 移动不产生；无上下文（孤立柜/stack）不产生。
+- **④ 真问题（实现中抓到）**：观察原本把 `scope.cabinet=柜名` 一起存 → 偏好只在"叫这名字的柜"上生效，既不可复用又在真正该生效时被 `scopeMatches` 挡掉（applicable 恒 0，症状是"确认了却读不到偏好"）。**落位偏好挂在情形上，不挂柜名**；是哪只柜改的由 evidence.cabinetId 留痕。
+- **⑤ 上下文不同=两类情形**：`contextKey` 分格——右转角 270 与左转角 90 **不冲突、不合并**（否则被迫二选一）；同上下文不同值才是真冲突（双方都保留人工裁决）。`turnSide` 以**对方柜**为视角，转自己时不变才沉淀得出知识。
+- **⑥ 优先级证据三条**：硬规则冲突→进 suppressed 且不进 applicable；`preferredOrientation()` 只读 applicable（未确认/被压制→null，"没依据就别说"）；流水线层偏好在而 P8.3 结论**逐值不变**（error 不消失、warning 不抹平、alternatives/ambiguous 一个不少）。
+- **⑦ 硬性边界**：`placement.ts`/`placementDesign.ts` **不 import knowledge**（源码扫描）；有/无偏好同一 intent 解析结果逐值相同；偏好只变提案 rotation，x/y 仍由 Resolver 算（偏好换 90 时位置随之重算）；不新增写入命令；preview===commit。
+- **⑧ 主动缩小范围（并写明原因）**：只落地 `orientation` 一类。corner turn side 与 orientation 同源证据无法区分"偏好右转"vs"房间只能右转"；alignment 类因**模型不存落位意图**（placement 只有 x/y/rotation，"按背面齐还是中心齐"落盘即消失），而对齐偏好只能从 x/y 观察——与"普通移动不产生偏好"直接冲突，硬造 relation 字段=拿猜测当证据。
+- **⑨ 验收**：tsc 0；`verify:placement-preference` 96/96；knowledge 61/61、placement 82/82、attach 105/105、placement-design 107/107、relations、proposal、import 59/59、manufacturing 101/101、fixhint 全绿；全量 verify:all EXIT=0。
+- 文档 §23.12；commit `P84HASH`。
 - **明确不做**：自动改 rotation、自动选方案、Z 轴、上下叠放、贴墙/房间边界/门窗、碰撞优化、全屋布局、P8.4。

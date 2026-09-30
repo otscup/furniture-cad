@@ -16,7 +16,15 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-import type { KnowledgeEntry, KnowledgePredicate, KnowledgeScope } from './model.ts';
+import {
+  contextCovers,
+  contextKey,
+  placementContextZh,
+  type KnowledgeEntry,
+  type KnowledgePredicate,
+  type KnowledgeScope,
+  type PlacementContext,
+} from './model.ts';
 
 /** 当前设计上下文（Resolver 只读它做 scope 匹配） */
 export interface KnowledgeContext {
@@ -79,9 +87,14 @@ function asNumber(v: number | string): number | null {
  */
 export function predicatesConflict(a: KnowledgePredicate, b: KnowledgePredicate): boolean | null {
   if (a.kind !== b.kind) return false;
-  // 枚举维度：prefer 两个不同值 = 矛盾建议（同层）；min/max/forbid 不参与
+  // 上下文不同 = 说的不是同一件事：右转角偏好 270 与左转角偏好 90 并不矛盾
+  // —— 反过来，若不看上下文，两条偏好会被误判成冲突而被迫"二选一"。
+  if (contextKey(a.context) !== contextKey(b.context)) return false;
+  // 枚举维度：prefer 两个不同值 = 矛盾建议（同层）；forbid 命中 prefer 的值 = 硬禁止
   if (!NUMERIC_KINDS.has(a.kind)) {
     if (a.op === 'prefer' && b.op === 'prefer') return a.value !== b.value;
+    if (a.op === 'forbid' && b.op === 'prefer') return a.value === b.value;
+    if (b.op === 'forbid' && a.op === 'prefer') return b.value === a.value;
     return false;
   }
   const av = asNumber(a.value);
@@ -118,6 +131,7 @@ function whyOf(e: KnowledgeEntry, ctx: KnowledgeContext): string {
   };
   parts.push(originZh[e.evidence[0]?.source ?? 'system']);
   if (e.confirmedAt) parts.push('已确认');
+  if (e.predicate?.context) parts.push(`适用情形：${placementContextZh(e.predicate.context)}`);
   return parts.join(' · ');
 }
 
@@ -193,4 +207,22 @@ export function resolveKnowledge(ctx: KnowledgeContext, entries: KnowledgeEntry[
 /** 段落维度是否可判定参与冲突（供观察器决定是否生成谓词） */
 export function isJudgable(kind: KnowledgePredicate['kind']): boolean {
   return NUMERIC_KINDS.has(kind) || kind === 'unitKind' || kind === 'layoutStyle';
+}
+
+/**
+ * 当前情形下**建议**的朝向（P8.4）—— 只回答"建议什么"，**不回答"几何怎么算"**。
+ *
+ *  · 只从 `applicable` 里读：未确认的 candidate 不算，被硬规则压制的也不算。
+ *  · 它不参与、更不影响 `resolvePlacement` —— 落位永远是确定性解析的结果。
+ *  · 返回 null = 没有可依据的偏好。**没依据就别说**，不猜一个默认值回来。
+ */
+export function preferredOrientation(res: KnowledgeResolution, ctx: PlacementContext): number | null {
+  for (const { entry } of res.applicable) {
+    const p = entry.predicate;
+    if (!p || p.kind !== 'orientation' || p.op !== 'prefer') continue;
+    if (!contextCovers(p.context, ctx)) continue;
+    const n = Number(p.value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
 }

@@ -49,16 +49,75 @@ export type PredicateKind =
   | 'cabinetWidth'  // 柜宽 mm（数值）
   | 'cabinetDepth'  // 柜深 mm（数值）
   | 'unitKind'      // 分区类型（枚举：drawerBank/hanging/shelves/open/appliance）
-  | 'layoutStyle';  // 布局风格（枚举：moreDrawers/moreHanging/moreOpen）
+  | 'layoutStyle'   // 布局风格（枚举：moreDrawers/moreHanging/moreOpen）
+  /** 柜体朝向 deg（0/90/180/270）—— **只在 PlacementContext 下有意义**，见下 */
+  | 'orientation';
 
 /** 比较方向：prefer = 软建议值；min/max = 范围边界（hardRule 用）；forbid = 禁止 */
 export type PredicateOp = 'prefer' | 'min' | 'max' | 'forbid';
+
+/**
+ * 落位上下文（P8.4）—— 朝向偏好**必须带上下文**，否则它就是设计习惯冒充规则。
+ *
+ * 「corner 副臂一律 rotation=270」是把一次观察写死成规则：左转角、镜像结构、
+ * 不同家具都能有别的合理朝向。同一条柜体朝向，在**右转角**里合适、在**左转角**
+ * 里可能正是被 P8.3 报可疑的那个 —— 所以偏好只在**同样的上下文**里才叫偏好。
+ *
+ * 字段一个都不新造，全部来自已有确定性事实：
+ *   · contact  ← P2 `Connection.kind`（声明）/ `deriveContacts().kind`（派生）
+ *   · turnSide ← P8.3 `cornerTurnSide()`，且**以对方柜为视角**（转自己时它不变）
+ *
+ *  ── 为什么没有 relation（adjacent / align / attach）──
+ *    语义模型里 `Cabinet.placement` 只有 {x, y, rotation} —— **不存落位意图**。
+ *    "这次并排是按背面齐还是按中心齐"落盘即消失，事后无法从模型反推。
+ *    硬造一个 relation 字段等于拿猜测当证据，所以对齐类偏好本阶段不做。
+ */
+export interface PlacementContext {
+  /** 接触形态：corner = 角接（L 型）；butt = 并排/前后续接 */
+  contact?: 'corner' | 'butt';
+  /** 转角方向（仅 corner 有意义）：站在**参照柜**背面朝它门脸看，目标柜在哪侧 */
+  turnSide?: 'left' | 'right';
+}
+
+/** 有上下文的落位类维度（这些维度**不接受**无上下文的谓词） */
+export const PLACEMENT_KINDS: PredicateKind[] = ['orientation'];
 
 export interface KnowledgePredicate {
   kind: PredicateKind;
   op: PredicateOp;
   /** prefer/min/max 的值（数值维度为 mm/个数，枚举维度为字符串） */
   value: number | string;
+  /** 落位类谓词的上下文（见 PlacementContext）；非落位维度不带 */
+  context?: PlacementContext;
+}
+
+/** 上下文的稳定键（用于"是不是同一类情形"的比较，不用于展示） */
+export function contextKey(c?: PlacementContext): string {
+  if (!c) return '';
+  return `contact=${c.contact ?? '*'};turn=${c.turnSide ?? '*'}`;
+}
+
+/**
+ * 偏好上下文是否**覆盖**当前情形 —— 偏好里写了的字段必须逐项相等，
+ * 没写的字段不限（"右转角偏好 270"不要求 contact 也一致 —— 它自己就写了）。
+ */
+export function contextCovers(pc: PlacementContext | undefined, ctx: PlacementContext): boolean {
+  if (!pc) return true;
+  if (pc.contact !== undefined && pc.contact !== ctx.contact) return false;
+  if (pc.turnSide !== undefined && pc.turnSide !== ctx.turnSide) return false;
+  return true;
+}
+
+const CONTACT_ZH: Record<string, string> = { corner: '角接（L 型）', butt: '并排/前后续接' };
+const TURN_ZH: Record<string, string> = { left: '左转角', right: '右转角' };
+
+/** 上下文的人话（展示与摘要用；空上下文如实说"不限定情形"） */
+export function placementContextZh(c?: PlacementContext): string {
+  if (!c || (c.contact === undefined && c.turnSide === undefined)) return '不限定情形';
+  const parts: string[] = [];
+  if (c.contact) parts.push(CONTACT_ZH[c.contact] ?? c.contact);
+  if (c.turnSide) parts.push(TURN_ZH[c.turnSide] ?? c.turnSide);
+  return parts.join(' · ');
 }
 
 /** 适用范围 —— 第一版只做柜体名/房间名的精确匹配，'any' = 不限 */

@@ -3,6 +3,7 @@ export * from './resolver.ts';
 export * from './observe.ts';
 export * from './store.ts';
 export * from './digest.ts';
+export * from './placementContext.ts';
 
 import { loadCorrections } from '../correctionStore.ts';
 import { hardRuleEntries, type KnowledgeEntry } from './model.ts';

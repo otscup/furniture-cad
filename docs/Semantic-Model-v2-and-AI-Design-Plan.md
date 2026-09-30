@@ -1410,3 +1410,89 @@ ambiguous: true   // 候选不止一个
 3. **用户偏好影响朝向**：P6 的 userPreference 可作为 candidate orientation preference 影响下一次 Proposal，但不得覆盖硬几何约束。
 
 - 本阶段停在 P8.3，未自动进入 P8.4。
+
+---
+
+### 23.12 P8.4 实施记录：落位偏好与设计知识接入（Placement Preference / Design Knowledge Integration，已完成）
+
+> 把 P6 Design Knowledge、P8.1 确定性落位、P8.2 面接触、P8.3 设计语义验证接成一条链：
+> **观察 → candidate → 用户确认 → active → 提案上下文 → 语义意图 → 确定性解析 → 设计校验**。
+> 一句话边界：**偏好只影响"建议什么"，永远不影响"几何怎么算"。**
+
+#### 23.12.1 架构审查结论（先审查，后编码）
+
+| 审查问题 | 结论 |
+| --- | --- |
+| P6 `PredicateKind` 是否够用 | **维度名够用，上下文不够**：`{kind, op, value}` + `KnowledgeScope{cabinet,room}` 表达不了"corner / 右转角"。裸的 `{kind:'orientation',value:270}` 恰恰就是被禁止的"corner 永远 270" |
+| 最小扩展点 | 在 `KnowledgePredicate` 上加**封闭的** `context?: PlacementContext`（`contact` + `turnSide`），不新增 scope 字段、不新增第二套知识系统 |
+| 属于哪一层 | **userPreference**（来自该用户的行为观察）。designKnowledge 是"行业通常这样做"，与本阶段来源不同 |
+| 怎么防止被当成硬规则 | 复用既有机制：layer rank（hard 0 / knowledge 1 / preference 2）+ candidate 不进 `applicable` + 硬规则压制进 `suppressed`/`conflicts` |
+| 提案注入口是否已有 | **已有且唯一**：`AIPanel` → `knowledgeDigest(resolveKnowledge(...))` → `aiContract` system prompt。本阶段只扩展 digest 内容，不新建提示词系统 |
+| P8.3 的结论要不要影响偏好 | **不要**。warning 是提示不是证据；偏好也不得反过来消灭 P8.3 结论 |
+| 需不需要新语义字段 | **不需要**。`ProposalCabinet.rotation`（"朝向意图，落位由系统定"）P3 就已存在并编译进 create 参数，本阶段直接复用 |
+
+#### 23.12.2 偏好数据模型（带上下文，不是裸值）
+
+```ts
+interface PlacementContext {
+  contact?:  'corner' | 'butt';   // ← P2 Connection.kind / deriveContacts().kind
+  turnSide?: 'left'   | 'right';  // ← P8.3 cornerTurnSide()，**以对方柜为视角**
+}
+predicate = { kind: 'orientation', op: 'prefer', value: 270, context: { contact:'corner', turnSide:'right' } }
+```
+
+- `turnSide` 取**对方柜**为视角：转目标柜时上下文不变，否则改一次朝向就换一个上下文，永远沉淀不出知识。
+- 上下文不同即**两类情形**：右转角 270 与左转角 90 不冲突、不合并（冲突检测与证据累积都按 `contextKey` 分格）。
+- **语义模型零新增字段**：`Cabinet.placement` 仍是 `{x,y,rotation}`，没有 `facing`/`orientation` 第二真相（验收逐键断言）。
+
+#### 23.12.3 观察门禁（只有能证明是用户选择的改动才成为证据）
+
+产生候选的**全部**条件：命令 op ∈ {`cabinet.rotate`, `cabinet.update`, `cabinet.create`} 且路径是 `placement.rotation`、source 是**人的来源**（`ui`/`mcp`）、值确实变了（等价角 `-90 ≡ 270` 不算）、且**拿得到上下文**。
+
+| 情形 | 是否产生 | 理由 |
+| --- | --- | --- |
+| 用户改朝向（90 → 270） | ✅ candidate | 唯一能证明"用户选择"的落位证据 |
+| AI 给的朝向（source='ai'） | ❌ 一条都不产生 | 尚未经用户确认，不得冒充 user-observed |
+| 撤销 / 系统（source='system'） | ❌ | 不是新事实 |
+| `cabinet.place`（Resolver 算的） | ❌ **整类排除** | 系统输出当证据 = 自我强化闭环 |
+| 同值写入 / 等价角 | ❌ | 没有发生改动 |
+| 只挪 x/y | ❌ | 位置是一次性决定，不是偏好 |
+| 拿不到上下文（孤立柜 / stack） | ❌ | 说不出是哪一类情形，就不记（不猜） |
+
+> 实现中发现并修掉的一个真问题：观察原本会把 `scope.cabinet = 柜名` 一起存下来，导致偏好只在"叫这个名字的柜子"上生效 —— 既不可复用，也会在真正该生效时被 `scopeMatches` 挡掉。**落位偏好挂在情形上，不挂在柜子名上**（是哪只柜改的，证据里 `cabinetId` 已留痕）。
+
+#### 23.12.4 生命周期与优先级（复用 P6，不重新定义）
+
+`观察 → candidate（置信 0.3）→ 累积同类证据（不升级）→ 用户确认 → active（置信 1）`，另有 `rejected`。
+优先级沿用既有三层：**Hard Rule > Design Knowledge > User Preference**，实现证据三条：
+① 与硬规则冲突的偏好进 `suppressed` 且不出现在 `applicable`；② `preferredOrientation()` 只读 `applicable`（被压制/未确认的一律读不到，返回 null = "没依据就别说"）；③ 流水线层：偏好在，P8.3 的 error/warning 结论**逐值不变**。
+
+#### 23.12.5 本阶段**没有**做的三类偏好（及原因）
+
+用户建议了四类，本阶段只落地了 `orientation` 一类，另外三类明确不做 —— 不是偷懒，是模型不足以安全表达：
+
+- **corner turn side preference**：与 orientation 来自同一条证据，无法区分"用户偏好右转角"与"这个房间只能右转"，记下来是重复计数。
+- **adjacent / attach alignment preference**：语义模型的 `Cabinet.placement` **不存落位意图**（只存 `{x,y,rotation}`），"这次并排按背面齐还是中心齐"落盘即消失；而对齐偏好只能从 x/y 移动观察 —— 那又与"普通移动不产生偏好"直接冲突。硬造 `relation` 字段 = 拿猜测当证据。
+
+#### 23.12.6 边界的硬保证（不是约定，是结构与断言）
+
+- `placement.ts` / `placementDesign.ts` **不 import knowledge**（源码扫描断言）；有偏好与没偏好，同一 `PlacementIntent` 的解析结果**逐值相同**。
+- 偏好只变成提案里的 `rotation` 语义意图；**x/y 仍由 Resolver 算**（偏好换成 90 时位置随之重算，证明位置来自几何而非偏好）。
+- 不新增写入命令、不改 `cabinet.place`；`preview === commit` 照旧。
+- 多解保留：`alternatives` 与 `ambiguous` 一个都不少，偏好的 270 只是候选之一。
+
+#### 23.12.7 核心文件
+
+新增：`src/ai/knowledge/placementContext.ts`（上下文派生）、`verify/placement-preference-acceptance.ts`（96 断言）。
+修改：`src/ai/knowledge/model.ts`（PlacementContext / orientation / contextKey / contextCovers）、`resolver.ts`（上下文感知冲突 + `preferredOrientation`）、`observe.ts`（旋转观察 + 门禁 + 上下文分格）、`digest.ts`（上下文展示 + 落位免责条款）、`index.ts`、`src/ui/App.tsx`（传上下文）、`package.json`。
+
+#### 23.12.8 验收
+
+- `tsc --noEmit` 0 错；`verify:placement-preference` **96/96**。
+- 回归：knowledge 61/61、placement 82/82、attach 105/105、placement-design 107/107、relations、proposal、import 59/59、manufacturing 101/101、fixhint 全绿。
+- 全量 `verify:all`（node + UI）：**VERIFY_ALL_EXIT=0**，UI 686/686、零 console error、2735 条断言 0 红。
+- 旧测试零删除、零放宽；P6 原有 61 条断言（含"450 硬规则 vs 400 偏好"）逐条保留。
+
+#### 23.12.9 停在 P8.4
+
+下一步候选（仅记录不做）：alignment 类偏好需先让落位意图可追溯；UI 渲染"设计语义提示"区块；用户偏好影响 Proposal 后的二次确认回路。

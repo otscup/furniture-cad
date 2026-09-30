@@ -18,7 +18,7 @@ import { Viewport } from './Viewport.tsx';
 const ThreeViewport = lazy(() => import('./ThreeViewport.tsx').then((m) => ({ default: m.ThreeViewport })));
 import { Toolbar } from './Toolbar.tsx';
 import type { RightTab } from './Toolbar.tsx';
-import { observeCommand, recordObservation, loadKnowledge, saveKnowledge } from '../ai/knowledge/index.ts';
+import { observeCommand, recordObservation, loadKnowledge, saveKnowledge, placementContextOf } from '../ai/knowledge/index.ts';
 import { ContextMenu } from './ContextMenu.tsx';
 import type { CtxItem } from './ContextMenu.tsx';
 import { StatusBar } from './StatusBar.tsx';
@@ -338,7 +338,9 @@ export function App() {
       // 撤销/重做/被丢弃的分支不是新事实
       if (!e.applied || e.command.source === 'system') continue;
       const cab = e.command.target?.kind === 'cabinet' ? bus.getState().cabinets.find((c) => c.id === e.command.target?.id) : undefined;
-      for (const obs of observeCommand(e.command, e.diff, cab?.name)) {
+      // 落位上下文（P8.4）：朝向类观察必须带"发生在哪一类情形里"，拿不到就不观察
+      const pCtx = cab ? placementContextOf(bus.getState(), cab.id) : null;
+      for (const obs of observeCommand(e.command, e.diff, cab?.name, pCtx)) {
         saveKnowledge(recordObservation(loadKnowledge(), obs));
       }
     }

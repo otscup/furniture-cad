@@ -735,3 +735,72 @@ src/import/
 - **真实 Vision API 通路未实测**（本机无可用 key 的视觉模型）：`/api/ai/vision` 路由 + `RemoteVisionProvider` 已按 OpenAI 兼容协议就位，语法校验通过；接通验证与提示词调优留到有 key 环境（gpt-load 网关后挂视觉模型即可，无需改码）。
 - **「声明续接 → 系统自动贴合落位」是既有缺口**（非 P5 引入）：编译期 `pickFreeSpot` 基于编译时快照，多动作序列中后建柜看不到先建柜，故声明 butt 必被严格邻接校验拒收。P5 的处理是诚实绕开（组合=纯分组，连接由用户确认后用 P2 既有命令补）；若未来要"AI/Vision 直接声明并排续接"，需在干跑期逐动作推进落位快照——已记为独立架构项，不在 P5 范围内动。
 - B43 同时补上了 **P4 的 UI 覆盖缺口**（P4 报告称"导入页签已覆盖"，实测 661 条中并无 ImportPanel 断言——本轮已修正并新增 17 条）。
+
+---
+
+## §21 P6 实施记录：设计知识系统第一版（三层分离）
+
+> commit `a556353`。目标：把「硬规则 / 设计知识 / 用户偏好」从架构上分层，为「根据设计师历史修改持续优化」打地基。不做大模型记忆库。
+
+### 21.1 三层边界与执行体（单一真相源）
+
+| 层 | 内容 | 执行体 | 来源 |
+|---|---|---|---|
+| Hard Rule | 几何/板厚/五金/结构约束 | **Rules Engine + CommandBus 记忆门**（原有，不在知识层重新实现） | 规则集 + active Correction（引用） |
+| Design Knowledge | 「这类衣柜通常怎么做」 | 无 —— 只作 AI 规划参考 | AI 推测 / 归纳 |
+| User Preference | 「这个用户习惯怎么做」 | 无 —— 只作 AI 规划参考 | 行为观察（candidate）/ 用户明说（active） |
+
+优先级**确定性**：`hardRule > designKnowledge > userPreference`，由 Resolver 判定，不由 AI 决定。
+
+### 21.2 生命周期（不是"用户改过一次就永久记住"）
+
+```
+事实/观察（observeCommand：LogEntry.diff 的有限语义维度）
+  → candidate（置信 0.3 起步，同值重复观察合并证据、上限 0.9）
+  → 用户在知识面板确认（唯一升级通道）→ active（confidence=1）
+  →（可 rejected 撤回）
+用户明说（知识面板手动输入 / 「以后都这样」）→ user-stated → 直接 active
+```
+
+candidate **永远不进** Resolver 的 applicable —— 没确认的知识不参与规划。
+
+### 21.3 关键组件（src/ai/knowledge/）
+
+| 文件 | 职责 |
+|---|---|
+| `model.ts` | `KnowledgeEntry`（layer/status/origin/predicate/scope/evidence/confidence/confirmedAt/conflicts）；谓词是**有限集合**（drawerCount/rowHeight/cabinetWidth/cabinetDepth/unitKind/layoutStyle），无谓词的知识只展示不参与冲突检测；不保存 geometry/坐标/DXF primitive |
+| `observe.ts` | 修改观察器：吃 CommandBus 的 `LogEntry.diff`（权威 diff，不重新算），只翻译行高/件数/分区类型/柜宽深四类有限语义事实；撤销/系统命令/位置移动/改名不产生知识；观察只产生 candidate |
+| `resolver.ts` | 确定性纯函数（验收深比较输入不变）：scope 匹配 → candidate 过滤 → 硬规则压制（数值/枚举冲突检测）→ 同层矛盾暴露。输出 `{applicable, conflicts, suppressed}`，**不产生 Command、不写模型** |
+| `store.ts` | JSONL localStorage/内存（与 correctionStore 同模式），键序固定往返逐字节幂等。**不进 project.json**（知识是跨项目用户资产，不背项目往返契约） |
+| `digest.ts` | Resolver 结果 → AI system prompt 附加段；明写「硬规则永远优先、方案仍将通过规则校验」；无知识时为空（不注入空段落） |
+
+与 Phase 2 Correction 的关系：Correction 是**拦阻性**记忆（编译成检查挂在 CommandBus 门），Knowledge 是**建议性**知识（供规划参考）。hardRule 层把 active Correction 引用进来做**提前暴露**（提交前告诉 AI/用户会撞硬规则），最终拦截仍由原执行体负责。
+
+### 21.4 冲突处理（以用户原例验证）
+
+硬规则「五金最小净宽 450mm」 vs 用户偏好「我喜欢所有抽屉都做 400」：
+偏好被压制（不进 applicable）→ 进 `suppressed` + `conflicts`（kind=`hard-rule-beats-preference`）→ 冲突理由点名双方原文与数值 → AI 的知识摘要里出现「必须遵守硬规则一方，不得绕过」。同层矛盾（两条 active 偏好建议不同值）双方都保留、冲突暴露，AI 不替用户选。
+
+### 21.5 与既有链路集成（不造第二套流程）
+
+`shared/aiContract.buildDesignRequest` 新增可选 `knowledgeDigest`（不破坏既有调用）→ `/api/ai/design` 透传（截断 4000 字）→ AIPanel 生成设计方案时按当前房间注入适用知识。AI 产出仍是 DesignProposal，仍走 validateProposal → dryRunPlan → 确认 → CommandBus。知识不给 AI 任何特权。
+
+### 21.6 UI（轻量验证闭环）
+
+右侧「知识」页签（KnowledgePanel）：分层列表（层/来源/置信/scope/确认状态/冲突）+ 候选「确认生效/拒绝」+ 手动添加偏好 + 「给 AI 的知识摘要」调试段。不做知识管理后台。
+
+### 21.7 验收（实测 2026-09-30）
+
+| 判据 | 结果 |
+|---|---|
+| `tsc --noEmit` | 无错 |
+| `verify:knowledge`（新建，接入 `verify:all`） | **61 / 61**：用户 8 条测试要求逐条覆盖（450 vs 400 真实例子验冲突、同层矛盾、provenance 原话保留、Resolver 深比较不变、观察器负样本：位置/改名/撤销/同值不产生知识、JSONL 往返幂等、digest 空态） |
+| `verify:ui` | **686 / 686**（B44 共 8 条：知识页签 → 手动偏好生效 → 卡片标注 → AI 摘要段 → 面板边界声明；console error 0） |
+| 全量 node 链 | 全部 exit=0 |
+| 旧断言 | 一条未删、未放宽 |
+
+### 21.8 遗留与后续（P6 之后）
+
+- 谓词维度目前 6 种（有限可靠集）。更多维度（分格风格比例、五金品牌偏好等）= 在 `PredicateKind` 加枚举 + `observe.ts` 加翻译 + 冲突检测——扩展点集中，不需要动架构。
+- Design Knowledge 目前只有用户观察/AI 推测两个来源，尚无「从案例库归纳」的自动通道（那是后续版本的活）。
+- 知识暂为浏览器 localStorage（跨项目用户资产）；多人/多设备同步需上云，属商业化阶段。

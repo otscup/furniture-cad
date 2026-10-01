@@ -536,6 +536,139 @@ export function validateCandidateRequest(raw) {
 }
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ *  规划请求（P9.5）—— AI 表达"请为这些柜体在这些方向下做一次规划"的唯一入口
+ *
+ *  ── 与 `candidateRequest`（P9.3）的分工 ──
+ *    `candidateRequest` ：最小的候选通道 —— "我想看这几条意图下的候选摆法"。
+ *    `plannerRequest`   ：规划通道 —— 在上面再加**目标方向**（`generationGoals`）
+ *                         与**规模上限**（`maxCabinets` 由系统按 `PLANNER_LIMITS` 卡）。
+ *    两者都**不是动作**：它们不改模型，所以都不进 ACTIONS（动作清单仍 21 条）。
+ *    两者最终都由**同一个确定性生成器**产出候选 —— 没有第二套枚举。
+ *
+ *  ── 铁律：规划请求里**没有几何**（与 candidateRequest 同一条）──
+ *    AI 能给的只有 **id 引用**（意图 / 柜体）、**枚举**（scope）、**方向词**
+ *    （generationGoals，9 词闭集）与一个数量上限。
+ *    不许出现 x / y / rotation / polygon / placement / **wallId / wallStart / wallEnd**
+ *    —— 墙只能用"希望贴墙"这类**语义目标**去说（"贴哪面墙"是落位决定，不是 AI 能拍板的事，
+ *    与 P9.2 拒绝把 wallId 放进 DesignIntentScope 是同一条理由）。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+export const PLANNER_REQUEST_KEYS = ['scope', 'intentIds', 'cabinetIds', 'generationGoals', 'maxCandidates'];
+
+/**
+ * 规划规模上限 —— 超限**整份拒绝**，绝不裁剪。
+ * 与 `src/core/planner/model.ts` 的 `MAX_PLANNER_*` 必须逐字一致（由 verify:ai-planner 断言）。
+ * 原由：一次规划覆盖 200 只柜在形状上合法，但枚举成本与上下文都会失控；
+ * 而"悄悄砍到 24 只"会让用户以为整屋都规划了 —— 静默丢柜。
+ */
+export const PLANNER_LIMITS = { maxCabinets: 24, maxIntents: 12, maxGoals: 9 };
+
+/** 明确点名拒收的"几何"键（规划请求版）—— 比候选请求多一组"墙"的名字 */
+const PLANNER_GEOMETRY_KEYS = new Set([
+  'x',
+  'y',
+  'z',
+  'rotation',
+  'angle',
+  'dx',
+  'dy',
+  'polygon',
+  'points',
+  'pts',
+  'path',
+  'placements',
+  'placement',
+  'geometry',
+  'coordinates',
+  'wallId',
+  'wallStart',
+  'wallEnd',
+  'wallCoords',
+  'bbox',
+  'radius',
+  'arc',
+]);
+
+/**
+ * 校验（并归一化）一个规划请求。白名单口径与 `validateAction` / `validateCandidateRequest`
+ * 完全一致：未知键一律整条拒收，不"忽略掉不认识的部分继续"。
+ *
+ * 这里只做**形状**：id 存不存在、意图是不是 active、目标词认不认识 —— 全在 core 层
+ * （`src/core/planner/request.ts`）对着项目判。分层做，不重复。
+ *
+ * @returns { ok: true, request } | { ok: false, code, error }
+ */
+export function validatePlannerRequest(raw) {
+  if (!isPlainObject(raw)) return { ok: false, code: 'NOT_OBJECT', error: '规划请求不是一个对象' };
+
+  const geo = Object.keys(raw).filter((k) => PLANNER_GEOMETRY_KEYS.has(k));
+  if (geo.length > 0) {
+    return {
+      ok: false,
+      code: 'GEOMETRY_FORBIDDEN',
+      error: `规划请求不许带几何字段：${geo.join('、')} —— 坐标与"贴哪面墙"一律由系统确定性算，AI 只给 id 与目标方向`,
+    };
+  }
+  const extra = Object.keys(raw).filter((k) => !PLANNER_REQUEST_KEYS.includes(k));
+  if (extra.length > 0) {
+    return { ok: false, code: 'EXTRA_KEY', error: `规划请求里出现了契约外的字段：${extra.join('、')}` };
+  }
+
+  const out = {};
+  for (const key of ['intentIds', 'cabinetIds']) {
+    if (raw[key] !== undefined) {
+      if (!Array.isArray(raw[key]) || raw[key].some((v) => typeof v !== 'string' || v.length > MAX_STRING)) {
+        return { ok: false, code: 'BAD_IDS', error: `${key} 必须是字符串 id 数组（每个 ${MAX_STRING} 字以内）` };
+      }
+      out[key] = [...raw[key]];
+    }
+  }
+  if (out.intentIds && out.intentIds.length > PLANNER_LIMITS.maxIntents) {
+    return {
+      ok: false,
+      code: 'EXCESS_SCALE',
+      error: `规划请求要按 ${out.intentIds.length} 条意图规划，超过上限 ${PLANNER_LIMITS.maxIntents} —— 请拆成几次规划（不裁剪）`,
+    };
+  }
+  if (out.cabinetIds && out.cabinetIds.length > PLANNER_LIMITS.maxCabinets) {
+    return {
+      ok: false,
+      code: 'EXCESS_SCALE',
+      error: `规划请求要规划 ${out.cabinetIds.length} 只柜体，超过上限 ${PLANNER_LIMITS.maxCabinets} —— 请拆成几次规划（不裁剪，免得你以为整屋都规划了）`,
+    };
+  }
+  if (raw.generationGoals !== undefined) {
+    if (!Array.isArray(raw.generationGoals) || raw.generationGoals.some((v) => typeof v !== 'string')) {
+      return { ok: false, code: 'BAD_GOALS', error: 'generationGoals 必须是字符串数组（目标方向词）' };
+    }
+    if (raw.generationGoals.length > PLANNER_LIMITS.maxGoals) {
+      return {
+        ok: false,
+        code: 'EXCESS_SCALE',
+        error: `generationGoals 给了 ${raw.generationGoals.length} 个目标词，超过上限 ${PLANNER_LIMITS.maxGoals}`,
+      };
+    }
+    out.generationGoals = [...raw.generationGoals];
+  }
+  if (raw.scope !== undefined) {
+    if (raw.scope !== 'room' && raw.scope !== 'project') {
+      return { ok: false, code: 'BAD_SCOPE', error: `scope 只允许 "room" 或 "project"，收到 "${String(raw.scope)}"` };
+    }
+    out.scope = raw.scope;
+  } else {
+    out.scope = 'project';
+  }
+  if (raw.maxCandidates !== undefined) {
+    if (!Number.isInteger(raw.maxCandidates) || raw.maxCandidates < 1) {
+      return { ok: false, code: 'BAD_MAX', error: `maxCandidates 必须是 ≥1 的整数，收到 ${String(raw.maxCandidates)}` };
+    }
+    out.maxCandidates = raw.maxCandidates;
+  }
+  return { ok: true, request: out };
+}
+
+/**
  * 部件词汇表（闭合，Task #25 A3）—— 来自 core/geometry/pickLines.ts 的 CabinetPart。
  * AI 只允许用清单里的部件名指"图上那条线"；写别的一律整条拒收。
  */
@@ -1118,6 +1251,27 @@ export function buildUserMessage(text, snapshot, history = []) {
    */
   lines.push(
     '快照里的 `candidateScore` 是系统对候选布局的**确定性评分结论**（只读）：逐条给出可用/不可行、命中项数（`total`，null = 有阻断错误、不评分）、判不出来的项数、以及阻断错误码。三点注意：① 它**只读**，你**不能**据此选择方案、也不能宣布"哪个更好"—— 选哪个由用户拍板，你也没有任何能落地候选的动作；② 里面**没有任何坐标**，别试图从它反推位置；③ 它**不含用户偏好**的命中（`preferencesApplied: false`），所以"没列出来"不等于"没命中"。'
+  );
+  /**
+   * 规划请求的读法（P9.5）。与上面四段**同一条纪律**：能表达诉求，不能改模型、不能给几何。
+   *
+   * ── 为什么要点名"哪些不能写" ──
+   *   这是最容易被模型"顺手补全"的一次：它知道房间多宽、柜子多大，很容易想帮你把
+   *   x / y / rotation 一并算出来。但那份几何它**看不到墙的真实位置**（快照里没有墙坐标），
+   *   算出来就是猜；猜出来的坐标扎进墙里，整份会被拒。所以这里把"不许写什么"逐项列全。
+   *
+   * ── 为什么要说清"你只负责组织目标" ──
+   *   Planner 的职责分工是：**你**说"要为这些柜、在这些方向上做一次规划"，
+   *   **系统**负责枚举候选、算坐标、做校验、打分。你既不设计几何，也不当裁判。
+   */
+  lines.push(
+    '想要"为若干柜体做一次设计规划"时，你可以额外输出一个 `plannerRequest`：' +
+      '`{ scope, intentIds?, cabinetIds?, generationGoals?, maxCandidates? }`。' +
+      '`scope` 是 `"room"` / `"project"`；`intentIds` / `cabinetIds` 只给 **id**；' +
+      '`generationGoals` 给**目标方向词**（从快照 `designIntent` 的 `goal` 词里挑，例如 `wall-contact`）。' +
+      '**绝对不要给** x / y / rotation / polygon / placement，也**不要给 wallId**（"贴哪面墙"是系统的落位决定，不是你能拍板的）——' +
+      '坐标一律由系统的确定性落位引擎算。系统据此枚举候选并给出确定性评分；' +
+      '**候选不会被自动采用**，你也**不要**替用户挑一个"推荐方案"：你只负责把需求组织成规划目标。'
   );
   lines.push('');
   lines.push('【用户这一句要求】');

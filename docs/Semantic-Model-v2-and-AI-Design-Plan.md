@@ -2898,3 +2898,134 @@ CandidateLayout
 **停在 P9.4。**（续段后仍不做：权重系统、P9.5 AI Planner、LLM 自动布局、自动选 winner、
 自动 adopt、候选 UI 接线、多柜组合枚举）
 
+### 23.23 P9.5 AI Planner Foundation（AI 规划底座）
+
+> 独立实施记录：`docs/P9.5-AI-Planner-Foundation.md`（§一 架构审查 / §二 实施记录）。
+
+#### 23.23.1 阶段目标与边界
+
+让 AI 开始参与**"设计规划"**，但 AI 永远不成为 Geometry / Placement / Validation / Score 的真相源。
+两阶段：**Phase A**（用户需求 → AI Planner → `PlannerRequest`，无坐标）
+→ **Phase B**（`PlannerRequest` → 确定性候选生成 → `CandidateLayout[]` → `DesignScore[]`）。
+
+**十条禁令**（AI 不得）：直接生成 x/y/rotation · polygon · wall coordinate · 修改 `Opening` ·
+调用 `CommandBus` · 绕过 Resolver · 自己判 collision · 自己判 door swing · 自己算 score ·
+自动选最终方案并写入模型。
+
+**严格停在 P9.5**：不进入 P9.6（Compare UI / winner UI / 自动 adopt / 选方案后的落盘体验）。
+
+#### 23.23.2 实现前的审查结论（要点）
+
+- `DesignProposal`（P3）**不是** Planner 载体：它是"一次改动的意图草案"（单柜、动作导向），
+  表达不了"哪些目标、要枚举哪些方向"。
+- `candidateRequest` **不够**：缺方向层（`generationGoals`）与规模上限（一次可覆盖多少柜）。
+- P9.3 **逐柜独立**枚举，**不是**"一次只能重摆一只柜"的瓶颈 —— 真正的缺口是
+  **不做整体联动方案**（组合搜索），本阶段**如实登记进 `unresolved`**，不冒充"整墙最优"。
+- `draftSession` / `PlanRun` **适合承载多批**（每批一次 `dryRunPlan → 预览 → commitPlan`），
+  所以分批方案**不需要**新的执行机制。
+
+#### 23.23.3 ★ `MAX_ACTIONS = 12` 专项裁决（用户盯点一）
+
+- **限制在哪**：`shared/aiContract.mjs` 第 36 行，`validatePlan` 用它判"一轮动作条数"，
+  超限 **整份拒绝**（`ok:false` + `actions: []`），**不截断、不丢柜**（现有实现已成立）。
+- **为何 6 柜触顶**：一只柜 2 条动作（`cabinet.create` + `cabinet.place`）⇒ 6 柜 = 12 条 = **0 余量**，
+  第 7 只柜即 13 条被拒。根因是 **2N 的固定成本**，不是"12 太小"。
+- **三方案裁决**：采纳 **A 分批**（`$ref` 依赖闭包分组 + 贪心装箱，每批各走既有链路）；
+  拒绝 **B 新增高层批量命令**（要动唯一写入口与两段式原子性）；拒绝 **C 改数字**
+  （放大单轮破坏面，用户复核能力与回滚粒度同时退化）。
+- **数字一个字节没改**：`ACTION_BUDGET` 只是 `MAX_ACTIONS` 的再导出（同一处真相）。
+  分批**没放宽任何限制**：上限仍 12、每批仍整份通过或整份拒绝、仍 `preview === commit`，
+  且每批**更小**、影响面更小。单组自身超限 ⇒ `unsplittable: true`，**不给假批次也不截断**。
+
+#### 23.23.4 ★ Planner ↔ Candidate Generator 边界（用户盯点二）
+
+Planner **只决定"该枚举什么"**，坐标与判定一个都不归它：
+
+| 环节 | 唯一实现 | Planner 的角色 |
+|---|---|---|
+| 枚举候选 | P9.3 `generateCandidateLayouts()` | 传 `CandidateRequest`（与直接调用**逐字节相同**） |
+| 算坐标 | `resolvePlacement()`（P9.3 内） | 完全不出现 |
+| 判碰撞 | `detectCollisions()` | 完全不出现 |
+| 判门扇净空 | P8.9 | 完全不出现 |
+| 评分 | P9.4 `scoreCandidateLayoutSet()` | 只转发 `entries`，不读它（不 import 解析器） |
+| 选方案 | **没有** | 不做（导出面无 winner/best/recommended/pick/adopt/apply/commit/persist） |
+
+#### 23.23.5 交付物
+
+- `core/planner/model.ts` —— `PlannerRequest`（混入 `PlannerGeometryForbidden`：`x?: never` 等 22 个禁字段，
+  **赋一个值就编译不过**）/ `PlannerPlan`（**没有 winner 字段**）/ `PlannerUnresolved` / 规模上限。
+- `core/planner/request.ts` —— 语义归一化：id 必须真实存在且 active；目标词必须在闭集；
+  **超规模整份拒绝**（不裁剪 —— 砍掉几条 = 用户以为整屋都规划了）。
+- `core/planner/plan.ts` —— `planCandidates()`：复用 P9.3 枚举 + P9.4 评分，**零第二份判定**。
+- `ai/plannerContext.ts` —— `spatial` / `designIntent` / `candidateScore` 三块只读组合视图（**零新增计算**，同一引用）。
+- `ai/actionBudget.ts` —— `$ref` 依赖闭包分组（并查集）+ 贪心装箱；不可拆时如实说不拆。
+- `shared/aiContract.mjs` —— `plannerRequest` 是**请求通道不是动作**：**动作清单仍 21 条**。
+- `verify:ai-planner`（96 条，入 `verify:all`）+ `verify:ai-planner-mutation`（13 条物理变异，**不进** `verify:all`）。
+
+#### 23.23.6 一处有意偏离
+
+用户给的形状含 `PlannerRequest.unresolved`；实现把它放在 **`PlannerPlan`（系统产出）**——
+AI 声明"哪些没解决"等于让模型编造系统状态（与 P9.2 把 `'system'` 从 origin 里拿掉同一条理由）。
+契约层因此把 `unresolved` 判为 `EXTRA_KEY` 拒收。
+
+#### 23.23.7 验收：`verify:ai-planner`（96 条，12 节）
+
+`§0` 哨兵自检 6 · `§1` Schema 9 · `§2` Context 8 · `§3` 确定性边界 8 · `§4` Unknown 8 ·
+`§5` 多柜 6 · `§6` Preference 9 · `§7` AI safety 11 · `§8` Lifecycle 8 · `§9` Action Budget 10 ·
+`§10` 变异自检 10 · `§11` 接线 3。
+
+#### 23.23.8 变异测试（13 条，全部先红再还原）
+
+| 变异 | 变红的断言 |
+| --- | --- |
+| 契约放过 x/y | 3 / 31 / 49 |
+| 契约放过 rotation | 32 / 50 |
+| 契约放过 placement(s) | 5 / 51 |
+| 绕过 Resolver（自己改坐标） | 12 / 13 |
+| 契约多出 score/total 键 | 6b / 11 / 53 |
+| 用 inactive preference | 27 / 28 |
+| 计划里擅自默认门向 `into-room` | 19 |
+| 把门向假设写进模型 | 19b |
+| 导出面长出 `pickBest` | 37b / 41 / 56 |
+| 导出面长出 `adoptPlan` | 37b / 42 / 57 |
+| 超预算静默截断（丢弃装不下的组） | 46 / 47 / 48 |
+| `core/planner` 直接 import `CommandBus` | 0.5 / 35 / 37d |
+| 类型探针尝试写 `x/rotation/polygon/wallId` | **tsc** TS2322 ×3（编译期保证） |
+
+**变异暴露的两条真缺陷（在验收脚本自己身上）**：
+
+1. **哨兵 49/50/51 是瞎的** —— 原来只断言 `ok === false`；把 `x/y` 从几何键里拿掉后，
+   请求仍会因"契约外的键"被拒，`ok === false` 照样成立 ⇒ **假绿**。已改成断言 **`code === 'GEOMETRY_FORBIDDEN'`**。
+   又一次实证"**判据要看'因对的原因失败'**"。
+2. **V7 判据挂错了地方** —— "写进模型"与"写进计划文本"是两种不同的错，分别由 19b / 19 钉住；
+   合成一条会让两个断言里必有一个"看起来没红"。已拆成 V7 / V7b。
+
+#### 23.23.9 本次踩到的坑
+
+1. **本机 `spawnSync` / `execSync` 一律 EBUSY**（沙箱拦同步建进程）→ 变异夹具只能用**异步** `execFile`。
+2. **源文件是 CRLF**：锚点按 LF 书写会导致"锚点匹配 0 次"→ 匹配前归一化、写回时还原原行尾。
+3. **锚点必须唯一命中**：`'placements','placement'` 在候选几何键与规划几何键里各有一份，
+   夹具把它当"锚点打偏"直接报错（**宁可夹具报错，也不许变异打偏还报绿**）。
+4. **合法只读事实 ≠ 坐标**：`spatialContext.cabinetFacts[].wallContacts[].wallId` 是 P9.1 的
+   **只读事实**（墙名引用），扫"零坐标"时必须排除，否则假红。
+5. **`Math.max` / `Math.min` 是合法夹取**：收紧成 `Math\.(sin|cos|tan|hypot|atan2|sqrt)\s*\(`，
+   别把"夹取"当"三角函数"。
+6. **写源码的工具要自己兜底**：变异夹具改前先落盘 `<file>.bak95`、`finally` 从磁盘还原、
+   **启动时先扫残留备份**（防止被强杀后留下"改坏的源码"），并 `*.bak95` 入 `.gitignore`。
+
+#### 23.23.10 回归 / 红线核查
+
+- `GOMEMLIMIT=1500MiB npx tsc --noEmit` → 0；`verify:ai-planner` → **96/96**；变异 → **13/13**。
+- 用户指定 15 套件全 EXIT=0（design-score 133 / candidate-layout 69 / design-intent 158 /
+  spatial-context-ai 72 / door-swing 65 / design-validation 77 / placement-design 107 /
+  placement-preference 96 / provenance 61 / provenance-persistent 63 / placement-intent-ui 62 /
+  manufacturing / import 59 / vision 49 / fixhint 27）。
+- `GOMEMLIMIT=1500MiB npm run verify:all` → **EXIT=0**：全链 **0 处 ✗**、`verify:ui` **686/686**、console error **0**。
+- `MAX_ACTIONS` 未改（仍 12）✅ ｜ 动作清单仍 21 条 ✅ ｜ `types.ts` / `schemaVersion` 未触碰 ✅
+- 候选 / 评分 / 计划**不进 `project.json`**、不进 Knowledge ✅ ｜ Resolver / Spatial Truth / Manufacturing / DXF 未触碰 ✅
+- `core/planner` 不 import commandBus / aiClient / export / manufacturing ✅ ｜ 导出面无 winner / adopt ✅
+- 旧测试零删除、零放宽 ✅
+
+**停在 P9.5。** 本阶段明确不做：候选 Compare UI、winner UI、自动 adopt、选方案后的落盘体验优化、
+多柜整体联动（组合搜索）、权重系统、Floorplan Vision。
+

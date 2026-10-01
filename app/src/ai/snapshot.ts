@@ -3,6 +3,7 @@ import { KIND_ZH } from '../core/relations.ts';
 import { canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { buildSpatialContext, type AiSpatialContext } from './spatialContext.ts';
 import { buildDesignIntentContext, type AiDesignIntentContext } from './designIntentContext.ts';
+import { buildCandidateScoreContext, type AiCandidateScoreContext } from './candidateScoreContext.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -130,6 +131,27 @@ export interface AiSnapshot {
    * 由 `designIntentContext.ts` 唯一实现（纯投影：不判断、不评分、不补默认值）。
    */
   designIntent: AiDesignIntentContext;
+  /**
+   * 候选评分（P9.4，§十二）—— 系统对候选布局的**确定性评分结论摘要**，只读。
+   *
+   * ── 为什么它单独一块，既不并进 spatialContext 也不并进 designIntent ──
+   *   `spatialContext` 是**世界的样子**（派生事实）；
+   *   `designIntent` 是**人想要的样子**（authored 目标）；
+   *   这一块是**系统算出来的结果**（对候选的评估结论）。
+   *   三者是三种性质的东西，混在一起读的人就分不清"哪句是事实、哪句是诉求、哪句是算出来的"。
+   *
+   * ── 只读 + 无坐标 + 不含决策 ──
+   *   `readOnly: true`；块里没有任何 x / y / rotation / 多边形；
+   *   **没有"哪份最好"**（评分不选 winner），也没有任何"采用了它"的痕迹。
+   *   "AI 看到评分 ≠ AI 自动选择"：你可以据此理解现状，落地仍必须走动作清单。
+   *
+   * ── 不落盘 ──
+   *   每次构建快照时现算（候选与评分都是运行态，见 core/candidateLayout、core/designScore），
+   *   不进 project.json、不进 Semantic Model、不进 Knowledge。
+   *
+   * 由 `candidateScoreContext.ts` 唯一实现（纯投影：不判定、不排序、不补默认值）。
+   */
+  candidateScore: AiCandidateScoreContext;
 }
 
 export interface AiCabinetView {
@@ -243,6 +265,12 @@ export function buildSnapshot(project: Project, rules: RuleSet): AiSnapshot {
      * 它与 spatialContext 是两个顶层键，**互不嵌套**：事实与目标不许住在一起。
      */
     designIntent: buildDesignIntentContext(project),
+    /**
+     * 候选评分（P9.4）：与上面两块一样**永远出现**（没有 active 意图就是空表 + 计数 0）。
+     * 形状稳定的理由同上方 —— 提示词前缀在多轮之间逐字节一致。
+     * 它是**只读结论**：模型能看见"系统算出来什么"，但不能据此决策，更拿不到任何坐标。
+     */
+    candidateScore: buildCandidateScoreContext(project),
     ...(project.assemblies && project.assemblies.length > 0
       ? {
           assemblies: project.assemblies.map((asm, i) => ({

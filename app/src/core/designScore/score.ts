@@ -22,6 +22,16 @@
  *    ④ **无 adopt**：导出面里没有 winner / best / recommended / adopt / apply。
  *       本层只回答"这份候选如果这样摆会得到什么"，让候选生效是**未来**的事。
  *
+ *  ── 候选生命周期（§十一）──
+ *      `draft`（P9.3）→ `evaluated`（本层 `evaluateCandidateLayout`）→ adopted（**未来**）。
+ *      本层只推进到 `evaluated`，且**它仍然是运行态**：
+ *      不进 `project.json`、不进 Semantic Model、不进 Knowledge（类型层也写不出 `'adopted'`）。
+ *
+ *  ── 与 AI 的关系（§十二）──
+ *      评分**不下发给模型做决策**：AI 契约里没有评分入口、没有动作、更没有坐标。
+ *      `ai/candidateScoreContext.ts` 给模型的只是一份**只读、无坐标**的投影
+ *      （"看到了评分"，不等于"可以据此选择或落地"）。
+ *
  *  ── 硬约束闸门（§四）──
  *      先过 Gate → valid / infeasible；**valid 才进入软评分**。
  *      infeasible ⇒ `total:null` + `components:[]`。
@@ -57,6 +67,7 @@ import {
   type DesignScoreHardFailure,
   type DesignScoreHit,
   type DesignScorePreferenceMatch,
+  type EvaluatedCandidate,
 } from './model.ts';
 
 /** 归一到 [0,360) 的整数角 —— 只用于**比较**朝向是否相同，不做任何几何计算 */
@@ -151,13 +162,28 @@ function readGoalFact(goal: DesignIntentGoal, cabId: string, ctx: FactCtx): Fact
       return { hit, detail: `洞口关系 = [${rels.join(', ') || '（无洞口）'}]，规则要求 ∈ [${spec.satisfiedValues.join(', ')}]` };
     }
     case 'door-swing-clear': {
+      /**
+       * ⚠ 这里有一处必须小心的地方：**判不出开启方向的门根本不产生净空行**。
+       *   若只看 `clearances`，一个"门缺 swingDirection、柜正堵在门口"的场景会得到
+       *   空数组 → 被读成"让开了" —— 那是把 **unknown 当成 clear**（§十四 / §十六）。
+       *   所以还要看本柜所在房间里有没有**判不出开启区域**的门（`doors[].status==='unknown'`）。
+       */
+      const cab = ctx.project.cabinets.find((c) => c.id === cabId);
+      const unknownDoors = ctx.report.doorSwing.doors.filter(
+        (d) => d.roomId === cab?.roomId && d.status === 'unknown'
+      ).length;
       const st = ctx.report.doorSwing.clearances.filter((c) => c.cabinetId === cabId).map((c) => c.status);
       const hit: DesignScoreHit = st.some((s) => s === 'overlap' || s === 'touch')
         ? 'no'
-        : st.some((s) => s === 'unknown')
+        : st.some((s) => s === 'unknown') || unknownDoors > 0
           ? 'unknown'
           : 'yes';
-      return { hit, detail: `门扇净空 = [${st.join(', ') || '（无门扇）'}]，规则要求 ∈ [${spec.satisfiedValues.join(', ')}]` };
+      return {
+        hit,
+        detail:
+          `门扇净空 = [${st.join(', ') || '（无判定）'}]，规则要求 ∈ [${spec.satisfiedValues.join(', ')}]` +
+          (unknownDoors > 0 ? `；另有 ${unknownDoors} 扇门判不出开启区域（unknown ≠ 让开）` : ''),
+      };
     }
     case 'room-inside': {
       const rel = ctx.facts.cabinets.find((c) => c.cabId === cabId)?.room ?? 'unknown';
@@ -426,13 +452,27 @@ export function scoreCandidateLayout(project: Project, layout: CandidateLayout, 
   };
 }
 
-/** 一次给整批候选评分（顺序与 `set.candidates` 一致；纯函数） */
+/** 评一份候选 → 推进它的生命周期（`draft → evaluated`）。**运行态**，不落盘、不进模型 */
+export function evaluateCandidateLayout(
+  project: Project,
+  layout: CandidateLayout,
+  entries: KnowledgeEntry[] = []
+): EvaluatedCandidate {
+  return {
+    candidateId: layout.id,
+    fromStatus: layout.status, // 恒 'draft'（P9.3 的产出物状态）
+    lifecycle: 'evaluated',
+    score: scoreCandidateLayout(project, layout, entries),
+  };
+}
+
+/** 一次给整批候选评分（顺序与 `set.candidates` 一致；纯函数）—— 每份都推进到 `evaluated` */
 export function scoreCandidateLayoutSet(
   project: Project,
   set: CandidateLayoutSet,
   entries: KnowledgeEntry[] = []
-): Array<{ candidateId: string; score: DesignScore }> {
-  return set.candidates.map((c) => ({ candidateId: c.id, score: scoreCandidateLayout(project, c, entries) }));
+): EvaluatedCandidate[] {
+  return set.candidates.map((c) => evaluateCandidateLayout(project, c, entries));
 }
 
 // ─────────────────────────── ④ 确定性比较（§十：**不选 winner**） ───────────────────────────

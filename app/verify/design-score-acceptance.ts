@@ -42,10 +42,13 @@ import {
   type DesignIntent,
 } from '../src/core/designIntent/index.ts';
 import { generateCandidateLayouts, type CandidateLayout, type CandidatePlacement } from '../src/core/candidateLayout/index.ts';
+import { designIntentGoalSpec, type DesignIntentGoal } from '../src/core/designIntent/vocabulary.ts';
+import { buildSnapshot } from '../src/ai/snapshot.ts';
 import {
   SCORE_WEIGHT_POLICY,
   compareDesignScores,
   designScoreSummaryZh,
+  evaluateCandidateLayout,
   scoreCandidateLayout,
   scoreCandidateLayoutSet,
   type DesignScore,
@@ -133,6 +136,11 @@ const priorityIntent = (id = 'di_003'): DesignIntent => ({
   ...pin(makeStatedIntent({ goal: 'storage-priority', scope: { kind: 'room', roomId: 'r1' }, detail: '用户：以储物为主', taken: new Set<string>() })),
   id,
 });
+/** 任意目标 + 指定柜的 active 意图（事实指标用） */
+const cabIntent = (goal: DesignIntentGoal, cabId: string, id: string): DesignIntent => ({
+  ...pin(makeStatedIntent({ goal, scope: { kind: 'cabinet', cabinetId: cabId }, detail: '用户明说', taken: new Set<string>() })),
+  id,
+});
 const projWithIntents = (intents: DesignIntent[]): Project => ({ ...baseProject(), designIntents: intents });
 
 /** 把某只柜按 `resolved` 摆到副本上，再跑真实冲突判定（与 CommandBus 同一来源） */
@@ -168,6 +176,10 @@ function firstCandidate(project: Project, intentId = 'di_001'): CandidateLayout 
 // ─────────────────────── 哨兵（会被自检的判据） ───────────────────────
 
 const FORBIDDEN_EXPORT = /^(winner|best|recommended|recommend|adopt|apply|commit|persist|write|execute|save|sync|pick)/i;
+/** 「让候选生效」类名字（§十五.30 无 auto-adopt） */
+const ADOPT_LIKE = /^(adopt|apply|commit|persist|write|execute|save|sync)/i;
+/** 「选优」类名字（§十五.29 无 winner API） */
+const WINNER_LIKE = /^(winner|best|recommended|recommend|pick|top|rank|choose)/i;
 const hasForbiddenExport = (names: string[]): boolean => names.some((n) => FORBIDDEN_EXPORT.test(n));
 /** 评分层源码里不许出现的几何/三角/容差痕迹（§八） */
 const GEOMETRY_SMELL = /Math\.(sin|cos|tan|hypot|atan2|sqrt)\s*\(|\b[A-Z_]*TOL\b|polyDistance|polysOverlapInterior|segsProperCross|pointInPoly|openingZoneRect|wallPolygon|getCabinetFootprint|bboxOf|polysOverlap/;
@@ -341,7 +353,7 @@ section('§7 AI 契约：动作仍 21 条，评分不进契约');
   ok('36. ACTION_NAMES 仍是 21 条', ACTION_NAMES.length === 21, ACTION_NAMES.length);
   ok('37. 动作清单里没有任何 score 相关动作', !ACTION_NAMES.some((a) => /score|rank|winner|best/i.test(a)), ACTION_NAMES.filter((a) => /score|rank/i.test(a)));
   const contract = readFileSync(join(APP, 'shared/aiContract.mjs'), 'utf8');
-  ok('38. AI 契约里没有评分入口（评分不下发给模型）', !/scoreCandidateLayout|DesignScore|compareDesignScores/.test(contract));
+  ok('38. AI 契约里没有评分**入口**（模型不能调用评分、更不能据评分决策）', !/scoreCandidateLayout|DesignScore|compareDesignScores/.test(contract));
 }
 
 // ═══════════════════ §8 rejected / candidate / 未生效意图不产生 component ═══════════════════
@@ -457,6 +469,231 @@ section('§13 compare：确定性比较，不产生 winner');
   const r3 = compareDesignScores(a, b);
   ok('69. 可复现（三次结果一致）', r1 === r2 && r2 === r3, [r1, r2, r3]);
   ok('70. 导出面没有"选优"入口', !hasForbiddenExport(Object.keys(scoreMod)), Object.keys(scoreMod));
+}
+
+// ═══════════════════ §14 §十五.1–3 硬闸门（补：error 不能靠低分伪装） ═══════════════════
+section('§14 硬闸门：blocking error 不能靠"扣很多分"伪装成有效候选');
+{
+  const project = projWithIntents([wallIntent('c1')]);
+  const good = firstCandidate(project);
+  const sg = scoreCandidateLayout(project, good);
+  ok('71. 无 blocking error ⇒ valid（feasible）', sg.status === 'valid' && sg.hardFailures.length === 0, sg.status);
+
+  const bad = overlappingLayout(project);
+  const sb = scoreCandidateLayout(project, bad);
+  ok('72. ★ 有 blocking error 时软评分**一条都不产出**（不是 ERROR=-100 继续算）', sb.components.length === 0 && sb.total === null, { comps: sb.components.length, total: sb.total });
+  ok('73. ★ 坏候选不可能出现在 valid 名单里（不能靠低分混进来）', sb.status === 'infeasible' && sg.status === 'valid', [sb.status, sg.status]);
+  ok('74. "不评分(null)" 与 "得 0 分" 是两回事（闸门显式区分）', sb.total === null && typeof sg.total === 'number', { bad: sb.total, good: sg.total });
+}
+
+// ═══════════════════ §15 §十五.4–7 四项事实指标：全部读既有事实 ═══════════════════
+section('§15 事实指标：wall-contact / opening-clear / door-swing-clear / room-inside');
+
+/** 北墙(w3)挂一扇门的房间（房间先深拷贝 —— 用例之间不许共用 Room 对象） */
+function roomWithDoor(patch: Record<string, unknown> = {}): Room {
+  const room = mkRoom('r1');
+  room.walls[2]!.openings = [
+    { id: 'open_001', kind: 'door', offset: 1000, width: 900, hinge: 'start', swingDirection: 'into-room', ...patch } as never,
+  ];
+  return room;
+}
+/** 房间级夹具：只放 c1（位置由调用方定），可选挂门 / 去掉一面墙 */
+function factProject(c1: Cabinet, opts: { door?: boolean; noDoorSwing?: boolean; unclosed?: boolean } = {}): Project {
+  const room = opts.door || opts.noDoorSwing ? roomWithDoor(opts.noDoorSwing ? { swingDirection: undefined } : {}) : mkRoom('r1');
+  if (opts.unclosed) room.walls = room.walls.slice(0, 3);
+  const moved: Cabinet = { ...c1, roomId: room.id, placement: { ...c1.placement } };
+  return { ...baseProject(), rooms: [room], cabinets: [moved] } as Project;
+}
+const factIntents = (): DesignIntent[] => [
+  cabIntent('wall-contact', 'c1', 'di_f1'),
+  cabIntent('opening-clear', 'c1', 'di_f2'),
+  cabIntent('door-swing-clear', 'c1', 'di_f3'),
+  cabIntent('room-inside', 'c1', 'di_f4'),
+];
+const compOf = (s: DesignScore, goal: string): DesignScoreComponent | undefined =>
+  s.components.find((c) => c.kind === 'condition' && c.goal === goal);
+/** 只把某只柜摆到指定位置的手工候选（形状与 P9.3 产出相同） */
+function laidOut(p: Project, x: number, y: number, rotation: number): CandidateLayout {
+  return mkLayout('cl_fact', 'c1', { x, y, rotation }, p, ['di_f1']);
+}
+
+{
+  // ① 贴南墙 (1600,60) rot0 —— 背面贴墙 / 洞口 clear / 门扇 clear / 房间 inside
+  const good = factProject(mkCab(mkRoom('r1'), 'c1', 1600, 60, 900, 600, 0), { door: true });
+  const sg = scoreCandidateLayout({ ...good, designIntents: factIntents() } as Project, laidOut(good, 1600, 60, 0));
+  ok('75. wall-contact：背面贴墙 ⇒ 命中', compOf(sg, 'wall-contact')?.hit === 'yes', compOf(sg, 'wall-contact'));
+  ok('76. opening-clear：洞口关系 clear ⇒ 命中', compOf(sg, 'opening-clear')?.hit === 'yes', compOf(sg, 'opening-clear'));
+  ok('77. door-swing-clear：门扇净空 clear ⇒ 命中', compOf(sg, 'door-swing-clear')?.hit === 'yes', compOf(sg, 'door-swing-clear'));
+  ok('78. room-inside：房间关系 inside ⇒ 命中', compOf(sg, 'room-inside')?.hit === 'yes', compOf(sg, 'room-inside'));
+  ok('79. ★ 四条事实 component 的 fact 名字与词表 spec 逐字一致（不另起叫法）',
+    ['wall-contact', 'opening-clear', 'door-swing-clear', 'room-inside'].every((g) => compOf(sg, g)?.fact === designIntentGoalSpec(g as never).fact),
+    ['wall-contact', 'opening-clear', 'door-swing-clear', 'room-inside'].map((g) => [g, compOf(sg, g)?.fact]));
+
+  // ② 房间正中 —— 没靠墙 ⇒ 未命中（其余仍是 clear/inside）
+  const mid = factProject(mkCab(mkRoom('r1'), 'c1', 1600, 1400, 900, 600, 0), { door: true });
+  const sm = scoreCandidateLayout({ ...mid, designIntents: factIntents() } as Project, laidOut(mid, 1600, 1400, 0));
+  ok('80. wall-contact：房间正中（floating）⇒ 未命中', compOf(sm, 'wall-contact')?.hit === 'no', compOf(sm, 'wall-contact'));
+  ok('81. 同一份候选里其余事实照常命中（不是"一否全否"）', compOf(sm, 'room-inside')?.hit === 'yes' && compOf(sm, 'door-swing-clear')?.hit === 'yes', compOf(sm, 'room-inside'));
+}
+{
+  // ③ 压在洞口影响带上 —— 这是**硬错误**（SPATIAL-CABINET-OPENING），不是"软失败"
+  const p = factProject(mkCab(mkRoom('r1'), 'c1', 2400, 2200, 900, 600, 0), { door: true });
+  const s = scoreCandidateLayout({ ...p, designIntents: factIntents() } as Project, laidOut(p, 2400, 2200, 0));
+  ok('82. ★ 压在洞口上 ⇒ infeasible + 硬失败码是 SPATIAL-CABINET-OPENING（不是软 "no"）',
+    s.status === 'infeasible' && s.hardFailures.some((f) => f.code === 'SPATIAL-CABINET-OPENING'),
+    { status: s.status, codes: s.hardFailures.map((f) => f.code) });
+
+  // ④ 压在门扇开启包络里 —— 同样是硬错误
+  const p2 = factProject(mkCab(mkRoom('r1'), 'c1', 2400, 2340, 900, 600, 180), { door: true });
+  const s2 = scoreCandidateLayout({ ...p2, designIntents: factIntents() } as Project, laidOut(p2, 2400, 2340, 180));
+  ok('83. ★ 压在门扇开启包里 ⇒ infeasible + 硬失败码是 DESIGN-CABINET-DOOR-SWING',
+    s2.status === 'infeasible' && s2.hardFailures.some((f) => f.code === 'DESIGN-CABINET-DOOR-SWING'),
+    { status: s2.status, codes: s2.hardFailures.map((f) => f.code) });
+  ok('84. 硬错误**不会**被降级成一条 hit:"no" 的条件 component', s.components.length === 0 && s2.components.length === 0, [s.components.length, s2.components.length]);
+}
+
+// ═══════════════════ §16 §十四 unknown ≠ failed ≠ clear ═══════════════════
+section('§16 §十四 unknown ≠ failed ≠ clear：判不出来就说判不出来');
+{
+  // 门缺 swingDirection ⇒ 事实层**根本不产出**净空行（P8.9 绝不默认向内开）
+  const p = factProject(mkCab(mkRoom('r1'), 'c1', 1600, 1400, 900, 600, 0), { noDoorSwing: true });
+  const s = scoreCandidateLayout({ ...p, designIntents: factIntents() } as Project, laidOut(p, 1600, 1400, 0));
+  const c = compOf(s, 'door-swing-clear');
+  ok('85. ★ 判不出开启方向的门 ⇒ hit 是 unknown（**不是** yes）', c?.hit === 'unknown', c);
+  ok('86. 该 component 的 why 里说清了"判不出来"（unknown 不伪装成结论）', /判不出|unknown/.test(c?.why ?? ''), c?.why);
+  ok('87. unknown 不计入 total（total 仍等于命中数）', s.total === s.components.filter((x) => x.hit === 'yes').length, { total: s.total });
+
+  // 房间不闭合 ⇒ 房间关系 unknown
+  const p2 = factProject(mkCab(mkRoom('r1'), 'c1', 1600, 1400, 900, 600, 0), { unclosed: true });
+  const s2 = scoreCandidateLayout({ ...p2, designIntents: factIntents() } as Project, laidOut(p2, 1600, 1400, 0));
+  const c2 = compOf(s2, 'room-inside');
+  ok('88. ★ 房间不闭合 ⇒ room-inside 是 unknown（不是 no —— 不把判不出当失败）', c2?.hit === 'unknown', c2);
+  ok('89. ★ 不得假设默认值：unknown 既没被算成命中、也没被算成未命中', c2?.hit !== 'yes' && c2?.hit !== 'no', c2?.hit);
+  ok('90. 房间不闭合是 WARNING（不阻断）⇒ 候选仍是 valid，unknown 才看得见', s2.status === 'valid', s2.status);
+}
+
+// ═══════════════════ §17 §十五.8–12 偏好：只有 applicable 参与 ═══════════════════
+section('§17 偏好：rejected / candidate 都不参与；硬规则压制优先');
+{
+  const project = projWithIntents([wallIntent('c1')]);
+  const cand = firstCandidate(project);
+  const rot = cand.placements[0]!.resolved.rotation;
+  const norm = (d: number): number => ((Math.round(d) % 360) + 360) % 360;
+  const prefPred: KnowledgePredicate = { kind: 'orientation', op: 'prefer', value: norm(rot) };
+  const base = makeStatedPreference({ statement: '这个柜我一直用这个朝向', predicate: prefPred, scope: { cabinet: 'c1' }, detail: '用户明说', seq: 9 });
+
+  ok('91. active（已确认）偏好 ⇒ 参与', scoreCandidateLayout(project, cand, [base]).components.some((c) => c.preferenceId === base.id));
+
+  const rejected = { ...base, status: 'rejected' as const };
+  ok('92. ★ rejected 偏好不参与评分', !scoreCandidateLayout(project, cand, [rejected]).components.some((c) => c.preferenceId === rejected.id));
+
+  const candidatePref = { ...base, status: 'candidate' as const, confirmedAt: undefined };
+  ok('93. ★ candidate（未确认）偏好不参与评分', !scoreCandidateLayout(project, cand, [candidatePref]).components.some((c) => c.preferenceId === candidatePref.id));
+
+  const hard = hardRuleEntries([{ code: 'TEST-HARD-ORIENT', statement: '规则：此情形禁止该朝向', predicate: { kind: 'orientation', op: 'forbid', value: norm(rot) }, scope: {} }], []);
+  const sup = scoreCandidateLayout(project, cand, [...hard, base]);
+  ok('94. ★ 被硬规则压制时偏好不参与，且**不覆盖**硬规则', !sup.components.some((c) => c.preferenceId === base.id) && sup.hardFailures.length === 0, sup.preferenceMatches);
+  ok('95. 偏好**永远**进不了 hardFailures（偏好≠硬约束）', sup.status === 'valid', sup.status);
+}
+
+// ═══════════════════ §18 §十五.13–16 确定性：同输入同输出 / 不改 Candidate / 不改 Project ═══════════════════
+section('§18 确定性：顺序无关、不改入参');
+{
+  const project = projWithIntents([wallIntent('c1')]);
+  const set = generateCandidateLayouts(project, { intentIds: ['di_001'], scope: 'project' });
+  ok('96. 至少两份候选（否则"顺序无关"无从谈起）', set.candidates.length >= 2, set.candidates.length);
+  const A = set.candidates[0]!;
+  const B = set.candidates[1]!;
+
+  const forward = scoreCandidateLayoutSet(project, set);
+  const reversedSet = { ...set, candidates: [...set.candidates].reverse() };
+  const reversed = scoreCandidateLayoutSet(project, reversedSet);
+  const scoreOf = (list: typeof forward, id: string): string =>
+    JSON.stringify(list.find((x) => x.candidateId === id)?.score);
+  ok('97. ★ 候选顺序变化不改变单候选的 score（A 在前或在后，结果逐字节相同）',
+    scoreOf(forward, A.id) === scoreOf(reversed, A.id) && scoreOf(forward, B.id) === scoreOf(reversed, B.id));
+
+  const candBefore = JSON.stringify(A);
+  const projBefore = JSON.stringify(project);
+  scoreCandidateLayout(project, A);
+  scoreCandidateLayoutSet(project, set);
+  ok('98. ★ 评分不修改 Candidate（逐字节不变）', JSON.stringify(A) === candBefore);
+  ok('99. 评分不修改 Project（逐字节不变）', JSON.stringify(project) === projBefore);
+  ok('100. 重复评分逐字节可复现', JSON.stringify(scoreCandidateLayout(project, A)) === JSON.stringify(scoreCandidateLayout(project, A)));
+
+  // ⚠ 上面 98 抓不住"评分把候选改了"的一类写法：它在**已经被评过**的候选上取快照。
+  //    所以另起一份**全新、从未被评分过**的候选来钉这一条（否则断言是瞎的 —— 实测 M5 时只有 108 变红）。
+  const fresh = generateCandidateLayouts(project, { intentIds: ['di_001'], scope: 'project' }).candidates[0]!;
+  const freshBefore = JSON.stringify(fresh);
+  const freshStatus = fresh.status;
+  scoreCandidateLayout(project, fresh);
+  ok('100b. ★ 全新候选评完分后逐字节不变（且状态仍是 draft）', JSON.stringify(fresh) === freshBefore && fresh.status === freshStatus && fresh.status === 'draft', { now: fresh.status });
+}
+
+// ═══════════════════ §19 §十五.20–26 架构：不 import 写路径 / 不产几何 / 不新增容差 ═══════════════════
+section('§19 架构：不 import 写路径，不生成几何与 placement，不新增容差与旋转数学');
+{
+  const code = stripComments(
+    readFileSync(join(SCORE_SRC, 'score.ts'), 'utf8') + '\n' + readFileSync(join(SCORE_SRC, 'model.ts'), 'utf8')
+  );
+  ok('101. 不 import CommandBus', !/commandBus/.test(code));
+  ok('102. 不 import AI 客户端', !/aiClient|buildDesignRequest|chat\/completions/.test(code));
+  ok('103. 不 import Manufacturing / 导出', !/manufacturing|\/export|dxf|bom/i.test(code));
+  ok('104. 不生成 geometry（无三角函数 / 无 bbox·polygon 原语 / 无新容差）', !hasGeometrySmell(code), GEOMETRY_SMELL.exec(code)?.[0]);
+  ok('105. ★ 不出现新的旋转数学（Math 只用于 round/min/max/floor/abs）',
+    !/Math\.(sin|cos|tan|atan|atan2|asin|acos|hypot|sqrt|pow)\s*\(/.test(code) && !/rotation\s*[-+*/]\s*\d/.test(code),
+    (code.match(/Math\.\w+\s*\(/g) ?? []).join(' '));
+
+  const project = projWithIntents([wallIntent('c1')]);
+  const s = scoreCandidateLayout(project, firstCandidate(project));
+  ok('106. ★ 评分结果里没有 placement / resolved / intent（不产落位、只读事实）',
+    !coordKeysIn(s).length && !/\bplacements?\b|\bresolved\b|\bintent\b/.test(JSON.stringify(s)),
+    coordKeysIn(s));
+}
+
+// ═══════════════════ §20 §十一 生命周期 + §十二 AI 只读块 ═══════════════════
+section('§20 候选生命周期（draft → evaluated）与 AI 只读候选评分块');
+{
+  const project = projWithIntents([wallIntent('c1')]);
+  const cand = firstCandidate(project);
+
+  const ev = evaluateCandidateLayout(project, cand);
+  ok('107. ★ draft → evaluated：评估结果记录 fromStatus=draft、lifecycle=evaluated',
+    ev.fromStatus === 'draft' && ev.lifecycle === 'evaluated' && ev.candidateId === cand.id, ev);
+  ok('108. 评估**不修改**候选本身（它仍然是一份 status=draft 的产出物）', cand.status === 'draft', cand.status);
+  ok('109. evaluated 是运行态：不进 project.json（序列化里查不到 evaluated 与候选 id）',
+    !serializeProjectFile(project, FIXED_SAVED_AT).includes('evaluated') && !serializeProjectFile(project, FIXED_SAVED_AT).includes(cand.id));
+  ok('110. 生命周期类型层没有 adopted（源码里剥掉注释后不存在这个词）',
+    !/adopted/.test(stripComments(readFileSync(join(SCORE_SRC, 'model.ts'), 'utf8'))));
+
+  const names = Object.keys(scoreMod);
+  ok('111. ★ 无 auto-adopt：导出面没有 adopt / apply / commit / persist 类名字', !names.some((n) => ADOPT_LIKE.test(n)), names.filter((n) => ADOPT_LIKE.test(n)));
+  ok('112. ★ 无 winner API：导出面没有 winner / best / recommended / pick 类名字', !names.some((n) => WINNER_LIKE.test(n)), names.filter((n) => WINNER_LIKE.test(n)));
+
+  // ── §十二 AI 只读块 ──
+  const snap = buildSnapshot(project, RULES);
+  ok('113. 快照新增只读候选评分块（candidateScore.readOnly === true）', snap.candidateScore?.readOnly === true);
+  ok('114. ★ 该块**零坐标**（没有任何 x/y/rotation/resolved/多边形）', coordKeysIn(snap.candidateScore).length === 0, coordKeysIn(snap.candidateScore));
+  ok('115. 该块**不含用户偏好**且如实标注（preferencesApplied === false，免得把"没列"读成"没命中"）', snap.candidateScore.preferencesApplied === false);
+  ok('116. ★ 该块里没有 winner / best / recommended / "推荐" 字样', !/winner|best|recommend|推荐/i.test(JSON.stringify(snap.candidateScore)));
+  ok('117. 该块里没有任何"让候选生效"的字段（apply / adopt / commit / write）',
+    !/apply|adopt|commit|write|execute/i.test(JSON.stringify(snap.candidateScore)));
+
+  const empty = buildSnapshot(projWithIntents([]), RULES);
+  ok('118. 无 active 意图时该块仍然出现（空表 + 计数 0 —— 形状稳定）',
+    Array.isArray(empty.candidateScore.evaluated) && empty.candidateScore.evaluated.length === 0 && empty.candidateScore.counts.evaluated === 0,
+    empty.candidateScore.counts);
+  ok('119. 有 active 意图时该块确实有内容（否则"只读通道"是空的）', snap.candidateScore.evaluated.length > 0, snap.candidateScore.counts);
+
+  const contract = readFileSync(join(APP, 'shared/aiContract.mjs'), 'utf8');
+  ok('120. ★ AI 契约里写清了 candidateScore 的只读读法（看到评分 ≠ 可以据此决策）',
+    contract.includes('candidateScore') && /只读/.test(contract) && /不能.{0,6}据此选择/.test(contract));
+  ok('121. 动作清单仍 21 条（AI 没有获得任何"选方案 / 落地"的动作）', ACTION_NAMES.length === 21, ACTION_NAMES.length);
+
+  // 哨兵自检（"断言不可信比失败更危险"）：用故意写坏的样本确认它们真能判红
+  ok('122. 哨兵自检：ADOPT_LIKE 认得出 adoptScore', ADOPT_LIKE.test('adoptScore') === true);
+  ok('123. 哨兵自检：WINNER_LIKE 认得出 pickBestCandidate', WINNER_LIKE.test('pickBestCandidate') === true);
+  ok('124. 哨兵自检：两个哨兵不误伤正常导出名', ADOPT_LIKE.test('scoreCandidateLayout') === false && WINNER_LIKE.test('compareDesignScores') === false);
 }
 
 // ─────────────────────────── 汇总 ───────────────────────────

@@ -143,6 +143,36 @@ export const SCORE_WEIGHT_POLICY: DesignScoreWeightPolicy = {
     'total = 命中条件数（确定性、可解释、无 magic number）；权重系统与其归属留待后续阶段。',
 };
 
+/**
+ * ── 候选生命周期（§十一）──
+ *   `draft`（P9.3 枚举产出）→ `evaluated`（P9.4 评过分）→ adopted（**未来、且必须用户拍板**）。
+ *
+ * 本阶段的类型只有前两个值：`'adopted'` **写不出来**（与 P9.3 把 `CandidateStatus`
+ * 定成字面量 `'draft'`、P9.2 把 `'system'` 从 `origin` 里拿掉是同一手法）。
+ *
+ * 两者**都是运行态**：不进 `project.json`、不进 Semantic Model、不进 Knowledge。
+ * `evaluated` 只是"这份候选被算过一次分"，**不是**"它被采用了"。
+ */
+export type CandidateLifecycle = 'draft' | 'evaluated';
+
+/**
+ * 一份**被评估过**的候选 —— 运行态包装。
+ *
+ * 为什么不让 `CandidateLayout` 自己带上 `evaluated`：
+ *   `CandidateLayout` 是"枚举产出物"（P9.3，状态恒 `draft`）；
+ *   "评过没评过"是**评估这件事**的属性，不是候选本身的属性。
+ *   把它包在外面，P9.3 的对象就仍然是一个干净、可复现的产出物，
+ *   而 `fromStatus` 保留了"从 draft 走到 evaluated"这一步的痕迹。
+ */
+export interface EvaluatedCandidate {
+  candidateId: string;
+  /** 评估前它在 P9.3 里的状态（恒 `'draft'`）—— 保留它才看得出这一步是"推进"而非"重造" */
+  fromStatus: 'draft';
+  /** 评估后的生命周期（**只能是 evaluated**；候选不会在这里变成 adopted） */
+  lifecycle: 'evaluated';
+  score: DesignScore;
+}
+
 /** 一条候选布局的评分结果（纯临时对象） */
 export interface DesignScore {
   status: DesignScoreStatus;

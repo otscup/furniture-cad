@@ -2855,3 +2855,46 @@ CandidateLayout
 **停在 P9.4。** 本阶段明确不做：权重系统、P9.5 AI Planner、LLM 自动布局、
 自动选 winner、自动 adopt、候选 UI 接线、多柜组合枚举。
 
+#### 23.22.10 续（§十一–§十八）：候选生命周期 / AI 只读块 / 未知 / 6 项变异
+
+> 指令第二段到达后补做。仍**停在 P9.4**（不升 schemaVersion、不改 Resolver / 真相源 / 空间事实）。
+
+1. **候选生命周期 `draft → evaluated`**：`CandidateLifecycle = 'draft' | 'evaluated'`
+   （类型层**无 `adopted`**）+ `EvaluatedCandidate{candidateId,fromStatus,lifecycle,score}`。
+   它是**运行态包装** —— `CandidateLayout` 自己仍是 `draft`（P9.3 产出物保持干净），
+   "评过没评过"是**评估这件事**的属性。不落盘、不进 Model / Knowledge。
+2. **AI 只读候选评分块（§十二）**：快照新顶层键 `candidateScore`
+   （`ai/candidateScoreContext.ts` 纯投影）—— `readOnly:true`、**零坐标**、
+   `preferencesApplied:false`（快照这条路上没有 Knowledge 条目，如实标注）、
+   最多 6 条（`truncated` 标注）、`note` 明说"看到评分 ≠ 可以据此选择"。
+   判读依据：P9 惯例是每阶段加一块"能读、不能写"的上下文（§23.19 / §23.20）。
+   动作清单**仍 21 条**。
+3. **可解释性**：component 六问齐备（source 闭集 / fact / rule / isPreference / weight / why），
+   无裸分字段。
+4. **`unknown ≠ failed ≠ clear`**：★ 修掉一处真缺陷 —— `door-swing-clear` 原先只读
+   `doorSwing.clearances`，而**判不出开启方向的门不产出净空行**，空数组被读成"让开了"
+   （= 把 unknown 当 clear）。改为再看房间里有没有 `doors[].status==='unknown'` 的门。
+   `room-inside` 在房间不闭合时是 `unknown`（`SPATIAL-ROOM-OPEN` 是 WARNING，不阻断，所以看得见）。
+5. **验收 78 → 133 条**（20 节）：新增硬闸门补充 / 四项事实指标 / 洞口与门扇硬错误
+   **不降级**为软 `no` / unknown 三条 / 偏好四条（active·rejected·candidate·suppressed）/
+   确定性（顺序无关、不改 Candidate、不改 Project）/ 架构（不 import 写路径与 AI 客户端、
+   不产几何与 placement、无新容差、无新旋转数学）/ 生命周期与 AI 只读块。
+6. **变异 6 项（全部先红再还原）**：
+   | 变异 | 变红的断言 |
+   | --- | --- |
+   | blocking error → 普通扣分 | 2/3/4/5/6/7/22 |
+   | 让失效偏好生效 | 55/56/58/92/93/94 |
+   | 评分里偷偷重做 collision | 22/49/104/105 |
+   | unknown 当 clear | 85 |
+   | 评分修改 candidate | 100b/108 |
+   | 增加 winner / auto-adopt | 32/70/111/112 |
+7. **本轮坑**：① **自己的断言可能是瞎的** —— M5 首轮只有 108 变红，98（"评分不改 Candidate"）
+   因为在**已被评过**的候选上取快照而抓不到；改用**全新未评分**候选后新增 100b 才钉住。
+   ② **"判不出来"常常表现为"这一行根本不存在"**（P8.9 缺开启方向的门不产出净空行）——
+   消费"逐条事实列表"时必须问"这一条为什么不在列表里"。③ **某条能力事实层只给一半**
+   （`overlap` 同时也是 ERROR ⇒ 进不了软评分，"未命中"不可观测）→ 不要硬造 `'no'`，
+   应断言"被闸门拦住"。
+
+**停在 P9.4。**（续段后仍不做：权重系统、P9.5 AI Planner、LLM 自动布局、自动选 winner、
+自动 adopt、候选 UI 接线、多柜组合枚举）
+

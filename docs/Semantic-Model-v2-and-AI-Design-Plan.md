@@ -2449,3 +2449,225 @@ P8.x 同链全绿。**旧测试零删除、零放宽**。
 Design Score、LLM Planner、空间设计意图词汇（P9.2）、自动布局/自动移柜、
 人流模拟、Z 轴、3D 动态开门、BIM/IFC、图片户型识别（P10）、Door Swing Preference 自动学习。
 
+
+---
+
+### 23.20 P9.2 实施记录：Spatial Design Intent Vocabulary（空间设计意图词汇层）
+
+> 完整审查报告（实现前的逐条核对与逐条裁决）见 `docs/P9.2-Design-Intent-Vocabulary.md` §一；实施记录见 §二。
+
+#### 23.20.1 阶段目标与边界
+
+把"用户到底想要什么"从**自然语言**抬升为一层**封闭的、可判定的、不含坐标的**语义词汇。
+
+**本阶段第一原则：Intent ≠ Layout。** 意图表达的是"用户想要什么效果"，不是"放在哪"。
+链路 `Intent → Candidate Layout(P9.3) → Placement Resolver → Spatial Validation` 里，
+本阶段**只在第一个箭头之前做事**。
+
+严格不做：候选布局 / 自动摆柜 / 优化搜索 / LLM Planner / Constraint Graph /
+Placement Resolver 改动 / Spatial Truth 改动。
+
+#### 23.20.2 实现前的审查结论（要点）
+
+系统已有四种"语义表达"：**落位指令**（`PlacementIntent`）、**关系声明**（`Connection` / `FurnitureAssembly`）、
+**建议性偏好**（`KnowledgeEntry` / `Correction`）、**派生事实**（`AiSnapshot.spatialContext`）。
+**缺的那一种，是"用户的设计目标"** —— 不重叠于以上任何一种。
+
+用户给的 12 个候选词逐条裁决：
+
+| 裁决 | 词 |
+|---|---|
+| ✅ 收（3 条取舍方向） | `kitchen-workflow` / `storage-priority` / `circulation-priority` |
+| ✅ 收（6 条空间条件，改名用事实维度） | `prefer-wall`→`wall-contact`、`avoid-opening`→`opening-clear`、`keep-clearance`→`door-swing-clear`、`near-window`→`near-opening`(+`openingKind`)、`room-inside` |
+| 🟡 收成 `standalone` | `relationship: avoid`（"不要和别的柜相接"有依据；"不要挡住门窗"已由前两条覆盖，不重复设词） |
+| ❌ 不收（已有主人） | `align-with`、`adjacent-to` |
+| ❌ 不收（今天判不出来） | `near`（柜↔柜） |
+| ❌ 不收（会变成坐标） | `face` |
+
+**一句话规则**：凡是已经能由 `PlacementIntent` 表达的，一律**不属于**设计意图；
+凡是今天算不出来的，一律**不进词表**。宁可少一个词，也不给一个假词。
+
+#### 23.20.3 交付物：`core/designIntent/`（纯语义层，4 个文件）
+
+```
+vocabulary.ts   封闭词表（9 词 + 5 个事实维度 + 唯一的取值字段 + "为什么不收某些词"的机器可读记录）
+model.ts        记录模型 + 生命周期（stated / candidate / confirm / reject / activeDesignIntents）
+validate.ts     四道闸门 + 提案通道 + 文件边界分区（唯一实现）
+index.ts        对外唯一出口
+```
+
+```
+取舍方向（priority，fact === null —— 唯一允许没有判定依据的一类）
+  kitchen-workflow / storage-priority / circulation-priority          scope=room
+
+空间条件（condition，每条都必须指向一个既有事实维度）
+  wall-contact       → cabinet.wallContacts       (P8.8 WallContactKind)
+  opening-clear      → cabinet.openingProximity   (P8.7 CabOpeningRelation)
+  door-swing-clear   → cabinet.doorClearances     (P8.9 DoorClearanceStatus)
+  near-opening       → cabinet.openingProximity   (P8.8 NEAR-DOOR / WINDOW-BEHIND)
+  standalone         → cabinet.contacts           (P2 deriveContacts)
+  room-inside        → cabinet.roomRelation       (P8.7 CabRoomRelation)
+```
+
+**三条准入纪律**（写进文件头，被验收逐条钉住）：
+
+1. **用事实维度名，不用祈使句**：`wall-contact` 而不是 `prefer-wall` ——
+   祈使句会诱导下一个人把"多近算贴上"写进意图里（那是 `SPATIAL_TOL.TOUCH` 的事）。
+2. **词表里不含任何数字**：验收递归扫整个词表对象，`typeof === 'number'` 一个都不许有。
+   阈值是**规则**，只有一个出处；否则同一个词在两条意图里意思不同。
+3. **每条 condition 必须指名产出方**（`producer: { file, signal }`），验收**去真实文件里逐字核对信号串存在** ——
+   这是"词表不许指向不存在的事实"的机器化。
+
+**唯一例外是三个取舍方向**：它们判定不出来，必须显式标 `class: 'priority'`。
+验收的核心断言是：**`fact` 为空的词恰好就是 priority 这一类**（防住"随手加一个判不出的词"）。
+
+#### 23.20.4 数据模型与生命周期
+
+```ts
+type DesignIntentStatus      = 'candidate' | 'active' | 'rejected';
+type DesignIntentOrigin      = 'user-stated' | 'ai-inferred';      // ← 没有 'system'
+type DesignIntentConfirmedBy = 'user-stated' | 'user-confirmed';
+type DesignIntentScope       = { kind:'room'; roomId } | { kind:'cabinet'; cabinetId };
+                                                                    // ← 写不出 wallId / openingId
+```
+
+```
+用户明说 ──────────────────────────► active（进 model）
+AI 推断 ──► candidate ──► 用户确认 ──► active（进 model）
+                    └────► rejected（不进 model；不能靠再确认复活）
+系统 ──► 什么也不产生（'system' 在类型层就不存在）
+```
+
+三条关键决定：
+
+1. **`'system'` 从类型里去掉，而不是靠校验拦住** —— 写不出来比"写得出但被拦"彻底一档。
+   §4 的"系统不产生偏好"因此不是一句承诺，是编译期事实。
+2. **模型只装 active**（P8.5-B 的教训直接搬过来）：candidate 只活在"意图提案"对象里。
+   未确认与已确认是**真实语义差异**，一旦落盘就分不清"用户要的"与"AI 猜的"，
+   而 `preview === commit`、`dryRun === commit` 两条逐字节不变量都建立在"模型里只有已确认的事"之上。
+3. **`makeCandidateIntent` / `proposalToCandidates` 没有参数能造出 active** ——
+   "AI 推断只能产生 candidate"不是一句承诺，是这两个函数的签名。
+
+#### 23.20.5 四道闸门（`validate.ts`，唯一实现）
+
+| # | 闸门 | 报错口径 |
+|---|---|---|
+| ① | **载荷禁数字**（刻意排第一位） | "设计意图的载荷里不许出现数字（坐标 / 尺寸 / 阈值一律属于几何层）" |
+| ② | **词的闭集** | "不在设计意图词表里 —— 未知意图不被接受，不会"忽略掉继续"" |
+| ③ | **载荷无实体** | scope 只认 `room` / `cabinet`；"墙、洞口、坐标都不是意图能指的对象" |
+| ④ | **生命周期** | candidate 自带 `confirmedBy` / active 无人认领 / AI 推断的 active 自己宣布生效 |
+
+**为什么数字筛子排第一位**：坐标走私是本层最想防的事，而**坐标一定是数字**。
+放在最前既让报错最准（`scope.rotation=90` 直说"不许出现数字"），又让这道筛子**真的会触发** ——
+本项目对"恒真断言 / 永不触发检查"的态度是：**没被证伪过的检查不算检查**。
+（验收的变异测试专门关掉它一次，见 23.20.9。）
+
+**载荷禁的是"一切数字"，不是"名字叫 x 的字段"** —— 比"禁止 x/y"强一档：
+坐标在物理上无法表达，而不是"写了 x/y 会被拒、写了 px/py 就漏过去"。
+
+**坐标走私的两条路都堵死**：`scope` 内的数撞数字筛子；`scope` 外的键撞键闭集（报出字段名）。没有第三条路。
+
+**闸门是白名单不是黑名单**：多一个键就拒，不做"忽略不认识的字段继续" ——
+静默忽略是最危险的行为（提的人以为生效了，系统以为没提）。
+
+#### 23.20.6 提案通道与提示词
+
+- 提案顶层键闭集 `['intents','reply']`；空数组拒；一次最多 8 条；一条坏 → **整份拒**（原子）并报出"第 N 条"。
+- **不挤进 `ACTIONS`**：动作清单管"AI 能改模型什么"，而意图提案**改不了模型**（只能产 candidate）
+  → 不该让动作数从 21 变成 23。验收把 21 这条数当成**漂移哨兵**钉住。
+- 草案**不许自带元信息**（7 个键），报错是点名的："提出者不能自己宣布生效"。
+- 提示词里**只给"能读"，并明说"本阶段不能写"**：意图提案的接线在 P9.3，
+  现在说"你可以提"会让模型认真写一段没人读的 `intents` —— 那就是**静默丢弃**。
+
+#### 23.20.7 载体与文件边界
+
+载体 = `Project.designIntents?`（顶层扁平数组，与 `assemblies` 同构）。
+Intent 是**这份设计的目标**（换项目就不成立）→ 属于这份设计的真相源；
+Knowledge 是**跨项目仍成立的习惯** → 独立存储（`store.ts` 已写明"知识不进 project.json"）。
+
+**悬空引用丢弃而不是拒绝整个文件**（与 `Cabinet.roomId` 悬空**故意不同**）：
+
+| | 性质 | 悬空时 |
+|---|---|---|
+| `Cabinet.roomId` | **事实** | 整组操作会少动一个柜（静默做错事）→ **必须拒绝整个文件** |
+| `designIntents[].scope` | **注解** | 顶多"少知道一条诉求"；拒绝文件会让用户连柜体尺寸都改不了 → **丢弃 + 可见警告** |
+
+**抹掉而不是留着**：留着一个系统认不出的值，存盘时会把垃圾写回文件。
+
+**不升 `schemaVersion`**：版本号跟"这份文件用了哪些结构"走，判据是**旧读者会不会静默做错事**。
+`rows` / `assemblies` 会让旧读者按错误形状算板件 → 必须升；
+而设计意图**今天没有任何执行体**，旧读者忽略它时设计结果**逐位相同** → 没有静默做错事的风险 → **不升，仍给 0.2**。
+
+#### 23.20.8 AI 侧：与 `spatialContext` 分成两块
+
+`spatialContext` 装**世界的样子**（派生事实）；`designIntent` 装**人想要的样子**（用户确认的目标）。
+两者**犯错的方式完全不同**：事实错 = 系统算错；诉求错 = 系统会错，但它本来就是用户的权利。
+混在一个块里，下一个人读快照时就分不清哪句是事实、哪句是诉求。
+
+```
+AiDesignIntentContext { readOnly: true, count, intents[] }
+AiDesignIntent { id, goal, goalZh, scope, roomId?/cabinetId?, openingKind?, statement?, origin, fact, expect }
+```
+
+- **零坐标**：goal 是词、scope 是 id、openingKind 是枚举；`fact` 是**维度的名字**不是值。
+- **只读、只装 active**；排序稳定（先词表顺序、再 id）→ 提示词前缀逐字节一致。
+- **空项目也给形状齐备的空块**（不是 `undefined`）。
+
+#### 23.20.9 验收：`verify:design-intent`（158 条）
+
+| 分组 | 条数 |
+|---|---|
+| §1 词表封闭、每格可判定 | 20 |
+| §2 未知意图不被接受（负样本精确到原因） | 12 |
+| §3 AI 不能写 geometry | 44 |
+| §4 provenance（用户明说 / 无 system） | 19 |
+| §5 生命周期（candidate / active / rejected） | 28 |
+| §6 与 spatialContext 分离 | 14 |
+| §7 不污染 cabinets / 几何 / 制造 / 清单 / schemaVersion | 19 |
+| §8 架构与依赖方向 | 13 |
+
+**变异测试（6 次，全部先变红再还原）**：
+
+| # | 变异 | 变红的断言 |
+|---|---|---|
+| 1 | `proposalToCandidates` 直接产 `active` | 57 |
+| 2 | 去掉 `goal` 闭集校验（未知词被接受） | 21–26、28、30、32（9 条） |
+| 3 | 关掉载荷数字筛子 | 29、33、34、40、44、45、46、47（8 条） |
+| 4 | 把 `designIntent` 塞进 `spatialContext`（混块） | 113、125 |
+| 5 | `activeDesignIntents` 改成"只要不是 rejected" | 95、116 |
+| 6 | `confirmIntent` 去掉 `status === 'candidate'`（rejected 能复活） | 91、93 |
+
+变异 5 暴露第 95 条原本只测了 rejected 没测 candidate → 已加强并复跑变异确认它真会红。
+
+#### 23.20.10 本次踩到的坑
+
+1. **夹具撞 id**：两个夹具都从空集合取号 → 都拿到 `di_001` → `rejectIntent` 一次带走两条。
+   这正是本项目反复钉过的"**撞 id 不报错、只静默共用记录**"（连验收脚本自己都会踩）。
+2. **同一条规矩的两处入口**：记录闸门若 = 草案判定 + 元信息，会**误拒所有完整记录**
+   → 抽出独立的载荷判定 `intentPayloadError()`，两个闸门各自在它之上加自己的那层。
+3. **TS 收窄**：`scope.roomId` 在 `find((x) => …)` 回调里不被收窄 → 先取局部常量再进回调。
+4. **"恒真检查"**：依赖方向断言原本扫原文，会把词表里的**维度名**（`core/spatial/derive.ts`）当成依赖 → 假绿。
+   修法 = 只扫 import 说明符，并断言**来源数量**。
+5. **生成器时间戳**：`toNeutralExport` 自带 `generatedAt`（与 `serializeProjectFile` 的 `savedAt` 同源），
+   而且它**嵌在生成器信息块里** —— 逐字节比较前必须**递归**摘掉，否则测的是"两次调用间隔了 12 毫秒"。
+6. **扫注释会自欺**：断言"源码里没有 `'system'`"必须**只扫代码行** ——
+   文件头注释正在讨论这件事，扫注释会把"说明它不存在"当成"它存在"的证据。
+
+#### 23.20.11 回归
+
+`GOMEMLIMIT=1500MiB npx tsc --noEmit` → **0**；
+`GOMEMLIMIT=1500MiB npm run verify:all` → **一次跑通（全链 EXIT=0，UI 链 686/686，0 失败）**；
+`verify:design-intent` **158/158**。**旧测试零删除、零放宽。**
+
+#### 23.20.12 红线核查 / 停在 P9.2
+
+- 不进入 P9.3（无候选布局 / 无自动摆柜 / 无优化搜索 / 无 LLM Planner / 无 Constraint Graph）✅
+- Placement Resolver 未触碰 ✅ ｜ Spatial Truth（`core/spatial/*`、`core/designValidation/*`、`core/relations.ts`）未触碰 ✅
+- 真相边界：意图里写不出 `{x, y, rotation, wallId, exactPosition}`（类型层 + 两道运行时闸门）✅
+- AI 不能写 geometry：动作清单 21 条未变；`design.intent.add` → `UNKNOWN_ACTION`；提案产物零坐标 ✅
+- AI 不能自己宣布生效：`makeCandidateIntent` / `proposalToCandidates` 产不出 active ✅
+- system 不产生偏好：`'system'` 不在 origin 联合类型里，也不在源码里 ✅
+- 不进入 manufacturing：制造层源码零 `designIntent`；输出逐字节不变 ✅
+
+**停在 P9.2。** 本阶段明确不做：候选布局枚举、布局评分、LLM Planner、Constraint Graph、
+自动摆柜 / 自动移柜、意图满足度评估、意图提案的接线（P9.3）。

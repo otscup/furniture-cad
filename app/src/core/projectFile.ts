@@ -20,6 +20,7 @@
  */
 import type { Project } from './types.ts';
 import { toFileProject } from './layoutModel.ts';
+import { partitionModelIntents } from './designIntent/validate.ts';
 
 export const PROJECT_FILE_FORMAT = 'furniture-cad-project';
 export const PROJECT_FILE_FORMAT_VERSION = 1;
@@ -394,6 +395,35 @@ export function parseProjectFile(raw: string): ParseResult {
           return { ok: false, error: `组合 ${asm.id} 的连接 ${conn.id} 的 origin 非法（只能是 authored / inferred）` };
         }
       }
+    }
+  }
+
+  /**
+   * ⑧ 设计意图（v0.3，P9.2）—— 缺省即没有任何目标，旧文件逐字节不受影响。
+   *
+   * ── 为什么这里**丢弃**坏条目，而柜体的悬空 roomId 却**拒绝整个文件** ──
+   *   因为两者一个是注解、一个是事实：
+   *     · `Cabinet.roomId` 悬空 → 整组操作会少动一个柜（静默做错事）→ 必须拒绝；
+   *     · 设计意图悬空/非法 → 顶多"少知道一条诉求"，而拒绝文件会让用户连柜体尺寸都改不了。
+   *   这与 P8.9 对 `hinge` / `swingDirection` 的口径同源：注解类数据坏掉就抹掉并给警告，
+   *   绝不因为一个坏字段打不开项目。**抹掉而不是留着**：留着一个系统认不出的值，
+   *   存盘时会把垃圾写回文件。
+   *
+   * ── 为什么在这里就要拦"未确认" ──
+   *   模型只装 active（见 core/designIntent/model.ts）。一个带 `status:'candidate'`
+   *   的条目混进模型，就等于"AI 猜的和用户要的分不清了" —— 而这是靠"没人会这么写文件"
+   *   来防不住的（文件是攻击面，不是数据）。所以判定统一走 `partitionModelIntents()`
+   *   这一份实现（与提案闸门共用同一套词表与生命周期规则）。
+   */
+  if (p.designIntents !== undefined) {
+    if (!Array.isArray(p.designIntents)) {
+      warnings.push('project.designIntents 不是数组，已按「没有任何设计意图」处理');
+      delete (p as unknown as Record<string, unknown>).designIntents;
+    } else {
+      const part = partitionModelIntents(p.designIntents, p);
+      for (const d of part.dropped) warnings.push(`设计意图被丢弃：${d.why}`);
+      if (part.keep.length > 0) p.designIntents = part.keep;
+      else delete (p as unknown as Record<string, unknown>).designIntents;
     }
   }
 

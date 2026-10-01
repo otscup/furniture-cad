@@ -2,6 +2,7 @@ import type { Cabinet, Project, RuleSet, UnitSpec } from '../core/types.ts';
 import { KIND_ZH } from '../core/relations.ts';
 import { canonicalUnits, isMultiRow, layoutRows } from '../core/layoutModel.ts';
 import { buildSpatialContext, type AiSpatialContext } from './spatialContext.ts';
+import { buildDesignIntentContext, type AiDesignIntentContext } from './designIntentContext.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -109,6 +110,26 @@ export interface AiSnapshot {
    * 由 `spatialContext.ts` 唯一实现（纯投影：不新增判定，全部读 `deriveSpatial` 的输出）。
    */
   spatialContext: AiSpatialContext;
+  /**
+   * 设计意图（P9.2）—— **用户确认过的设计目标**，只读。
+   *
+   * ── 为什么与 spatialContext 分成两块，而不是塞在一起 ──
+   *   `spatialContext` 装的是**世界的样子**（派生事实："这面墙多长"）；
+   *   这块装的是**人想要的样子**（authored 目标："这个厨房要优先储物"）。
+   *   两者犯错的方式完全不同：事实错 = 系统算错；目标错 = 用户本来就是这么想的。
+   *   混在一块，读快照的人（和模型）就分不清哪句能拿来做判断依据、哪句只能拿来做取舍。
+   *
+   * ── 零坐标 ──
+   *   goal 是词、scope 是 id、openingKind 是枚举 —— 本块里**没有任何数字**
+   *   （`fact` 是事实维度的名字，不是值）。
+   *
+   * ── 只有 active 才在这里 ──
+   *   模型里不存在 candidate（见 core/designIntent/model.ts）：
+   *   "AI 猜的"和"用户要的"一旦混进模型，下次打开就分不开了。
+   *
+   * 由 `designIntentContext.ts` 唯一实现（纯投影：不判断、不评分、不补默认值）。
+   */
+  designIntent: AiDesignIntentContext;
 }
 
 export interface AiCabinetView {
@@ -216,6 +237,12 @@ export function buildSnapshot(project: Project, rules: RuleSet): AiSnapshot {
      * 不会因为"这次多了一个键"把缓存与对比全部打乱。
      */
     spatialContext: buildSpatialContext(project),
+    /**
+     * 设计意图（P9.2）：与 spatialContext 一样**永远出现**（空项目 = count 0 + 空数组）。
+     * 形状稳定的理由同上方那段 —— 提示词前缀在多轮之间逐字节一致。
+     * 它与 spatialContext 是两个顶层键，**互不嵌套**：事实与目标不许住在一起。
+     */
+    designIntent: buildDesignIntentContext(project),
     ...(project.assemblies && project.assemblies.length > 0
       ? {
           assemblies: project.assemblies.map((asm, i) => ({

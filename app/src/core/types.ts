@@ -17,6 +17,7 @@ import type { ProjectViewSet } from './geometry/views.ts';
  */
 import type { PlacementAuthority } from './commandBus.ts';
 import type { PlacementIntentDecl } from './placement.ts';
+import type { DesignIntent } from './designIntent/model.ts';
 
 export interface Vec2 {
   x: number;
@@ -44,6 +45,29 @@ export interface Project {
    *   旧文件没有这个字段，读出来是 `undefined`，所有派生与校验按"无组合"处理。
    */
   assemblies?: FurnitureAssembly[];
+  /**
+   * 设计意图（v0.3，P9.2，可选）—— 用户确认过的**设计目标**。
+   *
+   * ── 它为什么属于真相源，而 Knowledge 不属于 ──
+   *   Knowledge（P6）是**跨项目仍成立的习惯**（"我习惯背面齐"）→ 换个项目也成立
+   *   → 独立存储（`ai/knowledge/store.ts` 写明"知识不进 project.json"）。
+   *   而"这个厨房要优先储物"**换个项目就不成立** —— 它是这份设计的目标，
+   *   所以它随项目走（与 `assemblies` 同构的顶层扁平数组：新增/删除都只动一个数组）。
+   *
+   * ── 模型里只装 active（P8.5-B 的教训）──
+   *   AI 推断只产生 candidate，**candidate 不进模型**（未确认 vs 已确认是真实语义差异；
+   *   一旦落盘，下次打开就分不清"用户要的"和"AI 猜的"）。
+   *   保存边界另有一道闸：非 active / 无人认领 / 悬空引用的条目会被丢弃并给出可见警告
+   *   （见 core/designIntent/validate.ts 的 `partitionModelIntents`）。
+   *
+   * ── 不升 schemaVersion 的理由 ──
+   *   版本号跟"这份文件用了哪些结构"走，判据是**旧读者会不会静默做错事**：
+   *   `rows` / `assemblies` 会让旧读者按错误的形状算板件或漏掉柜体 → 必须升到 0.3；
+   *   而设计意图**今天没有任何执行体**（本阶段只定义语言），旧读者忽略它时
+   *   设计结果与不忽略时**逐位相同** → 没有静默做错事的风险 → 不升版本。
+   *   缺省 = 没有任何意图（旧文件逐字节兼容）。
+   */
+  designIntents?: DesignIntent[];
 }
 
 export interface Room {

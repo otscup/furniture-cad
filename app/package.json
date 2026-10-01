@@ -62,8 +62,7 @@
     "verify:design-intent": "node verify/design-intent-acceptance.ts",
     "verify:candidate-layout": "node verify/candidate-layout-acceptance.ts",
     "verify:design-score": "node verify/design-score-acceptance.ts",
-    "verify:ai-planner": "node verify/ai-planner-acceptance.ts",
-    "verify:ai-planner-mutation": "node verify/ai-planner-mutation.mjs"
+    "verify:ai-planner": "node verify/ai-planner-acceptance.ts"
   },
   "dependencies": {
     "@types/three": "^0.186.0",

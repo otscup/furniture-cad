@@ -337,8 +337,16 @@ function candidatesForTarget(
  * （`explored` / `rejected{resolve,collision,duplicate}` / `budgetExhausted`）。
  */
 
-/** 候选去重键（§十）：柜 id + resolver 输出 —— 只是 resolved result 的比较键，不是新真相源 */
-function candidateSignature(c: CandidateLayout): string {
+/**
+ * 候选**内容键**（§十）：柜 id + resolver 输出 —— 只是 resolved result 的比较键，不是新真相源。
+ *
+ * ── 为什么现在导出（P9.9 §9.3）──
+ *    候选 `id` 是**位置性**的（每轮从 `cl_001` 起），所以"选中了 cl_003"在重新生成后
+ *    会**指到另一个候选**（§9.2 的真实错指）。稳定的身份只能来自**内容**，而这个键
+ *    早已在这里用于去重 —— P9.9 只把它**导出去**（`candidateKey`），**严禁另写一份
+ *    "看起来一样"的签名**（两份迟早分家）。selection 存 `{id, key}` 并按它校验。
+ */
+export function candidateKey(c: CandidateLayout): string {
   return c.placements.length +
     '|' + c.placements.map((p) => `${p.targetId}@${p.resolved.x},${p.resolved.y},${p.resolved.rotation}`).sort().join('|');
 }
@@ -544,7 +552,7 @@ function coordinatedCandidates(
         reason: `本整体候选未满足「${designIntentGoalZh(intent.goal)}」（${cp.targetId}）`,
       })),
     };
-    const sig = candidateSignature(cand);
+    const sig = candidateKey(cand);
     if (signatureSeen.has(sig)) {
       out.rejected.duplicate++;
       return null;
@@ -867,14 +875,14 @@ export function generateCandidateLayouts(project: Project, request?: CandidateRe
     const seen = new Set<string>();
     const deduped: CandidateLayout[] = [];
     for (const c of candidates) {
-      const sig = candidateSignature(c);
+      const sig = candidateKey(c);
       if (!seen.has(sig)) {
         seen.add(sig);
         deduped.push(c);
       }
     }
     const uniqueCoord = coordEntries.filter((e) => {
-      const sig = candidateSignature(e.candidate);
+      const sig = candidateKey(e.candidate);
       if (seen.has(sig)) {
         rejected.duplicate++; // 与单柜路径撞车也如实计数（恒等式要把每一条丢弃说清楚）
         return false;

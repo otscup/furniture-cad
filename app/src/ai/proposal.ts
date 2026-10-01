@@ -2,7 +2,7 @@ import type { ConnectionKind, Issue, Project, RuleSet, UnitSpec } from '../core/
 import { buildIssue } from '../core/rules/issueCatalog.ts';
 import { defaultCabinetParams } from '../core/docFactory.ts';
 import { ADJACENT_ALIGNMENTS, ALIGN_ALIGNMENTS, ATTACH_ALIGNMENTS, PLACEMENT_FACES, PLACEMENT_SIDES } from '../core/placement.ts';
-import { ACTIONS } from '../../shared/aiContract.mjs';
+import { ACTIONS, UNIT_INTENT_ITEM } from '../../shared/aiContract.mjs';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -47,6 +47,17 @@ export interface ProposalUnit {
   count?: number | null;
   /** 门扇数（0 = 开放格） */
   doorCount?: number | null;
+  /**
+   * 门板材质 id（引用 `RuleSet.materials`）。玻璃门给 `kind='glass'` 的材质（如 `M_GLASS_8_GREY`）；
+   * 不给 = 规则集默认门板材质。
+   *
+   * ── 为什么必须在这里（P9.9 约束一：禁止静默丢字段）──
+   *    这是**业务语义字段**（工艺/材质）。契约 `UNIT_INTENT_ITEM` 与 legacy `compile.ts`
+   *    都支持它（`doorIntentOf` / `checkDoorMaterial`），但本方案层此前**没有声明**它，
+   *    导致方案路径把它**静默丢掉**（玻璃门被降级成默认木门，且无人报错）。
+   *    要么**显式透传**（本字段 + `stripUnit` 复制），要么**显式拒绝**；**不许静默丢**。
+   */
+  doorMaterial?: string | null;
   /** 挂衣区挂杆高 */
   rodHeight?: number | null;
   // ── 电器格（kind='appliance'）──
@@ -166,6 +177,15 @@ const UNIT_KINDS: UnitSpec['kind'][] = ['drawerBank', 'hanging', 'shelves', 'ope
 const CONN_KINDS: ConnectionKind[] = ['corner', 'butt', 'stack'];
 
 /**
+ * 分区**字段**白名单 —— 唯一真相源是契约 `UNIT_INTENT_ITEM`（与 `stripUnit` 拷贝的闭集同源）。
+ *
+ * 为什么不另写一份常量：写死一份必然与契约分家（契约加字段、这边的拒绝还在报旧表）。
+ * `stripUnit` 是"闭集拷贝"，本表是"闭集校验"，两者必须同源，否则会出现
+ * "校验放行、拷贝丢掉"的静默丢字段 —— 正是 P9.9 约束一要堵的洞。
+ */
+const UNIT_FIELDS = new Set(Object.keys(UNIT_INTENT_ITEM as Record<string, unknown>));
+
+/**
  * 柜体尺寸范围 —— **直接读契约**，不在这里再写死一遍数字。
  *
  * 写死一份必然与契约分家（契约改了、这边的报错还在说旧范围），
@@ -248,6 +268,16 @@ export function validateProposal(p: DesignProposal, project: Project): Issue[] {
             target: t(`.cabinets[${i}]`), targetKind: 'project',
             ctx: { where, index: k + 1, kind: String(u.kind), count: UNIT_KINDS.length, kinds: UNIT_KINDS.join(' / ') },
           }));
+        }
+        // ★ P9.9 约束一：表外字段**显式拒绝**，绝不静默丢。
+        //   这里逐个字段报（不合并成一条）：用户要照着 hint 改，得知道改哪一个。
+        for (const field of Object.keys(u)) {
+          if (!UNIT_FIELDS.has(field)) {
+            out.push(buildIssue('PROPOSAL-UNIT-FIELD', {
+              target: t(`.cabinets[${i}]`), targetKind: 'project',
+              ctx: { where, index: k + 1, field, count: UNIT_FIELDS.size, fields: [...UNIT_FIELDS].join(' / ') },
+            }));
+          }
         }
       });
     }

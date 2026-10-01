@@ -778,6 +778,20 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: (c) => `改成这 ${num(c, 'count')} 种之一：${str(c, 'kinds')}。`,
     manual: '分区类型是封闭词汇表（与模型 UnitSpec 同源）。',
   },
+  // ★ P9.9 约束一：禁止静默丢字段。
+  //   分区字段是**封闭词汇表**（唯一真相源 = 契约 `UNIT_INTENT_ITEM`）；方案里出现表外字段，
+  //   系统既不认识、也不该装作没看见 —— 装作没看见的后果是"你以为配上了、其实没有"
+  //   （AI 写 `customHardware:"blum"` 而系统静默丢掉 ⇒ 用户以为拿到了阻尼五金）。
+  //   与 `PROPOSAL-UNIT-KIND` 同族同责：那一条管"值不认识"，这一条管"字段不认识"。
+  //   严重级别取 WARNING（不是 ERROR）：多写一个字段不该把整份方案退回，
+  //   但它必须**显式**出现在 `issues` 与 `notes` 里（界面显示为"提示"），不许无声消失。
+  'PROPOSAL-UNIT-FIELD': {
+    title: '方案里的分区带了不认识的字段',
+    severity: 'WARNING',
+    message: (c) => `${str(c, 'where')}第 ${num(c, 'index')} 格带了本系统不认识的字段「${str(c, 'field')}」（可用字段 ${num(c, 'count')} 个：${str(c, 'fields')}）。`,
+    hint: (c) => `把「${str(c, 'field')}」删掉、或改成这 ${num(c, 'count')} 个字段之一：${str(c, 'fields')}。系统**不会**静默忽略它 —— 忽略了你就会以为它配上了。`,
+    manual: '分区字段是封闭词汇表（与契约 UNIT_INTENT_ITEM 同源）；表外字段一律显式拒绝，不静默丢弃。',
+  },
   'PROPOSAL-ASM-MIN': {
     title: '组合的柜体不够',
     severity: 'ERROR',

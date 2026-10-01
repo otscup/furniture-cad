@@ -197,7 +197,7 @@ export interface AiUnitView {
   requestedWidth: number;
   drawers: { count: number; runnerLength: number } | null;
   shelves: { count: number } | null;
-  doors: { count: number; gapOuter: number; gapMid: number } | null;
+  doors: { count: number; gapOuter: number; gapMid: number; material: string | null } | null;
   rod: { count: number; heightFromBottom: number } | null;
   /** 仅 kind='appliance'：洞口与上下分体（null = 不是电器格） */
   appliance: { name: string; openingWidth: number; openingHeight: number; openingDepth: number; topDrawers: number } | null;
@@ -346,7 +346,10 @@ function unitView(u: UnitSpec, j: number): AiUnitView {
     // 每一个子规格都显式列出"没有就是 null"，让模型能判断"这个分区没有抽屉"
     drawers: u.drawers ? { count: u.drawers.count, runnerLength: mm(u.drawers.runnerLength) } : null,
     shelves: u.shelves ? { count: u.shelves.count } : null,
-    doors: u.doors ? { count: u.doors.count, gapOuter: u.doors.gapOuter, gapMid: u.doors.gapMid } : null,
+    // ★ P9.9 约束一：门板材质（业务语义字段）此前被静默丢弃 ⇒ 显式透传，AI 才看得见"这扇门是玻璃的"
+    doors: u.doors
+      ? { count: u.doors.count, gapOuter: u.doors.gapOuter, gapMid: u.doors.gapMid, material: u.doors.material ?? null }
+      : null,
     rod: u.rod ? { count: u.rod.count, heightFromBottom: mm(u.rod.heightFromBottom) } : null,
     appliance: u.appliance
       ? {

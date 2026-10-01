@@ -21,9 +21,11 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import type { PlannerPlan } from '../../core/planner/model.ts';
-import type { CandidateLayout } from '../../core/candidateLayout/model.ts';
+import type { CandidateGenerationStats, CandidateLayout } from '../../core/candidateLayout/model.ts';
 import type { DesignScore, EvaluatedCandidate } from '../../core/designScore/model.ts';
 import { SCORE_WEIGHT_POLICY, compareDesignScores } from '../../core/designScore/index.ts';
+import { candidateKey } from '../../core/candidateLayout/generate.ts';
+import { buildCandidateExplanation, type CandidateExplanation } from '../../core/candidateLayout/explain.ts';
 
 /** 稳定显示序号 A/B/C…（按 `plan.candidates` 的稳定顺序） */
 export function candidateLabel(index: number): string {
@@ -31,11 +33,17 @@ export function candidateLabel(index: number): string {
   return LETTERS[index] ?? `C${index + 1}`;
 }
 
-/** 一份对比行：一个候选 + 它的评分（按 candidateId 关联） */
+/** 一份对比行：一个候选 + 它的评分（按 candidateId 关联）+ 它的**只读解释投影** */
 export interface CandidateComparisonRow {
   label: string;
   layout: CandidateLayout;
   score: DesignScore;
+  /**
+   * 解释（P9.9 S1）：`(layout, score)` 的**只读投影**，与 UI 展示逐字同源。
+   * 放在 DTO 里（而不是渲染层现算）的理由：① 渲染层保持"只渲染不判断"；
+   * ② 验收与界面消费**同一份**对象，不会出现"验收绿、界面显示另一套"。
+   */
+  explanation: CandidateExplanation;
 }
 
 /** 跨候选的设计意图对比：每条 intent → 每个候选的命中（yes/no/unknown） */
@@ -51,6 +59,8 @@ export interface CandidateComparison {
   plan: PlannerPlan;
   rows: CandidateComparisonRow[];
   intentMatrix: IntentMatrixRow[];
+  /** 候选搜索台账（P9.8 运行态 `plan.generation`）的**转述**；undefined = 本轮未启用协调枚举 */
+  generation: CandidateGenerationStats | undefined;
 }
 
 /** 缺失评分的兜底：必须是 infeasible（不假成 valid / 不折算 0 分） */
@@ -79,12 +89,16 @@ function missingScore(targetId: string): DesignScore {
 export function buildCandidateComparison(plan: PlannerPlan): CandidateComparison {
   const scoreById = new Map<string, DesignScore>();
   for (const e of plan.scores as EvaluatedCandidate[]) scoreById.set(e.candidateId, e.score);
-  const rows: CandidateComparisonRow[] = plan.candidates.map((layout, i) => ({
-    label: candidateLabel(i),
-    layout,
-    score: scoreById.get(layout.id) ?? missingScore(layout.placements[0]?.targetId ?? ''),
-  }));
-  return { plan, rows, intentMatrix: buildIntentMatrix(rows) };
+  const rows: CandidateComparisonRow[] = plan.candidates.map((layout, i) => {
+    const score = scoreById.get(layout.id) ?? missingScore(layout.placements[0]?.targetId ?? '');
+    return {
+      label: candidateLabel(i),
+      layout,
+      score,
+      explanation: buildCandidateExplanation(layout, score),
+    };
+  });
+  return { plan, rows, intentMatrix: buildIntentMatrix(rows), generation: plan.generation };
 }
 
 /**
@@ -115,4 +129,78 @@ export function buildIntentMatrix(rows: CandidateComparisonRow[]): IntentMatrixR
 export function sortComparisonRows(rows: CandidateComparisonRow[], sortByScore: boolean): CandidateComparisonRow[] {
   if (!sortByScore) return rows;
   return [...rows].sort((a, b) => compareDesignScores(a.score, b.score));
+}
+
+// ═══════════════════════════ 探索台账转述（P9.9 S1）═══════════════════════════
+
+/**
+ * 把 P9.8 的 `CandidateGenerationStats` 转述成人话行 —— **只转述，不重算、不推断**。
+ *
+ * 纪律：
+ *   · 每个数字都**直接来自** `stats`，不做任何四则运算（不做百分比、不做差值）；
+ *   · 不判断"够不够好"，不做优劣排序 —— 它只回答"搜了多少、为什么没搜完"；
+ *   · `budgetExhausted` 必须如实说成"没搜完"，**不许**说成"没有候选"（两者天差地别）。
+ */
+export function generationLedgerZh(stats: CandidateGenerationStats | undefined): string[] {
+  if (!stats) return [];
+  const out: string[] = [];
+
+  out.push(`本次请求最多 ${stats.requested} 条候选；枚举产出有效候选 ${stats.generated} 条，实际返回 ${stats.returned} 条。`);
+  if (stats.truncated > 0) {
+    out.push(
+      `有 ${stats.truncated} 条因上限没返回` +
+        (stats.generationLimited ? '（枚举空间被上限截断 —— 不是搜不出，是没让返回）。' : '。'),
+    );
+  }
+
+  if (stats.explored !== undefined) {
+    const r = stats.rejected;
+    const rejectedZh = r ? `解析失败 ${r.resolve} 条、有冲突 ${r.collision} 条、与已得候选重复 ${r.duplicate} 条` : '原因未分类';
+    out.push(`一共评估过 ${stats.explored} 个组合；其中被丢弃：${rejectedZh}。`);
+  }
+
+  if (stats.budget !== undefined) {
+    out.push(
+      `本次评估预算上限 ${stats.budget} 个组合` +
+        (stats.budgetExhausted ? '—— 预算已耗尽、提前停止：这是"没搜完"，不是"搜不出"。' : '（未耗尽）。'),
+    );
+  }
+
+  return out;
+}
+
+// ═══════════════════════════ Selection 身份（P9.9 S3）═══════════════════════════
+/**
+ * 一条被选中的候选（**session 运行态**）：位置性 `candidateId` + 内容键 `key`。
+ *
+ * ── 为什么必须两个一起（§9.2 的真实错指）──
+ *  候选 id 是**位置性**的（每轮从 `cl_001` 起，见 `candidateLayoutId`），
+ *  所以"选中 cl_003"在**重新生成**后会指到**另一个候选**。稳定身份只能来自**内容** ——
+ *  即既有的 `candidateKey`（内容签名）。两个一起存，恢复时**双重校验**。
+ */
+export interface StoredCandidateSelection {
+  candidateId: string;
+  key: string;
+}
+
+/**
+ * 恢复选中：`{candidateId, key}` 必须**同时**成立 ——
+ *  - id 在本次 plan 里找得到，**且**
+ *  - 该候选的当前 `candidateKey` 与存下来的 key **逐字符相同**。
+ *
+ * 任一不成立 ⇒ 返回 `null`（**失效**）。调用方必须据此**清除**选中，
+ * **绝不回退**到"id 相同就认"（那正是旧 bug：内容变了还高亮着别人）。
+ *
+ * 纯函数：不写 sessionStorage、不碰 bus、不读 project —— 便于验收直测。
+ */
+export function resolveSelection(
+  plan: PlannerPlan | null,
+  stored: StoredCandidateSelection | null | undefined,
+): StoredCandidateSelection | null {
+  if (!plan || !stored) return null;
+  const c = plan.candidates.find((x) => x.id === stored.candidateId);
+  if (!c) return null;
+  const key = candidateKey(c);
+  if (key !== stored.key) return null; // 内容变了 ⇒ 失效，不回退
+  return { candidateId: c.id, key };
 }

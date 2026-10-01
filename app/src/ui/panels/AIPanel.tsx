@@ -21,6 +21,8 @@ import { compileProposal } from '../../ai/compileProposal.ts';
 import type { AiAction } from '../../ai/compile.ts';
 import { PlanRunView } from './PlanRunView.tsx';
 import { CandidateComparePanel } from './candidateCompare.tsx';
+import { resolveSelection, type StoredCandidateSelection } from './candidateCompareLogic.ts';
+import { candidateKey } from '../../core/candidateLayout/generate.ts';
 import { planCandidates, type PlannerPlan } from '../../core/planner/index.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { currentKnowledge, resolveKnowledge, knowledgeDigest as knowledgeDigestOf } from '../../ai/knowledge/index.ts';
@@ -528,30 +530,52 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   //    selected 用独立前缀的 sessionStorage key（不污染 CONVO_KEY/ROOM_KEY）。
   const [comparePlan, setComparePlan] = useState<PlannerPlan | null>(null);
   const SELECT_KEY = 'p96:selectedCandidate';
-  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(() => {
+  /**
+   * 选中态 = `{candidateId, key}`（P9.9 S3）。
+   * 旧版只存**位置性 id** ⇒ 重新生成后高亮会**错指**到另一个候选（§9.2 的真实缺陷）。
+   * 现在 id 与**内容键**（`candidateKey`）一起存；恢复时经 `resolveSelection` 双重校验，
+   * 失配即**清除**（**绝不回退**到"id 相同就认"）。
+   */
+  const [selectedCandidate, setSelectedCandidate] = useState<StoredCandidateSelection | null>(() => {
     try {
-      return sessionStorage.getItem(SELECT_KEY);
+      const raw = sessionStorage.getItem(SELECT_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw) as unknown;
+      if (o && typeof o === 'object') {
+        const r = o as Record<string, unknown>;
+        if (typeof r.candidateId === 'string' && typeof r.key === 'string') {
+          return { candidateId: r.candidateId, key: r.key };
+        }
+      }
+      return null;
     } catch {
       return null;
     }
   });
-  const selectCandidate = useCallback((id: string) => {
-    setSelectedCandidateId(id);
+  /** 写 sessionStorage；null = 清除（隐私模式下可能不可用 —— 只是不记住，不影响使用） */
+  const persistSelection = useCallback((s: StoredCandidateSelection | null) => {
     try {
-      sessionStorage.setItem(SELECT_KEY, id);
-    } catch {
-      /* 隐私模式下 sessionStorage 可能不可用 —— 只是不记住，不影响使用 */
-    }
-  }, []);
-  const closeCompare = useCallback(() => {
-    setComparePlan(null);
-    setSelectedCandidateId(null);
-    try {
-      sessionStorage.removeItem(SELECT_KEY);
+      if (s) sessionStorage.setItem(SELECT_KEY, JSON.stringify(s));
+      else sessionStorage.removeItem(SELECT_KEY);
     } catch {
       /* ignore */
     }
   }, []);
+  const selectCandidate = useCallback(
+    (id: string) => {
+      const c = comparePlan?.candidates.find((x) => x.id === id);
+      if (!c) return;
+      const s: StoredCandidateSelection = { candidateId: c.id, key: candidateKey(c) };
+      setSelectedCandidate(s);
+      persistSelection(s);
+    },
+    [comparePlan, persistSelection],
+  );
+  const closeCompare = useCallback(() => {
+    setComparePlan(null);
+    setSelectedCandidate(null);
+    persistSelection(null);
+  }, [persistSelection]);
 
   /**
    * 生成候选对比（P9.6 入口）：读当前项目 + 生效设计意图，跑 `planCandidates`
@@ -573,13 +597,21 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           scores: [],
           explanations: [],
         });
+        setSelectedCandidate(null); // 没有候选 ⇒ 选中失效并清除
+        persistSelection(null);
         return;
       }
       setComparePlan(r.plan);
+      // ★ 重新生成 ⇒ 旧选中必须用**新 plan** 复核（id 存在**且**内容键匹配），失配即清除、不回退
+      setSelectedCandidate((prev) => {
+        const ok = resolveSelection(r.plan, prev);
+        persistSelection(ok);
+        return ok;
+      });
     } finally {
       setBusyKind('');
     }
-  }, [bus, busy, props]);
+  }, [bus, busy, props, persistSelection]);
 
   /**
    * 预览一份候选（§七/§九）：候选的坐标来自 `resolvePlacement`（唯一出口），
@@ -1161,7 +1193,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           <CandidateComparePanel
             plan={comparePlan}
             project={bus.getState()}
-            selectedCandidateId={selectedCandidateId}
+            selectedCandidateId={selectedCandidate?.candidateId ?? null}
             onSelect={selectCandidate}
             onPreview={previewCandidate}
             onClose={closeCompare}

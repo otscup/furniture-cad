@@ -208,8 +208,14 @@ section('§4 Selection：选中仅 UI/session 态');
   ok('17. selected 走 sessionStorage（get/set/remove 三项齐全，不进 project.json）', /sessionStorage\.getItem\(('p96:selectedCandidate'|SELECT_KEY)\)/.test(AIPANEL_SRC) && /sessionStorage\.setItem\(SELECT_KEY/.test(AIPANEL_SRC) && /sessionStorage\.removeItem\(SELECT_KEY\)/.test(AIPANEL_SRC));
   ok('18. SELECT_KEY 独立于会话键（不与 CONVO_KEY/ROOM_KEY 混淆）', /const SELECT_KEY = 'p96:selectedCandidate'/.test(AIPANEL_SRC) && /const CONVO_KEY = 'furniture-cad\.ai\.convos\.v2'/.test(AIPANEL_SRC) && /const ROOM_KEY = 'furniture-cad\.ai\.room\.v2'/.test(AIPANEL_SRC));
   ok('19. ★ selectCandidate 只改 UI 状态 + 写 session，不调总线/提交', (() => {
+    // P9.9 S3：选中态改为 {candidateId,key}（setSelectedCandidate），session 写入抽到 persistSelection。
+    // 本项意图不变（只改 UI 态 + 写 session、不碰总线），并**加强**为：连 persistSelection 体内
+    // 的 set/remove 一起核，会话写入链仍是逐环可查的（不是放宽）。
     const body = cbBody(AIPANEL_SRC, 'selectCandidate');
-    return body.includes('setSelectedCandidateId') && body.includes('sessionStorage.setItem') && !/bus\.execute|commitPlan|dryRunPlan/.test(body);
+    const persistBody = cbBody(AIPANEL_SRC, 'persistSelection');
+    return body.includes('setSelectedCandidate') && body.includes('persistSelection')
+      && persistBody.includes('sessionStorage.setItem') && persistBody.includes('sessionStorage.removeItem')
+      && !/bus\.execute|commitPlan|dryRunPlan/.test(body);
   })(), cbBody(AIPANEL_SRC, 'selectCandidate').slice(0, 200));
   ok('20. 点击选择不自动预览/自动提交（selectCandidate 体内无 previewCandidate/dryRunPlan/commitPlan）', (() => {
     const body = cbBody(AIPANEL_SRC, 'selectCandidate');

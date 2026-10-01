@@ -67,6 +67,12 @@ export function compileProposal(p: DesignProposal, project: Project, rules: Rule
   const issues = validateProposal(p, project);
   const notes: string[] = [];
 
+  // ★ P9.9 约束一：被显式拒绝的字段必须写进 `notes`（界面必须显示）。
+  //   判据只有一处（`validateProposal` 的字段白名单），这里只**转述**它，
+  //   不重判一遍 —— 重判就是"一种形状两处判断"，迟早分家。
+  //   放在阻塞判断**之前**：即使方案因别的原因被退，用户也看得到"这几个字段我不认"。
+  for (const i of issues.filter((x) => x.code === 'PROPOSAL-UNIT-FIELD')) notes.push(i.message);
+
   if (proposalBlocked(issues)) {
     const blocking = issues.filter((i) => i.severity === 'ERROR' || i.code === 'PROPOSAL-OPEN-QUESTIONS');
     return {
@@ -243,6 +249,8 @@ function stripUnit(u: ProposalUnit): Record<string, unknown> {
   if (u.width !== undefined && u.width !== null) out.width = Number(u.width);
   if (u.count !== undefined && u.count !== null) out.count = Number(u.count);
   if (u.doorCount !== undefined && u.doorCount !== null) out.doorCount = Number(u.doorCount);
+  // ★ P9.9 约束一：门板材质是业务语义字段，必须**显式透传**（此前被静默丢弃 ⇒ 玻璃门降级成木门）
+  if (u.doorMaterial !== undefined && u.doorMaterial !== null) out.doorMaterial = String(u.doorMaterial);
   if (u.rodHeight !== undefined && u.rodHeight !== null) out.rodHeight = Number(u.rodHeight);
   if (u.applianceName) out.applianceName = String(u.applianceName);
   if (u.openingWidth !== undefined && u.openingWidth !== null) out.openingWidth = Number(u.openingWidth);

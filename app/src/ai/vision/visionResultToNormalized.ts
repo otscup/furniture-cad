@@ -57,6 +57,8 @@ function mapUnit(u: VisionUnit, cabW: number | null): ProposalUnit {
     width,
     count: typeof u.count === 'number' ? u.count : null,
     doorCount: typeof u.doorCount === 'number' ? u.doorCount : null,
+    // ★ P9.9 约束一：挂衣区挂杆高是业务语义字段（VisionUnit 有），此前被静默丢弃 ⇒ 显式透传
+    rodHeight: typeof u.rodHeight === 'number' ? u.rodHeight : null,
     applianceName: u.applianceName ?? null,
     openingWidth: u.openingWidth ?? null,
     openingHeight: u.openingHeight ?? null,

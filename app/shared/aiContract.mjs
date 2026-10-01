@@ -456,6 +456,86 @@ const TOP_KEYS = new Set(['action', 'target', 'params', 'reason']);
 const TARGET_KEYS = new Set(['cabinetId', 'cabinetName', 'roomId', 'roomName', 'unit', 'part', 'scope']);
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ *  候选布局请求（P9.3）—— AI 表达"想看哪几条意图下的候选摆法"的唯一入口
+ *
+ *  ── 为什么它是**请求**而不是**动作** ──
+ *    动作（ACTIONS）是"改模型"的事，每一跳都要过 CommandBus 与白名单；
+ *    候选布局**不改模型**（只描述"如果这样摆，会得到什么结果"），
+ *    所以它不该、也**不能**混进动作清单 —— 动作清单仍然 21 条，一个字没变。
+ *
+ *  ── 铁律：候选请求里**没有几何** ──
+ *    AI 只能引用 id（意图 / 柜体）与枚举（scope），
+ *    **不许**出现 x / y / rotation / placements / geometry 之类字段。
+ *    坐标一律由确定性枚举 + 落位引擎（`resolvePlacement`）算出来 ——
+ *    让 AI 直接吐坐标，等于又回到"让看不见墙的一方去猜几何"。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+export const CANDIDATE_REQUEST_KEYS = ['intentIds', 'cabinetIds', 'scope', 'maxCandidates'];
+
+/** 明确点名拒收的"几何"键 —— 白名单本就会挡，这里只为给更清楚的话术 */
+const CANDIDATE_GEOMETRY_KEYS = new Set([
+  'x',
+  'y',
+  'rotation',
+  'placements',
+  'placement',
+  'geometry',
+  'coordinates',
+  'dx',
+  'dy',
+  'angle',
+]);
+
+/**
+ * 校验（并归一化）一个候选请求。**白名单**口径与 `validateAction` 完全一致：
+ * 未知键一律整条拒收，不"忽略掉不认识的部分继续"（静默忽略是最危险的行为）。
+ *
+ * @returns { ok: true, request } | { ok: false, code, error }
+ */
+export function validateCandidateRequest(raw) {
+  if (!isPlainObject(raw)) return { ok: false, code: 'NOT_OBJECT', error: '候选请求不是一个对象' };
+
+  const geo = Object.keys(raw).filter((k) => CANDIDATE_GEOMETRY_KEYS.has(k));
+  if (geo.length > 0) {
+    return {
+      ok: false,
+      code: 'GEOMETRY_FORBIDDEN',
+      error: `候选请求不许带几何字段：${geo.join('、')} —— 坐标一律由系统确定性算，AI 只给 id`,
+    };
+  }
+  const extra = Object.keys(raw).filter((k) => !CANDIDATE_REQUEST_KEYS.includes(k));
+  if (extra.length > 0) {
+    return { ok: false, code: 'EXTRA_KEY', error: `候选请求里出现了契约外的字段：${extra.join('、')}` };
+  }
+
+  const out = {};
+  for (const key of ['intentIds', 'cabinetIds']) {
+    if (raw[key] !== undefined) {
+      if (!Array.isArray(raw[key]) || raw[key].some((v) => typeof v !== 'string' || v.length > MAX_STRING)) {
+        return { ok: false, code: 'BAD_IDS', error: `${key} 必须是字符串 id 数组（每个 ${MAX_STRING} 字以内）` };
+      }
+      out[key] = [...raw[key]];
+    }
+  }
+  if (raw.scope !== undefined) {
+    if (raw.scope !== 'room' && raw.scope !== 'project') {
+      return { ok: false, code: 'BAD_SCOPE', error: `scope 只允许 "room" 或 "project"，收到 "${String(raw.scope)}"` };
+    }
+    out.scope = raw.scope;
+  } else {
+    out.scope = 'project';
+  }
+  if (raw.maxCandidates !== undefined) {
+    if (!Number.isInteger(raw.maxCandidates) || raw.maxCandidates < 1) {
+      return { ok: false, code: 'BAD_MAX', error: `maxCandidates 必须是 ≥1 的整数，收到 ${String(raw.maxCandidates)}` };
+    }
+    out.maxCandidates = raw.maxCandidates;
+  }
+  return { ok: true, request: out };
+}
+
+/**
  * 部件词汇表（闭合，Task #25 A3）—— 来自 core/geometry/pickLines.ts 的 CabinetPart。
  * AI 只允许用清单里的部件名指"图上那条线"；写别的一律整条拒收。
  */
@@ -1009,6 +1089,21 @@ export function buildUserMessage(text, snapshot, history = []) {
    */
   lines.push(
     '快照里的 `designIntent` 是**已经确认的设计目标**（用户想要的，不是系统算出来的）：每条一个词 `goal`、它说的是哪个房间/柜体（`scope`）、将来按哪一项既有事实对账（`fact`，null = 判不出来的取舍方向）。它同样是**只读**的：你可以据此判断该往哪个方向设计，但**这一轮你不能新增或修改设计意图**（目前没有这条通道，写了也不会生效）—— 要改模型只能用上面动作清单里的事。'
+  );
+  /**
+   * 候选布局请求的读法（P9.3）。与上面两段**同一条纪律**：能表达诉求，不能改模型。
+   *
+   * ── 为什么必须说清"没有坐标" ──
+   *   候选问的是"如果这样摆会得到什么结果"，摆法是**系统算**的。若不说清，
+   *   模型很可能自作聪明地给一串 x/y —— 那正是本项目一直在消灭的
+   *   "让看不见墙的一方去猜几何"。这里明说：只给 id，坐标由系统算。
+   *
+   * ── 为什么说"不会被自动采用" ──
+   *   本阶段候选只到 `draft` 为止（没有 adopt 通道）。先说清，
+   *   免得模型以为"我一说，柜子就摆好了"。
+   */
+  lines.push(
+    '想要"比较几条设计目标下的不同摆法"时，你可以额外输出一个 `candidateRequest`：`{ intentIds?, cabinetIds?, scope, maxCandidates? }` —— **只用 id** 表达"想看哪几条意图、哪几只柜"，**绝对不要给 x / y / rotation**（落位一律由系统按语义确定性算）。系统会据此枚举出若干候选布局给用户看，**候选不会被自动采用**（本阶段没有"采用"这一步）。'
   );
   lines.push('');
   lines.push('【用户这一句要求】');

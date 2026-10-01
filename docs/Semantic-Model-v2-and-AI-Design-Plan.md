@@ -2671,3 +2671,82 @@ AiDesignIntent { id, goal, goalZh, scope, roomId?/cabinetId?, openingKind?, stat
 
 **停在 P9.2。** 本阶段明确不做：候选布局枚举、布局评分、LLM Planner、Constraint Graph、
 自动摆柜 / 自动移柜、意图满足度评估、意图提案的接线（P9.3）。
+
+---
+
+### 23.21 P9.3 Candidate Layout Foundation（候选布局基础设施）
+
+> 完整审查报告 + 实施记录：`docs/P9.3-Candidate-Layout-Foundation.md`。
+> 状态：**已完成，停在 P9.3。**
+
+#### 23.21.1 阶段目标与边界
+
+引入**纯临时**的"候选布局"对象：给定已有柜体，确定性枚举"如果这样摆，会得到什么结果"。
+本阶段**只到 draft**。红线（逐条）：不进 P9.4 / 无评分 / 无 winner / 无 AI Planner /
+无 LLM 自动布局 / **不改 Placement Resolver** / **不改 Semantic Model 真相源** /
+**不写 project.json** / **不把 candidate 变成 Cabinet** / 不新增 CommandBus op。
+
+#### 23.21.2 实现前的审查结论（要点）
+
+- **`VariantDraft` 复用思想、不复用结构**：它的核心字段是 `cabinet: Cabinet`（一只**候选新柜**），
+  而本层讲的是"同一批**已有**柜体的不同落位"——复用它的 `cabinet` 字段 = 候选里长出 Cabinet = 踩红线。
+- **候选数据只能活内存**（P8.5-B 纪律的直接延续）：坐标是"系统算的第二种读数"，落盘即破坏
+  `preview===commit` / `dryRun===commit` 逐字节不变量。
+- **四条硬保证**（逐条可测）：①类型保证（`CandidatePlacement` 无 `Cabinet`）；
+  ②写保证（不 import commandBus/ai/export/manufacturing）；③路由保证（每条落位必过 `resolvePlacement`）；
+  ④无 adopt（不导出任何 adopt/apply/commit）。
+
+#### 23.21.3 交付物
+
+| 文件 | 性质 |
+|---|---|
+| `core/candidateLayout/model.ts` | 新：`CandidateStatus='draft'` / `CandidateRequest` / `CandidatePlacement`（无 Cabinet）/ `CandidateLayout` / `CandidateLayoutSet` |
+| `core/candidateLayout/generate.ts` | 新：`generateCandidateLayouts(project, request?)` 确定性枚举器 |
+| `core/candidateLayout/index.ts` | 新：对外唯一出口（导出面即纪律：无 adopt/apply/commit/persist） |
+| `shared/aiContract.mjs` | 改：`CANDIDATE_REQUEST_KEYS` + `validateCandidateRequest()`（拒几何）+ 提示词一句（**动作清单仍 21 条**） |
+| `verify/candidate-layout-acceptance.ts` | 新：`verify:candidate-layout`，**69 条断言** |
+
+#### 23.21.4 生成链：Intent → Placement → Resolver → validation
+
+`activeDesignIntents` →（只留可构造目标 `wall-contact`/`standalone`）→ `candidateSpots`（确定性贴墙枚举）
+→ `PlacementIntent{absolute, origin:'authored'}` → **`resolvePlacement`（唯一坐标出口）**
+→ `cloneWithPlacement`（只读副本）→ `detectCollisions` + `deriveSpatialFacts` + `deriveContacts`。
+
+- **三档策略 A/B/C**：`wall-same`（贴墙·保持朝向）/ `wall-other`（贴墙·换个朝向）/ `satisfy`（贴墙·满足目标）。
+- "放得下"的判据**只有一份**（`detectCollisions`）；满足性判定**只有一份**（事实层）。
+- 同输入两次生成**逐字节相同**（无随机、无时钟）。
+
+#### 23.21.5 AI 边界
+
+AI 输出 `candidateRequest = {intentIds?, cabinetIds?, scope, maxCandidates?}` —— **只有 id 与枚举，零坐标**；
+`validateCandidateRequest` 把 `x`/`y`/`rotation`/`placements`/`geometry`… 一律 `GEOMETRY_FORBIDDEN` 拒收；
+提示词明说"只给 id、不要给 x/y/rotation"且"候选不会被自动采用"。**动作清单 21 条一字未改。**
+
+#### 23.21.6 验收：`verify:candidate-layout`（69 条）
+
+覆盖用户 9 项要求（不污染 Model / 不进 project.json / 不进 schemaVersion / 与 Resolver 一致 /
+validation 一致 / 多候选独立 / adopt 不可调用 / AI 契约无几何 / rejected·unknown 不产候选），
+另加"未确认不产候选""取舍方向类不产候选""混合场景只对 active 构造目标产候选"。
+
+#### 23.21.7 本次踩到的坑
+
+1. **"值不变地绕过 resolver"抓不住**：候选 intent 是 `absolute`，而 Resolver 对 `absolute` 只做取整
+   —— 整数进 = 整数出（恒等）。所以"删掉 resolvePlacement 调用、值照抄"单靠动态等值判据是**假绿**；
+   必须补一条**源码级**判据（源码里真的存在 `resolvePlacement(` 调用）兜底。教训：
+   **判据要挑"变异真能把它变红"的那一条**，别指望一条恒等的动态判据能替你守门。
+2. **哨兵必须先自检**：§9 的三条变异哨兵各自配了一个"故意写坏的样本"自检
+   （塞了 `cabinet` 的落位 / 手改了 `x` 的落位 / 伪造的导出名列表），确认判据**真能返回 false** ——
+   否则哨兵可能永远是绿的（断言不可信比失败更危险）。
+3. **房间级意图不搞组合爆炸**：room-scope 的可构造意图按"逐柜生成一份候选"处理，
+   真正的多柜组合枚举刻意留待后续；本阶段宁可少给，不给错。
+
+#### 23.21.8 回归 / 红线核查
+
+- `GOMEMLIMIT=1500MiB npx tsc --noEmit` → 0；`verify:candidate-layout` → **69/69**。
+- `GOMEMLIMIT=1500MiB npm run verify:all` → 全链 EXIT=0，**一次跑通**（含 UI 链）。
+- Placement Resolver 未触碰 ✅ ｜ Semantic Model / `types.ts` 未触碰 ✅ ｜ `schemaVersion` 不变 ✅
+- 候选不进 `project.json`（生成前后序列化逐字节不变）✅ ｜ 候选层无 adopt ✅
+- 候选层不 import commandBus/ai/export/manufacturing ✅ ｜ 动作清单仍 21 条 ✅
+
+**停在 P9.3。** 本阶段明确不做：布局评分、选 winner、AI Planner、LLM 自动布局、
+`adopt` 通道、多柜组合枚举、候选 UI 接线。

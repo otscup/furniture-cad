@@ -41,7 +41,9 @@ NAS 群晖：网关 key 须非占位符；宿主机测 000 是 DNS 假故障（�
 - **几何**：两矩形面贴合⇒相对旋转必是 90° 整数倍；placement=背面左角约定。**DXF**：R2007（R2000 须 gbk+dwgcodepage、dimlfac=1.0）。
 
 ## v0.3 路线（完整 hash 链见日志）
-P0→…→P9.3(`601faf7`)→P9.4(`bd025d0`+`6332b79`)→P9.5(`9e28c84`)。**停在 P9.5。** P9.6=Multi-Candidate Compare UI 进行中（消费 CandidateLayout/DesignScore/PlannerPlan 运行态，不造 winner、不写 project.json、selected 仅 session 态）。
+P0→…→P9.3(`601faf7`)→P9.4(`bd025d0`+`6332b79`)→P9.5(`9e28c84`)→P9.6（Multi-Candidate Compare UI）。**停在 P9.6。** P9.6=`candidateCompare.tsx`(渲染)+`candidateCompareLogic.ts`(纯逻辑)；消费 P9.3/9.4/9.5 运行态、不造 winner、不写 project.json、selected 仅 session(`p96:selectedCandidate`)；42 项 compare + 18 项 real-furniture-request(玻璃门衣柜端到端) 均入 verify:all；7 变异全红。
 - P9.2 `core/designIntent/`（158）/ P9.3 `core/candidateLayout/`（69）：Intent≠Layout≠Cabinet；只装 active；`scope` 写不出 wallId；候选只到 draft、必过 Resolver、不进 project.json、无 adopt。
 - P9.4 `core/designScore/`（133）：来源闭集 `fact|rule|preference`；**Gate 前置**（ERROR⇒`infeasible`）；偏好=`resolveKnowledge().applicable`（永不进 hardFailures）；不选 winner；AI 只读块 `snapshot.candidateScore`。
 - P9.5 `core/planner/`（96 + 13 变异）：两阶段（AI 出 `PlannerRequest` → 系统确定性枚举+评分）。**类型层禁几何**（`x?: never`）；`plannerRequest` 是**请求不是动作**（仍 21 条）；`PlannerPlan` **无 winner/adopt**；枚举/坐标/碰撞/评分复用唯一实现（逐字节相同）；Planner 只转发 `entries`。**`MAX_ACTIONS=12` 不改数字** → `$ref` 闭包分批（单组超限如实 `unsplittable`，绝不截断）。
+- P9.6 修 **validate.ts 玻璃门假缺陷**：玻璃门走甲购分流不进 geom.panels → 门宽恒等式读到 0 块误报"程序缺陷"；守卫后改验甲购条目（材质/数量）。§二十七 端到端（P8/P9 系验收走 dryRunPlan 真链路）才能逼出 generateCabinet 直连覆盖不到的死角。
+- 变异测试纪律：锚点必须落 JSX/实码（首现在头注释=被剥=假绿）；变异崩 exit≠0 ≠ 断言红（用不存在的导出会 import 崩，红得没意义）；**沙箱 node 无法 spawn 子进程（EBUSY 连 bash 也是）** → 变异 harness= node 补丁器(纯文件读写) + bash 驱动(跑验收/判红/还原)。

@@ -2750,3 +2750,108 @@ validation 一致 / 多候选独立 / adopt 不可调用 / AI 契约无几何 / 
 
 **停在 P9.3。** 本阶段明确不做：布局评分、选 winner、AI Planner、LLM 自动布局、
 `adopt` 通道、多柜组合枚举、候选 UI 接线。
+
+---
+
+### 23.22 P9.4 —— Deterministic Design Score（确定性设计评分，commit 见下）
+
+> 独立实施记录：`docs/P9.4-Deterministic-Design-Score.md`（§一 审查报告 / §二 实施记录）。
+
+#### 23.22.1 阶段目标与边界
+
+给 P9.3 的候选布局打一份**确定性、可解释**的分。回答方式**不是**一个裸数字
+（`score = 82` 明令禁止），而是一串 component：每条都答得出「来自什么 / 依据哪条 fact /
+哪条 rule / 是不是 preference / 权重多少 / 为什么加·减」。
+
+**严格停在 P9.4**：不进入 P9.5 AI Planner、不接 LLM 自动布局、不自动选 winner、
+不自动 adopt、不改 Semantic Model / Placement Resolver / Spatial Truth / Manufacturing、
+不把 score 写进 `project.json`。
+
+#### 23.22.2 实现前的审查结论（要点）
+
+- **没有可复用的评分基础**：全仓 `score|rank|weight|compare|best|winner|recommend` 只命中
+  `weightKg`（板件重量）与局部变量 `best`（最近面/最近墙）——与"方案好坏"无关。
+  `VariantDraft.stats` 是柜体派生统计。→ 本层是**新增**，但**纯组合**。
+- **可复用的消费口齐全**：`validateDesign`（门槛 + 设计语义）、`deriveSpatialFacts` /
+  `deriveContacts`（事实）、`activeDesignIntents`（读侧唯一入口）、`resolveKnowledge` +
+  `preferredOrientation`（偏好唯一入口）、`cornerTurnSide`（转角唯一实现）。
+- **危险清单**（会偷偷变成第二套规则）：自造"离墙 300mm"新阈值、"门扇扫过面积"新几何、
+  "柜间距离"（P9.2 已判定这个词判不出来）、"L 型必须 270°"（P8.3 已拒绝）、
+  自己判 corner/butt 与左右转、拿 `class:'priority'` 的词凑"动线分"。
+  唯一安全写法：**读一个已算好的枚举值，与 spec 声明的 `satisfiedValues` 对账**。
+
+#### 23.22.3 交付物
+
+- `core/designScore/model.ts` —— `DesignScore{status,total,totalKind,weights,components[],
+  hardFailures[],preferenceMatches[],explanations[]}`；`DesignScoreSource` 是**闭集**
+  `'fact'|'rule'|'preference'`（没有第四种，尤其没有 `llm`）；`SCORE_WEIGHT_POLICY.assigned=false`。
+- `core/designScore/score.ts` —— `scoreCandidateLayout` / `scoreCandidateLayoutSet` /
+  `compareDesignScores` / `designScoreSummaryZh`。
+- `core/designScore/index.ts` —— 导出面**无** winner / best / recommended / adopt / apply。
+- `verify/design-score-acceptance.ts` —— `verify:design-score`，**78 条**，接入 `verify:all`。
+
+#### 23.22.4 评分链：Gate → 条件命中 → 偏好命中
+
+```
+CandidateLayout
+  ├─① Hard Constraint Gate   （读 candidate.issues 的 ERROR + validateDesign 的 error 结论）
+  │     infeasible ⇒ total:null + components:[]      ← 不进入软评分
+  └─② 软评分（只在 valid 时）
+       条件命中  逐条 active 意图 → 读词表 spec 的 fact → 与 satisfiedValues 对账
+       偏好命中  resolveKnowledge().applicable → preferredOrientation(res, 落位情形)
+       total = 命中数（**无权重**，如实标注）
+```
+
+- **门槛不自己定等级**：severity 真相源仍是 `issueCatalog`，本层只读 `status === 'error'`。
+- **落位情形**复用 `deriveContacts`（接触形态）+ `cornerTurnSide`（转角方向，以对方柜为视角）
+  —— 不写第二份接触/转角判定。
+- **判不出来就说判不出来**：`class:'priority'`（`fact === null`）→ `unavailable` 组件，
+  `hit:'unknown'`，**不计入 total**；房间级条件意图同理。
+
+#### 23.22.5 权重为什么是 null（§九的结论）
+
+权重要有归属。唯一像样的归属地是 `RuleSet`，而它当前**没有任何评分配置**
+（只有 `limits/policy/materials/edgebanding/hardware/stylePresets`）。
+为"看起来完整"去扩展被 `factory-default.json` + 解析 + 迁移锁定的生产配置 = 用错归属地。
+→ 本阶段 `weight:null` + `weightSource:'unassigned'`，`total` = 命中数（确定性、可解释、无 magic number），
+权重系统与其归属**留待后续阶段**。
+
+#### 23.22.6 验收：`verify:design-score`（78 条，13 节）
+
+覆盖：① 闸门语义（infeasible ⇒ null + 空 components）② 不污染模型 / 不进 `project.json` /
+不升 schemaVersion ③ 与 Resolver 一致（评分结果不带坐标）④ 门槛结论与既有层 ERROR 码集**逐条一致**
+且文案**逐字节**来自 issueCatalog ⑤ 多候选独立 + 逐字节可复现 ⑥ 导出面无 adopt/winner
+⑦ AI 契约动作仍 21 条 ⑧ rejected / candidate 意图不产生 component ⑨ unavailable 不计入 total
+⑩ source 闭集 + 源码无毒（剥注释后扫代码）⑪ 偏好：压制不参与 / candidate 不参与 / 永不进 hardFailures
+⑫ 权重归属 ⑬ compare 确定性且不自称 winner。含 6 条哨兵自检 + 2 条剥注释哨兵自检。
+
+#### 23.22.7 变异测试（3 项，全部先红再还原）
+
+| 变异 | 实测变红的断言 |
+| --- | --- |
+| 评分把候选坐标写回真实模型 | **11 / 12 / 13**（模型逐字节、placement、序列化） |
+| `score.ts` 里自己算几何（`Math.hypot` + 新容差） | **49**（源码无毒哨兵，命中 `Math.hypot(`） |
+| 评分层导出 `adoptScore` / `pickBestCandidate` | **32 / 70**（导出面"无选优入口"） |
+
+#### 23.22.8 本次踩到的坑
+
+1. **源码级判据必须先剥注释**：文件头恰恰会写"本层不 import `commandBus` / 不用 `SPATIAL_TOL`" ——
+   那是**纪律声明**，拿全文扫会把"解释"当成"实现"（首轮两条假红都出自这里）。
+   修法 = `stripComments()` 后只扫**代码**，并给剥注释本身配两条哨兵自检（0.7 / 0.8）。
+2. **哨兵要用"故意写坏的样本"自检**：`hasGeometrySmell` / `hasForbiddenExport` / `coordKeysIn`
+   各配正反样本，确认它们**真能返回 false**（断言不可信比失败更危险）。
+3. **容差哨兵要认 `_TOL` 后缀**：`\bTOL\b` 抓不住 `MUTANT_TOL`（`_` 是词字符，没有词边界）→
+   收紧成 `\b[A-Z_]*TOL\b`。
+
+#### 23.22.9 回归 / 红线核查
+
+- `GOMEMLIMIT=1500MiB npx tsc --noEmit` → 0；`verify:design-score` → **78/78**。
+- `GOMEMLIMIT=1500MiB npm run verify:all` → 全链 EXIT=0（含 UI 链 686/686）。
+- Placement Resolver 未触碰 ✅ ｜ Semantic Model / `types.ts` 未触碰 ✅ ｜ `schemaVersion` 不变 ✅
+- 评分不进 `project.json`（评分前后序列化逐字节不变）✅ ｜ Spatial Truth / Manufacturing 未触碰 ✅
+- 评分层不 import commandBus/aiClient/export/manufacturing；无三角函数、无新容差 ✅
+- 动作清单仍 21 条 ✅ ｜ 旧测试零删除零放宽 ✅
+
+**停在 P9.4。** 本阶段明确不做：权重系统、P9.5 AI Planner、LLM 自动布局、
+自动选 winner、自动 adopt、候选 UI 接线、多柜组合枚举。
+

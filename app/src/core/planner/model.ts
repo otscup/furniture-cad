@@ -101,7 +101,13 @@ export interface PlannerRequest extends PlannerGeometryForbidden {
   cabinetIds?: string[];
   /** 目标方向词（9 词闭集）。缺省 = 由 `intentIds` 指向的意图自己决定 */
   generationGoals?: DesignIntentGoal[];
-  /** 每只目标柜最多几条候选（缺省 / 非法 = `MAX_CANDIDATES_PER_TARGET`，超过夹到该值） */
+  /**
+   * 最多要几条候选（缺省 = 由生成器按路径政策定；非法 = 回落默认）。
+   *
+   * P9.8 §四：归一化时按**两条路径里较宽的**那条夹到 `MAX_CANDIDATES_COORDINATED`
+   * （单柜路径随后仍按每只柜 `MAX_CANDIDATES_PER_TARGET` 档再夹一次，并如实记账）——
+   * 不再让多柜协调的新搜索空间被旧的 `<=3` 在上游卡死。
+   */
   maxCandidates?: number;
 }
 

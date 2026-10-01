@@ -121,18 +121,30 @@ export interface Spot {
 const SLIDE = [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.12, 0.88, 0.05, 0.95];
 
 /**
+ * 既有"整墙固定阶梯"的前 `count` 档（P9.7 的提议空间）。
+ * 只把它暴露成**沿墙参数**，让调用方（候选生成器）能像空白段采样那样
+ * 做"整块能不能落在这面墙上"的检查 —— 不再拿回一组已经算好的 x/y。
+ */
+export function legacyWallParams(count: number): number[] {
+  return SLIDE.slice(0, Math.max(0, count));
+}
+
+/** 种子点自墙面往屋里推出的距离（mm）—— 沿用本文件既有提议参数，不是新判定 */
+const SEED_PUSH_MM = 30;
+
+/**
  * 沿房间的每一面墙给出一串落点：贴墙、朝房间内、沿墙从中间向两端滑。
  *
  * 只负责"生成候选"，**不负责判断放不放得下** —— 那个判据只有一份（校验器），
  * 在这里再写一遍 AABB 就是第二份真相源，两边迟早算出不一样的答案。
  * 调用方拿这串落点逐个去试算（见 variants.ts 的 placeVariant）。
  */
-export function candidateSpots(project: Project, roomId: string, width: number): Spot[] {
-  const room = project.rooms.find((r) => r.id === roomId) ?? project.rooms[0];
-  if (!room || room.walls.length === 0) return [];
-
-  // 房间"内部"的方向：用墙端点平均求一个大致在房间里的点，只对矩形房间精确，
-  // 但对任意多边形也足够稳定地指出"哪一侧是屋里"。
+/**
+ * 房间"内部"的方向指示点：用墙端点平均求一个大致在房间里的点，只对矩形房间精确，
+ * 但对任意多边形也足够稳定地指出"哪一侧是屋里"。
+ * `candidateSpots` 与 `spotOnWall` 共用这一份（提议侧不许有两套"屋里是哪侧"）。
+ */
+function interiorPoint(room: { walls: Array<{ start: Vec2; end: Vec2 }> }): Vec2 | null {
   let cx = 0;
   let cy = 0;
   let n = 0;
@@ -141,8 +153,16 @@ export function candidateSpots(project: Project, roomId: string, width: number):
     cy += w.start.y + w.end.y;
     n += 2;
   }
-  if (n === 0) return [];
-  const inside = { x: cx / n, y: cy / n };
+  if (n === 0) return null;
+  return { x: cx / n, y: cy / n };
+}
+
+export function candidateSpots(project: Project, roomId: string, width: number): Spot[] {
+  const room = project.rooms.find((r) => r.id === roomId) ?? project.rooms[0];
+  if (!room || room.walls.length === 0) return [];
+
+  const inside = interiorPoint(room);
+  if (!inside) return [];
 
   const walls = room.walls
     .map((w) => ({ w, len: Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y) }))
@@ -153,17 +173,132 @@ export function candidateSpots(project: Project, roomId: string, width: number):
   for (const { w, len } of walls) {
     if (len < width * 0.5) continue; // 明显放不下的墙直接跳过（判据仍以试算为准）
     for (const t of SLIDE) {
-      const foot = { x: w.start.x + (w.end.x - w.start.x) * t, y: w.start.y + (w.end.y - w.start.y) * t };
-      // 把种子点从墙中心线往屋里推一点，placeAgainstNearestWall 才会挑中这面墙、且朝屋里
-      const toIn = { x: inside.x - foot.x, y: inside.y - foot.y };
-      const lenIn = Math.hypot(toIn.x, toIn.y) || 1;
-      const push = w.thickness / 2 + 30;
-      const seed = { x: foot.x + (toIn.x / lenIn) * push, y: foot.y + (toIn.y / lenIn) * push };
-      const r = placeAgainstNearestWall(project, seed, width);
-      out.push({ x: r.x, y: r.y, rotation: r.rotation, wallId: r.wallId, wallName: r.wallName });
+      const spot = spotOnWall(project, w, t, width);
+      if (spot) out.push(spot);
     }
   }
   return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  空白墙段提议（P9.8）—— 只提议，不判定
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * 墙上一段**没有被 authored 洞口占用**的连续区段（P9.8）。
+ *
+ * ── 它是什么 ──
+ *   纯 authored 数据的补集运算：`Opening.offset / width`（沿墙中心线自 wall.start 量起）
+ *   从整条墙里挖掉，剩下的就是"没有被洞口占住"的区段。
+ *
+ * ── 它不是什么（本层红线）──
+ *   · **不是判定**：它不说"这里能放 / 不能放"，只说"提议器可以去这里试"；
+ *     能不能放一律由 `detectCollisions` / `deriveSpatialFacts` / `validateDesign` 说了算；
+ *   · **不是 Spatial Truth**：不进 `SpatialFacts`，不落盘，不参与任何 issue 判定；
+ *   · **不解释门扇**：洞口只有 `offset/width` 参与切段，`hinge / swingDirection`
+ *     一概不读（那是 door.ts 的事，读了就是在生成层复制开门包络）。
+ *
+ * ── unknown 怎么办 ──
+ *   洞口参数不可用时（非有限值 / 宽度非正 / span 越界），**整面墙不参与切段**，
+ *   并把原因如实交给调用方记进 `unresolved` —— 绝不把 unknown 当空白。
+ */
+export interface WallFreeSegment {
+  wallId: string;
+  wallName: string;
+  /** 沿墙自 `wall.start` 起的归一化区间（0~1），与 `Opening.offset/width` 同一坐标系 */
+  t0: number;
+  t1: number;
+  /** 该区段的实际长度（mm） */
+  lengthMm: number;
+  /** 所在墙的中心线长度（mm）—— 让调用方不必自己再算一次墙长（避免第二份量距实现） */
+  wallLengthMm: number;
+}
+
+export interface WallSegmentProposal {
+  segments: WallFreeSegment[];
+  /** 参数不可用 ⇒ 该墙不按空白区段提议（unknown 绝不当空白） */
+  unknown: Array<{ wallId: string; wallName: string; reason: string }>;
+}
+
+/**
+ * 按 authored 洞口把每面墙切成若干空白连续区段。
+ * 顺序完全确定：房间按 `project.rooms`、墙按 `room.walls`、区段按沿墙先后。
+ */
+export function freeWallSegments(project: Project, roomId: string): WallSegmentProposal {
+  const room = project.rooms.find((r) => r.id === roomId);
+  const segments: WallFreeSegment[] = [];
+  const unknown: Array<{ wallId: string; wallName: string; reason: string }> = [];
+  if (!room) return { segments, unknown };
+
+  for (const w of room.walls) {
+    const name = w.name ?? w.id;
+    const len = Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y);
+    if (!(len > 0)) continue;
+    const ops = w.openings ?? [];
+    if (ops.length === 0) {
+      segments.push({ wallId: w.id, wallName: name, t0: 0, t1: 1, lengthMm: len, wallLengthMm: len });
+      continue;
+    }
+    // 洞口参数不可用 ⇒ 整面墙不切段（不猜、不当空白）
+    const bad = ops.find(
+      (o) =>
+        !Number.isFinite(o.offset) ||
+        !Number.isFinite(o.width) ||
+        !(o.width > 0) ||
+        !(o.offset >= 0) ||
+        o.offset + o.width > len
+    );
+    if (bad) {
+      unknown.push({
+        wallId: w.id,
+        wallName: name,
+        reason: `墙「${name}」上洞口「${bad.name ?? bad.id}」的 offset/width 不可用（越界或非有限），本阶段不按空白墙段提议 —— unknown 绝不当空白`,
+      });
+      continue;
+    }
+    const spans = ops
+      .map((o) => [o.offset / len, (o.offset + o.width) / len] as const)
+      .map(([a, b]) => [Math.max(0, Math.min(1, a)), Math.max(0, Math.min(1, b))] as const)
+      .filter(([a, b]) => b > a)
+      .sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+    // 求补集：从 0 开始，跳过每个被占区间
+    let cursor = 0;
+    for (const [a, b] of spans) {
+      if (a > cursor) segments.push({ wallId: w.id, wallName: name, t0: cursor, t1: a, lengthMm: (a - cursor) * len, wallLengthMm: len });
+      cursor = Math.max(cursor, b);
+    }
+    if (cursor < 1) segments.push({ wallId: w.id, wallName: name, t0: cursor, t1: 1, lengthMm: (1 - cursor) * len, wallLengthMm: len });
+  }
+  return { segments, unknown };
+}
+
+/**
+ * 把"墙上某个沿墙参数 t"翻译成一个贴墙落点提议。
+ *
+ * 仍然复用 `placeAgainstNearestWall`（全项目唯一的"贴这面墙、朝屋里"的落点算法），
+ * 本函数只负责算种子点；若吸附结果不是目标墙（例如被邻墙抢走），如实返回 null。
+ */
+export function spotOnWall(project: Project, wall: { id: string; name?: string; start: Vec2; end: Vec2; thickness: number }, t: number, width: number): Spot | null {
+  const len = Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y);
+  if (!(len > 0)) return null;
+  const room = project.rooms.find((r) => r.walls.some((w) => w.id === wall.id));
+  if (!room) return null;
+  const inside = interiorPoint(room);
+  if (!inside) return null;
+  const clamped = Math.max(0, Math.min(1, t));
+  const ux = (wall.end.x - wall.start.x) / len;
+  const uy = (wall.end.y - wall.start.y) / len;
+  const foot = { x: wall.start.x + (wall.end.x - wall.start.x) * clamped, y: wall.start.y + (wall.end.y - wall.start.y) * clamped };
+  // 沿**墙法线**往屋里推一点（而不是朝房间质心斜推）：
+  // 斜推会让种子带一个沿墙分量，投影回墙面时锚点就漂走了 —— 段内采样点必须落在它该在的位置。
+  const nx = -uy;
+  const ny = ux;
+  const s = (inside.x - foot.x) * nx + (inside.y - foot.y) * ny >= 0 ? 1 : -1;
+  const push = wall.thickness / 2 + SEED_PUSH_MM;
+  const seed = { x: foot.x + nx * s * push, y: foot.y + ny * s * push };
+  const r = placeAgainstNearestWall(project, seed, width);
+  if (r.wallId !== wall.id) return null; // 被别的墙抢走：如实放弃，不硬编坐标
+  return { x: r.x, y: r.y, rotation: r.rotation, wallId: r.wallId, wallName: r.wallName };
 }
 
 /**

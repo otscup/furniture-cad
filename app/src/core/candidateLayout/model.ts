@@ -31,6 +31,7 @@
  */
 import type { Issue, Project } from '../types.ts';
 import { nextId } from '../ids.ts';
+import { MAX_PLANNER_CABINETS } from '../planner/model.ts';
 import type { PlacementIntent, ResolvedPlacement } from '../placement.ts';
 import type { DesignIntentGoal } from '../designIntent/vocabulary.ts';
 
@@ -66,6 +67,29 @@ export const CANDIDATE_REQUEST_KEYS = ['intentIds', 'cabinetIds', 'scope', 'maxC
 
 /** 每个目标柜最多产出几个候选（A / B / C 三档） */
 export const MAX_CANDIDATES_PER_TARGET = 3;
+
+/**
+ * 每个"可用空白墙段"至少提议几个锚点（P9.8）。
+ * 来源：覆盖要求本身 —— 区段起端 / 中部 / 末端（不是拍的数字）。
+ */
+export const COVERAGE_SAMPLES_PER_SEGMENT = 3;
+
+/**
+ * 协调路径（多柜整体候选）的返回上限（P9.8）。
+ * 来源：`COVERAGE_SAMPLES_PER_SEGMENT` × `MAX_CANDIDATES_PER_TARGET`
+ * —— "每个区段三个采样点" × "每只柜三个策略档"，不是新造的常数。
+ * 请求值超过它时如实夹紧并记 `generationLimited`，绝不静默 slice。
+ */
+export const MAX_CANDIDATES_COORDINATED = COVERAGE_SAMPLES_PER_SEGMENT * MAX_CANDIDATES_PER_TARGET;
+
+/**
+ * 每组协调枚举的**组合评估预算上限**（P9.8）。
+ * 来源：既有政策常量 —— `MAX_CANDIDATES_COORDINATED`（协调返回上限）
+ * × `MAX_PLANNER_CABINETS`（单次规划最大柜数）。
+ * 语义：每只柜至多贡献 `MAX_CANDIDATES_COORDINATED` 个组合评估。
+ * 达到上限即停，并**必须**记 `budgetExhausted`（不静默截断）。
+ */
+export const COMBO_BUDGET_PER_GROUP = MAX_CANDIDATES_COORDINATED * MAX_PLANNER_CABINETS;
 
 /** 一条候选落位对某条意图的满足情况（**事实层判定**的结果，不是这里算的） */
 export interface CandidateSatisfies {
@@ -139,6 +163,16 @@ export interface CandidateLayout {
  * `maxCandidates` 是**运行态计算限制**：生成空间本身受控（确定性有限枚举），
  * 达到上限时 `generationLimited = true` 并给出 truncated 数 —— 绝不静默 slice。
  */
+/** 被丢弃的组合按原因分类（P9.8：每一条丢弃都要能说出原因，不许静默） */
+export interface CandidateRejectedCounts {
+  /** resolvePlacements 解析失败（含依赖成环之外的几何/语义失败） */
+  resolve: number;
+  /** 整体克隆上 detectCollisions 有冲突 */
+  collision: number;
+  /** 解析成功且无冲突，但落位签名与已有候选重复 */
+  duplicate: number;
+}
+
 export interface CandidateGenerationStats {
   /** 本次运行允许返回的候选上限（= 夹取后的 maxCandidates） */
   requested: number;
@@ -150,6 +184,18 @@ export interface CandidateGenerationStats {
   truncated: number;
   /** truncated > 0 —— 明确告诉调用方"枚举空间被上限截断了" */
   generationLimited: boolean;
+  /**
+   * P9.8 探索台账（全部运行态，不落盘、不触 schemaVersion）：
+   * 恒等式 `explored = generated + rejected.resolve + rejected.collision + rejected.duplicate`。
+   */
+  /** 实际评估过的组合数（每个组合 = 一次 resolvePlacements + 一次整体克隆碰撞检测） */
+  explored?: number;
+  /** 被丢弃的组合按原因计数 */
+  rejected?: CandidateRejectedCounts;
+  /** 本次协调枚举的评估预算上限（来源见 `COMBO_BUDGET_PER_GROUP`） */
+  budget?: number;
+  /** 预算耗尽导致提前停止（**必须**记账，绝不静默截断） */
+  budgetExhausted?: boolean;
 }
 
 /** 一次候选生成的结果集（生成期就产不出候选的意图逐条记在 `unresolved`） */

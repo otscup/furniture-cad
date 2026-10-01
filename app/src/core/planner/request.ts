@@ -18,7 +18,7 @@
 import type { Project } from '../types.ts';
 import { activeDesignIntents } from '../designIntent/model.ts';
 import { DESIGN_INTENT_GOALS, designIntentGoalZh, type DesignIntentGoal } from '../designIntent/vocabulary.ts';
-import { MAX_CANDIDATES_PER_TARGET } from '../candidateLayout/model.ts';
+import { COVERAGE_SAMPLES_PER_SEGMENT, MAX_CANDIDATES_COORDINATED, MAX_CANDIDATES_PER_TARGET } from '../candidateLayout/model.ts';
 import {
   MAX_PLANNER_CABINETS,
   MAX_PLANNER_GOALS,
@@ -31,11 +31,22 @@ import {
 
 const GOAL_WORDS = new Set(Object.keys(DESIGN_INTENT_GOALS));
 
-/** 夹取候选上限：非法值回落到默认（与 P9.3 `clampMax` 同一口径，不静默给 0） */
+/**
+ * 夹取候选上限：非法值回落到默认（与 P9.3 `clampMax` 同一口径，不静默给 0）。
+ *
+ * ── P9.8 §四：这里的上限**不是** `MAX_CANDIDATES_PER_TARGET`（=3）──
+ *   `MAX_CANDIDATES_PER_TARGET` 是**单柜路径**每只目标柜的档数上限；多柜协调路径
+ *   的返回上限是 `MAX_CANDIDATES_COORDINATED`（= 段内采样点 × 单柜策略档）。
+ *   以前这一层统一夹到 3，等于把 P9.8 新扩出来的协调搜索空间在上游就卡死 ——
+ *   请求 6 只拿到 3，而且是"静默"的（只有一句"不在 [1,3] 内"）。
+ *   现在按**两条路径里较宽的**那条夹（= `MAX_CANDIDATES_COORDINATED`），
+ *   具体走哪条、夹到几，由 `generateCandidateLayouts` 按路径各自的政策再夹一次并如实记账。
+ *   上限来源：`COVERAGE_SAMPLES_PER_SEGMENT` × `MAX_CANDIDATES_PER_TARGET`，不是拍脑袋的数字。
+ */
 function clampMax(v: number | undefined): number | undefined {
   if (v === undefined) return undefined;
   if (typeof v !== 'number' || !Number.isFinite(v)) return MAX_CANDIDATES_PER_TARGET;
-  return Math.max(1, Math.min(MAX_CANDIDATES_PER_TARGET, Math.floor(v)));
+  return Math.max(1, Math.min(MAX_CANDIDATES_COORDINATED, Math.floor(v)));
 }
 
 /**
@@ -143,7 +154,10 @@ export function normalizePlannerRequest(raw: unknown, project: Project): Planner
   const maxCandidates = clampMax(r.maxCandidates as number | undefined);
   if (r.maxCandidates !== undefined && maxCandidates !== r.maxCandidates) {
     unresolved.push({
-      reason: `maxCandidates=${JSON.stringify(r.maxCandidates)} 不在 [1, ${MAX_CANDIDATES_PER_TARGET}] 内，已夹到 ${maxCandidates}`,
+      reason:
+        `maxCandidates=${JSON.stringify(r.maxCandidates)} 不在 [1, ${MAX_CANDIDATES_COORDINATED}] 内，已夹到 ${maxCandidates}` +
+        `（上限来源：段内采样点 ${COVERAGE_SAMPLES_PER_SEGMENT} × 单柜策略档 ${MAX_CANDIDATES_PER_TARGET}；` +
+        `单柜路径仍按每只柜 ${MAX_CANDIDATES_PER_TARGET} 档再夹一次，届时另行说明）`,
     });
   }
 

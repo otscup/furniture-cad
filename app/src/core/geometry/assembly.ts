@@ -486,7 +486,10 @@ export function buildAssembly(cab: Cabinet, rules: RuleSet): Assembly {
         const cell = cellH[Math.min(k, cellH.length - 1)]!;
         let zFront = rowBaseZ + d.gap;
         for (let j = 0; j < k && j < cellH.length; j++) zFront += cellH[j]! + d.gap;
-        const frontH = cell - 2 * d.gap;
+        // 与 generate.ts 的抽屉面板高度口径一致：cell 已由 drawerCellHeights 扣除
+        // 全部 (n+1) 道缝，这里直接作为箱体高度，不得再扣 2×gap（否则 3D 落位箱体比
+        // 开料清单的裁切尺寸矮 2×gap，B2 的 box/cut 同构检查会失配）。
+        const frontH = cell;
         const box = drawerBoxParts(d, frontH, netW);
         /** 箱体在 X 向居中于分区（模型未定义横向基准） */
         const bx0 = x0 + (netW - box.boxW) / 2;

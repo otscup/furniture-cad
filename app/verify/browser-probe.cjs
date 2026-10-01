@@ -971,7 +971,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('该条记录写了 op = cabinet.moveBatch', /cabinet\.moveBatch/.test(hist), hist.slice(0, 240));
     ok('该条记录给出 diff：placement.y 从 60 起', /placement\.y:\s*60\s*→/.test(hist), hist.slice(0, 400));
     ok(`该条记录带派生快照（板件 ${FACT.totalPieces} 件）`, new RegExp(`板件\\s*${FACT.totalPieces}\\s*件`).test(hist));
-    ok('该条记录带重量快照 244.8 kg', /244\.8\s*kg/.test(hist), hist.slice(0, 300));
+    ok('该条记录带重量快照 245.1 kg', /245\.1\s*kg/.test(hist), hist.slice(0, 300));
     ok('该条操作没有产生 ERROR 增量', !/\+\d+\s*ERROR/.test(hist));
     ok('历史面板给出可撤销/可重做计数', /可撤销\s*\d+\s*条/.test(hist), hist.slice(0, 120));
 

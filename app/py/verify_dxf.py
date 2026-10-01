@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 
 import ezdxf
+from ezdxf.audit import Auditor
 
 
 def main() -> int:
@@ -66,7 +67,7 @@ def main() -> int:
         "sampleTexts": texts[:6],
         "insUnits": doc.header.get("$INSUNITS"),
         "custom": custom,
-        "auditIssues": [str(i) for i in ezdxf.audit(doc, renumber=False)][:20],
+        "auditIssues": [str(i) for i in Auditor(doc).run()][:20],
     }
     sys.stdout.write(json.dumps(out, ensure_ascii=False))
     sys.stdout.write("\n")

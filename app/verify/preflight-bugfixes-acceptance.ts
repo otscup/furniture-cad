@@ -498,7 +498,7 @@ const VERIFY_DXF = join(APP, 'py', 'verify_dxf.py');
 await mutate(
   'P2-②',
   VERIFY_DXF,
-  '        "auditIssues": [str(i) for i in ezdxf.audit(doc, renumber=False)][:20],',
+  '        "auditIssues": [str(i) for i in Auditor(doc).run()][:20],',
   '        "auditIssues": len(ezdxf.audit(doc, renumber=False)) if False else None,',
   async () => {
     const src = readFileSync(VERIFY_DXF, 'utf8');

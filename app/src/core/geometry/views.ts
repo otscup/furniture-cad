@@ -590,7 +590,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         const cellH = drawerCellHeights(u, netH, rules);
         let z = z0 + u.drawers.gap + (u.kind === 'appliance' && u.appliance ? u.appliance.openingHeight + t : 0);
         for (const ch of cellH) {
-          S.rect(faceSpan.y0, faceSpan.y1, z, z + ch - 2 * u.drawers.gap, L_FRONT, 1.8);
+          S.rect(faceSpan.y0, faceSpan.y1, z, z + ch, L_FRONT, 1.8);
           z += ch + u.drawers.gap;
         }
       }
@@ -910,7 +910,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const cellH = drawerCellHeights(u, rowNH, rules);
           let z = rowZ0 + d.gap;
           for (const ch of cellH) {
-            P.rect(x0 + d.gap, x0 + netW - d.gap, z, z + ch - 2 * d.gap, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+            P.rect(x0 + d.gap, x0 + netW - d.gap, z, z + ch, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
             z += ch + d.gap;
           }
         }

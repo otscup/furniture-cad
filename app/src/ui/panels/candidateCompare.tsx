@@ -7,6 +7,7 @@ import { designScoreHitZh } from '../../core/designScore/index.ts';
 import { plannerPlanSummaryZh } from '../../core/planner/plan.ts';
 import { Pill, Row, Text } from './common.tsx';
 import { buildCandidateComparison, sortComparisonRows } from './candidateCompareLogic.ts';
+import { candidatePlacementZh } from '../../core/candidateLayout/model.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -131,6 +132,17 @@ export function CandidateComparePanel(props: CandidateComparePanelProps): ReactN
                 {row.layout.placements.map((p) => cabinetNameOf(project, p.targetId)).join('、')}
               </span>
             </div>
+
+            {row.layout.placements.length > 1 ? (
+              <div className="cc-multi">
+                <div className="ts">整体方案（{row.layout.placements.length} 柜同时落位）：</div>
+                <ul className="diff-list">
+                  {row.layout.placements.map((p) => (
+                    <li key={p.targetId} className="muted-sm">{candidatePlacementZh(p, project)}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
 
             {row.score.status === 'infeasible' ? (
               <ul className="diff-list">

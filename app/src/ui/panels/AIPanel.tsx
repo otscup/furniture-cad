@@ -594,15 +594,19 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       if (!plan0) return;
       const layout = plan0.candidates.find((c) => c.id === candidateId);
       if (!layout || layout.placements.length === 0) return;
-      const p = layout.placements[0]!;
-      const cab = bus.getState().cabinets.find((c) => c.id === p.targetId);
-      if (!cab) return;
+      // P9.7：多柜整体候选 → 逐 placement 产动作（一批 dryRun，天然原子）；
+      // 单柜候选 placements.length===1，行为与 P9.6 完全一致。
+      const state0 = bus.getState();
       const actions: AiAction[] = [];
-      if (cab.placement.x !== p.resolved.x || cab.placement.y !== p.resolved.y) {
-        actions.push({ action: 'cabinet.move', target: { cabinetId: cab.id }, params: { x: p.resolved.x, y: p.resolved.y }, reason: `预览候选 ${candidateId}`, index: actions.length });
-      }
-      if (cab.placement.rotation !== p.resolved.rotation) {
-        actions.push({ action: 'cabinet.rotate', target: { cabinetId: cab.id }, params: { deg: p.resolved.rotation }, reason: `预览候选 ${candidateId}`, index: actions.length });
+      for (const p of layout.placements) {
+        const cab = state0.cabinets.find((c) => c.id === p.targetId);
+        if (!cab) continue; // 候选引用的柜已不存在 —— 该 placement 跳过（dryRun 会如实呈现实际效果）
+        if (cab.placement.x !== p.resolved.x || cab.placement.y !== p.resolved.y) {
+          actions.push({ action: 'cabinet.move', target: { cabinetId: cab.id }, params: { x: p.resolved.x, y: p.resolved.y }, reason: `预览候选 ${candidateId}`, index: actions.length });
+        }
+        if (cab.placement.rotation !== p.resolved.rotation) {
+          actions.push({ action: 'cabinet.rotate', target: { cabinetId: cab.id }, params: { deg: p.resolved.rotation }, reason: `预览候选 ${candidateId}`, index: actions.length });
+        }
       }
       if (actions.length === 0) {
         props.onToast?.('info', '这份候选与当前落位一致，无需改动');

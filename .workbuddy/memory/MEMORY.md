@@ -41,7 +41,8 @@ NAS 群晖：网关 key 须非占位符；宿主机测 000 是 DNS 假故障（�
 - **几何**：两矩形面贴合⇒相对旋转必是 90° 整数倍；placement=背面左角约定。**DXF**：R2007（R2000 须 gbk+dwgcodepage、dimlfac=1.0）。
 
 ## v0.3 路线（完整 hash 链见日志）
-P0→…→P9.3(`601faf7`)→P9.4(`bd025d0`+`6332b79`)→P9.5(`9e28c84`)→P9.6（Multi-Candidate Compare UI）。**停在 P9.6。** P9.6=`candidateCompare.tsx`(渲染)+`candidateCompareLogic.ts`(纯逻辑)；消费 P9.3/9.4/9.5 运行态、不造 winner、不写 project.json、selected 仅 session(`p96:selectedCandidate`)；42 项 compare + 18 项 real-furniture-request(玻璃门衣柜端到端) 均入 verify:all；7 变异全红。
+P0→…→P9.3(`601faf7`)→P9.4(`bd025d0`+`6332b79`)→P9.5(`9e28c84`)→P9.6（Multi-Candidate Compare UI, `38c3830`）→P9.7（Multi-Cabinet Coordinated Candidate Layout）。**停在 P9.7。** P9.6=`candidateCompare.tsx`(渲染)+`candidateCompareLogic.ts`(纯逻辑)；消费 P9.3/9.4/9.5 运行态、不造 winner、不写 project.json、selected 仅 session(`p96:selectedCandidate`)；42 项 compare + 18 项 real-furniture-request(玻璃门衣柜端到端) 均入 verify:all；7 变异全红。
+- P9.7：`generate.ts` 协调枚举（行链=锚点×顺序 attach left↔right；L 型=rel90/270 back/front↔left/right）；坐标唯一出口 resolvePlacements、整体克隆整体 detectCollisions、跨路径签名去重、CandidateGenerationStats 如实统计；`verify:multi-candidate-layout` 55 项入 verify:all；8 变异全红。**坑**：候选"替换非追加"（push 追加致三套件假红）；attach 面贴合派生接触是 butt（corner=纯角点，attach 产不出，断言不能造假）；变异补丁器同文件多补丁只备份一次、SIGTERM 跳过 restore 留残留；验收脚本对 0 候选须守卫（crash≠断言红）。
 - P9.2 `core/designIntent/`（158）/ P9.3 `core/candidateLayout/`（69）：Intent≠Layout≠Cabinet；只装 active；`scope` 写不出 wallId；候选只到 draft、必过 Resolver、不进 project.json、无 adopt。
 - P9.4 `core/designScore/`（133）：来源闭集 `fact|rule|preference`；**Gate 前置**（ERROR⇒`infeasible`）；偏好=`resolveKnowledge().applicable`（永不进 hardFailures）；不选 winner；AI 只读块 `snapshot.candidateScore`。
 - P9.5 `core/planner/`（96 + 13 变异）：两阶段（AI 出 `PlannerRequest` → 系统确定性枚举+评分）。**类型层禁几何**（`x?: never`）；`plannerRequest` 是**请求不是动作**（仍 21 条）；`PlannerPlan` **无 winner/adopt**；枚举/坐标/碰撞/评分复用唯一实现（逐字节相同）；Planner 只转发 `entries`。**`MAX_ACTIONS=12` 不改数字** → `$ref` 闭包分批（单组超限如实 `unsplittable`，绝不截断）。

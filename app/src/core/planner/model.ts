@@ -24,7 +24,7 @@
  *    不进 Knowledge、不升 `schemaVersion`。它是"这次规划算出来的东西"，刷新即消失。
  * ══════════════════════════════════════════════════════════════════════
  */
-import type { CandidateLayout } from '../candidateLayout/model.ts';
+import type { CandidateGenerationStats, CandidateLayout } from '../candidateLayout/model.ts';
 import type { EvaluatedCandidate } from '../designScore/model.ts';
 import type { DesignIntentGoal } from '../designIntent/vocabulary.ts';
 
@@ -151,6 +151,11 @@ export interface PlannerPlan {
   candidates: CandidateLayout[];
   scores: EvaluatedCandidate[];
   explanations: string[];
+  /**
+   * 多柜协调枚举统计（P9.7，运行态透传自 CandidateLayoutSet.generation）。
+   * undefined = 本轮没有启用协调枚举（意图只作用到单柜）。
+   */
+  generation?: CandidateGenerationStats;
 }
 
 /**

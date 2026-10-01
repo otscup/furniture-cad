@@ -114,18 +114,42 @@ export interface CandidateUnresolved {
  *
  * 它描述"如果把这几只柜按 `placements` 这样摆，会得到什么结果"，
  * **绝不替代真实 placement** —— 真实 placement 仍然只在 `Cabinet.placement` 里。
+ *
+ * P9.7 起 `placements` 允许多项：一份候选可以同时重摆多只柜
+ * （整墙链 / L 型拼接的**整体**候选）—— 多柜候选仍然只持 `targetId` 引用，
+ * 每条落位仍各自过 Resolver，整体验证/评分在克隆副本上做。
+ * 禁止 `cabinets: Cabinet[]`（候选里长出 Cabinet 本体 = VariantDraft 的语义越界）。
  */
 export interface CandidateLayout {
   id: string;
   status: CandidateStatus;
   /** 驱动本候选的意图 id（引用 active 意图） */
   sourceIntent: string[];
-  /** 候选落位（每只被重摆的柜一条；本阶段一份候选只重摆一只柜） */
+  /** 候选落位（每只被重摆的柜一条；P9.7 起允许多柜整体候选） */
   placements: CandidatePlacement[];
   /** 人话说明（为什么生成它、试了什么策略、算了什么数） */
   explanations: string[];
   /** 本候选**没解决**的事（例如"这条候选没满足某意图"） */
   unresolved: CandidateUnresolved[];
+}
+
+/**
+ * 本轮候选生成统计（P9.7 §十一 —— 运行态，绝不进 project.json）。
+ *
+ * `maxCandidates` 是**运行态计算限制**：生成空间本身受控（确定性有限枚举），
+ * 达到上限时 `generationLimited = true` 并给出 truncated 数 —— 绝不静默 slice。
+ */
+export interface CandidateGenerationStats {
+  /** 本次运行允许返回的候选上限（= 夹取后的 maxCandidates） */
+  requested: number;
+  /** 枚举产出的**有效**（解析成功 + 零冲突 + 去重后）协调候选数 */
+  generated: number;
+  /** 实际返回的候选数（≤ requested） */
+  returned: number;
+  /** generated - returned（有明确原因的丢弃数，不是静默截断） */
+  truncated: number;
+  /** truncated > 0 —— 明确告诉调用方"枚举空间被上限截断了" */
+  generationLimited: boolean;
 }
 
 /** 一次候选生成的结果集（生成期就产不出候选的意图逐条记在 `unresolved`） */
@@ -134,6 +158,11 @@ export interface CandidateLayoutSet {
   candidates: CandidateLayout[];
   /** 生成期就产不出候选的意图 / 请求（未生效 / 取舍方向 / 没有可作用的柜 / 放不下） */
   unresolved: CandidateUnresolved[];
+  /**
+   * 多柜协调枚举（P9.7）的生成统计；单柜路径不填（undefined = 本轮未启用协调枚举）。
+   * 运行态字段 —— CandidateLayoutSet 整体不落盘，这里加字段不触碰 schemaVersion。
+   */
+  generation?: CandidateGenerationStats;
 }
 
 /** 候选 id：确定性、可读（与 `di_001` / `cab_001` 同一套；**必须传 takenIds**） */

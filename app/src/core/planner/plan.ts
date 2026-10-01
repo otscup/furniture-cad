@@ -119,9 +119,15 @@ export function planCandidates(project: Project, raw: unknown, entries: Knowledg
   // ── ③ 确定性评分（P9.4）—— 零第二份判定；entries 只转发，本层不读 ──
   const scores = scoreCandidateLayoutSet(project, set, entries);
 
-  // ── ④ 如实说明本层的边界 ──
+  // ── ④ 如实说明本层的边界（P9.7 起按是否产出了整体候选条件化）──
   const cabinetCount = request.cabinetIds?.length ?? 0;
-  if (cabinetCount > 1 || set.candidates.length > 1) {
+  const hasCoordinated = set.candidates.some((c) => c.placements.length > 1);
+  if (hasCoordinated) {
+    explanations.push(
+      '本层包含**多柜整体候选**：一份候选同时重摆多只柜（整墙链 / L 型拼接），' +
+        '成员落位由批量 Resolver 依赖排序算出、整体在克隆副本上验证 —— 不是把几份单柜候选拼起来。'
+    );
+  } else if (cabinetCount > 1 || set.candidates.length > 1) {
     explanations.push(
       '本层是**逐柜独立**枚举：每份候选只重摆一只柜，多只柜只是并列地各出几份。' +
         '它**不生成**"把这几只柜作为一个整体同时挪"的联动方案（那需要组合搜索，本阶段不做）。'
@@ -136,7 +142,14 @@ export function planCandidates(project: Project, raw: unknown, entries: Knowledg
   );
   explanations.push('本层**不选方案**：给出多份候选时只说明各份满足了什么、还有什么没满足；选哪份由用户拍板。');
 
-  const plan: PlannerPlan = { request, unresolved, candidates: set.candidates, scores, explanations };
+  const plan: PlannerPlan = {
+    request,
+    unresolved,
+    candidates: set.candidates,
+    scores,
+    explanations,
+    ...(set.generation ? { generation: set.generation } : {}),
+  };
   return { ok: true, plan };
 }
 

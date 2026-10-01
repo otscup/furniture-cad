@@ -283,7 +283,9 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     const d = unit.drawers!;
     const cellH = drawerCellHeights(unit, netH, rules);
     for (let k = 0; k < d.count; k++) {
-      const frontH = cellH[k] - 2 * d.gap;
+      // cellH 已由 layout.drawerCellHeights 扣除全部 (n+1) 道缝，这里直接作为面板高度，
+      // 不得再扣 2×gap（否则面板比格子矮 2×gap，Σ面板高比净高短 2n×gap）。
+      const frontH = cellH[k];
       const frontW = netW - 2 * d.gap;
       push({ id: `P_${cabId}_${uid}_DF${k + 1}`, role: 'DrawerFront', nameZh: `抽屉面板-${k + 1}`, belongsTo: `${cabId}.${uid}`, group: uid, material: p.boardMaterial, thickness: t, length: frontH, width: frontW, grain: 'length', edge: edge(E1, E1, E1, E1), edgeLabel: '四周 1mm（可见面）', layer: layerOf(t) });
       // 箱体尺寸来自 layout.ts 的 drawerBoxParts —— 与分解图共用同一份，不许各自算
@@ -503,6 +505,9 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       }
       if (u.shelves && u.shelves.count > 0) {
         const tilt = u.shelves.tilt ?? 0;
+        // 层板图元与真实 ShelfPanel 同源：宽 = 净宽 - 2×gapPerSide（两侧留缝），不是满净宽。
+        const sw = netW - 2 * u.shelves.gapPerSide;
+        const sx0 = x0 + u.shelves.gapPerSide;
         const shift = tilt > 0 ? Math.round(netW * Math.tan((tilt * Math.PI) / 180)) : 0;
         equalSpacing(rowNetH, u.shelves.count).forEach((pos) => {
           const yb = rowZ0 + pos;
@@ -510,12 +515,12 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
           const pts =
             shift > 0
               ? [
-                  { x: x0, y: yb },
-                  { x: x0 + netW, y: yb - shift },
-                  { x: x0 + netW, y: yb - shift + t },
-                  { x: x0, y: yb + t },
+                  { x: sx0, y: yb },
+                  { x: sx0 + sw, y: yb - shift },
+                  { x: sx0 + sw, y: yb - shift + t },
+                  { x: sx0, y: yb + t },
                 ]
-              : rectPts(x0, yb, netW, t);
+              : rectPts(sx0, yb, sw, t);
           elevation.push({ k: 'poly', pts, closed: true, layer: L_STRUCT, lw: 1 });
         });
       }
@@ -524,11 +529,13 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
         const cellH = drawerCellHeights(u, netH, rules);
         let y = rowZ0 + apZ0 + u.drawers.gap;
         for (let k = 0; k < cellH.length; k++) {
-          elevation.push({ k: 'poly', pts: rectPts(x0 + u.drawers.gap, y, netW - 2 * u.drawers.gap, cellH[k]! - 2 * u.drawers.gap), closed: true, layer: L_FRONT, lw: 1.4 });
+          elevation.push({ k: 'poly', pts: rectPts(x0 + u.drawers.gap, y, netW - 2 * u.drawers.gap, cellH[k]!), closed: true, layer: L_FRONT, lw: 1.4 });
           y += cellH[k]! + u.drawers.gap;
         }
       }
-      if (u.doors) {
+      // 电器格（appliance）即使语义带 doors，也不画门 —— 门是给柜体分区用的，
+      // 电器格画门会凭空造出不存在的 DoorPanel（与 buildRow 的守卫口径一致）。
+      if (u.doors && u.kind !== 'appliance') {
         const widths = doorWidths(u, netW, rules);
         let x = x0 + u.doors.gapOuter;
         for (const w of widths) {

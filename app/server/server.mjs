@@ -30,7 +30,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync, createReadStream, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync, createReadStream, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -386,9 +386,21 @@ async function handleApi(req, res, pathname) {
   const env = readEnv();
   const s = currentSettings();
 
-  // ── 鉴权前置：除白名单外一律先过门（管理模式额外要求 canManage）──
-  const managePaths = pathname.startsWith('/api/account/') || pathname.startsWith('/api/security/');
-  const gate = requireAuth(req, res, pathname, { manage: managePaths });
+  // ── 鉴权前置：除白名单外一律先过门 ──
+  // 管理模式（账号 / 安全 / 系统设置**写操作**）额外要求 canManage；
+  // 设计修改类接口（生成方案 / 设计 / AIGC 视觉识别）额外要求 canDesign，禁止只读账号改动模型。
+  const isSettingsWrite =
+    (pathname === '/api/settings' || pathname.startsWith('/api/settings/')) &&
+    (req.method === 'PUT' || req.method === 'POST');
+  const managePaths =
+    pathname.startsWith('/api/account/') ||
+    pathname.startsWith('/api/security/') ||
+    isSettingsWrite;
+  const designPaths =
+    pathname === '/api/ai/plan' ||
+    pathname === '/api/ai/design' ||
+    pathname === '/api/ai/vision';
+  const gate = requireAuth(req, res, pathname, { manage: managePaths, design: designPaths });
   if (!gate.ok) return;
   const actor = gate.account ? gate.account.id : null;
 
@@ -1556,6 +1568,14 @@ async function handleApi(req, res, pathname) {
     const dir = mkdtempSync(join(tmpdir(), 'furniture-dxf-'));
     const neutralPath = join(dir, 'neutral.json');
     const dxfPath = join(dir, 'out.dxf');
+    // 临时目录必须清理：成功（流式写完）/ 失败 / 客户端断开都要兜底，否则 tmp 目录会越积越多。
+    const cleanup = () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (e) {
+        console.error('[dxf] 临时目录清理失败（已忽略，下次启动仍可回收）：', dir, e?.message ?? e);
+      }
+    };
     try {
       const neutralOut = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
         input: JSON.stringify({ project, which, modelVersion: String(body.modelVersion ?? 'unknown') }),
@@ -1571,9 +1591,14 @@ async function handleApi(req, res, pathname) {
         'Content-Disposition': `attachment; filename="export.dxf"; filename*=UTF-8''${encodeURIComponent(base)}`,
         'X-Export-Info': encodeURIComponent(JSON.stringify(info)),
       });
-      createReadStream(dxfPath).pipe(res);
+      // 流式转发：文件读完 / 出错 / 客户端断开时再清理，不能提前同步删（流尚未读取）
+      const stream = createReadStream(dxfPath);
+      stream.on('end', cleanup);
+      stream.on('error', cleanup);
+      stream.pipe(res);
       return;
     } catch (e) {
+      cleanup();
       return json(res, 500, { ok: false, error: `DXF 导出失败：${e.message}` });
     }
   }

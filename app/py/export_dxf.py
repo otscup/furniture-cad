@@ -72,6 +72,8 @@ def align_of(a: str):
 
 
 def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
+    if "meta" not in data:
+        raise ValueError("中立交换 JSON 缺少 meta 字段（顶层必须有 meta）")
     meta = data["meta"]
 
     doc = ezdxf.new(dxfversion, setup=True)
@@ -91,9 +93,11 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
 
     # 图层按需创建：图元里出现过才建，不预先写一大堆用不上的层
     layers: dict[str, None] = {}
-    for sh in data.get("sheets", []):
-        for pr in sh.get("prims", []):
-            layers.setdefault(pr["layer"], None)
+    for sh in data.get("sheets", []) or []:
+        for pr in sh.get("prims", []) or []:
+            # 缺 layer / 非对象的坏图元不在此处裸崩，交给下方逐图元处理统一给出「图元损坏」结构化报错
+            if isinstance(pr, dict) and pr.get("layer"):
+                layers.setdefault(pr["layer"], None)
     for name in layers:
         ltype = "CONTINUOUS"
         if name not in doc.layers:
@@ -103,49 +107,67 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
 
     stats = {"poly": 0, "fill": 0, "text": 0}
 
-    for sh in data.get("sheets", []):
-        for pr in sh.get("prims", []):
-            layer = pr["layer"]
-            if pr["k"] == "poly":
-                pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
-                if len(pts) < 2:
-                    continue
-                attribs = {"layer": layer}
-                if pr.get("dash"):
-                    attribs["linetype"] = "DASHED"
-                # 闭合是构造参数，不是 dxf 属性（pl.dxf.closed 会直接抛 DXFAttributeError）
-                pl = msp.add_lwpolyline(pts, close=bool(pr.get("closed")), dxfattribs=attribs)
-                pl.dxf.lineweight = lineweight_for(float(pr.get("lw", 1)))
-                stats["poly"] += 1
+    for si, sh in enumerate(data.get("sheets", []) or []):
+        for pi, pr in enumerate(sh.get("prims", []) or []):
+            if not isinstance(pr, dict):
+                raise ValueError(f"图元损坏：sheet[{si}] prim[{pi}] 不是对象")
+            try:
+                layer = pr["layer"]
+                kind = pr["k"]
+            except (KeyError, TypeError) as e:
+                raise ValueError(
+                    f"图元损坏：sheet[{si}] prim[{pi}] 缺少必填字段 layer/k（kind={pr.get('k') if isinstance(pr, dict) else '?'}）"
+                ) from e
+            try:
+                if kind == "poly":
+                    pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
+                    if len(pts) < 2:
+                        continue
+                    attribs = {"layer": layer}
+                    if pr.get("dash"):
+                        attribs["linetype"] = "DASHED"
+                    # 闭合是构造参数，不是 dxf 属性（pl.dxf.closed 会直接抛 DXFAttributeError）
+                    pl = msp.add_lwpolyline(pts, close=bool(pr.get("closed")), dxfattribs=attribs)
+                    pl.dxf.lineweight = lineweight_for(float(pr.get("lw", 1)))
+                    stats["poly"] += 1
 
-            elif pr["k"] == "fill":
-                pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
-                if len(pts) < 3:
-                    continue
-                hatch = msp.add_hatch(color=color_for(layer), dxfattribs={"layer": layer})
-                hatch.paths.add_polyline_path(pts, is_closed=True)
-                try:
-                    hatch.set_solid_fill(color=color_for(layer))
-                except Exception:
-                    pass
-                stats["fill"] += 1
+                elif kind == "fill":
+                    pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
+                    if len(pts) < 3:
+                        continue
+                    hatch = msp.add_hatch(color=color_for(layer), dxfattribs={"layer": layer})
+                    hatch.paths.add_polyline_path(pts, is_closed=True)
+                    try:
+                        hatch.set_solid_fill(color=color_for(layer))
+                    except Exception:
+                        pass
+                    stats["fill"] += 1
 
-            elif pr["k"] == "text":
-                t = pr["text"]
-                if not t:
-                    continue
-                e = msp.add_text(
-                    t,
-                    height=float(pr.get("size", 90)),
-                    dxfattribs={"style": TXT_STYLE, "layer": layer},
-                )
-                e.set_placement(
-                    (float(pr["p"]["x"]), float(pr["p"]["y"])),
-                    align=align_of(pr.get("align", "l")),
-                )
-                if pr.get("rot"):
-                    e.dxf.rotation = float(pr["rot"])
-                stats["text"] += 1
+                elif kind == "text":
+                    t = pr["text"]
+                    if not t:
+                        continue
+                    e = msp.add_text(
+                        t,
+                        height=float(pr.get("size", 90)),
+                        dxfattribs={"style": TXT_STYLE, "layer": layer},
+                    )
+                    e.set_placement(
+                        (float(pr["p"]["x"]), float(pr["p"]["y"])),
+                        align=align_of(pr.get("align", "l")),
+                    )
+                    if pr.get("rot"):
+                        e.dxf.rotation = float(pr["rot"])
+                    stats["text"] += 1
+                else:
+                    # 未知图元类型：不静默吞，明确报错（让验收抓得到）
+                    raise ValueError(f"图元损坏：sheet[{si}] prim[{pi}] 未知图元类型 k={kind!r}")
+            except (KeyError, TypeError, ValueError) as e:
+                if isinstance(e, ValueError) and "图元损坏" in str(e):
+                    raise
+                raise ValueError(
+                    f"图元损坏：sheet[{si}] prim[{pi}] kind={kind!r} 字段缺失或类型错误：{e}"
+                ) from e
 
     # 生产数据三件套写进文件的自定义属性：模型版本 + 生成器版本 + 规则集版本。
     # 主方案红线：交付物必须能完整复现，光靠一个文件名做不到 —— 文件会被改名。

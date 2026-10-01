@@ -25,7 +25,7 @@
  *                   一旦建了第一个账号，就没有"悄悄绕过"的口子 —— 这个切换是单向的。
  * ══════════════════════════════════════════════════════════════════════
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 
@@ -122,8 +122,8 @@ export class AuthStore {  /**
     const dir = dirname(this.auditPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const line = JSON.stringify({ at: new Date().toISOString(), ...entry });
-    const prev = existsSync(this.auditPath) ? readFileSync(this.auditPath, 'utf8') : '';
-    writeFileSync(this.auditPath, `${prev}${line}\n`, 'utf8');
+    // 只追加、不读改写回 —— readFile+writeFile 在并发写时会互相覆盖，丢失他人条目。
+    appendFileSync(this.auditPath, `${line}\n`, 'utf8');
   }
 
   readAudit(limit = 200) {
@@ -595,7 +595,7 @@ export function securityPolicy({ mode, accountsPath, auditPath, host }) {
     ],
     notImplemented: [
       '⚠ 没有 HTTPS —— 上线必须由反向代理终止 TLS，本服务本身不做',
-      '⚠ 会话不会轮换（refresh）也不能远程撤销单条，只能整账号踢下线',
+      '⚠ 会话不会轮换（refresh），但已支持单条撤销（account.revokeSession）与整账号踢下线（revokeAllSessions）',
       '⚠ 没有二次验证（邮件/短信/TOTP），口令是唯一凭据',
       '⚠ 账号库是本地 JSON 文件，没有并发写保护，多进程会互相覆盖',
       '⚠ 没有密码找回流程，忘记口令只能由管理员重置',

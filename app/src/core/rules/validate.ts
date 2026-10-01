@@ -213,9 +213,9 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
         );
         assertEq(
           `抽屉面板高之和 + 缝 = 净高（${u.id}）`,
-          fronts.reduce((a, x) => a + x.length, 0) + (u.drawers.count + 1) * u.drawers.gap + 2 * u.drawers.count * u.drawers.gap,
+          fronts.reduce((a, x) => a + x.length, 0) + (u.drawers.count + 1) * u.drawers.gap,
           netH,
-          'Σ面板高 + (n+1)×gap + 2n×gap = 净高'
+          'Σ面板高 + (n+1)×gap = 净高'
         );
         for (const f of fronts) {
           assertEq(`抽屉面板宽 + 2×缝 = 净宽（${f.id}）`, f.width + 2 * u.drawers.gap, netW, '面板宽 + 2×缝 = 净宽');

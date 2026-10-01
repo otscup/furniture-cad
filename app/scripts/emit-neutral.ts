@@ -16,7 +16,9 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import type { Project, RuleSet } from '../src/core/types.ts';
-import { toNeutralExport } from '../src/export/neutralSheet.ts';
+// DXF 真正消费制造层：几何 → 制造件 → 回投影板件 → 中立导出（P7 确立的唯一路径）。
+// 不再走旧的 toNeutralExport（绕过制造层会让 DXF 板件与开料单分叉）。
+import { manufacturingToNeutralExportDefault } from '../src/core/manufacturing/index.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const RULES_PATH = join(here, '..', 'src', 'core', 'ruleset', 'factory-default.json');
@@ -42,7 +44,7 @@ async function main(): Promise<void> {
   }
   const rules = JSON.parse(readFileSync(input.rulesPath ?? RULES_PATH, 'utf8')) as RuleSet;
   const which = input.which && input.which.length > 0 ? input.which : ['plan', 'sheet'];
-  const out = toNeutralExport(input.project, rules, which, input.modelVersion ?? 'unknown');
+  const out = manufacturingToNeutralExportDefault(input.project, rules, which, input.modelVersion ?? 'unknown');
   process.stdout.write(JSON.stringify(out));
 }
 

@@ -66,7 +66,7 @@ def main() -> int:
         "sampleTexts": texts[:6],
         "insUnits": doc.header.get("$INSUNITS"),
         "custom": custom,
-        "auditIssues": len(ezdxf.audit(doc, renumber=False)) if False else None,
+        "auditIssues": [str(i) for i in ezdxf.audit(doc, renumber=False)][:20],
     }
     sys.stdout.write(json.dumps(out, ensure_ascii=False))
     sys.stdout.write("\n")

@@ -25,7 +25,7 @@ FROM node:22-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir ezdxf
+    && pip3 install --break-system-packages --no-cache-dir "ezdxf==1.4.4"
 
 ENV APP_PYTHON=/usr/bin/python3 \
     APP_HOST=0.0.0.0 \

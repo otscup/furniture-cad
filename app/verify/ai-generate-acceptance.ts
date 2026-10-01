@@ -152,8 +152,10 @@ ok('A9 门扇数超上限 → 拒', badDoor.ok === false, JSON.stringify(badDoor
 
 ok('A10 每一项字段都登记在册（不许出现没有校验的字段）',
   (() => {
-    // 电器格五字段加入后清单变长 —— 断言的意图不变：字段清单封闭，且每个都有类型声明
-    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
+    // 电器格五字段加入后清单变长 —— 断言的意图不变：字段清单封闭，且每个都有类型声明。
+    // P9.6 §二十七：doorMaterial（玻璃门材质 id）入册 —— 契约有类型、编译期 checkDoorMaterial
+    // 校验存在性（未知材质拒收），real-furniture-request 验收 §2 钉住负样本。
+    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'doorMaterial', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
     const keys = Object.keys(UNIT_INTENT_ITEM);
     return keys.every((k) => KNOWN.includes(k)) && keys.every((k) => UNIT_INTENT_ITEM[k] && typeof UNIT_INTENT_ITEM[k].type === 'string');
   })(),

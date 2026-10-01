@@ -18,7 +18,10 @@ import {
 } from '../../ai/draftSession.ts';
 import { validateProposal, type DesignProposal } from '../../ai/proposal.ts';
 import { compileProposal } from '../../ai/compileProposal.ts';
+import type { AiAction } from '../../ai/compile.ts';
 import { PlanRunView } from './PlanRunView.tsx';
+import { CandidateComparePanel } from './candidateCompare.tsx';
+import { planCandidates, type PlannerPlan } from '../../core/planner/index.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { currentKnowledge, resolveKnowledge, knowledgeDigest as knowledgeDigestOf } from '../../ai/knowledge/index.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
@@ -520,6 +523,99 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
   const dismissPlan = useCallback(() => setPlan({ ...EMPTY_PLAN }), [setPlan]);
 
+  // ── 候选对比（P9.6）：只消费运行态，选中仅 UI/session 态 ──
+  // ⚠ 红线：comparePlan / selectedCandidateId **绝不**进 project.json、不进 convo 存盘。
+  //    selected 用独立前缀的 sessionStorage key（不污染 CONVO_KEY/ROOM_KEY）。
+  const [comparePlan, setComparePlan] = useState<PlannerPlan | null>(null);
+  const SELECT_KEY = 'p96:selectedCandidate';
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem(SELECT_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const selectCandidate = useCallback((id: string) => {
+    setSelectedCandidateId(id);
+    try {
+      sessionStorage.setItem(SELECT_KEY, id);
+    } catch {
+      /* 隐私模式下 sessionStorage 可能不可用 —— 只是不记住，不影响使用 */
+    }
+  }, []);
+  const closeCompare = useCallback(() => {
+    setComparePlan(null);
+    setSelectedCandidateId(null);
+    try {
+      sessionStorage.removeItem(SELECT_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /**
+   * 生成候选对比（P9.6 入口）：读当前项目 + 生效设计意图，跑 `planCandidates`
+   * （确定性枚举 + 确定性评分），把 `PlannerPlan` 交给 `CandidateComparePanel` 消费。
+   * 不调 AI、不改模型、不写盘。
+   */
+  const generateCompare = useCallback(() => {
+    if (busy) return;
+    setBusyKind('plan');
+    try {
+      const entries = currentKnowledge();
+      const r = planCandidates(bus.getState(), { scope: 'project' }, entries);
+      if (!r.ok) {
+        props.onToast?.('warn', r.error ?? '无法生成候选对比');
+        setComparePlan({
+          request: { scope: 'project' },
+          unresolved: [{ reason: r.error ?? '无法生成候选对比' }],
+          candidates: [],
+          scores: [],
+          explanations: [],
+        });
+        return;
+      }
+      setComparePlan(r.plan);
+    } finally {
+      setBusyKind('');
+    }
+  }, [bus, busy, props]);
+
+  /**
+   * 预览一份候选（§七/§九）：候选的坐标来自 `resolvePlacement`（唯一出口），
+   * 这里只把它翻译成既有 UI 授权动作 `cabinet.move` + `cabinet.rotate`，
+   * 走 **既有** `dryRunPlan` → `PlanRunView` → `commitPlan` 链路 —— 不建第二条提交路径，
+   * 更不调 `core/variants.ts` 的 `adoptVariant`（那是 VariantDraft→Cabinet，语义不同）。
+   * 点"应用"才会真正改模型（preview===commit）。
+   */
+  const previewCandidate = useCallback(
+    (candidateId: string) => {
+      const plan0 = comparePlan;
+      if (!plan0) return;
+      const layout = plan0.candidates.find((c) => c.id === candidateId);
+      if (!layout || layout.placements.length === 0) return;
+      const p = layout.placements[0]!;
+      const cab = bus.getState().cabinets.find((c) => c.id === p.targetId);
+      if (!cab) return;
+      const actions: AiAction[] = [];
+      if (cab.placement.x !== p.resolved.x || cab.placement.y !== p.resolved.y) {
+        actions.push({ action: 'cabinet.move', target: { cabinetId: cab.id }, params: { x: p.resolved.x, y: p.resolved.y }, reason: `预览候选 ${candidateId}`, index: actions.length });
+      }
+      if (cab.placement.rotation !== p.resolved.rotation) {
+        actions.push({ action: 'cabinet.rotate', target: { cabinetId: cab.id }, params: { deg: p.resolved.rotation }, reason: `预览候选 ${candidateId}`, index: actions.length });
+      }
+      if (actions.length === 0) {
+        props.onToast?.('info', '这份候选与当前落位一致，无需改动');
+        return;
+      }
+      const g = compiledRules().gate;
+      // 复用 plan 通道的预览/提交：setPlan 后由既有 PlanRunView + apply 接管
+      setPlan({ reply: '', rejected: [], rawReply: '', reasoning: '', meta: null, err: '', lastApply: '', run: null });
+      setPlan({ run: dryRunPlan({ bus, actions, gate: g, selection: props.selection }) });
+    },
+    [bus, comparePlan, props, setPlan],
+  );
+
   // ── 设计方案（P3：需求级 Proposal）──
 
   /**
@@ -980,6 +1076,15 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           >
             {busyKind === 'design' ? `设计方案生成中… ${waited}s` : design?.proposal ? '重新设计方案' : '设计方案'}
           </button>
+          <button
+            type="button"
+            className="tb-btn"
+            disabled={busy || rooms.length === 0}
+            onClick={() => void generateCompare()}
+            title="对当前生效的设计意图做确定性候选枚举 + 评分，并排对比（不调 AI、不改模型）。选哪份由你拍板。"
+          >
+            {busyKind === 'plan' ? `枚举中… ${waited}s` : '规划候选对比'}
+          </button>
           <button type="button" className="tb-btn" disabled={busy || chat.length === 0} onClick={clearChat}>
             清空对话
           </button>
@@ -1043,6 +1148,20 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       {plan.run ? (
         <Section title={`干跑预览（${plan.run.okCount} 条可应用 / ${plan.run.errorCount} 条失败）`} defaultOpen>
           <PlanRunView run={plan.run} onApply={apply} onDismiss={dismissPlan} lastApply={plan.lastApply} />
+        </Section>
+      ) : null}
+
+      {/* ═══════════════ 候选对比（P9.6）：纯消费运行态，手动选，不造 winner ═══════════════ */}
+      {comparePlan ? (
+        <Section title="候选方案对比（确定性枚举 + 评分，你选一份）" defaultOpen>
+          <CandidateComparePanel
+            plan={comparePlan}
+            project={bus.getState()}
+            selectedCandidateId={selectedCandidateId}
+            onSelect={selectCandidate}
+            onPreview={previewCandidate}
+            onClose={closeCompare}
+          />
         </Section>
       ) : null}
 

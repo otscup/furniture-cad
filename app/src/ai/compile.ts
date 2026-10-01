@@ -108,10 +108,40 @@ const mm = (v: number): number => Math.round(Number(v));
  * 0 是明确说"不要门"，结果同样是开放格 —— 两者结果一致但语义不同，
  * 这里统一成"不挂 doors"，因为 makeUnit 里"没有 doors"就是开放格的合法表达。
  */
-function doorIntentOf(doorCount: unknown): { count: number } | undefined {
+/**
+ * 「要不要门、几扇」的意图 → makeUnit 需要的 doors 形状。
+ *
+ * doorCount 缺省（undefined）= **没说**，建出来是不带门的开放格；
+ * 0 是明确说"不要门"，结果同样是开放格 —— 两者结果一致但语义不同，
+ * 这里统一成"不挂 doors"，因为 makeUnit 里"没有 doors"就是开放格的合法表达。
+ *
+ * doorMaterial（§二十七/F）：门板材质 id，引用 `RuleSet.materials`。
+ * 玻璃门给 `kind:'glass'` 的材质（如 `M_GLASS_8_GREY`）—— 清单据此把门板
+ * 分流到「甲购件」而非开料。这里**只透传 id**，不替用户猜材质：
+ * 没给 ⇒ makeUnit 用规则集默认门板材质；给了不存在的 id ⇒ 调用方先校验报错
+ * （玻璃门绝不能被静默降级成普通木门）。
+ */
+function doorIntentOf(doorCount: unknown, doorMaterial?: unknown): { count: number; material?: string } | undefined {
   if (doorCount === undefined || doorCount === null) return undefined;
   const n = Math.round(Number(doorCount));
-  return n > 0 ? { count: n } : undefined;
+  if (n <= 0) return undefined;
+  const out: { count: number; material?: string } = { count: n };
+  if (doorMaterial !== undefined && doorMaterial !== null) {
+    const id = String(doorMaterial);
+    if (id.length > 0) out.material = id;
+  }
+  return out;
+}
+
+/**
+ * 门板材质校验（§二十七/F）：只查"规则集里有没有这个材质 id"。
+ * 与 `checkMaterial`（柜体板/背板按 kind 限用途）不同 —— 门板可以是玻璃/镜子/
+ * 木门任意材质，所以只验证存在性，不限制 kind。不存在 ⇒ 报错（不静默降级）。
+ */
+function checkDoorMaterial(rules: RuleSet, id: string): string | null {
+  const m = rules.materials[id];
+  if (!m) return `规则集里没有门板材质 "${id}"（可选：${Object.keys(rules.materials).join('、')}）`;
+  return null;
 }
 
 /**
@@ -194,6 +224,11 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; t
     const it = (raw[i] ?? {}) as Record<string, unknown>;
     const kind = String(it.kind ?? '') as UnitSpec['kind'];
     if (!kind) return `units 第 ${i + 1} 项缺 kind（分区类型）`;
+    // 门板材质（§二十七/F）：给了就先校验存在性，不存在直接报错（玻璃门不被降级成木门）
+    if (it.doorMaterial !== undefined && it.doorMaterial !== null) {
+      const dm = checkDoorMaterial(opts.rules, String(it.doorMaterial));
+      if (dm) return `units 第 ${i + 1} 项的门板材质：${dm}`;
+    }
     let unit: UnitSpec;
     try {
       unit = makeUnit({
@@ -204,7 +239,7 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; t
         depth: opts.depth,
         count: it.count === undefined ? undefined : Number(it.count),
         rodHeight: it.rodHeight === undefined ? undefined : Number(it.rodHeight),
-        doors: doorIntentOf(it.doorCount),
+        doors: doorIntentOf(it.doorCount, it.doorMaterial),
         takenIds: taken,
         appliance:
           kind === 'appliance'
@@ -619,6 +654,11 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (kind === 'appliance' && p.doorCount !== undefined && Number(p.doorCount) !== 0) {
         return { ok: false, error: '电器格的洞口和门在同一张脸上互相冲突 —— 不要给电器格装门（机器露前脸是常规做法）' };
       }
+      // 门板材质（§二十七/F）：给了就先校验存在性，不存在直接报错（玻璃门不被降级成木门）
+      if (p.doorMaterial !== undefined && p.doorMaterial !== null) {
+        const dm = checkDoorMaterial(rules, String(p.doorMaterial));
+        if (dm) return { ok: false, error: `门板材质：${dm}` };
+      }
       // 分区 id 的唯一性必须**跨行**成立：板件 id 由 unit.id 拼出（`P_cab_unit_001_SHELF1`），
       // 两行各有一个 `unit_001` 会让两份板件在清单里合成一条 —— 静默少件。
       const taken = new Set(allUnits(cab.layout).map((u) => u.id));
@@ -632,7 +672,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         depth: cab.params.depth,
         count: p.count === undefined ? undefined : Number(p.count),
         rodHeight: p.rodHeight === undefined ? undefined : Number(p.rodHeight),
-        doors: doorIntentOf(p.doorCount),
+        doors: doorIntentOf(p.doorCount, p.doorMaterial),
         appliance:
           kind === 'appliance'
             ? {

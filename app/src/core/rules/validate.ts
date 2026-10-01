@@ -170,17 +170,36 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
       const unitName = `${u.nickname ?? u.id}${label}`;
       const ctxBase = { unitIndex: ui, unitName, unitId: u.id, unitBasePath: basePath, rowLabel };
 
+      /**
+       * 门板恒等式断言：**只对"可开料门板"成立**。
+       *
+       * 玻璃门（材质 kind='glass'）由 `generate.ts` 分流到 `purchased`（甲购/外采件，
+       * 玻璃不走开料机）——它**不在 `geom.panels` 里**。下面这组"Σ门宽 + 缝 = 净宽"
+       * 读的是开料门板，对玻璃门天然没有输入：若不分流，一条**合法**玻璃门会被算成
+       * "Σ门宽 = 0"，于是报出 IDENTITY-FAIL（"这是程序缺陷"）——把用户明确要的玻璃门
+       * 误判成生成器自相矛盾。这与上面"高度链只在行高配置合法时断言"是同一条纪律：
+       * **只在断言有意义时才断言**，绝不把设计意图说成程序缺陷。
+       *
+       * 玻璃门这里改验"是否按门扇数全部派生到甲购清单"（可判定、非恒等、非恒真）——
+       * 门宽本身的分配仍由双方共用的 `doorWidths()` 保证（木门路径已覆盖）。
+       */
       if (u.doors) {
-        const doors = geom.panels.filter((x) => x.group === u.id && x.role === 'DoorPanel');
-        const expect = doorWidths(u, netW, rules);
-        assertEq(
-          `门宽之和 + 缝 = 净宽（${u.id}）`,
-          doors.reduce((a, x) => a + x.width, 0) + 2 * u.doors.gapOuter + (u.doors.count - 1) * u.doors.gapMid,
-          netW,
-          'Σ门宽 + 2×外缝 + (n-1)×中缝 = 净宽'
-        );
-        assertEq(`门宽分配与 layout 一致（${u.id}）`, doors.reduce((a, x) => a + x.width, 0), expect.reduce((a, b) => a + b, 0), '门宽来自共享的 doorWidths()');
-        if (doors[0]) assertEq(`门高 + 2×外缝 = 净高（${u.id}）`, doors[0].length + 2 * u.doors.gapOuter, netH, '门高 + 2×外缝 = 净高');
+        const doorMatKind = u.doors.material ? rules.materials[u.doors.material]?.kind : undefined;
+        if (doorMatKind === 'glass') {
+          const glass = geom.purchased.filter((x) => x.belongsTo === `${cab.id}.${u.id}` && x.kind === 'glassDoor');
+          assertEq(`玻璃门数 = 门扇数（${u.id}）`, glass.length, u.doors.count, '玻璃门进 purchased（不进 panels），只验派生数量');
+        } else {
+          const doors = geom.panels.filter((x) => x.group === u.id && x.role === 'DoorPanel');
+          const expect = doorWidths(u, netW, rules);
+          assertEq(
+            `门宽之和 + 缝 = 净宽（${u.id}）`,
+            doors.reduce((a, x) => a + x.width, 0) + 2 * u.doors.gapOuter + (u.doors.count - 1) * u.doors.gapMid,
+            netW,
+            'Σ门宽 + 2×外缝 + (n-1)×中缝 = 净宽'
+          );
+          assertEq(`门宽分配与 layout 一致（${u.id}）`, doors.reduce((a, x) => a + x.width, 0), expect.reduce((a, b) => a + b, 0), '门宽来自共享的 doorWidths()');
+          if (doors[0]) assertEq(`门高 + 2×外缝 = 净高（${u.id}）`, doors[0].length + 2 * u.doors.gapOuter, netH, '门高 + 2×外缝 = 净高');
+        }
       }
 
       if (u.drawers) {

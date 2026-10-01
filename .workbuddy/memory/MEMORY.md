@@ -1,8 +1,7 @@
 # 项目长期记忆（骨架 · 2026-10-01）
 
 ## 项目
-浏览器端参数化定制家具设计与生产系统：**语义模型(JSON)=真相源**，2D/3D/DXF/清单同源派生；自然语言入口，可被 MCP 驱动。
-**git 仓在项目根**（不是 `app/`）；公开仓库 `otscup/furniture-cad`（默认 `master`）。
+浏览器端参数化定制家具设计与生产系统：**语义模型(JSON)=真相源**，2D/3D/DXF/清单同源派生；自然语言入口，可被 MCP 驱动。**git 仓在项目根**（不是 `app/`）；公开仓库 `otscup/furniture-cad`（默认 `master`）。
 - 主文档 `docs/AI-Web-CAD-Furniture-Master-Plan-v0.1.md`；v0.3 路线+逐阶段记录 `docs/Semantic-Model-v2-and-AI-Design-Plan.md` §23.x。
 - **完整踩坑史 + 阶段细节在日更日志 `.workbuddy/memory/YYYY-MM-DD.md`**；本文件只留骨架。
 
@@ -11,7 +10,7 @@
 2. AI 只出 Command，永不输出几何/坐标；不能写 derived/删项目/改规则集。
 3. 唯一写入口 CommandBus；两段式 dry-run→确认→commit，失败不改状态；AI 计划原子。
 4. **界面读数="最终会被用到的那个值"**（preview===commit、dryRun===commit 逐字节）；交互结束即清瞬时状态。
-5. 机器硬规则 与 AI 软建议 分离；"是否需模型"与"用哪个模型"两层→路由要有 `none`。
+5. 机器硬规则与 AI 软建议分离；"是否需模型"与"用哪个模型"两层→路由要有 `none`。
 6. 一键修复只对修法唯一可判定者开放、修后用真实几何复核；设计决定只给诚实说明。
 7. 报错文案唯一真相源 `issueCatalog.buildIssue()`；未登记码直接抛错。
 8. **一种形状/能力只许一处判断**：`units`/`rows`→`core/layoutModel.ts`；接触→`deriveContacts()`；容差→`SPATIAL_TOL`。
@@ -27,17 +26,18 @@
 - MCP 白名单不暴露 SQL/路径/shell/规则集；交付带"模型+生成器+规则集版本"三件套；首批生产人工全检。
 
 ## 最高频的坑（完整清单见日志）
-- **nextId 必传 takenIds**（撞 id 只静默共用）；**夹具必须深拷贝+显式指定 id**；结构性命令必带 `changes:[]`。
+- **nextId 必传 takenIds**；**夹具必须深拷贝+显式指定 id**；结构性命令必带 `changes:[]`。
 - **★ verify 运行期间禁改 `app/` 源文件**（Vite HMR 整页重载→恢复草稿→后续断言连环假红）。
 - **★ 不许要求模型输出它拿不到的几何**（坐标由系统定）。
-- **断言不可信比失败更危险**：先打原始值、先假定自己错；几何 0/±1 须精确；**新增断言须临时改坏确认真会红**；**恒真表达式＝假绿**；每条哨兵配"故意写坏的样本"自检。
-- **扫源码类断言必须剥注释后只扫代码**（文件头常写"本层不 import X"=纪律声明，扫原文→假红）；容差哨兵认 `_TOL` 后缀。
-- **负样本要精确到原因**；**"带数字"须断言喂进去的值真出现**（`num()` 缺值返 0→假绿）。
-- **逐字节比较先摘时间戳**（`serializeProjectFile.savedAt` 等，常嵌套）。
+- **断言不可信比失败更危险**：先打原始值、先假定自己错；**新增断言须临时改坏确认真会红**；恒真表达式＝假绿；每条哨兵配"故意写坏的样本"自检。
+- **★ 断言可能是瞎的**：在"已被处理过"的对象上取快照 → 抓不到"处理顺手改了它" → 用**全新未碰过**的对象，或在操作**之前**取快照。
+- **★ "判不出来"常表现为"这一行根本不存在"**（缺开启方向的门不产出净空行）→ 消费"逐条列表"时必问"**这一条为什么不在列表里**"；能力只给一半时（`overlap` 同时是 ERROR）断言"**被闸门拦住**"，别硬造 `'no'`。
+- **扫源码类断言必须剥注释后只扫代码**（文件头常写"本层不 import X"=纪律声明）；容差哨兵认 `_TOL` 后缀。
+- **负样本要精确到原因**；**"带数字"须断言喂进去的值真出现**（`num()` 缺值返 0→假绿）；**逐字节比较先摘时间戳**。
 - **`npm run typecheck` 本机可能 OOM**（TS7 是 Go 编译器）→ `GOMEMLIMIT=1500MiB npx tsc --noEmit`。
 - **verify:ui 分钟级**：跑前清 dev server(5273)；提交前 `git checkout -- app/verify/out/`（PNG tracked）；长输出别 `| tail -N`。
 - **环境代理假失败**：`HTTP_PROXY` 把局域网当外网→502。**AI 网关**：R1 系回 `reasoning_content`；`max_tokens` 夹 `[1,65536]`。
-- **几何**：两矩形面贴合⇒相对旋转必是 90° 整数倍；placement=背面左角约定。**DXF**：主交付 R2007、R2000 须 gbk+dwgcodepage、dimlfac=1.0。
+- **几何**：两矩形面贴合⇒相对旋转必是 90° 整数倍；placement=背面左角约定。**DXF**：R2007；R2000 须 gbk+dwgcodepage、dimlfac=1.0。
 
 ## 部署（NAS 群晖）
 网关 key 非占位符；宿主机测 000 是 DNS 假故障（容器内 node 测 200）；`docker cp /tmp` 用 stdin 法；`AI_TIMEOUT_MS` 改 `data/.env` 不重建镜像。
@@ -46,7 +46,7 @@
 用户只给产品方向/架构边界/阶段验收，我自主拆解实现测试提交；每阶段一份报告（完成/决策/测试/遗留/commit）。**停在阶段不自动进下一阶段**——除非用户明确"继续"。
 
 ## v0.3 路线
-P0→P1→P2(`66da2b5`)→P3(`26a7639`)→P4(`6f5541b`)→P5(`8aecd76`)→P6(`a556353`)→P7(`67f6764`)→P8.1(`4290a3a`)→P8.2(`7850046`)→P8.3(`53f20a8`)→P8.4(`bc8284c`)→P8.5(`ec3565b`)→P8.5-B(`99db98e`)→P8.6→P8.7(`c8c01c3`)→P8.8(`d892845`)→P8.9(`0cba2ef`+`b4c62f4`)→P9.0(`985c78b`)→P9.1(`4c50608`)→P9.2(`4c0b74c`)→P9.3(`601faf7`)→P9.4(`bd025d0`)。**停在 P9.4。**
-- P9.2 纯语义层 `core/designIntent/`（Intent≠Layout；模型只装 active；`scope` 写不出 wallId；不升 schemaVersion）158 条。
-- P9.3 纯临时候选布局 `core/candidateLayout/`（只到 draft；`CandidatePlacement` 无 Cabinet；必过 Resolver；不进 project.json；无 adopt；AI 只出无坐标 `candidateRequest`）69 条。
-- P9.4 纯临时评分 `core/designScore/`：来源闭集 `fact|rule|preference`；**Gate 前置**（ERROR⇒`infeasible`+`total:null`+`components:[]`）；条件命中=读词表 spec 的 `fact`×`satisfiedValues`；偏好=`resolveKnowledge().applicable`+`preferredOrientation`（偏永不进 hardFailures）；priority→unavailable；`total`=命中数（**无权重，留后续**）；compare 不选 winner。78 条。
+P0→P1→P2(`66da2b5`)→P3(`26a7639`)→P4(`6f5541b`)→P5(`8aecd76`)→P6(`a556353`)→P7(`67f6764`)→P8.1(`4290a3a`)→P8.2(`7850046`)→P8.3(`53f20a8`)→P8.4(`bc8284c`)→P8.5(`ec3565b`)→P8.5-B(`99db98e`)→P8.6→P8.7(`c8c01c3`)→P8.8(`d892845`)→P8.9(`0cba2ef`)→P9.0(`985c78b`)→P9.1(`4c50608`)→P9.2(`4c0b74c`)→P9.3(`601faf7`)→P9.4(`bd025d0`+`6332b79`)。**停在 P9.4。**
+- P9.2 `core/designIntent/`：Intent≠Layout；只装 active；`scope` 写不出 wallId；不升 schemaVersion（158 条）。
+- P9.3 `core/candidateLayout/`：只到 draft；`CandidatePlacement` 无 Cabinet；必过 Resolver；不进 project.json；无 adopt（69 条）。
+- P9.4 `core/designScore/`（**133 条**）：来源闭集 `fact|rule|preference`；**Gate 前置**（ERROR⇒`infeasible`+`total:null`+`components:[]`，硬错误**不降级**为软 no）；命中=读词表 spec 的 `fact`×`satisfiedValues`；偏好=`resolveKnowledge().applicable`（永不进 hardFailures）；`total`=命中数（无权重，留后续）；不选 winner。**生命周期** `'draft'|'evaluated'`（类型层无 `adopted`）+`EvaluatedCandidate`（运行态包装，不落盘）。**AI 只读块** `snapshot.candidateScore`（纯投影：只读、零坐标、`preferencesApplied:false`）—— 沿用 P9"每阶段加一块**能读不能写**的上下文"；动作清单仍 21 条。

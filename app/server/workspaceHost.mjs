@@ -16,7 +16,7 @@
  *   任何"只拷 import 闭包"的方案都会漏掉它 —— verify:image-closure 已单独守住这条。
  * ══════════════════════════════════════════════════════════════════════
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeFileAtomic } from './writeQueue.mjs';
@@ -58,6 +58,37 @@ export async function openWorkspace(opts) {
   /** 落盘仍经同一个进程内串行写队列 —— 与账号库写入口是同一条保护。 */
   const persist = (content) => writeFileAtomic(filePath, content);
 
+  /**
+   * draft 持久化（P10.0 · S4）。
+   * 位置：workspace 文件同目录下的 `drafts/`（§8.3 要求"落在数据卷上"；
+   * S1 用的是单文件布局而非 `workspaces/<id>/` 目录，这里取同目录是同一意图的最小实现）。
+   * 写仍经串行写队列；content 为 null = 删除（apply/discard 后）。
+   */
+  const draftsDir = join(dirname(filePath), 'drafts');
+  const persistDraft = async (draftId, content) => {
+    const safeId = String(draftId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const p = join(draftsDir, `${safeId}.json`);
+    if (content === null) {
+      // 删除：调用方（apply/discard 后）已 await 完之前的 save，不存在写竞争；幂等
+      const { unlinkSync } = await import('node:fs');
+      try {
+        unlinkSync(p);
+      } catch {
+        /* 文件不存在也不报错 */
+      }
+      return;
+    }
+    mkdirSync(draftsDir, { recursive: true });
+    await writeFileAtomic(p, content);
+  };
+  const loadDrafts = async () => {
+    if (!existsSync(draftsDir)) return [];
+    return readdirSync(draftsDir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => ({ draftId: f.replace(/\.json$/, ''), content: readFileSync(join(draftsDir, f), 'utf8') }));
+  };
+  const draftIO = { persistDraft, loadDrafts };
+
   if (existsSync(filePath)) {
     try {
       const workspace = WorkspaceStore.load({
@@ -65,13 +96,17 @@ export async function openWorkspace(opts) {
         rules,
         persist,
         readRaw: () => readFileSync(filePath, 'utf8'),
+        ...draftIO,
       });
+      const dl = await workspace.loadPersistedDrafts();
       notify({
         action: 'workspace.load',
         result: 'ok',
         workspaceId: workspace.workspaceId,
         liveModelVersion: workspace.getLiveModelVersion(),
         filePath,
+        draftsRestored: dl.loaded.length,
+        draftsSkipped: dl.skipped.length,
       });
       return { ok: true, workspace, filePath };
     } catch (e) {
@@ -85,7 +120,7 @@ export async function openWorkspace(opts) {
     }
   }
 
-  const workspace = WorkspaceStore.create({ filePath, rules, persist, owner, account });
+  const workspace = WorkspaceStore.create({ filePath, rules, persist, owner, account, ...draftIO });
   await workspace.save();
   notify({
     action: 'workspace.create',

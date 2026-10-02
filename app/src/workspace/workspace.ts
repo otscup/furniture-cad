@@ -84,6 +84,7 @@ class ServerDraft {
   readonly workspaceId: string;
   readonly baseModelVersion: number;
   readonly owner: string;
+  readonly createdAt: string;
   private readonly bus: CommandBus;
 
   constructor(opts: {
@@ -92,11 +93,15 @@ class ServerDraft {
     owner: string;
     project: Project;
     rules: RuleSet;
+    /** 从磁盘恢复时传入，保留原 draftId；新建时缺省自动生成 */
+    draftId?: string;
+    createdAt?: string;
   }) {
-    this.draftId = nextId('draft');
+    this.draftId = opts.draftId ?? nextId('draft');
     this.workspaceId = opts.workspaceId;
     this.baseModelVersion = opts.baseModelVersion;
     this.owner = opts.owner;
+    this.createdAt = opts.createdAt ?? new Date().toISOString();
     // CommandBus 构造时会 structuredClone(project) ⇒ draft 与 live 物理隔离
     this.bus = new CommandBus(opts.project, opts.rules);
   }
@@ -117,7 +122,65 @@ class ServerDraft {
       owner: this.owner,
     };
   }
+
+  /**
+   * 落盘形状：draft 是"未提交改动"，与 workspace 文件分开存放
+   *（§8.3：`drafts/<draftId>.json`，落在数据卷上，容器重建不丢）。
+   * 只存元数据 + project 快照；恢复时用同一份 rules 重建 CommandBus。
+   */
+  toJSON(): DraftFileShape {
+    return {
+      format: 'furniture-cad-draft',
+      formatVersion: 1,
+      draftId: this.draftId,
+      workspaceId: this.workspaceId,
+      baseModelVersion: this.baseModelVersion,
+      owner: this.owner,
+      createdAt: this.createdAt,
+      project: this.bus.getState(),
+    };
+  }
+
+  /** 从磁盘形状恢复（字段缺失/类型不对直接抛错，不降级、不静默修）。 */
+  static fromJSON(obj: unknown, rules: RuleSet): ServerDraft {
+    const o = obj as Record<string, unknown>;
+    if (!o || o.format !== 'furniture-cad-draft' || typeof o.draftId !== 'string' || !o.draftId) {
+      throw new Error('draft 文件格式非法：缺 format/draftId');
+    }
+    if (typeof o.workspaceId !== 'string' || typeof o.baseModelVersion !== 'number' || typeof o.owner !== 'string') {
+      throw new Error(`draft 文件元数据非法：${o.draftId}`);
+    }
+    if (!o.project || typeof o.project !== 'object') {
+      throw new Error(`draft 文件缺 project 快照：${o.draftId}`);
+    }
+    return new ServerDraft({
+      draftId: o.draftId,
+      workspaceId: o.workspaceId,
+      baseModelVersion: o.baseModelVersion,
+      owner: o.owner,
+      project: o.project as Project,
+      rules,
+      createdAt: typeof o.createdAt === 'string' ? o.createdAt : undefined,
+    });
+  }
 }
+
+/** draft 落盘文件形状（与 workspace 文件分开，不污染 projectFile 信封）。 */
+export interface DraftFileShape {
+  format: 'furniture-cad-draft';
+  formatVersion: 1;
+  draftId: string;
+  workspaceId: string;
+  baseModelVersion: number;
+  owner: string;
+  createdAt: string;
+  project: Project;
+}
+
+/** draft 落盘：content 为 null = 删除文件（apply/discard 后调用）。 */
+export type DraftPersistFn = (draftId: string, content: string | null) => Promise<void>;
+/** draft 装载：返回全部 draft 文件的原始字符串（读不进队列，解析失败由调用方处理）。 */
+export type DraftLoadFn = () => Promise<Array<{ draftId: string; content: string }>>;
 
 export interface WorkspaceStoreOpts {
   filePath: string;
@@ -129,6 +192,12 @@ export interface WorkspaceStoreOpts {
   liveModelVersion: number;
   updatedAt: string;
   bus: CommandBus;
+  /**
+   * draft 持久化（S4）：按 §8.3 落盘到数据卷，容器重建不丢。
+   * 缺省（测试）= 纯内存，与 S1 行为一致。
+   */
+  persistDraft?: DraftPersistFn;
+  loadDrafts?: DraftLoadFn;
 }
 
 /**
@@ -147,6 +216,8 @@ export class WorkspaceStore {
   private liveModelVersion: number;
   private updatedAt: string;
   private readonly drafts = new Map<string, ServerDraft>();
+  private readonly persistDraft?: DraftPersistFn;
+  private readonly loadDrafts?: DraftLoadFn;
 
   private constructor(opts: WorkspaceStoreOpts) {
     this.workspaceId = opts.workspaceId;
@@ -158,6 +229,8 @@ export class WorkspaceStore {
     this.bus = opts.bus;
     this.liveModelVersion = opts.liveModelVersion;
     this.updatedAt = opts.updatedAt;
+    this.persistDraft = opts.persistDraft;
+    this.loadDrafts = opts.loadDrafts;
   }
 
   /** 新建一个空（或示例）Workspace。 */
@@ -168,6 +241,8 @@ export class WorkspaceStore {
     owner?: string;
     account?: string;
     project?: Project;
+    persistDraft?: DraftPersistFn;
+    loadDrafts?: DraftLoadFn;
   }): WorkspaceStore {
     const project = opts.project ?? sampleProject(opts.rules);
     const bus = new CommandBus(project, opts.rules);
@@ -181,6 +256,8 @@ export class WorkspaceStore {
       liveModelVersion: 0,
       updatedAt: new Date().toISOString(),
       bus,
+      persistDraft: opts.persistDraft,
+      loadDrafts: opts.loadDrafts,
     });
   }
 
@@ -190,6 +267,8 @@ export class WorkspaceStore {
     rules: RuleSet;
     persist: PersistFn;
     readRaw: ReadRawFn;
+    persistDraft?: DraftPersistFn;
+    loadDrafts?: DraftLoadFn;
   }): WorkspaceStore {
     const raw = opts.readRaw();
     const parsed = parseProjectFile(raw);
@@ -224,6 +303,8 @@ export class WorkspaceStore {
       liveModelVersion: meta.liveModelVersion,
       updatedAt: meta.updatedAt,
       bus,
+      persistDraft: opts.persistDraft,
+      loadDrafts: opts.loadDrafts,
     });
   }
 
@@ -383,5 +464,59 @@ export class WorkspaceStore {
   /** 丢弃草稿（按归属控制由调用方负责；S1 不在此做权限判定，权限是 HTTP 层职责）。 */
   discardDraft(draftId: string): boolean {
     return this.drafts.delete(draftId);
+  }
+
+  /** MCP 写工具需要的规则集（构造 Cabinet / 编译 Proposal 用）。只读，不递引用。 */
+  getRules(): RuleSet {
+    return this.rules;
+  }
+
+  /** 列出内存中的全部 draft（含归属与创建时间，供 cad.list_drafts）。 */
+  listDrafts(): Array<DraftHandle & { createdAt: string }> {
+    return [...this.drafts.values()].map((d) => ({ ...d.handle(), createdAt: d.createdAt }));
+  }
+
+  /**
+   * 把指定 draft 落盘（S4）。
+   * 调用方（MCP 写工具）在 createDraft / draftExecute 成功后显式调用 ——
+   * 与 Workspace.execute() "提交成功才落盘"同一条纪律：没落盘就不算成功。
+   */
+  async saveDraft(draftId: string): Promise<void> {
+    if (!this.persistDraft) return;
+    const d = this.drafts.get(draftId);
+    if (!d) throw new Error(`draft 不存在，无法落盘：${draftId}`);
+    await this.persistDraft(draftId, JSON.stringify(d.toJSON(), null, 2));
+  }
+
+  /** 删除 draft 文件（apply/discard 后调用；文件不存在也不报错，幂等）。 */
+  async deleteDraftFile(draftId: string): Promise<void> {
+    if (!this.persistDraft) return;
+    await this.persistDraft(draftId, null);
+  }
+
+  /**
+   * 启动时从磁盘恢复 draft（S4）。
+   * 单个文件坏了只跳过该文件（记下 id），不让一个坏草稿拦住整个工作区装载；
+   * 返回成功恢复的 draftId 列表，调用方决定是否告警。
+   */
+  async loadPersistedDrafts(): Promise<{ loaded: string[]; skipped: string[] }> {
+    const loaded: string[] = [];
+    const skipped: string[] = [];
+    if (!this.loadDrafts) return { loaded, skipped };
+    const files = await this.loadDrafts();
+    for (const f of files) {
+      try {
+        const draft = ServerDraft.fromJSON(JSON.parse(f.content), this.rules);
+        if (draft.workspaceId !== this.workspaceId) {
+          skipped.push(f.draftId);
+          continue;
+        }
+        this.drafts.set(draft.draftId, draft);
+        loaded.push(draft.draftId);
+      } catch {
+        skipped.push(f.draftId);
+      }
+    }
+    return { loaded, skipped };
   }
 }

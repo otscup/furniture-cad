@@ -2089,7 +2089,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  账号库    ${ACCOUNTS_PATH}`);
   console.log(`  审计日志  ${AUDIT_PATH}`);
   console.log(`  工作区    ${WORKSPACE_PATH}（后台装载中，/mcp 取数前会等到装载结束）`);
-  console.log(`  MCP       http://${HOST}:${PORT}/mcp  · 只读工具：${ALLOWED_TOOLS.join(' / ')}`);
+  console.log(`  MCP       http://${HOST}:${PORT}/mcp  · ${ALLOWED_TOOLS.length} 个工具：${ALLOWED_TOOLS.join(' / ')}`);
   console.log(`  账号模式  ${auth.mode}${auth.enabled ? `（${auth.data.accounts.length} 个账号）` : '  ← 还没有账号，全部接口免登录'}`);
   console.log(
     DATA_WRITABLE

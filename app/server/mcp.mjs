@@ -1,20 +1,26 @@
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  MCP 基础层（P10.0 · S2）—— Streamable HTTP `/mcp`，官方 TypeScript MCP SDK
+ *  MCP 基础层（P10.0 · S2）+ 写工具（S4/S5）—— Streamable HTTP `/mcp`，官方 TypeScript MCP SDK
  *
- *  ── 本阶段范围（有意**只**做这些）──
- *   MCP客户端 → Streamable HTTP /mcp → AuthStore/requireAuth → 真实 Workspace → 只读工具
- *   只有两个工具：`cad.get_state` / `cad.validate`，都是**只读**、不改模型。
- *   故意不做：cad.create_room / draw_wall / place_cabinet / update_object / delete_object、
- *   proposal 提交、draft apply/discard、MCP 导出、OAuth、browser 自动化、实时推送。
+ *  ── 范围 ──
+ *   MCP客户端 → Streamable HTTP /mcp → AuthStore/requireAuth → 真实 Workspace →
+ *   只读工具（S2）+ 写工具（S4/S5，见 mcpWrite.mjs）。
+ *   只读：`cad.get_state` / `cad.validate`。
+ *   写（S4，designer+，只写 draft 不碰 live）：
+ *     `cad.create_cabinet` / `cad.place_cabinet` / `cad.update_object` /
+ *     `cad.delete_object` / `cad.submit_proposal` / `cad.list_drafts`。
+ *   写（S5）：`cad.apply_draft`（admin+，乐观锁）/ `cad.discard_draft`（按归属）。
+ *   故意不做：MCP 导出、OAuth、browser 自动化、实时推送。
  *
  *  ── 三条不变量 ──
  *   1. 同进程：挂在既有 8787 Node 服务的请求处理链上，**不新增服务进程**。
  *   2. 权限只有一条路：Bearer token → `AuthStore` → 账号 role。
- *      **不新增 MCP 专用角色/权限体系**；本阶段两个工具是只读，任何已认证角色皆可读
- *      （与既有 canView 一致）；写工具将来必须继续复用同一条判定路径。
- *   3. 工具**只读**：取数据一律经 WorkspaceStore 的只读出口（快照/校验），
- *      绝不 `project.foo = ...`、绝不自建第二套模型或第二套 validator。
+ *      **不新增 MCP 专用角色/权限体系**；只读工具任何已认证角色皆可读
+ *      （与既有 canView 一致）；写工具按 §11 权限矩阵收紧
+ *      （写 draft=designer+，apply=admin+，discard 按归属）。
+ *   3. 写工具**只写 draft**：取数/改数一律经 WorkspaceStore 的既有出口，
+ *      绝不 `project.foo = ...`、绝不自建第二套模型或第二套 validator；
+ *      唯一的 live 写入口是 `apply_draft` 的乐观锁提交。
  *
  *  ── token 安全 ──
  *   明文 token 从不出现在：审计、日志、错误响应、工具结果。审计只记
@@ -24,6 +30,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
+import { registerWriteTools, WRITE_TOOLS } from './mcpWrite.mjs';
 
 /**
  * 两个工具都**没有输入参数**，但 `inputSchema` 不能就此省掉：
@@ -39,8 +46,8 @@ const NO_ARGS = z.object({}).default({});
 export const TOOL_GET_STATE = 'cad.get_state';
 export const TOOL_VALIDATE = 'cad.validate';
 
-/** 本阶段允许暴露的 CAD 工具（**恰好**这两个；新增必须走新一轮方案）。 */
-export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE];
+/** 允许暴露的 CAD 工具（只读 S2 + 写 S4/S5；新增必须走新一轮方案）。 */
+export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, ...WRITE_TOOLS];
 
 const SERVER_INFO = { name: 'furniture-cad', version: '0.1.0' };
 
@@ -200,6 +207,14 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
       return toolText(payload);
     }
   );
+
+  // S4/S5 写工具（权限与 draft 纪律见 mcpWrite.mjs 文件头）。
+  // auditToolCall 在这里绑定 principal：mcpWrite 侧只传 (tool, result, extra)。
+  registerWriteTools(server, {
+    getWorkspaceState,
+    principal,
+    auditToolCall: (tool, result, extra) => auditToolCall(principal, tool, result, extra),
+  });
 
   return server;
 }

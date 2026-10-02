@@ -65,20 +65,21 @@ const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
 // ───────────────────────── 规格（硬编码，不 import 被测源码） ─────────────────────────
 
-/** S2 只允许暴露的工具（方案 §六）。**这是规格，不是从源码读来的。** */
-const EXPECTED_TOOLS = ['cad.get_state', 'cad.validate'];
-/** 本阶段明令禁止的写/管理工具词根（方案 §八"红线"与 §十"下一阶段"）。 */
-const FORBIDDEN_ROOTS = [
-  'create_room',
-  'draw_wall',
-  'place_cabinet',
-  'update_object',
-  'delete_object',
-  'submit_proposal',
-  'draft.apply',
-  'draft.discard',
-  'export',
+/** S2+S4/S5 允许暴露的工具（方案 §六/§七）。**这是规格，不是从源码读来的。** */
+const EXPECTED_TOOLS = [
+  'cad.get_state',
+  'cad.validate',
+  'cad.create_cabinet',
+  'cad.place_cabinet',
+  'cad.update_object',
+  'cad.delete_object',
+  'cad.submit_proposal',
+  'cad.list_drafts',
+  'cad.apply_draft',
+  'cad.discard_draft',
 ];
+/** 明令禁止的工具词根：IR-3 未定（create_room/draw_wall）与 S6 未做（export_*）。 */
+const FORBIDDEN_ROOTS = ['create_room', 'draw_wall', 'export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
 
 // ───────────────────────── 夹具 ─────────────────────────
 
@@ -355,9 +356,11 @@ console.log(`\n夹具 L（local-open）server :${L.port}  workspace=${L.wsPath}`
     JSON.stringify(names)
   );
   const tools = list.json?.result?.tools ?? [];
+  const READ_TOOLS = ['cad.get_state', 'cad.validate', 'cad.list_drafts'];
   ok(
-    '①3c 两个工具都声明 readOnlyHint=true（只读是**声明**出来的，不是口头的）',
-    tools.length === 2 && tools.every((t: any) => t.annotations?.readOnlyHint === true),
+    '①3c 读工具声明 readOnlyHint=true、写工具声明 readOnlyHint=false（只读是**声明**出来的，不是口头的）',
+    tools.filter((t: any) => READ_TOOLS.includes(t.name)).every((t: any) => t.annotations?.readOnlyHint === true) &&
+      tools.filter((t: any) => !READ_TOOLS.includes(t.name)).every((t: any) => t.annotations?.readOnlyHint === false),
     JSON.stringify(tools.map((t: any) => [t.name, t.annotations]))
   );
 
@@ -694,7 +697,7 @@ section('⑤ Token 安全：明文不出现在日志/审计/接口/工具结果/
   const toolLines = lines.filter((l) => l.action === 'mcp.tool');
   ok('⑤3 审计里有 mcp.tool 条目（工具调用留痕）', toolLines.length > 0, `count=${toolLines.length}`);
   ok('⑤3b mcp.tool 条目记了 actor / tool / result / role', toolLines.every((l) => 'actor' in l && 'tool' in l && 'result' in l), JSON.stringify(toolLines.at(-1)));
-  ok('⑤3c 审计里的 tool 名都是本阶段允许的两个（没有写工具被调用过）', toolLines.every((l) => EXPECTED_TOOLS.includes(l.tool)), JSON.stringify([...new Set(toolLines.map((l) => l.tool))]));
+  ok('⑤3c 审计里的 tool 名都是允许清单里的（无计划外工具）', toolLines.every((l) => EXPECTED_TOOLS.includes(l.tool)), JSON.stringify([...new Set(toolLines.map((l) => l.tool))]));
   ok('⑤3d 审计条目不含完整 model dump（没有把 project/cabinets 写进审计）', !/cabinets/.test(JSON.stringify(lines)), '审计里出现了 cabinets');
   ok('⑤3e 审计条目里的 tokenId 是短 id（pat_xxx），不是 token 本身', lines.filter((l) => l.action === 'account.createToken').every((l) => /^pat_[0-9a-f]+$/.test(String(l.tokenId))), JSON.stringify(lines.filter((l) => l.action === 'account.createToken').map((l) => l.tokenId)));
 
@@ -711,7 +714,7 @@ section('⑥ Regression：/api/* 行为未被 /mcp 改动');
   await waitWorkspaceLoaded(A.port);
   const h = await api(A.port, '/api/health', { method: 'GET' });
   ok('⑥1 /api/health 仍免鉴权 200（白名单没动）', h.status === 200 && h.json?.ok === true, `status=${h.status}`);
-  ok('⑥1b /api/health 新增 mcp 自述且工具清单=两个只读工具', JSON.stringify(h.json?.mcp?.tools) === JSON.stringify(EXPECTED_TOOLS) && h.json?.mcp?.path === '/mcp', JSON.stringify(h.json?.mcp));
+  ok('⑥1b /api/health 新增 mcp 自述且工具清单=10 个工具', JSON.stringify(h.json?.mcp?.tools) === JSON.stringify(EXPECTED_TOOLS) && h.json?.mcp?.path === '/mcp', JSON.stringify(h.json?.mcp));
   ok('⑥1c /api/health 报 workspace.ok=true（真实工作区已装载）且 loading=false', h.json?.workspace?.ok === true && h.json?.workspace?.loading === false && h.json?.workspace?.workspaceId === 'ws_fixture_s2', JSON.stringify(h.json?.workspace));
 
   const mode = await api(A.port, '/api/auth/mode', { method: 'GET' });
@@ -821,7 +824,7 @@ section('⑦ 源码纪律：同进程挂载、官方 SDK、一处鉴权、工具
   ok('⑦2b /mcp 未被加进免鉴权白名单 PUBLIC_API', !/PUBLIC_API\s*=\s*new Set\(\[[^\]]*\/mcp/.test(srvSrc), 'PUBLIC_API 里出现了 /mcp');
 
   // 工具层不得出现任何写路径
-  ok('⑦3 工具层没有调用 Workspace/CommandBus 的写入口（.execute / draft / applyDraft）', !/\.execute\(|applyDraft|createDraft|discardDraft/.test(mcpSrc), 'mcp.mjs 里出现了写入口');
+  ok('⑦3 传输层（mcp.mjs）不直接碰 draft/执行入口（写工具住在 mcpWrite.mjs）', !/\.(execute|draftExecute|applyDraft|createDraft|discardDraft)\(/.test(mcpSrc), 'mcp.mjs 里出现了执行入口');
   ok('⑦3b 工具层不直接操作文件系统（不自己落盘）', !/from 'node:fs'|require\('node:fs'\)/.test(mcpSrc), 'mcp.mjs 引入了 node:fs');
   ok('⑦3c 工具层不直接改 project 字段（无 obj.field = 赋值）', !/\b(project|payload|state)\.\w+\s*=[^=]/.test(mcpSrc), 'mcp.mjs 里出现了字段赋值');
 

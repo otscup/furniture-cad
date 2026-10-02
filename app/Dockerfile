@@ -79,6 +79,21 @@ COPY src/ai/memory.ts ./src/ai/memory.ts
 #   以后 server 再 import 新的 src/ 文件而忘了改这里，本地验收会先红。
 COPY src/workspace ./src/workspace
 
+# ── MCP 写工具的运行期源码（P10.0 S4/S5）────────────────────────────────
+# 为什么运行镜像还需要 src/ai/compile*.ts、planRunner.ts、proposal.ts：
+#   server/mcpWrite.mjs 在**调用时**用动态 import 装载它们 —— 写工具复用
+#   AI 编译器 compileAction（与内置 AI 逐字节同一条编译路）与
+#   compileProposal → dryRunPlan 链（submit_proposal），MCP 只做参数搬运。
+#   它们的运行期依赖全在 src/core（已拷），type-only import 会被 strip-types 擦除，
+#   所以只需拷这 4 个文件本身（不拷整个 src/ai/，那里面还有 planner/vision 等
+#   运行镜像用不到的东西）。漏拷的后果：写工具调用时动态 import 抛错 → 500，
+#   而宿主源码树里永远复现不出来（与 S0 那坑同类）。
+#   闭包由 verify/image-closure-acceptance.ts 的 G 段守住。
+COPY src/ai/compile.ts ./src/ai/compile.ts
+COPY src/ai/compileProposal.ts ./src/ai/compileProposal.ts
+COPY src/ai/planRunner.ts ./src/ai/planRunner.ts
+COPY src/ai/proposal.ts ./src/ai/proposal.ts
+
 # 运行时数据目录（账号库/审计/记忆/验证码库/.env 都会被 APP_*_PATH 指到这里）
 RUN mkdir -p /app/data
 

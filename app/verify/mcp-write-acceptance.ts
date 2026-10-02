@@ -64,6 +64,7 @@ const EXPECTED_TOOLS = [
   'cad.discard_draft',
   'cad.create_room',
   'cad.draw_wall',
+  'cad.duplicate_object',
   'cad.export_dxf',
   'cad.export_bom_csv',
   'cad.export_roombook',
@@ -211,7 +212,7 @@ section('① 工具清单');
 {
   const r = await mcp(port, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, PAT_VIEWER);
   const names = (r.json?.result?.tools ?? []).map((t: any) => t.name);
-  ok('①1 tools/list 恰好 = 15 个工具（规格硬编码，顺序无关）',
+  ok('①1 tools/list 恰好 = 16 个工具（规格硬编码，顺序无关）',
     JSON.stringify([...names].sort()) === JSON.stringify([...EXPECTED_TOOLS].sort()), JSON.stringify(names));
   ok('①2 无 S6 词根（export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
 }
@@ -379,6 +380,35 @@ section('⑩ S6：export_dxf / export_bom_csv / export_roombook（只读，复�
   const exHits = (auditText2.match(/"tool":"cad\.export_dxf"/g) || []).length;
   ok('⑩9 导出进了审计', exHits > 0, `命中 ${exHits} 行`);
   ok('⑩10 审计无文件内容（只记元数据）', !/"base64":"[A-Za-z0-9+\/]{100}/.test(auditText2), '审计里出现了长 base64');
+}
+
+section('⑪ duplicate_object：复制柜体');
+{
+  const before = await snapOf(PAT_OWNER);
+  // 先建一个柜体
+  const cc = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '被复制柜', width: 800, height: 2000, depth: 550 });
+  const srcId = cc.payload.cabinetId; const dId = cc.payload.draftId;
+  ok('⑪1 建源柜体成功', !cc.err && !!srcId);
+  // 复制
+  const dp = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: srcId, draftId: dId });
+  ok('⑪2 designer 复制成功', !dp.err && !!dp.payload?.newId, JSON.stringify(dp.payload)?.slice(0, 160));
+  ok('⑪3 新名默认为"原名 副本"', dp.payload?.newName === '被复制柜 副本', dp.payload?.newName);
+  ok('⑪4 新 ID 与源不同', dp.payload?.newId !== srcId);
+  ok('⑪5 复制后 live 未变', (await snapOf(PAT_OWNER)) === before);
+  // 自定义名复制
+  const dp2 = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: srcId, name: '定制名', draftId: dId });
+  ok('⑪6 自定义名复制成功', !dp2.err && dp2.payload?.newName === '定制名', JSON.stringify(dp2.payload)?.slice(0, 120));
+  // 复制不存在的
+  const bad = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: 'nope', draftId: dId });
+  ok('⑪7 复制不存在的被拒', bad.err, JSON.stringify(bad.payload)?.slice(0, 120));
+  // viewer 被拒
+  const v = await callTool(port, PAT_VIEWER, 'cad.duplicate_object', { sourceId: srcId });
+  ok('⑪8 viewer 复制 → FORBIDDEN', v.err && v.payload?.code === 'FORBIDDEN');
+  // apply 后 live 里有两个
+  await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: dId });
+  const gs = await getState(PAT_OWNER);
+  const cabs = (gs?.project?.cabinets ?? []).filter((c: any) => c.name === '被复制柜 副本' || c.name === '定制名');
+  ok('⑪9 apply 后 live 里有两个副本', cabs.length === 2, `found=${cabs.length}`);
 }
 
 for (const c of children) { try { c.kill(); } catch {} }

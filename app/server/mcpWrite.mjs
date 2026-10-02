@@ -6,7 +6,8 @@
  *   S4（designer+，只写 draft，绝不碰 live）：
  *     cad.create_cabinet / cad.place_cabinet / cad.update_object /
  *     cad.delete_object / cad.submit_proposal /
- *     cad.create_room / cad.draw_wall（IR-3：用户 2026-10-02 拍板开放）
+ *     cad.create_room / cad.draw_wall（IR-3：用户 2026-10-02 拍板开放）/
+ *     cad.duplicate_object（复用 duplicateCabinet）
  *   S5：
  *     cad.apply_draft（admin+，乐观锁，不对版本就 DRAFT_STALE 拒绝）
  *     cad.discard_draft（draft 归属者或 manage 角色）
@@ -40,6 +41,7 @@ export const TOOL_APPLY_DRAFT = 'cad.apply_draft';
 export const TOOL_DISCARD_DRAFT = 'cad.discard_draft';
 export const TOOL_CREATE_ROOM = 'cad.create_room';
 export const TOOL_DRAW_WALL = 'cad.draw_wall';
+export const TOOL_DUPLICATE_OBJECT = 'cad.duplicate_object';
 
 /** S4/S5 新增的全部写工具（ALLOWED_TOOLS 的扩展，走同一套方案纪律）。 */
 export const WRITE_TOOLS = [
@@ -54,6 +56,7 @@ export const WRITE_TOOLS = [
   // IR-3（用户 2026-10-02 拍板：开放）：room.create / wall.create 进 MCP 命令集
   TOOL_CREATE_ROOM,
   TOOL_DRAW_WALL,
+  TOOL_DUPLICATE_OBJECT,
 ];
 
 // ── .ts 核心模块懒加载（--experimental-strip-types，与 workspaceHost 同一条路）──
@@ -765,6 +768,61 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_DRAW_WALL, 'ok', { draftId: d.draftId, wallId });
       return toolText({ ok: true, draftId: d.draftId, wallId, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
+    }
+  );
+
+  // ── cad.duplicate_object ─────────────────────────────────────────
+  server.registerTool(
+    TOOL_DUPLICATE_OBJECT,
+    {
+      title: '复制柜体（进 draft）',
+      description:
+        '复制 draft 里的一个柜体，不碰 live。复用既有 duplicateCabinet（新 ID、' +
+        '名字后缀" 副本"、X 方向偏移避免重叠）。返回 draftId 与新柜体 ID。',
+      inputSchema: z.object({
+        sourceId: z.string().min(1).describe('要复制的柜体 ID'),
+        name: z.string().optional().describe('新柜体名；缺省为"原名 副本"'),
+        offset: z.number().optional().describe('X 方向偏移 mm；缺省 700'),
+        draftId: z.string().optional().describe('追加到已有 draft；缺省新建'),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needDesign();
+      if (deny) return deny;
+      const r = workspaceOrError(await getWorkspaceState());
+      if (r.error) return r.error;
+      const ws = r.workspace;
+      const d = await withDraft(ws, args.draftId, principal.actor);
+      if (d.error) return d.error;
+      const fail = async (msg) => {
+        if (d.isNew) await cleanupNewDraft(ws, d.draftId);
+        auditToolCall(TOOL_DUPLICATE_OBJECT, 'fail', { draftId: d.draftId, error: msg });
+        return toolError('COMMAND_REJECTED', msg);
+      };
+      const { commands } = await core();
+      const proj = ws.draftState(d.draftId);
+      const cab = proj?.cabinets?.find((c) => c.id === args.sourceId);
+      if (!cab) return fail(`找不到柜体：${args.sourceId}`);
+      const cmd = commands.duplicateCabinet(cab, args.offset ?? 700, 'mcp');
+      // 自定义名（duplicateCabinet 默认 "原名 副本"）
+      let newName = '';
+      if (args.name) {
+        cmd.payload.cabinet.name = args.name;
+        newName = args.name;
+      } else {
+        newName = cmd.payload.cabinet.name;
+      }
+      const er = ws.draftExecute(d.draftId, cmd);
+      if (!er.ok) return fail(er.error ?? '命令被拒绝');
+      // 从 draftState 读回新柜体 ID（按名定位，duplicate 后名字唯一）
+      let newId = '';
+      const st = ws.draftState(d.draftId);
+      const hit = (st?.cabinets ?? []).filter((c) => c.name === newName);
+      if (hit.length) newId = hit[hit.length - 1].id;
+      await ws.saveDraft(d.draftId);
+      auditToolCall(TOOL_DUPLICATE_OBJECT, 'ok', { draftId: d.draftId, sourceId: args.sourceId, newId });
+      return toolText({ ok: true, draftId: d.draftId, newId, newName, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
     }
   );
 }

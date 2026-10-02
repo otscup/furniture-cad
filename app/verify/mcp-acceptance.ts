@@ -79,6 +79,7 @@ const EXPECTED_TOOLS = [
   'cad.discard_draft',
   'cad.create_room',
   'cad.draw_wall',
+  'cad.duplicate_object',
   'cad.export_dxf',
   'cad.export_bom_csv',
   'cad.export_roombook',

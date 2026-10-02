@@ -155,6 +155,50 @@ function rejectMaxTokens(res, actor, endpoint, mt) {
 }
 
 /**
+ * 下载图片并转 data URL（供 /api/ai/vision/fetch）。
+ * 跟随重定向最多 3 次；限 10MB；超时 15 秒；只接受 image/*。
+ */
+async function fetchImageAsDataUrl(urlStr, maxRedirects = 3) {
+  let url = urlStr;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    let resp;
+    try {
+      resp = await fetch(url, {
+        signal: ctrl.signal,
+        redirect: 'manual',
+        headers: { 'User-Agent': 'furniture-cad/1.0 (image-fetch)' },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    // 手动跟随重定向（以便每跳都做 SSRF 检查）
+    if (resp.status >= 300 && resp.status < 400 && resp.headers.get('location')) {
+      const loc = new URL(resp.headers.get('location'), url).toString();
+      const locUrl = new URL(loc);
+      if (locUrl.protocol !== 'http:' && locUrl.protocol !== 'https:') {
+        throw new Error('重定向到了非 http/https 地址');
+      }
+      const h = locUrl.hostname.toLowerCase();
+      if (/^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0|::1|localhost$|.*\.local$)/.test(h)) {
+        throw new Error('重定向到了内网地址');
+      }
+      url = loc;
+      continue;
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const ct = resp.headers.get('content-type') || '';
+    if (!ct.startsWith('image/')) throw new Error(`不是图片（Content-Type: ${ct || '未知'}）`);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > 10 * 1024 * 1024) throw new Error('图片超过 10MB');
+    if (buf.length === 0) throw new Error('图片为空');
+    return `data:${ct.split(';')[0]};base64,${buf.toString('base64')}`;
+  }
+  throw new Error('重定向次数过多');
+}
+
+/**
  * Python 解释器：优先环境变量，其次项目根的 .venv（spike 用的就是它，ezdxf 装在那里）。
  * 找不到就如实报错，不许"假装导出成功"。
  */
@@ -585,7 +629,8 @@ async function handleApi(req, res, pathname) {
   const designPaths =
     pathname === '/api/ai/plan' ||
     pathname === '/api/ai/design' ||
-    pathname === '/api/ai/vision';
+    pathname === '/api/ai/vision' ||
+    pathname === '/api/ai/vision/fetch';
   const gate = requireAuth(req, res, pathname, { manage: managePaths, design: designPaths });
   if (!gate.ok) return;
   const actor = gate.account ? gate.account.id : null;
@@ -1303,6 +1348,80 @@ async function handleApi(req, res, pathname) {
    *     诚实映射成 NormalizedDesign，再走 P4 统一链路（compileImport → 预览 → 确认
    *     → CommandBus）。换 Vision 服务商 / 模型，Semantic Model / Geometry / Rules 一行不动。
    */
+  /**
+   * 图片链接转 data URL（P10.1 识图）。
+   * 用户粘贴效果图链接 → 服务端下载 → 返回 data URL → 再调 /api/ai/vision。
+   * SSRF 防护：只允许 http/https；禁内网 IP（127/10/172.16-31/192.168/::1 等）；
+   * 跟随重定向最多 3 次；限 10MB；超时 15 秒。
+   */
+  if (pathname === '/api/ai/vision/fetch' && req.method === 'POST') {
+    const body = await readBody(req);
+    const urlStr = typeof body.url === 'string' ? body.url.trim() : '';
+    if (!urlStr) return json(res, 400, { ok: false, error: 'url 不能为空' });
+    let url;
+    try {
+      url = new URL(urlStr);
+    } catch {
+      return json(res, 400, { ok: false, error: 'url 格式不正确' });
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return json(res, 400, { ok: false, error: '只支持 http/https 链接' });
+    }
+    // 内网 IP 黑名单（SSRF 防护）
+    const host = url.hostname.toLowerCase();
+    const isPrivate = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0|::1|localhost$|.*\.local$)/.test(host);
+    if (isPrivate) {
+      return json(res, 400, { ok: false, error: '不允许访问内网地址' });
+    }
+    try {
+      const dataUrl = await fetchImageAsDataUrl(urlStr);
+      return json(res, 200, { ok: true, dataUrl, size: dataUrl.length });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: `图片下载失败：${e.message}` });
+    }
+  }
+
+  /**
+   * 尺寸图专用 system prompt（P10.1）。
+   * 尺寸图 = 带尺寸标注的平面布置图/立面图/大样图。与效果图的区别：
+   *   · 尺寸是**读标注**，不是估计 —— 每个数字都要注明是从哪条标注线读到的；
+   *   · 重点是房间轮廓、墙体位置、门窗洞口、柜体占位（矩形+标注），不是材质质感；
+   *   · 标注单位通常是 mm，若图上是 cm/m 要换算并注明。
+   */
+  const DIMENSION_SYSTEM_PROMPT = [
+    '你是定制家具设计软件里的视觉识别助手。用户会发一张**带尺寸标注的图纸**（平面布置图/立面图/大样图），',
+    '你要识别并**只输出**一个 JSON 对象，符合下面的 TypeScript 形状（不要输出任何多余文字，也不要用 markdown 代码块包裹）：',
+    '',
+    'interface VisionResult {',
+    '  cabinets: VisionCabinet[];',
+    '  relations?: { from: string; to: string; kind: "L-shape" | "side-by-side" | "stacked" | "adjacent"; confidence: "high"|"medium"|"low" }[];',
+    '  scale?: { known: boolean; text?: string; referenceMm?: number; confidence: "high"|"medium"|"low" };',
+    '  overallConfidence: "high"|"medium"|"low";',
+    '  notes?: string[];',
+    '  ambiguous?: string[];',
+    '}',
+    'interface VisionCabinet {',
+    '  ref: string; name?: string;',
+    '  width?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+    '  height?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+    '  depth?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
+    '  rows?: { heightMm?: number; heightRatio?: number; units?: VisionUnit[]; confidence: "high"|"medium"|"low" }[];',
+    '  units?: VisionUnit[];',
+    '  components?: { type: "door"|"drawer"|"open-shelf"|"shelf"|"appliance-cavity"; location?: string; confidence: "high"|"medium"|"low" }[];',
+    '  rotation?: number; room?: string; confidence: "high"|"medium"|"low";',
+    '  notVisible?: ("depth"|"board-thickness"|"inner-partitions"|"connection"|"real-size")[];',
+    '}',
+    'interface VisionUnit { kind: "shelves"|"drawerBank"|"hanging"|"open"|"appliance"; widthMm?: number; widthRatio?: number; count?: number; doorCount?: number; confidence: "high"|"medium"|"low" }',
+    '',
+    '读图纪律（最重要）：',
+    '· 这是**尺寸图**，尺寸以**标注数字**为准 —— 每个 width/height/depth 的 source 能填 "annotation" 就填 "annotation"，并在 notes 里写清"宽 3600 取自底部标注线"。',
+    '· 单位换算：图上若是 cm/m（如 360），一律换算成 mm（3600）再填 value，并在 notes 注明原标注。',
+    '· 房间轮廓优先：先认房间的外框和墙体，再认房间里的柜体占位矩形。门窗洞口的位置和宽度也要读出来写进 notes。',
+    '· 立面图：高度方向的标注（如 2400 通顶、吊柜 800）填 height；平面图：只给 width/depth，height 填 notVisible。',
+    '· 标注模糊/被遮挡的数字：不要猜，写进 ambiguous（如"右下角 12xx 看不清"），对应字段 source 填 "estimate" 且 confidence 填 "low"。',
+    '· 和效果图一样：看不见内部结构的不脑补，看不清数量的写 ambiguous。',
+  ];
+
   if (pathname === '/api/ai/vision' && req.method === 'POST') {
     const body = await readBody(req);
     const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
@@ -1310,6 +1429,8 @@ async function handleApi(req, res, pathname) {
     const model = body.model || env.AI_MODEL || s.model;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
     if (typeof body.image !== 'string' || !body.image) return json(res, 400, { ok: false, error: 'image 不能为空（应为 data URL）' });
+    // mode: 'render'（效果图，默认）| 'dimension'（尺寸图/平面布置图，带标注）
+    const visionMode = body.mode === 'dimension' ? 'dimension' : 'render';
     if (gate.account) {
       const q = auth.checkQuota(gate.account.id, { generation: true });
       if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code, quota: q.view });
@@ -1317,7 +1438,7 @@ async function handleApi(req, res, pathname) {
       if (!m.ok) return json(res, 403, { ok: false, error: m.error, code: m.code });
     }
     const t0 = Date.now();
-    const systemPrompt = [
+    const systemPrompt = visionMode === 'dimension' ? DIMENSION_SYSTEM_PROMPT : [
       '你是定制家具设计软件里的视觉识别助手。用户会发一张柜体效果图/截图，',
       '你要识别并**只输出**一个 JSON 对象，符合下面的 TypeScript 形状（不要输出任何多余文字，也不要用 markdown 代码块包裹）：',
       '',

@@ -8,6 +8,8 @@ import type { QuotaView } from '../../ai/quotaTypes.ts';
 import { QuotaMeter } from '../QuotaMeter.tsx';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
+import { parseImageVisionImport } from '../../ai/import/imageVisionAdapter.ts';
+import { compileImport } from '../../ai/import/compileImport.ts';
 import {
   addDraftRound,
   draftSnapshot,
@@ -115,6 +117,41 @@ interface DraftRoundMark {
 
 interface Turn extends ChatTurn {
   draftRound?: DraftRoundMark;
+  /** 本轮附带的图片（data URL）。P10.1 识图：用户上传/粘贴链接的图片。 */
+  image?: string;
+  /** 图片类型：render=效果图 | dimension=尺寸图（决定 vision prompt） */
+  imageMode?: 'render' | 'dimension';
+  /** vision 识别结果（JSON 字符串，折叠展示） */
+  visionResult?: string;
+}
+
+/** 把 VisionResult 转成人类可读的摘要 */
+function summarizeVision(vr: any, mode: 'render' | 'dimension'): string {
+  if (!vr || !Array.isArray(vr.cabinets)) return '识别结果格式异常';
+  const lines: string[] = [];
+  lines.push(`识别到 ${vr.cabinets.length} 个柜体（整体可信度：${vr.overallConfidence ?? '未知'}）：`);
+  for (const c of vr.cabinets) {
+    const dims: string[] = [];
+    if (c.width?.value) dims.push(`宽 ${c.width.value}mm${c.width.source === 'annotation' ? '(标注)' : c.width.source === 'estimate' ? '(估计)' : ''}`);
+    if (c.height?.value) dims.push(`高 ${c.height.value}mm${c.height.source === 'annotation' ? '(标注)' : c.height.source === 'estimate' ? '(估计)' : ''}`);
+    if (c.depth?.value) dims.push(`深 ${c.depth.value}mm${c.depth.source === 'annotation' ? '(标注)' : c.depth.source === 'estimate' ? '(估计)' : ''}`);
+    const comps = (c.components ?? []).map((x: any) => {
+      const names: Record<string, string> = { door: '门', drawer: '抽屉', 'open-shelf': '开放格', shelf: '层板', 'appliance-cavity': '电器位' };
+      return names[x.type] ?? x.type;
+    });
+    lines.push(`· ${c.name ?? c.ref}：${dims.join(' × ') || '尺寸未知'}${comps.length ? `，${comps.join('、')}` : ''}（可信度 ${c.confidence ?? '未知'}）`);
+  }
+  if (vr.relations?.length) {
+    lines.push('位置关系：' + vr.relations.map((r: any) => `${r.from} ${r.kind} ${r.to}`).join('；'));
+  }
+  if (vr.ambiguous?.length) {
+    lines.push('⚠️ 存疑：' + vr.ambiguous.join('；'));
+  }
+  if (vr.notes?.length) {
+    lines.push('备注：' + vr.notes.slice(0, 3).join('；'));
+  }
+  lines.push('', mode === 'dimension' ? '尺寸以标注为准。如需建模，点「导入到模型」或在下方继续用文字微调。' : '如需建模，点「导入到模型」或在下方继续用文字微调。');
+  return lines.join('\n');
 }
 
 /** 计划通道那一整块的结果（一次性计划，不是草案） */
@@ -264,12 +301,19 @@ function loadRoomId(): string {
 export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
+  // ── P10.1 识图：待发送的图片（data URL）与类型 ──
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
+  const [pendingImageName, setPendingImageName] = useState('');
+  const [imageMode, setImageMode] = useState<'render' | 'dimension'>('render');
+  const [imageUrl, setImageUrl] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [pendingVisionRun, setPendingVisionRun] = useState<PlanRun | null>(null);
 
   /**
    * 谁在跑。同一个模型通道，**同时只允许一个请求**：
    * 并发发两个不但会让用量账目混乱，还会让用户分不清哪个回答对应哪句话。
    */
-  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft' | 'design'>('');
+  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft' | 'design' | 'vision'>('');
   const busy = busyKind !== '';
   /** 已等待秒数 —— 见文件头"为什么有一个计时器" */
   const [waited, setWaited] = useState(0);
@@ -473,6 +517,134 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   }, [busy, chat, props.token, scopePrefix, setConvo, snapshot, text]);
 
   const clearChat = useCallback(() => setConvo({ chat: [] }), [setConvo]);
+
+  // ── P10.1 识图 ──
+
+  /** 本地图片 → data URL */
+  const handleImageFile = useCallback((f: File | undefined) => {
+    if (!f) return;
+    if (!f.type.startsWith('image/')) {
+      props.onToast?.('error', '请选择图片文件');
+      return;
+    }
+    if (f.size > 10 * 1024 * 1024) {
+      props.onToast?.('error', '图片超过 10MB');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setPendingImage(reader.result as string);
+      setPendingImageName(f.name);
+      setImageUrl('');
+    };
+    reader.readAsDataURL(f);
+  }, [props]);
+
+  /** 图片链接 → 服务端下载 → data URL */
+  const handleImageUrl = useCallback(async () => {
+    const u = imageUrl.trim();
+    if (!u) return;
+    setBusyKind('vision');
+    try {
+      const r = await fetch('/api/ai/vision/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
+        body: JSON.stringify({ url: u }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        props.onToast?.('error', j.error ?? '图片下载失败');
+        return;
+      }
+      setPendingImage(j.dataUrl);
+      setPendingImageName(u.slice(0, 40));
+    } finally {
+      setBusyKind('');
+    }
+  }, [imageUrl, props]);
+
+  /** 发送图片做 vision 识别 */
+  const sendImageVision = useCallback(async () => {
+    if (!pendingImage || busy) return;
+    const img = pendingImage;
+    const mode = imageMode;
+    const hint = text.trim();
+    const next: Turn[] = [...chat, { role: 'user', text: hint || (mode === 'dimension' ? '请识别这张尺寸图' : '请识别这张效果图'), image: img, imageMode: mode }];
+    setConvo({ chat: next });
+    setText('');
+    setPendingImage(null);
+    setPendingImageName('');
+    setImageUrl('');
+    setBusyKind('vision');
+    try {
+      const r = await fetch('/api/ai/vision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
+        body: JSON.stringify({ image: img, mode, hint: hint || undefined }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        setConvo({ chat: [...next, { role: 'assistant', text: '', error: j.error ?? '识别失败' }] });
+        return;
+      }
+      const vr = j.result;
+      const summary = summarizeVision(vr, mode);
+      setConvo({
+        chat: [...next, {
+          role: 'assistant',
+          text: summary,
+          visionResult: JSON.stringify(vr, null, 2),
+          model: j.model, ms: j.ms,
+        }],
+      });
+      if (j.quota) setQuota(j.quota);
+    } catch (e) {
+      setConvo({ chat: [...next, { role: 'assistant', text: '', error: `识别失败：${(e as Error).message}` }] });
+    } finally {
+      setBusyKind('');
+    }
+  }, [pendingImage, imageMode, text, busy, chat, props]);
+
+  /** vision 结果一键导入建模（复用 P4 import 链：vision → normalized → compile → 干跑 → 确认） */
+  const importVisionToModel = useCallback(async (visionJson: string) => {
+    if (busy) return;
+    setBusyKind('plan');
+    try {
+      const nd = parseImageVisionImport(visionJson, {});
+      const compiled = compileImport(nd, bus.getState(), bus.getRules());
+      if (!compiled.ok) {
+        props.onToast?.('warn', compiled.blockedReason ?? '这份识别结果还不能编译成动作');
+        setConvo({ chat: [...chat, { role: 'assistant', text: `⚠️ 导入被拦下：${compiled.blockedReason ?? '未知原因'}` }] });
+        return;
+      }
+      const g = compiledRules().gate;
+      const run = dryRunPlan({ bus, actions: compiled.actions, gate: g });
+      setPendingVisionRun(run);
+      const actionNames = compiled.actions.map((a) => `${a.action} ${a.target?.cabinetName ?? a.target?.cabinetId ?? ''}`).join('\n');
+      setConvo({
+        chat: [...chat, {
+          role: 'assistant',
+          text: `干跑完成，${compiled.actions.length} 个动作待确认：\n${actionNames}\n\n点下方的「确认导入」写进模型（可撤销）。`,
+        }],
+      });
+    } finally {
+      setBusyKind('');
+    }
+  }, [busy, bus, props, chat]);
+
+  /** 确认导入（commit 干跑结果） */
+  const confirmVisionImport = useCallback(() => {
+    if (!pendingVisionRun) return;
+    const r = commitPlan(pendingVisionRun, bus);
+    setPendingVisionRun(null);
+    if (!r.ok) {
+      props.onToast?.('error', r.error);
+      return;
+    }
+    const msg = `已导入 ${r.applied} 条（跳过 ${r.skipped} 条）· 模型里还有 ${r.blockingErrors} 条 ERROR`;
+    setConvo({ chat: [...chat, { role: 'assistant', text: `✅ ${msg}` }] });
+    props.onToast?.(r.blockingErrors > 0 ? 'warn' : 'ok', msg);
+  }, [pendingVisionRun, bus, props, chat]);
 
   // ── 计划 ──
 
@@ -987,7 +1159,56 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
               <div key={i} className={`chat-msg chat-${m.role}`}>
                 <div className="chat-role">{m.role === 'user' ? '你' : 'AI'}</div>
                 <div className="chat-body">
+                  {/* P10.1：消息附带的图片 */}
+                  {m.image ? (
+                    <div className="chat-image">
+                      <img src={m.image} alt="用户图片" style={{ maxWidth: 300, maxHeight: 220 }} />
+                      <span className="muted-sm">（{m.imageMode === 'dimension' ? '尺寸图' : '效果图'}）</span>
+                    </div>
+                  ) : null}
                   {m.text ? <div className="chat-text">{m.text}</div> : null}
+                  {/* vision 识别结果（折叠） */}
+                  {m.visionResult ? (
+                    <>
+                      <details className="chat-vision">
+                        <summary>识别详情（JSON）</summary>
+                        <pre className="code">{m.visionResult}</pre>
+                      </details>
+                      <div className="btn-row">
+                        <button
+                          type="button"
+                          className="tb-btn primary"
+                          disabled={busy}
+                          onClick={() => void importVisionToModel(m.visionResult!)}
+                          title="把识别到的柜体导入到模型（先干跑预览，确认后才写入）"
+                        >
+                          📥 导入到模型
+                        </button>
+                      </div>
+                    </>
+                  ) : null}
+                  {/* 待确认的 vision 导入 */}
+                  {pendingVisionRun && m.role === 'assistant' && m.text.includes('干跑完成') ? (
+                    <div className="btn-row">
+                      <button
+                        type="button"
+                        className="tb-btn primary"
+                        disabled={busy}
+                        onClick={() => confirmVisionImport()}
+                        title="把干跑的动作写进模型"
+                      >
+                        ✅ 确认导入
+                      </button>
+                      <button
+                        type="button"
+                        className="tb-btn"
+                        disabled={busy}
+                        onClick={() => setPendingVisionRun(null)}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : null}
                   {/* 正文为空时显示**可操作**的原因，而不是留一个空白框 */}
                   {!m.text && m.emptyReason ? <div className="chat-empty">{m.emptyReason}</div> : null}
                   {m.error ? <div className="chat-error">{m.error}</div> : null}
@@ -1047,6 +1268,81 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           等于用户打开 AI 页签时看不到主入口（而我第一版就是那么写的）。
           输入框必须在打开面板的第一眼就在视野里。
         */}
+        {/* ── P10.1 识图工具条 ── */}
+        <div className="btn-row ai-vision-bar">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={(e) => { handleImageFile(e.target.files?.[0]); e.target.value = ''; }}
+          />
+          <button
+            type="button"
+            className="tb-btn"
+            disabled={busy}
+            onClick={() => fileInputRef.current?.click()}
+            title="上传效果图/尺寸图，AI 直接识别建模"
+          >
+            📷 上传图片
+          </button>
+          <input
+            className="input ai-url-input"
+            placeholder="或粘贴效果图链接…"
+            value={imageUrl}
+            disabled={busy}
+            onChange={(e) => setImageUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void handleImageUrl(); } }}
+          />
+          <button
+            type="button"
+            className="tb-btn"
+            disabled={busy || !imageUrl.trim()}
+            onClick={() => void handleImageUrl()}
+            title="从链接下载图片"
+          >
+            获取
+          </button>
+          <label className="ai-mode-label" title="效果图=认形状材质；尺寸图=读标注数字">
+            <input
+              type="radio"
+              name="ai-image-mode"
+              checked={imageMode === 'render'}
+              disabled={busy}
+              onChange={() => setImageMode('render')}
+            /> 效果图
+          </label>
+          <label className="ai-mode-label" title="效果图=认形状材质；尺寸图=读标注数字">
+            <input
+              type="radio"
+              name="ai-image-mode"
+              checked={imageMode === 'dimension'}
+              disabled={busy}
+              onChange={() => setImageMode('dimension')}
+            /> 尺寸图
+          </label>
+        </div>
+        {/* 待发送的图片预览 */}
+        {pendingImage ? (
+          <div className="ai-pending-image">
+            <img src={pendingImage} alt={pendingImageName} style={{ maxWidth: 200, maxHeight: 150 }} />
+            <div className="ai-pending-meta">
+              <span className="muted-sm">{pendingImageName}（{imageMode === 'render' ? '效果图' : '尺寸图'}）</span>
+              <button type="button" className="tb-btn" disabled={busy} onClick={() => { setPendingImage(null); setPendingImageName(''); }}>
+                移除
+              </button>
+              <button
+                type="button"
+                className="tb-btn primary"
+                disabled={busy}
+                onClick={() => void sendImageVision()}
+                title="AI 识别图片中的柜体与尺寸"
+              >
+                {busyKind === 'vision' ? '识别中…' : '🔍 识别并建模'}
+              </button>
+            </div>
+          </div>
+        ) : null}
         <textarea
           className="input ai-input"
           rows={3}

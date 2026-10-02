@@ -756,6 +756,15 @@ a.tb-btn { text-decoration: none; }
 .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .chip:disabled { opacity: .5; cursor: default; }
 
+/* P10.1 识图工具条 */
+.ai-vision-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+.ai-url-input { flex: 1; min-width: 140px; }
+.ai-mode-label { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer; }
+.ai-pending-image { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; padding: 6px; border: 1px dashed var(--line); border-radius: 4px; }
+.ai-pending-meta { display: flex; flex-direction: column; gap: 4px; }
+.chat-image img { border-radius: 4px; border: 1px solid var(--line); }
+.chat-vision { margin-top: 4px; }
+.chat-vision summary { cursor: pointer; font-size: 12px; color: var(--muted); }
 .ai-input { width: 100%; min-height: 62px; border: 1px solid var(--line); border-radius: 5px; padding: 7px 8px; font: inherit; font-size: 12px; line-height: 1.55; resize: vertical; box-sizing: border-box; }
 .ai-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 

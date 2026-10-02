@@ -75,7 +75,24 @@ function runTsChild(body: string): Promise<{ code: number; out: string }> {
   });
 }
 
-const PY = join(APP, '..', '.venv', 'Scripts', 'python.exe');
+/**
+ * Python 解释器跨平台解析（与 server.mjs 的 pythonExe() 同一优先级，Codex 验收§三①）。
+ */
+function resolvePython(): string {
+  const cand = [
+    process.env.APP_PYTHON,
+    join(APP, '.venv', 'Scripts', 'python.exe'),
+    join(APP, '..', '.venv', 'Scripts', 'python.exe'),
+    join(APP, '..', '.venv', 'bin', 'python'),
+    'python3',
+    'python',
+  ]
+    .filter((c): c is string => Boolean(c))
+    .filter((c) => (c.includes('/') || c.includes('\\') ? existsSync(c) : true));
+  return cand[0] ?? 'python';
+}
+
+const PY = resolvePython();
 function runPy(args: string[], input?: string): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
     const p = spawn(PY, args, { cwd: APP });

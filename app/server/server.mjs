@@ -864,7 +864,7 @@ async function handleApi(req, res, pathname) {
     const tokenId = String(body.tokenId ?? '').trim();
     if (!id || !tokenId) return json(res, 400, { ok: false, error: '缺少 accountId / tokenId' });
     const r = auth.revokeToken(id, tokenId, actor);
-    if (!r.ok) return json(res, 404, { ok: false, error: r.error });
+    if (!r.ok) return json(res, r.error === 'TOKEN_ID_TOO_SHORT' ? 400 : 404, { ok: false, error: r.error });
     return json(res, 200, { ok: true, accountId: id, ...r });
   }
 

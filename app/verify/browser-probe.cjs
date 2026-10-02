@@ -68,7 +68,25 @@ const SHOT_DRAG = path.join(OUT_DIR, 'app-drag-preview.png');
 const PROFILE_ROOT = path.join(os.tmpdir(), 'furniture-cad-cdp');
 const PROFILE = path.join(PROFILE_ROOT, `profile-${Date.now()}`);
 
+/**
+ * Chrome 查找：优先环境变量，其次 which/chromium 系候选，最后 Windows 硬编码路径
+ * （Codex 验收§三②：原先只有 Windows 路径，Linux CI 跑不起 verify:ui）。
+ * 显式路径必须存在才用；which 结果取第一行现货。
+ */
+function whichOne(...names) {
+  for (const n of names) {
+    try {
+      const r = spawnSync(process.platform === 'win32' ? 'where' : 'which', [n], { encoding: 'utf8' });
+      const line = String(r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean)[0];
+      if (r.status === 0 && line && fs.existsSync(line)) return line;
+    } catch { /* ignore，继续下一个 */ }
+  }
+  return null;
+}
+
 const CHROME_CANDIDATES = [
+  process.env.CHROME_PATH,
+  whichOne('chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable'),
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),

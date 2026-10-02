@@ -499,12 +499,18 @@ export class AuthStore {  /**
     return { ok: true, tokens };
   }
 
-  /** 撤销长期 token（按完整 id 或短前缀匹配，与会话撤销同口径）。撤 0 条不是错误，但要如实报。 */
+  /** 撤销长期 token（按完整 id 或短前缀匹配，与会话撤销同口径）。撤 0 条不是错误，但要如实报。
+   *
+   * 前缀最短 8 字符（Codex 验收§三③）：传 `pat_`（4 字符）会命中该账号下**所有**
+   * token —— 短 ID 是为了管理员好认（`pat_xxxxxxxx` 前 8 位），不是为了"少打字"。
+   * 8 字符仍可能多命中（返回 removed 数量，前端 removed>1 时二次确认），但不会一把全清。
+   */
   revokeToken(accountId, tokenId, actor = null) {
     const a = this.findById(accountId);
     if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
     const id = String(tokenId ?? '').trim();
     if (!id) return { ok: false, error: 'TOKEN_ID_REQUIRED' };
+    if (id.length < 8) return { ok: false, error: 'TOKEN_ID_TOO_SHORT' };
     const before = (a.tokens ?? []).length;
     a.tokens = (a.tokens ?? []).filter((t) => !t.id.startsWith(id));
     const removed = before - a.tokens.length;
@@ -690,6 +696,7 @@ export function securityPolicy({ mode, accountsPath, auditPath, host }) {
       // 「上线前必须补的几件大事」里要**点名**这个风险（不是放宽测试，是让文案继续点名）。
       // P10.0 S1 之后风险面收窄（同进程已串行化），但跨进程/多实例依旧不成立 —— 措辞要跟着走，关键词不能丢。
       '⚠ 账号库是本地 JSON 文件：同进程内写入已串行化（P10.0 S1），但跨进程/多实例仍缺少并发写保护，会互相覆盖',
+      '⚠ CORS 为 `*`（Codex 验收§三④已评估：仍需有效 token 才能调用，风险有限；但局域网多设备访问决定了暂不收紧到固定 origin）',
       '⚠ 没有密码找回流程，忘记口令只能由管理员重置',
       '⚠ 审计日志无防篡改（没有链式哈希或外部归档），且与账号库同机',
       '⚠ 上传/模型文件没有按账号隔离配额',

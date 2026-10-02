@@ -295,7 +295,9 @@ export function createMcpHandler({ auth, getWorkspaceState, audit = () => {} }) 
     } catch (e) {
       safeAudit({ actor: principal.actor, action: 'mcp.request', result: 'error', error: String(e?.message ?? e) });
       if (!res.headersSent) {
-        jsonRpcError(res, 500, -32603, `Internal error：${e.message}`);
+        // 500 响应脱敏（Codex 验收§三⑤）：详情只进审计（上一行），不透传给客户端 ——
+        // e.message 可能含内部路径/堆栈，固定文案 + audit 留痕才是正确姿势。
+        jsonRpcError(res, 500, -32603, 'Internal error：服务端处理失败，详情见服务端审计日志');
       } else {
         try {
           res.end();

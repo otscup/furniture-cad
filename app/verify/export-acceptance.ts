@@ -56,7 +56,26 @@ function section(t: string): void {
   console.log(`\n${t}`);
 }
 
-const PY = join(root, '..', '.venv', 'Scripts', 'python.exe');
+/**
+ * Python 解释器跨平台解析（与 server.mjs 的 pythonExe() 同一优先级，Codex 验收§三①）。
+ * 显式路径必须存在才用；裸命令名无法 existsSync，直接保留作兜底。
+ * 找不到就如实报错，不许"假装导出成功"。
+ */
+function resolvePython(): string {
+  const cand = [
+    process.env.APP_PYTHON,
+    join(root, '.venv', 'Scripts', 'python.exe'),
+    join(root, '..', '.venv', 'Scripts', 'python.exe'),
+    join(root, '..', '.venv', 'bin', 'python'),
+    'python3',
+    'python',
+  ]
+    .filter((c): c is string => Boolean(c))
+    .filter((c) => (c.includes('/') || c.includes('\\') ? existsSync(c) : true));
+  return cand[0] ?? 'python';
+}
+
+const PY = resolvePython();
 const VERIFY_DXF_PY = join(root, 'py', 'verify_dxf.py');
 const rules = JSON.parse(readFileSync(join(root, 'src', 'core', 'ruleset', 'factory-default.json'), 'utf8')) as RuleSet;
 const project: Project = sampleProject(rules);

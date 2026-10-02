@@ -614,6 +614,13 @@ let TOKEN_ID_OWNER = '';
   const rv = await api(A.port, '/api/account/tokens', { method: 'DELETE', token: T_OWNER_SESSION, body: { accountId: VIEWER_ID, tokenId: 'pat_does_not_exist' } });
   ok('④8b 撤销一个不存在的 id 不是错误，但要如实报 removed=0（不假装撤掉了）', rv.status === 200 && rv.json?.removed === 0, JSON.stringify(rv.json));
 
+  // 短前缀拒绝（Codex 验收§三③）：传 `pat_`（4 字符）会命中该账号下所有 token。
+  // 判据 = 400 + TOKEN_ID_TOO_SHORT，且此前有效的 PAT 必须还活着（没被误删）。
+  const shortRv = await api(A.port, '/api/account/tokens', { method: 'DELETE', token: T_OWNER_SESSION, body: { accountId: VIEWER_ID, tokenId: 'pat_' } });
+  ok('④8c 短前缀（<8 字符）撤销被 400 拒绝（TOKEN_ID_TOO_SHORT，不许一把全清）', shortRv.status === 400 && shortRv.json?.error === 'TOKEN_ID_TOO_SHORT', `status=${shortRv.status} ${shortRv.text.slice(0, 160)}`);
+  const stillAlive = await mcp(A.port, { jsonrpc: '2.0', id: 32, method: 'tools/list', params: {} }, { token: PAT_VIEWER });
+  ok('④8d 被拒的短前缀撤销没有任何副作用（那枚 PAT 还活着）', stillAlive.status === 200, `status=${stillAlive.status}`);
+
   const list = await api(A.port, `/api/account/tokens?accountId=${VIEWER_ID}`, { method: 'GET', token: T_OWNER_SESSION });
   const viewerTokId = list.json?.tokens?.[0]?.id ?? '';
   const rv2 = await api(A.port, '/api/account/tokens', { method: 'DELETE', token: T_OWNER_SESSION, body: { accountId: VIEWER_ID, tokenId: viewerTokId } });

@@ -241,6 +241,8 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; t
         rodHeight: it.rodHeight === undefined ? undefined : Number(it.rodHeight),
         doors: doorIntentOf(it.doorCount, it.doorMaterial),
         takenIds: taken,
+        // 灯带（Bug 2 修）：仅 shelves 有效，makeUnit 里缺省 'none'
+        ledStrip: it.ledStrip === undefined ? undefined : String(it.ledStrip) as 'none' | 'center' | 'front' | 'angled45',
         appliance:
           kind === 'appliance'
             ? {
@@ -427,6 +429,23 @@ function checkPartTarget(
 function compileResolved(action: AiAction, project: Project, rules: RuleSet): CompileResult {
   const p = action.params;
   const src = 'ai' as const;
+
+  /**
+   * 收集项目里全部已有的分区 id（Bug 1 修：多柜方案里分区 id 重复）。
+   * unitsFromIntents 靠 takenIds 避开已用 id，但之前只传了空 Set，
+   * 每个柜都从 unit_001 开始。跨 cabinet.create 累加靠 dryRunPlan 的
+   * sandbox：每步执行后 project 里已有前序柜的分区，下次编译能看到。
+   */
+  const collectUnitIds = (): Set<string> => {
+    const s = new Set<string>();
+    for (const c of project.cabinets) {
+      const l = c.layout;
+      for (const u of l.units ?? []) s.add(u.id);
+      for (const r of l.rows ?? []) for (const u of r.units ?? []) s.add(u.id);
+      for (const u of l.backUnits ?? []) s.add(u.id);
+    }
+    return s;
+  };
 
   switch (action.action) {
     // ───────────── 柜体外形 ─────────────
@@ -739,9 +758,12 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
 
       // ── 分区意图：AI 说"左边三个抽屉、右边两组对开门"时就落在这里 ──
       // 省略 units 才走默认三分区；给了就必须**完全按它说的建**，不许偷偷补默认分区。
+      // Bug 1 修：takenIds 初始含项目全部已有分区 id，且 units/rows/backUnits
+      // 共用同一个 Set（unitsFromIntents 会往里累加新 id）。
+      const unitTaken = collectUnitIds();
       let units: UnitSpec[] | undefined;
       if (p.units !== undefined) {
-        const built = unitsFromIntents(p.units, { rules, depth });
+        const built = unitsFromIntents(p.units, { rules, depth, takenIds: unitTaken });
         if (typeof built === 'string') return { ok: false, error: built };
         units = built;
       }
@@ -756,7 +778,8 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         const rawRows = p.rows as unknown as Array<Record<string, unknown>>;
         if (!Array.isArray(rawRows)) return { ok: false, error: 'rows 必须是一个数组' };
         if (rawRows.length === 0) return { ok: false, error: 'rows 是空数组 —— 想建单行柜就不要给这个参数' };
-        const taken = new Set<string>();
+        // Bug 1 修：复用外层的 unitTaken（已含项目全部已有分区 id），跨行跨柜累加
+        const taken = unitTaken;
         rows = [];
         for (let i = 0; i < rawRows.length; i++) {
           const r = (rawRows[i] ?? {}) as Record<string, unknown>;
@@ -774,7 +797,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (p.backUnits !== undefined) {
         const boardT = rules.materials[base.boardMaterial]?.thickness ?? 18;
         const rowDepth = Math.floor((depth - boardT) / 2);
-        const built = unitsFromIntents(p.backUnits, { rules, depth: rowDepth });
+        const built = unitsFromIntents(p.backUnits, { rules, depth: rowDepth, takenIds: unitTaken });
         if (typeof built === 'string') return { ok: false, error: built.replace('units 第', 'backUnits（背面分区）第') };
         backUnits = built;
       }

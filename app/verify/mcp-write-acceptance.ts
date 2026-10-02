@@ -411,6 +411,23 @@ section('⑪ duplicate_object：复制柜体');
   ok('⑪9 apply 后 live 里有两个副本', cabs.length === 2, `found=${cabs.length}`);
 }
 
+section('⑫ create_room 已有房间时不撞 id（Bug 3）');
+{
+  const before = await snapOf(PAT_OWNER);
+  // 先建一个房间（room_001）
+  const r1 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '房间一' });
+  ok('⑫1 建第一个房间成功', !r1.err && !!r1.payload?.roomId, r1.payload?.roomId);
+  const firstId = r1.payload.roomId;
+  // 再建一个，必须成功且 id 不同
+  const r2 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '房间二', draftId: r1.payload.draftId });
+  ok('⑫2 已有房间时再建成功', !r2.err && !!r2.payload?.roomId, JSON.stringify(r2.payload)?.slice(0, 120));
+  ok('⑫3 新房间 id 与第一个不同', r2.payload?.roomId !== firstId, `${firstId} vs ${r2.payload?.roomId}`);
+  ok('⑫4 建房间后 live 未变', (await snapOf(PAT_OWNER)) === before);
+  // 矩形房间同理
+  const r3 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '矩形房', x: 0, y: 0, w: 4000, h: 3000, draftId: r1.payload.draftId });
+  ok('⑫5 矩形房间也不撞 id', !r3.err && r3.payload?.roomId !== firstId && r3.payload?.roomId !== r2.payload?.roomId, r3.payload?.roomId);
+}
+
 for (const c of children) { try { c.kill(); } catch {} }
 console.log(`\n────────────────────────────────────────────────────────────\n通过 ${pass} 项，失败 ${fail} 项\n${fail > 0 ? '失败：\n' + failures.map((f) => `  - ${f}`).join('\n') : 'S4/S5 写工具成立：权限矩阵 × draft 隔离 × 持久化 × 乐观锁全部过关。'}`);
 process.exit(fail > 0 ? 1 : 0);

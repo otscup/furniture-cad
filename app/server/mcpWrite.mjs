@@ -669,6 +669,9 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       // docFactory 走动态 import（与 commands 同一批 .ts）
       const { createRoom, rectRoom } = await import('../src/core/docFactory.ts');
       const hasRect = args.x !== undefined || args.y !== undefined || args.w !== undefined || args.h !== undefined;
+      // Bug 3 修：透传 draft 里已有房间 id 作 takenIds，否则永远生成 room_001 撞号
+      const proj = ws.draftState(d.draftId);
+      const takenRoomIds = (proj?.rooms ?? []).map((rm) => rm.id);
       let room;
       try {
         if (hasRect) {
@@ -680,9 +683,10 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
             name: args.name, x: args.x, y: args.y, w: args.w, h: args.h,
             ...(args.thickness !== undefined ? { thickness: args.thickness } : {}),
             ...(args.height !== undefined ? { height: args.height } : {}),
+            takenIds: takenRoomIds,
           });
         } else {
-          room = createRoom({ name: args.name });
+          room = createRoom({ name: args.name, takenIds: takenRoomIds });
         }
       } catch (e) {
         return fail(`房间构造失败：${e?.message ?? e}`);

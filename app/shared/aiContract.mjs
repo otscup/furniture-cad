@@ -154,6 +154,7 @@ export const UNIT_INTENT_ITEM = {
   rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm' },
   doorCount: { type: 'number', min: 0, max: 6 },
   doorMaterial: { type: 'string', max: MAX_STRING, optional: true, desc: '门板材质 id（引用 RuleSet.materials）。玻璃门给 kind="glass" 的材质（如 M_GLASS_8_GREY）；不给 = 规则集默认门板材质。玻璃门不会被降级成普通木门' },
+  ledStrip: { type: 'enum', values: ['none', 'center', 'front', 'angled45'], optional: true, desc: '灯带安装位（仅 shelves 分区）：none=不装；center=层板前缘居中；front=贴前沿；angled45=45°斜光。不给=不装' },
   nickname: { type: 'string', max: MAX_STRING },
   // ── 电器格（洗衣机柜等）："预留洞口 + 上下分体" ──
   applianceName: { type: 'string', max: 20 },
@@ -298,6 +299,7 @@ export const ACTIONS = {
       rodHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', desc: '仅 hanging：挂衣杆离柜内底高度' },
       doorCount: { type: 'number', min: 0, max: 6, desc: '要不要门、几扇：0 = 开放格，2 = 对开门。不给就是不做门' },
       doorMaterial: { type: 'string', max: MAX_STRING, optional: true, desc: '门板材质 id（引用 RuleSet.materials）。玻璃门给 kind="glass" 的材质（如 M_GLASS_8_GREY）；不给 = 规则集默认门板材质。玻璃门不会被降级成普通木门' },
+      ledStrip: { type: 'enum', values: ['none', 'center', 'front', 'angled45'], optional: true, desc: '灯带安装位（仅 shelves 分区）：none=不装；center=层板前缘居中；front=贴前沿；angled45=45°斜光。不给=不装' },
       applianceName: { type: 'string', max: 20, desc: '仅 appliance：电器名（洗衣机/烘干机…）' },
       openingWidth: { type: 'number', min: 200, max: 2000, unit: 'mm', desc: '仅 appliance：洞口净空宽（机器尺寸+安装余量）' },
       openingHeight: { type: 'number', min: 200, max: 3000, unit: 'mm', desc: '仅 appliance：洞口净空高' },

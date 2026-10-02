@@ -304,6 +304,11 @@ export function makeUnit(opts: {
    */
   tilt?: number;
   /**
+   * 灯带安装位。仅 shelves 分区使用；由模板/AI/UI 透传，
+   * 缺省 'none'（不装，显式默认）。
+   */
+  ledStrip?: 'none' | 'center' | 'front' | 'angled45';
+  /**
    * 门板。**必须在这里挂，不能在调用方自己拼 UnitSpec** ——
    * 本函数是"新分区的唯一构造点"，门板引用规则集里的 `pickHinge()`，
    * 调用方拿不到、也不该自己去挑铰链型号。
@@ -343,7 +348,7 @@ export function makeUnit(opts: {
       unit = {
         ...base,
         nickname,
-        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5, ledStrip: 'none', tilt: opts.tilt ?? 0 },
+        shelves: { count: clampInt(opts.count ?? 4, 1, 12), mode: 'equal', gapPerSide: 0.5, ledStrip: opts.ledStrip ?? 'none', tilt: opts.tilt ?? 0 },
       };
       break;
     case 'hanging':

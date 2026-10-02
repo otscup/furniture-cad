@@ -32,8 +32,8 @@ MCP 白名单不暴露 SQL/路径/shell/规则集；交付带"模型+生成器+�
 ## 阶段路线与停点
 P0→…→P9.6(`38c3830`)→P9.7(`bff57e6`)→P9.8(`793a08a`)→P9.9(impl `5cf19ed`+docs `279fd42`)→**P10.0 架构审查 → S0(`4e18264`)+安全前置(`0d50e73`)+报告(`7f04121`)。停在 P10.0，等验收，不进 P10.1/MCP。**
 - **P10.0 推荐 A′**：服务端引入 `Workspace` 持久实体（**持有而非定义** Semantic Model，不夺走浏览器本地所有权），一份 workspace 只有一个可写端点，一致性=`liveModelVersion`+结构化 `DRAFT_STALE`；Phase 1 无推送通道 ⇒ MCP 改完浏览器须重载。鉴权复用 `AuthStore`+`ROLES`（token scope 只能收窄）；越权防线复用既有 `STRUCTURAL_OPS`/`WRITABLE`/`DENY`（不许新增万能命令）。待决策：①`room.create`/`wall.create` 是否对 AI 开放 ②`discard_draft` 权限边界 ③MCP SDK vs 手写协议。
-- **S1 已执行**（`be08596`，Workspace 持久实体 + 进程内串行写队列修复账号库并发丢写）：持有实体/乐观锁/DRAFT_STALE/复用现有 CommandBus 全部落地，红线全守；**停在 S1 等 Codex 验收，未进 S2~S6**。
-- **S0**：`Dockerfile` run 阶段补 `COPY scripts`+`src/core`+`src/export`+`src/ai/memory.ts`（故意不 `COPY src ./src`）；闭包实测 26 文件；`verify:image-closure`(32)+变异(10 全红)。**S0.5**：NAS 真重建（新 `07c74c7b6c1e`，旧 `93f524c627c4` 打标 `:pre-p10s0` 可回退）；三项导出真 HTTP 冒烟通过。**遗留：生产镜像尚未含安全前置**（容器内 `grep -c enforceMaxTokens`=0）。
+- **S1 已执行**（`be08596`，Workspace 持久实体 + 进程内串行写队列修复账号库并发丢写）：持有实体/乐观锁/DRAFT_STALE/复用现有 CommandBus 全部落地，红线全守。**S1-0 生产安全前置部署已完成**（NAS 真重建：旧 `07c74c7b6c1e` 打标 `pre-p10s1` → 新镜像 `eabc39ff37a5`/容器 `a07ee6a24d3b`；容器内 `enforceMaxTokens` grep 0→**7**；三大闸真实 HTTP 验证 T1 400/T2 403/T3 审计落盘；生产 `audit.jsonl` 57 行；FS 未启用只能 `tar|ssh`、docker 用 `sudo -n /usr/local/bin/docker`）。**停在 S1 等 Codex 验收，未进 S2~S6**。
+- **S0**：`Dockerfile` run 阶段补 `COPY scripts`+`src/core`+`src/export`+`src/ai/memory.ts`（故意不 `COPY src ./src`）；闭包实测 26 文件；`verify:image-closure`(32)+变异(10 全红)。**S0.5**：NAS 真重建（新 `07c74c7b6c1e`，旧 `93f524c627c4` 打标 `:pre-p10s0` 可回退）；三项导出真 HTTP 冒烟通过。**遗留（生产镜像未含安全前置）已由 S1-0 关闭**（新容器 `grep -c enforceMaxTokens`=7）。
 
 ## 最高频的坑（完整见日志）
 - **断言不可信比失败更危险**：先打原始值、先假定自己错；新增/改断言须临时改坏确认真会红。**子串断言只认特征短语、认数字会假绿**；**别在"已被处理过"的对象上取快照**（用全新对象）。

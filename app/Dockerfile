@@ -40,6 +40,31 @@ COPY --from=build /app/dist ./dist
 COPY server ./server
 COPY shared ./shared
 COPY py ./py
+
+# ── 导出链的运行期源码（P10.0 S0 修复）────────────────────────────────
+# 为什么运行镜像需要源码：
+#   server.mjs:1580/:1612/:1658 在**运行期**用子进程直跑
+#   `node --experimental-strip-types scripts/emit-*.ts`
+#   （几何必须在后端从语义模型重算，不接受浏览器上传的图元）。
+#   两个入口 import ../src/core|export/**，并**按路径读**
+#   src/core/ruleset/factory-default.json（server 不传 rulesPath ⇒ 必落到这份）。
+# 此前的缺陷：运行阶段只 COPY 了 dist/server/shared/py ⇒ 生产镜像里
+#   既没有 scripts/ 也没有 src/ ⇒ /api/export/{dxf,cutlist,roombook} 全部 500
+#   （Cannot find module '/app/scripts/emit-neutral.ts'）。
+# 为什么只拷这几个目录（不写 `COPY src ./src`）：
+#   实测运行期闭包只落在 scripts/ + src/core/ + src/export/（+ src/ai/memory.ts），
+#   不含 src/ui、src/state、src/viewport（前端源码，运行镜像用不到）。
+#   闭包由 verify/image-closure-acceptance.ts 静态守住，并已接入 verify:all ——
+#   将来 emit 入口新增依赖若逃出这些目录，本地验收会先红，而不是等生产 500。
+# ★ 规则集 JSON 是按路径读的，不出现在 import 图里 —— 它随 src/core 整目录一起进来，
+#   任何"只拷 import 闭包文件"的写法都会漏掉它（已由断言单独守住）。
+COPY scripts ./scripts
+COPY src/core ./src/core
+COPY src/export ./src/export
+# src/ai/memory.ts：被 src/core/commandBus.ts（随 src/core 一起进镜像）运行期 import，
+# 成对拷贝以免将来任何 core 模块开始加载 commandBus 时在生产静默解不开这个依赖。
+COPY src/ai/memory.ts ./src/ai/memory.ts
+
 # 运行时数据目录（账号库/审计/记忆/验证码库/.env 都会被 APP_*_PATH 指到这里）
 RUN mkdir -p /app/data
 

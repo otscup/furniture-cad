@@ -48,6 +48,7 @@ import {
   validatePlan,
   DEFAULT_MAX_TOKENS,
   resolveMaxTokens,
+  MAX_OUTPUT_TOKENS_CAP,
 } from '../shared/aiContract.mjs';
 import { quotaView } from '../shared/quota.mjs';
 
@@ -76,6 +77,69 @@ const DIST = join(ROOT, 'dist');
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
 const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
+
+// ══════════════ AI 输出预算的服务端硬顶（P10.0 安全前置 ③ / ④）══════════════
+//
+// ── 它防的是什么（真实缺陷，见 P10.0 §2.3）──
+//   `resolveMaxTokens` 只在"把 .env 的值解析成默认值时"做过一次 Math.min；
+//   而 /api/ai/chat 与 /api/ai/vision 过去把 `body.maxTokens` **原值透传**给上游
+//   （`max_tokens: body.maxTokens > 0 ? body.maxTokens : resolveMaxTokens(...)`），
+//   客户端传 maxTokens: 100000000 会被原样转发 —— MAX_OUTPUT_TOKENS_CAP 完全不参与，
+//   于是"上限"只是一句注释而不是闸门；/api/settings 的写入路径同样不夹取，
+//   造成"落盘 100000 / 界面显示 65536 / 永不提示"的两套口径。
+//
+// ── 本闸门的形状 ──
+//   · 上界 = MAX_OUTPUT_TOKENS_CAP（shared/aiContract.mjs 的**唯一真源**）；
+//   · 环境变量 AI_HARD_MAX_TOKENS 只能**收紧**（写大了也夹回 cap，永不提权）；
+//   · 四个 AI 端点**统一**走 enforceMaxTokens()（一处判断，不在各端点各写一遍）；
+//   · 请求体超顶 ⇒ 明确结构化错误 MAX_TOKENS_EXCEEDED(400)，**不静默改写**
+//     （P10.0 §2.3(e)：静默改写会制造"用户以为设置生效了、其实没有"的假象）。
+const HARD_MAX_TOKENS_CAP = MAX_OUTPUT_TOKENS_CAP;
+
+/** 服务端硬顶。AI_HARD_MAX_TOKENS 只允许把上限收紧，永远不能抬高到 cap 之上。 */
+function hardMaxTokens() {
+  const raw = Number(process.env.AI_HARD_MAX_TOKENS);
+  if (!Number.isFinite(raw) || raw <= 0) return HARD_MAX_TOKENS_CAP;
+  return Math.min(HARD_MAX_TOKENS_CAP, Math.max(1, Math.round(raw)));
+}
+
+/**
+ * 算出本次请求真正发给上游的 max_tokens。
+ * 返回 { ok:true, value } 或 { ok:false, code, error, cap, requested }。
+ * 请求体没给/非法 ⇒ 用 .env 的默认（经 resolveMaxTokens 解析后再夹一次 cap）。
+ */
+function enforceMaxTokens(body, envFallback) {
+  const cap = hardMaxTokens();
+  const want =
+    typeof body?.maxTokens === 'number' && Number.isFinite(body.maxTokens) && body.maxTokens > 0
+      ? Math.round(body.maxTokens)
+      : null;
+  if (want === null) return { ok: true, value: Math.min(cap, resolveMaxTokens(envFallback)) };
+  if (want > cap) {
+    return {
+      ok: false,
+      code: 'MAX_TOKENS_EXCEEDED',
+      cap,
+      requested: want,
+      error: `输出上限 ${want} 超过服务端硬顶 ${cap}，已拒绝（该硬顶只能由服务端收紧，请求体不能抬高）`,
+    };
+  }
+  return { ok: true, value: want };
+}
+
+/** 统一的超顶拒绝：结构化错误 + 审计（失败调用也要留痕）。 */
+function rejectMaxTokens(res, actor, endpoint, mt) {
+  auth.audit({
+    actor: actor ?? 'local-open',
+    action: 'ai.call.rejected',
+    result: 'rejected',
+    code: mt.code,
+    endpoint,
+    requested: mt.requested,
+    cap: mt.cap,
+  });
+  return json(res, 400, { ok: false, code: mt.code, error: mt.error, cap: mt.cap });
+}
 
 /**
  * Python 解释器：优先环境变量，其次项目根的 .venv（spike 用的就是它，ezdxf 装在那里）。
@@ -276,6 +340,11 @@ function currentSettings() {
     temperature: Number(env.AI_TEMPERATURE ?? 0.2),
     /** 输出预算。推理模型上这个值直接决定"有没有正文" —— 所以它必须可见、可改 */
     maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
+    /**
+     * 服务端硬顶（安全前置 ③/④）。前端必须用这个值做输入上限，
+     * 不要再自己写死 65536 —— 否则又是"两处各一个数"的老毛病。
+     */
+    maxTokensCap: hardMaxTokens(),
     timeoutMs: Number(env.AI_TIMEOUT_MS ?? 60000),
     providers: Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, { label: v.label, baseUrl: v.baseUrl, models: v.models }])),
     envPath: ENV_PATH,
@@ -392,10 +461,21 @@ async function handleApi(req, res, pathname) {
   const isSettingsWrite =
     (pathname === '/api/settings' || pathname.startsWith('/api/settings/')) &&
     (req.method === 'PUT' || req.method === 'POST');
+  /**
+   * 安全前置 ②（P10.0 §2.2）：/api/memory 的**写**必须要求 canManage。
+   *
+   * 此前它既不在 managePaths 也不在 designPaths ⇒ 只过"已登录"这一层，
+   * **viewer 账号即可整文件覆盖共享的 corrections.jsonl**。而那个文件不是普通配置 ——
+   * 它的条目会被当作**纠错规则**消费（scope:"rule" + checkSpec），
+   * 覆盖它等于替换整套规则，且覆盖前只留一份同名 .bak。
+   * GET 保持"已登录可读"（面板要显示内容），所以只对 PUT/POST 收紧。
+   */
+  const isMemoryWrite = pathname === '/api/memory' && (req.method === 'PUT' || req.method === 'POST');
   const managePaths =
     pathname.startsWith('/api/account/') ||
     pathname.startsWith('/api/security/') ||
-    isSettingsWrite;
+    isSettingsWrite ||
+    isMemoryWrite;
   const designPaths =
     pathname === '/api/ai/plan' ||
     pathname === '/api/ai/design' ||
@@ -668,11 +748,46 @@ async function handleApi(req, res, pathname) {
     if (typeof body.baseUrl === 'string') patch.AI_BASE_URL = body.baseUrl.trim().replace(/\/+$/, '');
     if (typeof body.model === 'string') patch.AI_MODEL = body.model.trim();
     if (typeof body.temperature === 'number') patch.AI_TEMPERATURE = String(body.temperature);
-    if (typeof body.maxTokens === 'number' && body.maxTokens > 0) patch.AI_MAX_TOKENS = String(Math.round(body.maxTokens));
+    // 安全前置 ③/④：写入路径也要过闸 —— 否则 .env 里会留下超过硬顶的值，
+    // 界面回显却被 resolveMaxTokens 夹到 cap，形成"两个说法"且不提示。
+    if (typeof body.maxTokens === 'number' && body.maxTokens > 0) {
+      const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
+      if (!mt.ok) {
+        auth.audit({
+          actor: gate.account?.id ?? 'local-open',
+          action: 'settings.ai',
+          result: 'rejected',
+          code: mt.code,
+          requested: mt.requested,
+          cap: mt.cap,
+        });
+        return json(res, 400, { ok: false, code: mt.code, error: mt.error, cap: mt.cap });
+      }
+      patch.AI_MAX_TOKENS = String(mt.value);
+    }
     // apiKey 缺省 = 不修改（前端只显示后四位，不可能把原文再发回来）
-    if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') patch.AI_API_KEY = body.apiKey.trim();
+    const apiKeyChanged = typeof body.apiKey === 'string' && body.apiKey.trim() !== '';
+    if (apiKeyChanged) patch.AI_API_KEY = body.apiKey.trim();
 
     writeEnv(patch);
+    // 安全前置 ①（P10.0 §2.1）：改 AI Key / Provider / baseUrl / model 过去**完全不留痕**，
+    // 而同文件里的 SMTP 设置却有 audit —— 与仓库自身纪律不一致。
+    // 只记"改了哪几项"（布尔）与 provider/model 取值；**绝不记 key 明文**。
+    auth.audit({
+      actor: gate.account?.id ?? 'local-open',
+      action: 'settings.ai',
+      result: 'ok',
+      changed: {
+        provider: Object.prototype.hasOwnProperty.call(patch, 'AI_PROVIDER'),
+        baseUrl: Object.prototype.hasOwnProperty.call(patch, 'AI_BASE_URL'),
+        model: Object.prototype.hasOwnProperty.call(patch, 'AI_MODEL'),
+        temperature: Object.prototype.hasOwnProperty.call(patch, 'AI_TEMPERATURE'),
+        maxTokens: Object.prototype.hasOwnProperty.call(patch, 'AI_MAX_TOKENS'),
+        apiKey: apiKeyChanged,
+      },
+      provider: patch.AI_PROVIDER ?? '(unchanged)',
+      model: patch.AI_MODEL ?? '(unchanged)',
+    });
     return json(res, 200, { ok: true, ...currentSettings() });
   }
 
@@ -905,6 +1020,9 @@ async function handleApi(req, res, pathname) {
     }
     const t0 = Date.now();
     try {
+      // 安全前置 ③/④：输出预算过服务端硬顶闸（此前 body.maxTokens 原值透传，可被绕过）
+      const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
+      if (!mt.ok) return rejectMaxTokens(res, actor, 'chat', mt);
       const payload = {
         model,
         messages: body.messages,
@@ -914,7 +1032,7 @@ async function handleApi(req, res, pathname) {
          * 留空交给服务商默认值时，一个"上限偏小"的网关就能让对话整整返回空正文，
          * 而界面上只会显示"AI 没有回答"。见 aiContract 里 DEFAULT_MAX_TOKENS 的说明。
          */
-        max_tokens: typeof body.maxTokens === 'number' && body.maxTokens > 0 ? body.maxTokens : resolveMaxTokens(env.AI_MAX_TOKENS),
+        max_tokens: mt.value,
       };
       if (body.json) payload.response_format = { type: 'json_object' };
       const r = await fetchWithTimeout(
@@ -1065,6 +1183,9 @@ async function handleApi(req, res, pathname) {
       ? body.hint
       : '请识别这张柜体效果图，给出结构化 JSON。';
     try {
+      // 安全前置 ③/④：输出预算过服务端硬顶闸（此前 body.maxTokens 原值透传，可被绕过）
+      const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
+      if (!mt.ok) return rejectMaxTokens(res, actor, 'vision', mt);
       const payload = {
         model,
         messages: [
@@ -1078,7 +1199,7 @@ async function handleApi(req, res, pathname) {
           },
         ],
         temperature: 0.2,
-        max_tokens: typeof body.maxTokens === 'number' && body.maxTokens > 0 ? body.maxTokens : resolveMaxTokens(env.AI_MAX_TOKENS),
+        max_tokens: mt.value,
       };
       const r = await fetchWithTimeout(
         `${baseUrl}/chat/completions`,
@@ -1189,13 +1310,17 @@ async function handleApi(req, res, pathname) {
 
     const t0 = Date.now();
     try {
+      // 安全前置 ③/④：输出预算过服务端硬顶闸（本端点过去忽略 body.maxTokens，
+      // 但统一走同一道闸门，避免"某个端点漏装闸"的老毛病）
+      const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
+      if (!mt.ok) return rejectMaxTokens(res, actor, 'plan', mt);
       const payload = buildChatRequest(model, text, body.snapshot, {
         history: Array.isArray(body.history) ? body.history : [],
         temperature: Number(env.AI_TEMPERATURE ?? 0.1),
         // 关键点：规划请求必须尊重 .env 里的 AI_MAX_TOKENS。
         // 早先这里没传 maxTokens，buildChatRequest 永远落到 DEFAULT(4096)，
         // 导致推理模型把预算吃光在思考上、正文为空 —— "调到无限也不管用"的真凶。
-        maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
+        maxTokens: mt.value,
       });
       const r = await fetchWithTimeout(
         `${baseUrl}/chat/completions`,
@@ -1417,12 +1542,15 @@ async function handleApi(req, res, pathname) {
 
     const t0 = Date.now();
     try {
+      // 安全前置 ③/④：输出预算过服务端硬顶闸（与其它三个端点同一道闸门）
+      const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
+      if (!mt.ok) return rejectMaxTokens(res, actor, 'design', mt);
       const payload = buildDesignRequest(model, text, body.snapshot, {
         history: Array.isArray(body.history) ? body.history : [],
         // P6：前端算好的知识摘要（Resolver 是纯前端确定性函数，服务端只透传文本）
         knowledgeDigest: typeof body.knowledgeDigest === 'string' ? body.knowledgeDigest.slice(0, 4000) : '',
         temperature: Number(env.AI_TEMPERATURE ?? 0.2),
-        maxTokens: resolveMaxTokens(env.AI_MAX_TOKENS),
+        maxTokens: mt.value,
       });
       const r = await fetchWithTimeout(
         `${baseUrl}/chat/completions`,
@@ -1547,6 +1675,14 @@ async function handleApi(req, res, pathname) {
     // 覆盖前先留一份上一版，误操作可回退
     if (existsSync(MEM_PATH)) writeFileSync(`${MEM_PATH}.bak`, readFileSync(MEM_PATH));
     writeFileSync(MEM_PATH, text.endsWith('\n') ? text : `${text}\n`, 'utf8');
+    // 安全前置 ②：整文件覆盖"纠错规则"，改动必须留痕（只记字节数与行数，不记内容）。
+    auth.audit({
+      actor: gate.account?.id ?? 'local-open',
+      action: 'memory.write',
+      result: 'ok',
+      bytes: Buffer.byteLength(text),
+      lines: text.split(/\r?\n/).filter((l) => l.trim()).length,
+    });
     return json(res, 200, { ok: true, path: MEM_PATH, bytes: Buffer.byteLength(text), backup: `${MEM_PATH}.bak` });
   }
 

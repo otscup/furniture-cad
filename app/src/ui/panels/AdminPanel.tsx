@@ -41,6 +41,11 @@ interface Settings {
    * 值太小 → 思考过程把预算吃光 → 正文是空字符串（而 HTTP 仍是 200）。
    */
   maxTokens: number;
+  /**
+   * 服务端硬顶（安全前置 ③/④）。由服务端下发，前端**不要**再自己写死 65536 ——
+   * 否则又是"两处各一个数"，后端改了上限界面还是老值。
+   */
+  maxTokensCap?: number;
   providers: Record<string, ProviderInfo>;
   envPath: string;
 }
@@ -416,6 +421,14 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
 
   const providerList = settings ? Object.entries(settings.providers) : [];
 
+  /**
+   * 输出上限的**服务端硬顶**（安全前置 ③/④）。
+   * 预设档位由这个 cap 派生，界面不再自己写死 65536 —— 一处判断，不在 JSX 里重复 5 次。
+   */
+  const maxTokensCap = settings?.maxTokensCap ?? 65536;
+  const tokenPresets = [4096, 8192, 16384, 32768, 65536].filter((v) => v <= maxTokensCap);
+  if (tokenPresets[tokenPresets.length - 1] !== maxTokensCap) tokenPresets.push(maxTokensCap);
+
   // ── 会话轮换 / 审计导出（Task #27）──
   const loadSessions = useCallback(
     async (id: string) => {
@@ -697,10 +710,10 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
             </Row>
             <Row
               label="输出上限"
-              hint="单次回复的最大 token 数，合法区间 1–65536。不能设到百万级（那是上下文/总量概念，不是这里的 max_tokens）。推理模型会先把预算花在思考上，值太小正文是空的；但值太大（如 64K）模型会写很久而超时 —— 建议 8K/16K。"
+              hint={`单次回复的最大 token 数，合法区间 1–${maxTokensCap}（这个上界由服务端硬顶决定，请求体抬不高它）。不能设到百万级（那是上下文/总量概念，不是这里的 max_tokens）。推理模型会先把预算花在思考上，值太小正文是空的；但值太大（如 64K）模型会写很久而超时 —— 建议 8K/16K。`}
             >
               <div className="token-presets">
-                {[4096, 8192, 16384, 32768, 65536].map((v) => (
+                {tokenPresets.map((v) => (
                   <button
                     key={v}
                     type="button"
@@ -712,39 +725,29 @@ export function AdminPanel(props: { token: string | null }): ReactNode {
                 ))}
                 <button
                   type="button"
-                  className={`tb-btn ${
-                    settings.maxTokens !== 4096 &&
-                    settings.maxTokens !== 8192 &&
-                    settings.maxTokens !== 16384 &&
-                    settings.maxTokens !== 32768 &&
-                    settings.maxTokens !== 65536
-                      ? 'active'
-                      : ''
-                  }`}
-                  onClick={() => setSettings({ ...settings, maxTokens: 16384 })}
+                  className={`tb-btn ${tokenPresets.includes(settings.maxTokens) ? '' : 'active'}`}
+                  // 自定义档必须在硬顶之内 —— 否则（服务端把 cap 收紧到 <16384 时）
+                  // 一点"自定义"就摆出一个会被服务端 400 拒绝的值。
+                  onClick={() => setSettings({ ...settings, maxTokens: Math.min(16384, maxTokensCap) })}
                 >
                   自定义
                 </button>
-                {settings.maxTokens !== 4096 &&
-                settings.maxTokens !== 8192 &&
-                settings.maxTokens !== 16384 &&
-                settings.maxTokens !== 32768 &&
-                settings.maxTokens !== 65536 ? (
+                {tokenPresets.includes(settings.maxTokens) ? null : (
                   <input
                     className="input token-custom"
                     type="number"
                     min={1}
-                    max={65536}
+                    max={maxTokensCap}
                     step={512}
                     value={String(settings.maxTokens)}
                     onChange={(e) =>
                       setSettings({
                         ...settings,
-                        maxTokens: Math.max(1, Math.min(65536, Math.round(Number(e.target.value) || 0))),
+                        maxTokens: Math.max(1, Math.min(maxTokensCap, Math.round(Number(e.target.value) || 0))),
                       })
                     }
                   />
-                ) : null}
+                )}
               </div>
               <span className="muted">当前：{settings.maxTokens} token（{Math.round(settings.maxTokens / 1024)}K）</span>
             </Row>

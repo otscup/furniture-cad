@@ -254,17 +254,14 @@ async function runServerGateTest(mutatedServerPath: string | null): Promise<{ co
 await mutate(
   'P0-2/P0-3',
   join(APP, 'server', 'server.mjs'),
+  // 锚点只取 isSettingsWrite 这一处赋值：它就是把"设置写 = 管理操作"接进闸门的那根线。
+  // 早先锚点一直延伸到 managePaths 结尾，P10.0 安全前置在两者之间插入了 isMemoryWrite
+  // （/api/memory 的写也要 canManage）⇒ 前缀不再连续，锚点失配。
+  // 缩短到"恰好一处判断"既修好了它，也不再把无关代码拖进变异范围。
   `  const isSettingsWrite =
     (pathname === '/api/settings' || pathname.startsWith('/api/settings/')) &&
-    (req.method === 'PUT' || req.method === 'POST');
-  const managePaths =
-    pathname.startsWith('/api/account/') ||
-    pathname.startsWith('/api/security/') ||
-    isSettingsWrite;`,
-  `  const isSettingsWrite = false;
-  const managePaths =
-    pathname.startsWith('/api/account/') ||
-    pathname.startsWith('/api/security/');`,
+    (req.method === 'PUT' || req.method === 'POST');`,
+  `  const isSettingsWrite = false;`,
   () => runServerGateTest(null),
 );
 

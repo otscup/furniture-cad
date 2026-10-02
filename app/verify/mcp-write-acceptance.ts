@@ -62,9 +62,11 @@ const EXPECTED_TOOLS = [
   'cad.list_drafts',
   'cad.apply_draft',
   'cad.discard_draft',
+  'cad.create_room',
+  'cad.draw_wall',
 ];
-/** IR-3 未定 / S6 未做：这两组词根出现即红 */
-const FORBIDDEN_ROOTS = ['create_room', 'draw_wall', 'export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
+/** S6 未做：export_* 出现即红。IR-3 已由用户拍板开放。 */
+const FORBIDDEN_ROOTS = ['export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
 
 // ── 夹具 ──
 const TMP = mkdtempSync(join(tmpdir(), 'furnicad-s45-'));
@@ -206,8 +208,9 @@ section('① 工具清单');
 {
   const r = await mcp(port, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, PAT_VIEWER);
   const names = (r.json?.result?.tools ?? []).map((t: any) => t.name);
-  ok('①1 tools/list 恰好 = 10 个写工具+读工具（规格硬编码）', JSON.stringify(names) === JSON.stringify(EXPECTED_TOOLS), JSON.stringify(names));
-  ok('①2 无 IR-3/S6 词根（create_room/draw_wall/export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
+  ok('①1 tools/list 恰好 = 12 个工具（规格硬编码，顺序无关）',
+    JSON.stringify([...names].sort()) === JSON.stringify([...EXPECTED_TOOLS].sort()), JSON.stringify(names));
+  ok('①2 无 S6 词根（export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
 }
 
 section('② 权限矩阵（禁止组合：FORBIDDEN + 模型一字节未变）');
@@ -311,6 +314,34 @@ section('⑧ submit_proposal 复用既有链');
   ok('⑧1 proposal 进 draft', !p.err && !!p.payload?.draftId && p.payload?.steps === 1, JSON.stringify(p.payload)?.slice(0, 200));
   const bad = await callTool(port, PAT_DESIGNER, 'cad.submit_proposal', { proposal: { title: '空', cabinets: [] } });
   ok('⑧2 空 proposal 被拒且不产生 draft', bad.err && bad.payload?.code === 'PROPOSAL_BLOCKED', JSON.stringify(bad.payload)?.slice(0, 160));
+}
+
+section('⑨ IR-3：create_room / draw_wall（用户已拍板开放）');
+{
+  const before = await snapOf(PAT_OWNER);
+  // 建矩形房间
+  const cr = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '卧室', x: 0, y: 0, w: 3600, h: 3000 });
+  ok('⑨1 designer 建矩形房间成功', !cr.err && !!cr.payload?.roomId, JSON.stringify(cr.payload)?.slice(0, 160));
+  const roomId = cr.payload.roomId; const dId = cr.payload.draftId;
+  ok('⑨2 建房间后 live 未变（只进 draft）', (await snapOf(PAT_OWNER)) === before);
+  // 在该房间画一面墙
+  const dw = await callTool(port, PAT_DESIGNER, 'cad.draw_wall', {
+    roomId, start: { x: 0, y: 0 }, end: { x: 3600, y: 0 }, thickness: 120, draftId: dId });
+  ok('⑨3 designer 画墙成功', !dw.err && !!dw.payload?.wallId, JSON.stringify(dw.payload)?.slice(0, 160));
+  // 起终点相同应被拒
+  const bad = await callTool(port, PAT_DESIGNER, 'cad.draw_wall', {
+    start: { x: 100, y: 100 }, end: { x: 100, y: 100 }, draftId: dId });
+  ok('⑨4 零长度墙被拒', bad.err, JSON.stringify(bad.payload)?.slice(0, 120));
+  // viewer 建房间应被拒且模型未变
+  const v = await callTool(port, PAT_VIEWER, 'cad.create_room', { name: '非法房间' });
+  ok('⑨5 viewer 建房间 → FORBIDDEN', v.err && v.payload?.code === 'FORBIDDEN', JSON.stringify(v.payload)?.slice(0, 120));
+  ok('⑨6 被拒后模型未变', (await snapOf(PAT_OWNER)) === before);
+  // apply 进 live
+  const ap = await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: dId });
+  ok('⑨7 apply 成功', !ap.err && ap.payload?.ok === true, JSON.stringify(ap.payload)?.slice(0, 120));
+  const gs = await getState(PAT_OWNER);
+  const room = (gs?.project?.rooms ?? []).find((r: any) => r.id === roomId);
+  ok('⑨8 live 里有新房间且含墙', !!room && room.walls.length >= 5, `walls=${room?.walls?.length}`);
 }
 
 for (const c of children) { try { c.kill(); } catch {} }

@@ -5,7 +5,8 @@
  *  ── 范围 ──
  *   S4（designer+，只写 draft，绝不碰 live）：
  *     cad.create_cabinet / cad.place_cabinet / cad.update_object /
- *     cad.delete_object / cad.submit_proposal
+ *     cad.delete_object / cad.submit_proposal /
+ *     cad.create_room / cad.draw_wall（IR-3：用户 2026-10-02 拍板开放）
  *   S5：
  *     cad.apply_draft（admin+，乐观锁，不对版本就 DRAFT_STALE 拒绝）
  *     cad.discard_draft（draft 归属者或 manage 角色）
@@ -37,6 +38,8 @@ export const TOOL_SUBMIT_PROPOSAL = 'cad.submit_proposal';
 export const TOOL_LIST_DRAFTS = 'cad.list_drafts';
 export const TOOL_APPLY_DRAFT = 'cad.apply_draft';
 export const TOOL_DISCARD_DRAFT = 'cad.discard_draft';
+export const TOOL_CREATE_ROOM = 'cad.create_room';
+export const TOOL_DRAW_WALL = 'cad.draw_wall';
 
 /** S4/S5 新增的全部写工具（ALLOWED_TOOLS 的扩展，走同一套方案纪律）。 */
 export const WRITE_TOOLS = [
@@ -48,6 +51,9 @@ export const WRITE_TOOLS = [
   TOOL_LIST_DRAFTS,
   TOOL_APPLY_DRAFT,
   TOOL_DISCARD_DRAFT,
+  // IR-3（用户 2026-10-02 拍板：开放）：room.create / wall.create 进 MCP 命令集
+  TOOL_CREATE_ROOM,
+  TOOL_DRAW_WALL,
 ];
 
 // ── .ts 核心模块懒加载（--experimental-strip-types，与 workspaceHost 同一条路）──
@@ -620,6 +626,145 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       await ws.deleteDraftFile(args.draftId);
       auditToolCall(TOOL_DISCARD_DRAFT, 'ok', { draftId: args.draftId });
       return toolText({ ok: true, draftId: args.draftId });
+    }
+  );
+
+  // ── cad.create_room（IR-3：用户已拍板开放）──────────────────────────
+  server.registerTool(
+    TOOL_CREATE_ROOM,
+    {
+      title: '新建房间（进 draft）',
+      description:
+        '在 draft 里新建一个房间，不碰 live。给 x/y/w/h 即建矩形房间（含四面墙）；' +
+        '不给则建空房间，后续用 cad.draw_wall 画墙。返回 draftId 与 roomId。',
+      inputSchema: z.object({
+        name: z.string().min(1).describe('房间名'),
+        x: z.number().optional().describe('矩形左下 x（mm）；与 y/w/h 同给才生效'),
+        y: z.number().optional(),
+        w: z.number().optional().describe('宽（mm），>0'),
+        h: z.number().optional().describe('高（mm），>0'),
+        thickness: z.number().optional().describe('墙厚 mm，缺省按规则默认'),
+        height: z.number().optional().describe('墙高 mm，缺省按规则默认'),
+        draftId: z.string().optional().describe('追加到已有 draft；缺省新建'),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needDesign();
+      if (deny) return deny;
+      const r = workspaceOrError(await getWorkspaceState());
+      if (r.error) return r.error;
+      const ws = r.workspace;
+      const d = await withDraft(ws, args.draftId, principal.actor);
+      if (d.error) return d.error;
+      const fail = async (msg) => {
+        if (d.isNew) await cleanupNewDraft(ws, d.draftId);
+        auditToolCall(TOOL_CREATE_ROOM, 'fail', { draftId: d.draftId, error: msg });
+        return toolError('COMMAND_REJECTED', msg);
+      };
+      const { commands } = await core();
+      // docFactory 走动态 import（与 commands 同一批 .ts）
+      const { createRoom, rectRoom } = await import('../src/core/docFactory.ts');
+      const hasRect = args.x !== undefined || args.y !== undefined || args.w !== undefined || args.h !== undefined;
+      let room;
+      try {
+        if (hasRect) {
+          if (args.x === undefined || args.y === undefined || args.w === undefined || args.h === undefined) {
+            return fail('矩形房间须同时给 x/y/w/h（只想占位就四个都不给，建空房间）');
+          }
+          if (!(args.w > 0 && args.h > 0)) return fail('w/h 必须是 >0 的数字（mm）');
+          room = rectRoom({
+            name: args.name, x: args.x, y: args.y, w: args.w, h: args.h,
+            ...(args.thickness !== undefined ? { thickness: args.thickness } : {}),
+            ...(args.height !== undefined ? { height: args.height } : {}),
+          });
+        } else {
+          room = createRoom({ name: args.name });
+        }
+      } catch (e) {
+        return fail(`房间构造失败：${e?.message ?? e}`);
+      }
+      const cmd = commands.createRoomCommand(room, 'mcp');
+      const er = ws.draftExecute(d.draftId, cmd);
+      if (!er.ok) return fail(er.error ?? '命令被拒绝');
+      await ws.saveDraft(d.draftId);
+      auditToolCall(TOOL_CREATE_ROOM, 'ok', { draftId: d.draftId, roomId: room.id });
+      return toolText({ ok: true, draftId: d.draftId, roomId: room.id, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
+    }
+  );
+
+  // ── cad.draw_wall（IR-3：用户已拍板开放）────────────────────────────
+  server.registerTool(
+    TOOL_DRAW_WALL,
+    {
+      title: '画墙（进 draft）',
+      description:
+        '在 draft 里画一段墙，不碰 live。起点终点给毫米坐标；' +
+        '没有房间时总线会自动建一个容器房间（撤销时一步回到画墙前）。返回 draftId 与 wallId。',
+      inputSchema: z.object({
+        name: z.string().optional().describe('墙名；缺省自动生成'),
+        roomId: z.string().optional().describe('归属房间；缺省由总线决定'),
+        start: z.object({ x: z.number(), y: z.number() }).describe('起点（mm）'),
+        end: z.object({ x: z.number(), y: z.number() }).describe('终点（mm）'),
+        thickness: z.number().optional().describe('墙厚 mm，缺省按规则默认'),
+        height: z.number().optional().describe('墙高 mm，缺省按规则默认'),
+        draftId: z.string().optional().describe('追加到已有 draft；缺省新建'),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needDesign();
+      if (deny) return deny;
+      const r = workspaceOrError(await getWorkspaceState());
+      if (r.error) return r.error;
+      const ws = r.workspace;
+      const d = await withDraft(ws, args.draftId, principal.actor);
+      if (d.error) return d.error;
+      const fail = async (msg) => {
+        if (d.isNew) await cleanupNewDraft(ws, d.draftId);
+        auditToolCall(TOOL_DRAW_WALL, 'fail', { draftId: d.draftId, error: msg });
+        return toolError('COMMAND_REJECTED', msg);
+      };
+      if (args.start.x === args.end.x && args.start.y === args.end.y) {
+        return fail('起点和终点不能是同一个点');
+      }
+      const { commands } = await core();
+      const { createWall } = await import('../src/core/docFactory.ts');
+      let wall;
+      try {
+        wall = createWall({
+          name: args.name ?? `墙_${Math.round(args.start.x)}_${Math.round(args.start.y)}`,
+          start: { x: args.start.x, y: args.start.y },
+          end: { x: args.end.x, y: args.end.y },
+          ...(args.thickness !== undefined ? { thickness: args.thickness } : {}),
+          ...(args.height !== undefined ? { height: args.height } : {}),
+        });
+      } catch (e) {
+        return fail(`墙构造失败：${e?.message ?? e}`);
+      }
+      const cmd = commands.drawWall(wall, 'mcp');
+      // 房间归属走命令 payload.roomId（bus 侧契约），不写 wall 对象（Wall 类型无此字段）
+      if (args.roomId) cmd.payload.roomId = args.roomId;
+      // id 删掉让 bus 按目标房间的实际 walls 分配 —— createWall 的自增 id
+      // 不带 takenIds，会跟房间里已有的墙撞号导致命令被拒
+      delete wall.id;
+      delete cmd.payload.wall.id;
+      const er = ws.draftExecute(d.draftId, cmd);
+      if (!er.ok) return fail(er.error ?? '命令被拒绝');
+      // 从 draftState 读回 bus 实际分配的 wallId（按用户给的起终点坐标定位）
+      let wallId = '';
+      const st = ws.draftState(d.draftId);
+      if (st) {
+        const room = args.roomId ? st.rooms.find((r) => r.id === args.roomId) : st.rooms[0];
+        const hit = (room?.walls ?? []).filter(
+          (w) => w.start.x === args.start.x && w.start.y === args.start.y &&
+                 w.end.x === args.end.x && w.end.y === args.end.y
+        );
+        if (hit.length) wallId = hit[hit.length - 1].id;
+      }
+      await ws.saveDraft(d.draftId);
+      auditToolCall(TOOL_DRAW_WALL, 'ok', { draftId: d.draftId, wallId });
+      return toolText({ ok: true, draftId: d.draftId, wallId, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
     }
   );
 }

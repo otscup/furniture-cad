@@ -77,9 +77,11 @@ const EXPECTED_TOOLS = [
   'cad.list_drafts',
   'cad.apply_draft',
   'cad.discard_draft',
+  'cad.create_room',
+  'cad.draw_wall',
 ];
-/** 明令禁止的工具词根：IR-3 未定（create_room/draw_wall）与 S6 未做（export_*）。 */
-const FORBIDDEN_ROOTS = ['create_room', 'draw_wall', 'export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
+/** 明令禁止的工具词根：S6 未做（export_*）。IR-3 已由用户拍板开放。 */
+const FORBIDDEN_ROOTS = ['export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
 
 // ───────────────────────── 夹具 ─────────────────────────
 

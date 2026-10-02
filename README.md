@@ -27,7 +27,7 @@ Linux 注意：测试脚本的 Python 解析优先级为 `APP_PYTHON` → 项目
 
 - **语义模型 = 唯一真相源**：派生数据（几何/板件/清单）永不写项目文件，只存 authored。
 - **AI 只出 Command、永不输出几何/坐标**；唯一写入口 `CommandBus`，两段式 dry-run → 确认 → commit。
-- **MCP（P10.0-S2 起）**：`POST /mcp`（Streamable HTTP，同进程），只读工具 `cad.get_state` / `cad.validate`；长期 token（PAT，只存 sha256）走既有 `AuthStore` 鉴权。写工具（P10.0-S4/S5）：`cad.create_cabinet` / `cad.place_cabinet` / `cad.update_object` / `cad.delete_object` / `cad.submit_proposal`（designer+，只写 draft）+ `cad.apply_draft`（admin+，乐观锁）/ `cad.discard_draft`（按归属）+ `cad.list_drafts`（读）。
+- **MCP（P10.0-S2 起）**：`POST /mcp`（Streamable HTTP，同进程），只读工具 `cad.get_state` / `cad.validate`；长期 token（PAT，只存 sha256）走既有 `AuthStore` 鉴权。写工具（P10.0-S4/S5）：`cad.create_cabinet` / `cad.place_cabinet` / `cad.update_object` / `cad.delete_object` / `cad.create_room` / `cad.draw_wall`（IR-3 已开放）/ `cad.submit_proposal`（designer+，只写 draft）+ `cad.apply_draft`（admin+，乐观锁）/ `cad.discard_draft`（按归属）+ `cad.list_drafts`（读）。一键更新 NAS：`bash app/update-nas.sh`（先按头注释装一次）。
 - **生产部署**：群晖 NAS Docker（`app/docker-compose.yml`），数据卷 `./data`，详见 `app/DEPLOY.md` 与仓库根 `deploy-nas.md`。
 
 ## 文档

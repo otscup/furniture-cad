@@ -38,6 +38,7 @@ import { spawn } from 'node:child_process';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
 import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
+import { exportDxf, exportCutlist, exportRoombook } from './exportCore.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
 // P10.0 S2：MCP 基础层（Streamable HTTP /mcp）与它读取的服务端 Workspace 实体。
@@ -1868,41 +1869,17 @@ async function handleApi(req, res, pathname) {
     const which = Array.isArray(body.which) && body.which.length ? body.which.filter((x) => x === 'plan' || x === 'sheet') : ['plan', 'sheet'];
     if (which.length === 0) return json(res, 400, { ok: false, error: 'which 只能是 plan / sheet' });
     const version = body.version === 'R2000' ? 'R2000' : 'R2007'; // R2000/GBK 只作兼容备用
-
-    const dir = mkdtempSync(join(tmpdir(), 'furniture-dxf-'));
-    const neutralPath = join(dir, 'neutral.json');
-    const dxfPath = join(dir, 'out.dxf');
-    // 临时目录必须清理：成功（流式写完）/ 失败 / 客户端断开都要兜底，否则 tmp 目录会越积越多。
-    const cleanup = () => {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch (e) {
-        console.error('[dxf] 临时目录清理失败（已忽略，下次启动仍可回收）：', dir, e?.message ?? e);
-      }
-    };
     try {
-      const neutralOut = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
-        input: JSON.stringify({ project, which, modelVersion: String(body.modelVersion ?? 'unknown') }),
-      });
-      writeFileSync(neutralPath, neutralOut.out, 'utf8');
-      const infoRaw = await run(pythonExe(), [EXPORT_DXF_PY, neutralPath, dxfPath, version]);
-      const info = JSON.parse(infoRaw.out || '{}');
-      const stamp = new Date().toISOString().slice(0, 10);
-      const base = `${String(project.name || 'project')}_${which.join('-')}_${stamp}_${version}.dxf`;
+      const { buffer, filename: base, info } = await exportDxf(project, { which, version, modelVersion: body.modelVersion });
       res.writeHead(200, {
         'Content-Type': 'application/dxf',
         // 中文文件名必须走 RFC 5987，否则浏览器下载下来是乱码
         'Content-Disposition': `attachment; filename="export.dxf"; filename*=UTF-8''${encodeURIComponent(base)}`,
         'X-Export-Info': encodeURIComponent(JSON.stringify(info)),
       });
-      // 流式转发：文件读完 / 出错 / 客户端断开时再清理，不能提前同步删（流尚未读取）
-      const stream = createReadStream(dxfPath);
-      stream.on('end', cleanup);
-      stream.on('error', cleanup);
-      stream.pipe(res);
+      res.end(buffer);
       return;
     } catch (e) {
-      cleanup();
       return json(res, 500, { ok: false, error: `DXF 导出失败：${e.message}` });
     }
   }
@@ -1913,38 +1890,11 @@ async function handleApi(req, res, pathname) {
     const project = body.project;
     if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
     try {
-      const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
-        input: JSON.stringify({ project, which: [], modelVersion: String(body.modelVersion ?? 'unknown') }),
-      });
-      const n = JSON.parse(r.out);
-      const rows = [
-        ['序号', '板件ID', '名称', '角色', '所属', '材质', '厚(mm)', '长(mm)', '宽(mm)', '数量', '纹理', '单件面积(m²)'],
-      ];
-      // 开料习惯：先按材质 + 厚度分组，组内按面积从大到小 —— 排版时一眼看到大板
-      const panels = [...n.panels].sort(
-        (a, b) => a.material.localeCompare(b.material) || a.thickness - b.thickness || b.length * b.width - a.length * a.width
-      );
-      panels.forEach((p, i) => {
-        rows.push([
-          i + 1, p.id, p.nameZh, p.role, p.belongsTo, p.material, p.thickness, p.length, p.width, p.qty, p.grain,
-          ((p.length * p.width) / 1e6).toFixed(3),
-        ]);
-      });
-      // 甲购/外采件（玻璃门等）单独一节 —— 它们不走开料机，混进板件清单会误导排产
-      if (n.purchased && n.purchased.length > 0) {
-        rows.push([]);
-        rows.push(['—— 甲购/外采件（不进开料）——']);
-        rows.push(['序号', '件ID', '名称', '类型', '所属', '材质', '规格/工艺要求', '数量']);
-        n.purchased.forEach((x, i) => {
-          rows.push([i + 1, x.id, x.nameZh, x.kind, x.belongsTo, x.material, x.spec, x.qty]);
-        });
-      }
-      const csv = '\uFEFF' + rows.map((r2) => r2.map(csvCell).join(',')).join('\r\n') + '\r\n';
-      const base = `${String(project.name || 'project')}_开料单_${new Date().toISOString().slice(0, 10)}.csv`;
+      const { csv, filename: base, stats } = await exportCutlist(project, { modelVersion: body.modelVersion });
       res.writeHead(200, {
         'Content-Type': 'text/csv; charset=utf-8',
         'Content-Disposition': `attachment; filename="cutlist.csv"; filename*=UTF-8''${encodeURIComponent(base)}`,
-        'X-Export-Stats': encodeURIComponent(JSON.stringify(n.stats)),
+        'X-Export-Stats': encodeURIComponent(JSON.stringify(stats)),
       });
       res.end(csv);
       return;
@@ -1959,12 +1909,7 @@ async function handleApi(req, res, pathname) {
     const project = body.project;
     if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
     try {
-      const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_ROOMBOOK_TS], {
-        input: JSON.stringify({ project, modelVersion: String(body.modelVersion ?? 'unknown') }),
-      });
-      const html = r.out || '';
-      if (!html.trim()) throw new Error(r.err || '生成器无输出');
-      const base = `${String(project.name || 'project')}_图纸册_${new Date().toISOString().slice(0, 10)}.html`;
+      const { html, filename: base } = await exportRoombook(project, { modelVersion: body.modelVersion });
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Disposition': `attachment; filename="roombook.html"; filename*=UTF-8''${encodeURIComponent(base)}`,

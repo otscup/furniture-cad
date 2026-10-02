@@ -79,9 +79,12 @@ const EXPECTED_TOOLS = [
   'cad.discard_draft',
   'cad.create_room',
   'cad.draw_wall',
+  'cad.export_dxf',
+  'cad.export_bom_csv',
+  'cad.export_roombook',
 ];
-/** 明令禁止的工具词根：S6 未做（export_*）。IR-3 已由用户拍板开放。 */
-const FORBIDDEN_ROOTS = ['export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
+/** 明令禁止的工具词根：目前无（S6 已做，IR-3 已开放）。保留空数组占位。 */
+const FORBIDDEN_ROOTS = [];
 
 // ───────────────────────── 夹具 ─────────────────────────
 
@@ -358,7 +361,7 @@ console.log(`\n夹具 L（local-open）server :${L.port}  workspace=${L.wsPath}`
     JSON.stringify(names)
   );
   const tools = list.json?.result?.tools ?? [];
-  const READ_TOOLS = ['cad.get_state', 'cad.validate', 'cad.list_drafts'];
+  const READ_TOOLS = ['cad.get_state', 'cad.validate', 'cad.list_drafts', 'cad.export_dxf', 'cad.export_bom_csv', 'cad.export_roombook'];
   ok(
     '①3c 读工具声明 readOnlyHint=true、写工具声明 readOnlyHint=false（只读是**声明**出来的，不是口头的）',
     tools.filter((t: any) => READ_TOOLS.includes(t.name)).every((t: any) => t.annotations?.readOnlyHint === true) &&

@@ -31,6 +31,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { registerWriteTools, WRITE_TOOLS } from './mcpWrite.mjs';
+import { registerExportTools, EXPORT_TOOLS } from './mcpExport.mjs';
 
 /**
  * 两个工具都**没有输入参数**，但 `inputSchema` 不能就此省掉：
@@ -47,7 +48,7 @@ export const TOOL_GET_STATE = 'cad.get_state';
 export const TOOL_VALIDATE = 'cad.validate';
 
 /** 允许暴露的 CAD 工具（只读 S2 + 写 S4/S5；新增必须走新一轮方案）。 */
-export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, ...WRITE_TOOLS];
+export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, ...WRITE_TOOLS, ...EXPORT_TOOLS];
 
 const SERVER_INFO = { name: 'furniture-cad', version: '0.1.0' };
 
@@ -211,6 +212,13 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
   // S4/S5 写工具（权限与 draft 纪律见 mcpWrite.mjs 文件头）。
   // auditToolCall 在这里绑定 principal：mcpWrite 侧只传 (tool, result, extra)。
   registerWriteTools(server, {
+    getWorkspaceState,
+    principal,
+    auditToolCall: (tool, result, extra) => auditToolCall(principal, tool, result, extra),
+  });
+
+  // S6 导出工具（只读，复用 exportCore.mjs 三条链）。
+  registerExportTools(server, {
     getWorkspaceState,
     principal,
     auditToolCall: (tool, result, extra) => auditToolCall(principal, tool, result, extra),

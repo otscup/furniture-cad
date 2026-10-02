@@ -64,9 +64,12 @@ const EXPECTED_TOOLS = [
   'cad.discard_draft',
   'cad.create_room',
   'cad.draw_wall',
+  'cad.export_dxf',
+  'cad.export_bom_csv',
+  'cad.export_roombook',
 ];
-/** S6 未做：export_* 出现即红。IR-3 已由用户拍板开放。 */
-const FORBIDDEN_ROOTS = ['export_dxf', 'export_bom', 'export_cutlist', 'export_roombook'];
+/** 明令禁止的工具词根：目前无（S6 已做，IR-3 已开放）。保留空数组占位。 */
+const FORBIDDEN_ROOTS = [];
 
 // ── 夹具 ──
 const TMP = mkdtempSync(join(tmpdir(), 'furnicad-s45-'));
@@ -208,7 +211,7 @@ section('① 工具清单');
 {
   const r = await mcp(port, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, PAT_VIEWER);
   const names = (r.json?.result?.tools ?? []).map((t: any) => t.name);
-  ok('①1 tools/list 恰好 = 12 个工具（规格硬编码，顺序无关）',
+  ok('①1 tools/list 恰好 = 15 个工具（规格硬编码，顺序无关）',
     JSON.stringify([...names].sort()) === JSON.stringify([...EXPECTED_TOOLS].sort()), JSON.stringify(names));
   ok('①2 无 S6 词根（export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
 }
@@ -342,6 +345,40 @@ section('⑨ IR-3：create_room / draw_wall（用户已拍板开放）');
   const gs = await getState(PAT_OWNER);
   const room = (gs?.project?.rooms ?? []).find((r: any) => r.id === roomId);
   ok('⑨8 live 里有新房间且含墙', !!room && room.walls.length >= 5, `walls=${room?.walls?.length}`);
+}
+
+section('⑩ S6：export_dxf / export_bom_csv / export_roombook（只读，复用导出链）');
+{
+  // viewer 可调（只读）
+  const dxf = await callTool(port, PAT_VIEWER, 'cad.export_dxf', { which: ['plan'] });
+  ok('⑩1 viewer 导出 DXF 成功', !dxf.err && !!dxf.payload?.base64, JSON.stringify(dxf.payload)?.slice(0, 160));
+  if (!dxf.err && dxf.payload?.base64) {
+    ok('⑩2 DXF 文件名以 .dxf 结尾', dxf.payload?.filename?.endsWith('.dxf'), dxf.payload?.filename);
+    const dxfBuf = Buffer.from(dxf.payload.base64, 'base64');
+    ok('⑩3 DXF base64 可解码且非空', dxfBuf.length > 100);
+    const dxfHead = dxfBuf.slice(0, 200).toString('ascii');
+    ok('⑩4 DXF 内容合法（SECTION/HEADER/$ACADVER）', dxfHead.includes('SECTION') && dxfHead.includes('$ACADVER'), dxfHead.slice(0, 60));
+  } else {
+    ok('⑩2 DXF 文件名以 .dxf 结尾（跳过，导出失败）', false, 'export failed');
+    ok('⑩3 DXF base64 可解码且非空（跳过）', false, '');
+    ok('⑩4 DXF 内容含 AutoCAD 标记（跳过）', false, '');
+  }
+
+  const csv = await callTool(port, PAT_VIEWER, 'cad.export_bom_csv', {});
+  ok('⑩5 viewer 导出开料单成功', !csv.err && !!csv.payload?.base64, JSON.stringify(csv.payload)?.slice(0, 120));
+  const csvText = Buffer.from(csv.payload.base64, 'base64').toString('utf8');
+  ok('⑩6 CSV 含表头（序号/板件ID）', csvText.includes('序号') && csvText.includes('板件ID'), csvText.slice(0, 60));
+
+  const rb = await callTool(port, PAT_VIEWER, 'cad.export_roombook', {});
+  ok('⑩7 viewer 导出图纸册成功', !rb.err && !!rb.payload?.base64, JSON.stringify(rb.payload)?.slice(0, 120));
+  const rbText = Buffer.from(rb.payload.base64, 'base64').toString('utf8');
+  ok('⑩8 图纸册是 HTML', rbText.includes('<html') || rbText.includes('<!DOCTYPE'), rbText.slice(0, 60));
+
+  // 审计只记元数据
+  const auditText2 = readFileSync(join(dir, 'audit.jsonl'), 'utf8');
+  const exHits = (auditText2.match(/"tool":"cad\.export_dxf"/g) || []).length;
+  ok('⑩9 导出进了审计', exHits > 0, `命中 ${exHits} 行`);
+  ok('⑩10 审计无文件内容（只记元数据）', !/"base64":"[A-Za-z0-9+\/]{100}/.test(auditText2), '审计里出现了长 base64');
 }
 
 for (const c of children) { try { c.kill(); } catch {} }

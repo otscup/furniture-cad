@@ -97,6 +97,17 @@ COPY src/ai/proposal.ts ./src/ai/proposal.ts
 # 运行时数据目录（账号库/审计/记忆/验证码库/.env 都会被 APP_*_PATH 指到这里）
 RUN mkdir -p /app/data
 
+# ── 权限归一（P10.0-IR3 修复）────────────────────────────────────────
+# 为什么需要这一行：
+#   Docker COPY 会把构建上下文文件的 POSIX 权限和 UID 原样带进镜像。
+#   宿主机上的文件可能因各种原因变成 700 / 属主非 node（NAS 上 tar 解压、
+#   umask、旧部署残留都可能），而容器以 `node`（UID 1000）运行，
+#   读不到这些文件就会 EACCES crash-loop（2026-10-03 生产事故）。
+#   在镜像里把 /app 统一 chown 给 node，构建产物就不再依赖宿主机权限。
+#   注意：/app/data 是卷挂载点，运行时会被宿主机目录覆盖，这里的 chown
+#   只影响镜像内默认值；data/ 的权限由部署脚本单独保障（dataWritable 检查）。
+RUN chown -R node:node /app
+
 EXPOSE 8787
 USER node
 CMD ["node", "server/server.mjs"]

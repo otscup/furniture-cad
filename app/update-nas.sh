@@ -74,6 +74,17 @@ $DOCKER run --rm -u 0 -v "$D:/srv" "$IMG" \
 log "同步新代码…"
 (cd "$SRC" && tar cf - --exclude=data .) | (cd "$D" && tar xf -)
 
+# ── 4.5 权限归一（2026-10-03 生产事故教训） ──
+# 宿主机文件可能因 umask/tar 解压变成 700，Docker COPY 会把权限原样带进镜像，
+# 而容器以 node（UID 1000）运行 → EACCES crash-loop。
+# Dockerfile 里已有 `chown -R node:node /app` 兜底，这里再把宿主机侧的可读位补上，
+# 双保险（且让宿主机上的文件本身也可读，方便排查）。
+log "归一化代码目录权限…"
+for d in server src shared py scripts dist public; do
+  [ -d "$D/$d" ] && chmod -R a+rX "$D/$d"
+done
+# 注意：绝不碰 data/（里面有 .env 密钥，a+r 会让它宿主机全局可读）
+
 # ── 5. 重建镜像并重启 ──
 cd "$D"
 OLD_IMG_ID="$($DOCKER images -q "$IMG" 2>/dev/null | head -1 || true)"

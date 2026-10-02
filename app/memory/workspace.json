@@ -1,0 +1,216 @@
+{
+  "format": "furniture-cad-project",
+  "formatVersion": 1,
+  "savedAt": "2026-10-02T22:19:57.577Z",
+  "project": {
+    "schemaVersion": "0.2",
+    "id": "project_001",
+    "name": "示例户型",
+    "ruleSetId": "factory_default_v1",
+    "rooms": [
+      {
+        "id": "room_001",
+        "name": "主卧",
+        "walls": [
+          {
+            "id": "wall_001",
+            "name": "主卧南墙",
+            "start": {
+              "x": 0,
+              "y": 0
+            },
+            "end": {
+              "x": 3200,
+              "y": 0
+            },
+            "thickness": 120,
+            "height": 2700
+          },
+          {
+            "id": "wall_002",
+            "name": "主卧东墙",
+            "start": {
+              "x": 3200,
+              "y": 0
+            },
+            "end": {
+              "x": 3200,
+              "y": 2600
+            },
+            "thickness": 120,
+            "height": 2700
+          },
+          {
+            "id": "wall_003",
+            "name": "主卧北墙",
+            "start": {
+              "x": 3200,
+              "y": 2600
+            },
+            "end": {
+              "x": 0,
+              "y": 2600
+            },
+            "thickness": 120,
+            "height": 2700
+          },
+          {
+            "id": "wall_004",
+            "name": "主卧西墙",
+            "start": {
+              "x": 0,
+              "y": 2600
+            },
+            "end": {
+              "x": 0,
+              "y": 0
+            },
+            "thickness": 120,
+            "height": 2700
+          }
+        ]
+      }
+    ],
+    "cabinets": [
+      {
+        "id": "cab_001",
+        "name": "主卧衣柜",
+        "roomId": "room_001",
+        "placement": {
+          "x": 400,
+          "y": 60,
+          "rotation": 0
+        },
+        "params": {
+          "width": 2400,
+          "height": 2400,
+          "depth": 600,
+          "boardMaterial": "M_BOARD_18_WOOD",
+          "backPanel": {
+            "material": "M_BACK_9",
+            "method": "groove",
+            "grooveDepth": 8,
+            "grooveSetback": 12,
+            "clearance": 0.5
+          },
+          "bodyLift": 80,
+          "shelfFrontClearance": 10,
+          "finishedEnds": "none"
+        },
+        "layout": {
+          "type": "row",
+          "widthMode": "fit_total",
+          "units": [
+            {
+              "id": "unit_001",
+              "kind": "drawerBank",
+              "requestedWidth": 600,
+              "nickname": "抽屉",
+              "drawers": {
+                "count": 3,
+                "runner": "HW_RUNNER_500",
+                "runnerLength": 500,
+                "sideThickness": 15,
+                "bottomThickness": 5,
+                "bottomGrooveDepth": 6,
+                "gap": 2,
+                "boxHeightDeduct": 30
+              }
+            },
+            {
+              "id": "unit_002",
+              "kind": "hanging",
+              "requestedWidth": 1200,
+              "nickname": "挂衣",
+              "rod": {
+                "count": 1,
+                "heightFromBottom": 1800,
+                "hardware": "HW_ROD_25"
+              },
+              "shelves": {
+                "count": 1,
+                "mode": "equal",
+                "gapPerSide": 0.5,
+                "ledStrip": "none"
+              }
+            },
+            {
+              "id": "unit_003",
+              "kind": "shelves",
+              "requestedWidth": 600,
+              "nickname": "层板",
+              "shelves": {
+                "count": 4,
+                "mode": "equal",
+                "gapPerSide": 0.5,
+                "ledStrip": "none"
+              },
+              "doors": {
+                "type": "hinged",
+                "count": 2,
+                "mode": "equal",
+                "style": "inset",
+                "gapOuter": 2,
+                "gapMid": 3,
+                "hinge": "HW_HINGE_110",
+                "hingeSide": "left",
+                "material": "M_BOARD_18_WOOD"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "id": "cab_002",
+        "name": "测试柜",
+        "roomId": "room_001",
+        "placement": {
+          "x": 400,
+          "y": 660,
+          "rotation": 0
+        },
+        "params": {
+          "width": 600,
+          "height": 2000,
+          "depth": 550,
+          "boardMaterial": "M_BOARD_18_WOOD",
+          "backPanel": {
+            "material": "M_BACK_9",
+            "method": "groove",
+            "grooveDepth": 8,
+            "grooveSetback": 12,
+            "clearance": 0.5
+          },
+          "bodyLift": 80,
+          "shelfFrontClearance": 10,
+          "finishedEnds": "none"
+        },
+        "origin": "mcp",
+        "layout": {
+          "type": "row",
+          "widthMode": "fit_total",
+          "units": [
+            {
+              "id": "unit_001",
+              "kind": "shelves",
+              "requestedWidth": 600,
+              "nickname": "层板",
+              "shelves": {
+                "count": 3,
+                "mode": "equal",
+                "gapPerSide": 0.5,
+                "ledStrip": "none",
+                "tilt": 0
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "workspaceId": "ws_muriy5r1_1",
+  "owner": "local-open",
+  "account": "local-open",
+  "liveModelVersion": 1,
+  "updatedAt": "2026-10-02T22:19:57.577Z"
+}

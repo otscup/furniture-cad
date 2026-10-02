@@ -1422,6 +1422,59 @@ async function handleApi(req, res, pathname) {
     '· 和效果图一样：看不见内部结构的不脑补，看不清数量的写 ambiguous。',
   ];
 
+  /**
+   * 草稿管理 HTTP 接口（P10.1）。
+   * MCP 的 draft 在服务端，工作台之前没有入口看 —— 这三个接口补上。
+   * 权限与 MCP 工具对齐：list=登录即可看；apply=manage（admin+）；
+   * discard=草稿归属者或 manage。
+   */
+  if (pathname === '/api/drafts' && req.method === 'GET') {
+    const ws = await getWorkspaceState();
+    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    const drafts = ws.workspace.listDrafts().map((d) => ({
+      draftId: d.draftId,
+      owner: d.owner,
+      createdAt: d.createdAt,
+      baseModelVersion: d.baseModelVersion,
+    }));
+    return json(res, 200, { ok: true, drafts, liveModelVersion: ws.workspace.getLiveModelVersion() });
+  }
+
+  if (pathname.startsWith('/api/drafts/') && pathname.endsWith('/apply') && req.method === 'POST') {
+    // local-open 模式没有账号体系，直接放行；accounts 模式需要 manage（admin+）
+    if (gate.mode !== 'local-open' && !ROLES[gate.account?.role]?.canManage) {
+      return json(res, 403, { ok: false, error: '需要管理权限', code: 'FORBIDDEN' });
+    }
+    const draftId = pathname.split('/')[3];
+    const ws = await getWorkspaceState();
+    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    const r = await ws.workspace.applyDraft(draftId);
+    if (!r.ok) {
+      return json(res, 409, { ok: false, error: r.message, code: r.code });
+    }
+    auth.audit({ action: 'draft.apply', actor: gate.account?.id, draftId, result: 'ok' });
+    return json(res, 200, { ok: true, newVersion: r.newVersion });
+  }
+
+  if (pathname.startsWith('/api/drafts/') && pathname.endsWith('/discard') && req.method === 'POST') {
+    const draftId = pathname.split('/')[3];
+    const ws = await getWorkspaceState();
+    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    const h = ws.workspace.getDraft(draftId);
+    if (!h) return json(res, 404, { ok: false, error: `draft 不存在：${draftId}`, code: 'DRAFT_NOT_FOUND' });
+    // 归属者或 manage（与 MCP cad.discard_draft 一致）；local-open 直接放行
+    if (gate.mode !== 'local-open') {
+      const mine = h.owner === gate.account?.id;
+      if (!mine && !ROLES[gate.account?.role]?.canManage) {
+        return json(res, 403, { ok: false, error: '只能丢弃自己的草稿', code: 'FORBIDDEN' });
+      }
+    }
+    ws.workspace.discardDraft(draftId);
+    await ws.workspace.deleteDraftFile(draftId);
+    auth.audit({ action: 'draft.discard', actor: gate.account?.id, draftId, result: 'ok' });
+    return json(res, 200, { ok: true });
+  }
+
   if (pathname === '/api/ai/vision' && req.method === 'POST') {
     const body = await readBody(req);
     const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');

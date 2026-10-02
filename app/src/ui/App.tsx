@@ -32,6 +32,7 @@ import { ViewsPanel } from './panels/ViewsPanel.tsx';
 import { MemoryPanel } from './panels/MemoryPanel.tsx';
 import { AdminPanel } from './panels/AdminPanel.tsx';
 import { AIPanel } from './panels/AIPanel.tsx';
+import { DraftsPanel } from './panels/DraftsPanel.tsx';
 import { ImportPanel } from './panels/ImportPanel.tsx';
 import { KnowledgePanel } from './panels/KnowledgePanel.tsx';
 import { ManufacturingPanel } from './panels/ManufacturingPanel.tsx';
@@ -1056,6 +1057,9 @@ export function App() {
             <button type="button" className={rightTab === 'ai' ? 'on' : ''} onClick={() => setRightTab('ai')}>
               AI
             </button>
+            <button type="button" className={rightTab === 'drafts' ? 'on' : ''} onClick={() => setRightTab('drafts')}>
+              草稿
+            </button>
             <button type="button" className={rightTab === 'import' ? 'on' : ''} onClick={() => setRightTab('import')}>
               导入
             </button>
@@ -1126,6 +1130,7 @@ export function App() {
           {rightTab === 'memory' ? <MemoryPanel /> : null}
           {rightTab === 'admin' ? <AdminPanel token={token} /> : null}
           {rightTab === 'ai' ? <AIPanel bus={bus} version={version} token={token} selection={selection} onToast={toast} /> : null}
+          {rightTab === 'drafts' ? <DraftsPanel token={token} version={version} onToast={toast} onApplied={() => setRightTab('props')} /> : null}
           {rightTab === 'import' ? <ImportPanel bus={bus} version={version} onToast={toast} /> : null}
           {rightTab === 'knowledge' ? <KnowledgePanel bus={bus} version={version} onToast={toast} /> : null}
           {rightTab === 'manufacturing' ? <ManufacturingPanel bus={bus} version={version} /> : null}

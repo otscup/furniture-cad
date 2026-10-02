@@ -16,6 +16,7 @@ export type RightTab =
   | 'memory'
   | 'admin'
   | 'ai'
+  | 'drafts'
   | 'import'
   | 'knowledge'
   | 'manufacturing'

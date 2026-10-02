@@ -26,6 +26,8 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, renameSync } from 'node:fs';
+// P10.0 S1-E：账号库写入口统一经进程内串行写队列，消除并发 save 的整文件丢写
+import { enqueueWrite } from './writeQueue.mjs';
 import { dirname } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 
@@ -109,12 +111,15 @@ export class AuthStore {  /**
   }
 
   #save() {
-    const dir = dirname(this.accountsPath);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    // 先写临时文件再 rename：避免写到一半断电留下半个 JSON
-    const tmp = `${this.accountsPath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
-    renameSync(tmp, this.accountsPath);
+    // 经进程内串行写队列：同一账号库路径的多次 save 按提交顺序落盘，
+    // 一个写失败不影响后续；写本身仍用 tmp + rename 原子替换。
+    return enqueueWrite(this.accountsPath, () => {
+      const dir = dirname(this.accountsPath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const tmp = `${this.accountsPath}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
+      renameSync(tmp, this.accountsPath);
+    });
   }
 
   /** 审计日志只追加，永不覆盖 —— 它是"谁在什么时候改了什么"的唯一凭据 */

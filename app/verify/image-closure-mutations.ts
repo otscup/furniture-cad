@@ -30,6 +30,9 @@ const DOCKERIGNORE = join(APP, '.dockerignore');
 const BRIDGE = join(APP, 'src', 'core', 'manufacturing', 'bridge.ts');
 const EMIT_NEUTRAL = join(APP, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK = join(APP, 'scripts', 'emit-roombook.ts');
+// P10.0 S2：服务端闭包（G 段）的两处源头 —— MCP 工具层与生产依赖声明
+const MCP = join(APP, 'server', 'mcp.mjs');
+const PACKAGE_JSON = join(APP, 'package.json');
 
 let pass = 0;
 let fail = 0;
@@ -154,6 +157,31 @@ const MUTANTS: Mutant[] = [
     to: "import { buildRoomBook, roomBookHtml } from '../src/export/roomBook.ts';\nimport { compileProposal } from '../src/ai/compileProposal.ts';",
     expect: 'B1（新依赖不在镜像覆盖内）',
   },
+  // ── P10.0 S2 新增：服务端闭包这条链（G 段）──
+  {
+    id: 'MS11',
+    what: 'Dockerfile 又漏掉 COPY src/workspace（= /mcp 只读工具在生产装载不到工作区）',
+    file: DOCKERFILE,
+    from: 'COPY src/workspace ./src/workspace\n',
+    to: '',
+    expect: 'G2 / G4（服务端闭包覆盖判定）',
+  },
+  {
+    id: 'MS12',
+    what: 'MCP 工具层新增一条运行镜像没覆盖的运行期依赖（→ src/ai/compileProposal.ts）',
+    file: MCP,
+    from: "import { z } from 'zod';",
+    to: "import { z } from 'zod';\nimport { compileProposal } from '../src/ai/compileProposal.ts';",
+    expect: 'G2（服务端闭包覆盖判定）',
+  },
+  {
+    id: 'MS13',
+    what: '运行期裸模块的依赖声明被写错（zod 不再出现在 dependencies 里）',
+    file: PACKAGE_JSON,
+    from: '"zod": "^4.6.5"',
+    to: '"zodx": "^4.6.5"',
+    expect: 'G3（运行期裸模块必须是生产依赖）',
+  },
 ];
 
 async function mutate(m: Mutant): Promise<void> {
@@ -200,7 +228,7 @@ section('启动自检：工作区无残留变异（有则自动还原）');
     }
   }
   console.log(`  · 本次自检还原 ${repaired} 处残留`);
-  for (const f of [DOCKERFILE, DOCKERIGNORE, BRIDGE, EMIT_NEUTRAL, EMIT_ROOMBOOK]) {
+  for (const f of [DOCKERFILE, DOCKERIGNORE, BRIDGE, EMIT_NEUTRAL, EMIT_ROOMBOOK, MCP, PACKAGE_JSON]) {
     const src = readFileSync(f, 'utf8');
     const clean = !MUTANTS.some((m) => m.file === f && m.to && src.includes(m.to));
     ok(`无残留变异：${f.replace(APP, '')}`, clean);

@@ -65,6 +65,20 @@ COPY src/export ./src/export
 # 成对拷贝以免将来任何 core 模块开始加载 commandBus 时在生产静默解不开这个依赖。
 COPY src/ai/memory.ts ./src/ai/memory.ts
 
+# ── MCP 基础层的运行期源码（P10.0 S2）────────────────────────────────
+# 为什么运行镜像还需要 src/workspace：
+#   server/workspaceHost.mjs 在**启动时**用动态 import 装载
+#   `src/workspace/workspace.ts`（服务端 Workspace 持久实体），MCP 只读工具
+#   `cad.get_state` / `cad.validate` 都从它取数 —— 它不在上面那条 emit 闭包里，
+#   所以必须单独拷。漏拷的后果与 S0 那个坑同类：镜像能起来、/api 正常，
+#   只有 /mcp 的工具返回 WORKSPACE_UNAVAILABLE（"装载失败"），
+#   而宿主源码树里永远复现不出来。
+#   MCP SDK 与 zod 由下面那条 `npm ci --omit=dev` 装（都在 dependencies），
+#   不需要也不能 COPY node_modules。
+#   闭包由 verify/image-closure-acceptance.ts 的 G 段（**服务端**闭包）守住：
+#   以后 server 再 import 新的 src/ 文件而忘了改这里，本地验收会先红。
+COPY src/workspace ./src/workspace
+
 # 运行时数据目录（账号库/审计/记忆/验证码库/.env 都会被 APP_*_PATH 指到这里）
 RUN mkdir -p /app/data
 

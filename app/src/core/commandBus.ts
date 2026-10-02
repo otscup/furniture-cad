@@ -889,6 +889,18 @@ export class CommandBus {
     return this.issues().some((i) => i.severity === 'ERROR');
   }
 
+  /**
+   * 派生汇总（只读出口）：板件数 / 件数 / 面积 / 重量。
+   *
+   * 为什么要有这个出口：`sumDerived` 的口径（面积、重量怎么加、保留几位）
+   * 只允许存在**一处**。只读消费者（P10.0 S2 的 MCP `cad.validate`）需要这份汇总时，
+   * 必须来这里取，而不是在下游按 geom 再算一遍 —— 否则迟早出现两个"总重量"。
+   * 本方法不改模型、不落盘、无副作用。
+   */
+  derivedSummary(): DerivedSummary {
+    return this.sumDerived(this.derive().geom);
+  }
+
   // ── 订阅 ──
   subscribe(fn: () => void): () => void {
     this.listeners.add(fn);

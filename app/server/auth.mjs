@@ -271,6 +271,8 @@ export class AuthStore {  /**
       password: { salt, hash },
       createdAt: new Date().toISOString(),
       sessions: [],
+      /** 长期 API token（PAT）—— 只落哈希，见 createToken。新账号初始化为空数组。 */
+      tokens: [],
       failedLogins: [],
       lockedUntil: null,
       usage: normalizeUsage(null),
@@ -429,6 +431,86 @@ export class AuthStore {  /**
       return a;
     }
     return null;
+  }
+
+  // ───────────────────────── 长期 API token（PAT，P10.0 S2）─────────────────────────
+  //
+  // 为什么需要它：MCP 客户端是**机器**，不能拿"人登录一次得到的 12 小时会话"当凭据。
+  // 目标形态是长期 token（类 GitHub PAT）：高熵、明文只在创建时出现一次、只落哈希、
+  // 可撤销；权限**仍由账号的 role 决定**（token 只是"同一个账号的另一种凭据"，
+  // 不是新身份、不引入第二套角色）。
+  //
+  // 为什么用 sha256 而不是 scrypt：token 是 32 字节随机值（256 bit 熵），
+  // 不存在"弱口令可爆破"的问题，摘要足够；且会话 token 本来就是这么存的
+  // —— 复用同一条既有实现，**不新造密码学方案**（P10.0 S2 红线）。
+  //
+  // 明文 token 只在 createToken 的返回值里出现一次；落盘、审计、日志、listTokens
+  // 与 publicView（白名单）里都**不含**它。publicView 是显式白名单 ⇒ tokens 天然不外泄。
+
+  /**
+   * 创建长期 token（绑定到 accountId）。
+   * @returns {{ok:true, token:string, record:{id,label,createdAt}}} 明文 token 只此一次
+   */
+  createToken(accountId, { label = '', actor = null } = {}) {
+    const a = this.findById(accountId);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const token = randomBytes(32).toString('base64url');
+    const rec = {
+      id: `pat_${randomBytes(4).toString('hex')}`,
+      hash: sha256(token), // ← 落盘的只有哈希
+      label: String(label ?? '').slice(0, 64),
+      createdAt: new Date().toISOString(),
+      createdBy: actor ?? accountId,
+    };
+    a.tokens = [...(a.tokens ?? []), rec];
+    this.#save();
+    this.audit({ actor: actor ?? accountId, action: 'account.createToken', target: accountId, tokenId: rec.id, label: rec.label });
+    return { ok: true, token, record: { id: rec.id, label: rec.label, createdAt: rec.createdAt } };
+  }
+
+  /**
+   * 校验**长期** token。返回账号（已过停用/锁定检查），或 null。
+   * 只看 tokens，不看 sessions —— 会话 token 走 authenticate()，两条路径各自独立、可单独收紧。
+   */
+  authenticateToken(token) {
+    if (!token) return null;
+    const h = sha256(String(token));
+    const now = Date.now();
+    for (const a of this.data.accounts) {
+      const t = (a.tokens ?? []).find((x) => x.hash === h);
+      if (!t) continue;
+      if (a.status !== 'active') return null;
+      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;
+      return a;
+    }
+    return null;
+  }
+
+  /** 列出某账号的长期 token（只回短 id 与标签，**永不含哈希**）。 */
+  listTokens(accountId) {
+    const a = this.findById(accountId);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const tokens = (a.tokens ?? []).map((t) => ({
+      id: t.id,
+      label: t.label ?? '',
+      createdAt: t.createdAt,
+      createdBy: t.createdBy ?? null,
+    }));
+    return { ok: true, tokens };
+  }
+
+  /** 撤销长期 token（按完整 id 或短前缀匹配，与会话撤销同口径）。撤 0 条不是错误，但要如实报。 */
+  revokeToken(accountId, tokenId, actor = null) {
+    const a = this.findById(accountId);
+    if (!a) return { ok: false, error: 'ACCOUNT_NOT_FOUND' };
+    const id = String(tokenId ?? '').trim();
+    if (!id) return { ok: false, error: 'TOKEN_ID_REQUIRED' };
+    const before = (a.tokens ?? []).length;
+    a.tokens = (a.tokens ?? []).filter((t) => !t.id.startsWith(id));
+    const removed = before - a.tokens.length;
+    if (removed > 0) this.#save();
+    this.audit({ actor, action: 'account.revokeToken', target: accountId, tokenId: id, result: removed > 0 ? 'ok' : 'no_token' });
+    return { ok: true, removed };
   }
 
   logout(token, actor = null) {
@@ -596,13 +678,18 @@ export function securityPolicy({ mode, accountsPath, auditPath, host }) {
       'AI 调用额度（按周期 token + 每日生成次数，任一用尽即止）与模型白名单',
       '邮箱验证码注册：验证码只落哈希、10 分钟过期、限次限频（SMTP / 落盘两种发信模式）',
       '管理操作与 AI 调用全量审计（actor / action / target / ip / 时间）',
+      '长期 API token（PAT）：高熵、明文只出现一次、只落哈希、可撤销；权限沿用账号角色（P10.0 S2）',
+      '账号库/工作区 JSON 写入经进程内串行写队列，同进程内并发写不再互相覆盖（P10.0 S1）',
       '账号库损坏时**拒绝启动**，不降级为无账号模式',
     ],
     notImplemented: [
       '⚠ 没有 HTTPS —— 上线必须由反向代理终止 TLS，本服务本身不做',
       '⚠ 会话不会轮换（refresh），但已支持单条撤销（account.revokeSession）与整账号踢下线（revokeAllSessions）',
       '⚠ 没有二次验证（邮件/短信/TOTP），口令是唯一凭据',
-      '⚠ 账号库是本地 JSON 文件，没有并发写保护，多进程会互相覆盖',
+      // 这句话里必须同时留着「并发写保护」这个词：verify:ui 的 B18 断言认定
+      // 「上线前必须补的几件大事」里要**点名**这个风险（不是放宽测试，是让文案继续点名）。
+      // P10.0 S1 之后风险面收窄（同进程已串行化），但跨进程/多实例依旧不成立 —— 措辞要跟着走，关键词不能丢。
+      '⚠ 账号库是本地 JSON 文件：同进程内写入已串行化（P10.0 S1），但跨进程/多实例仍缺少并发写保护，会互相覆盖',
       '⚠ 没有密码找回流程，忘记口令只能由管理员重置',
       '⚠ 审计日志无防篡改（没有链式哈希或外部归档），且与账号库同机',
       '⚠ 上传/模型文件没有按账号隔离配额',

@@ -700,7 +700,7 @@ const mock = createServer((req, res) => {
   });
 });
 
-const child: { proc: ReturnType<typeof spawn> | null } = { proc: null };
+const child: { proc: ReturnType<typeof spawn> | null; out: string } = { proc: null, out: '' };
 
 async function startup(): Promise<void> {
   mkdirSync(TMP, { recursive: true });
@@ -734,8 +734,11 @@ async function startup(): Promise<void> {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  child.proc.stdout?.on('data', () => {});
-  child.proc.stderr?.on('data', (d: Buffer) => process.stderr.write(`[server] ${d.toString()}`));
+  child.proc.stdout?.on('data', (d: Buffer) => (child.out += d.toString()));
+  child.proc.stderr?.on('data', (d: Buffer) => {
+    child.out += d.toString();
+    process.stderr.write(`[server] ${d.toString()}`);
+  });
 
   // 等服务起来
   for (let i = 0; i < 60; i++) {
@@ -747,7 +750,12 @@ async function startup(): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 150));
   }
-  throw new Error('本地服务未能在 9 秒内启动');
+  // 起不来说明不了问题在哪 —— 把服务端自己的输出一起抛出来（以前这里只丢一句"未启动"，排查全靠猜）
+  throw new Error(
+    `本地服务未能在 9 秒内启动（PORT=${API_PORT}）\n` +
+      `  exitCode=${child.proc.exitCode ?? '(仍在运行)'} signal=${child.proc.signalCode ?? '(无)'}\n` +
+      `  --- server stdout/stderr ---\n${child.out.trim() || '(服务端没有任何输出)'}`
+  );
 }
 
 function teardown(): void {
@@ -924,7 +932,7 @@ async function main(): Promise<void> {
     const policy = await get('/api/security/policy', token);
     const ni = (policy.data.notImplemented as string[]) ?? [];
     ok(
-      'H11 安全现状照实列出缺口（HTTPS / 二次验证 / 会话轮换 / 并发写保护 都在"尚未实现"里）',
+      'H11 安全现状照实列出缺口（HTTPS / 二次验证 / 会话轮换 都在"尚未实现"里）',
       policy.status === 200 && ni.some((x) => x.includes('HTTPS')) && ni.some((x) => x.includes('二次验证')) && ni.some((x) => x.includes('轮换')),
       ni.length ? '' : '缺口列表是空的 —— 那才是真的危险'
     );

@@ -40,6 +40,10 @@ import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
+// P10.0 S2：MCP 基础层（Streamable HTTP /mcp）与它读取的服务端 Workspace 实体。
+// 两者都挂在**本进程**上 —— 不新增服务进程（方案 §二.1）。
+import { createMcpHandler, ALLOWED_TOOLS } from './mcp.mjs';
+import { openWorkspace } from './workspaceHost.mjs';
 import {
   buildChatRequest,
   buildDesignRequest,
@@ -70,6 +74,14 @@ const MEM_PATH = process.env.APP_MEM_PATH ? resolve(process.env.APP_MEM_PATH) : 
 const ACCOUNTS_PATH = process.env.APP_ACCOUNTS_PATH ? resolve(process.env.APP_ACCOUNTS_PATH) : join(ROOT, 'memory', 'accounts.json');
 const AUDIT_PATH = process.env.APP_AUDIT_PATH ? resolve(process.env.APP_AUDIT_PATH) : join(ROOT, 'memory', 'audit.jsonl');
 const REGISTRATIONS_PATH = process.env.APP_REGISTRATIONS_PATH ? resolve(process.env.APP_REGISTRATIONS_PATH) : join(ROOT, 'memory', 'pending-registrations.json');
+/**
+ * 服务端 Workspace 落点（P10.0 S1 建立的持久实体；S2 起由 /mcp 只读消费）。
+ *
+ * 默认与账号库同目录（都在数据卷 `data/` 里），可用 APP_WORKSPACE_PATH 覆盖 ——
+ * 与其余 APP_*_PATH 同一条规则：换机器/换目录不该跟着代码走，自动化验收也必须
+ * 能在临时目录里跑，不碰真实工作区。
+ */
+const WORKSPACE_PATH = process.env.APP_WORKSPACE_PATH ? resolve(process.env.APP_WORKSPACE_PATH) : join(dirname(ACCOUNTS_PATH), 'workspace.json');
 const MEM_DIR = dirname(MEM_PATH);
 const DIST = join(ROOT, 'dist');
 
@@ -237,6 +249,86 @@ try {
   console.error('注册验证码库损坏会破坏注册限频的公正性，请修复或移走该文件后重启。');
   process.exit(1);
 }
+
+/**
+ * ── 服务端工作区（P10.0 · S2）──
+ *
+ * S1 已经把 `WorkspaceStore`（持有 Semantic Model 的持久实体）建好了，但**没人用它**。
+ * S2 要挂 MCP 只读工具，工具必须从**真实工作区**取数 —— 所以这里把该实体接进服务：
+ *   · 装载/新建的都是 `src/workspace/workspace.ts` 里那**同一个** WorkspaceStore，
+ *     不是 MCP 专用内存模型（方案 §六：工具禁止自建第二套模型）；
+ *   · 落盘走 S1 已有的进程内串行写队列（workspaceHost 注入 writeFileAtomic），
+ *     与账号库共用同一套并发写保护，不另造。
+ *
+ * ── 装载失败**不静默重建** ──
+ *   文件存在但读不出来（损坏/schema 不认识）时，如实报 `{ok:false}` 并让工具返回
+ *   `WORKSPACE_UNAVAILABLE`。**绝不能** catch 之后 create 一个新的 —— 那等于把用户的
+ *   工作区悄悄换成一张白纸，而界面上看不出来。宁可让 MCP 工具报错，不要静默换掉数据。
+ *
+ * ── 与浏览器模型的关系（本阶段已知边界，写在这里免得后人误判）──
+ *   浏览器目前仍把语义模型存在本地（S1 保留"浏览器本地所有权"）。服务端工作区是**持有**
+ *   而非**定义**，Phase 1 也没有 server→browser 推送通道 —— 所以此刻两者尚未接线：
+ *   `cad.get_state` 读到的是服务端工作区自身的状态，不是浏览器里那份。这份"尚未接线"
+ *   是有意的现状（S2 只做基础层），不是缺陷掩盖，已写进 S2 执行报告的遗留项。
+ *
+ * ── 为什么不 await（这一步曾经真的踩到）──
+ *   第一版写成顶层 `await openWorkspace(...)`：于是**所有** /api/* 都要等
+ *   「动态 import workspace.ts + 解析整张 core 依赖图 + 读规则集 + 建示例项目」跑完
+ *   才可能 listen。空载约 1.9 s，看着没事；但全量验收里机器一忙就顶破
+ *   验收脚本给的 9 s 启动预算，ai-acceptance 的 G0 当场变红 ——
+ *   一个和 AI 通路毫无关系的功能，把 AI 通路的验收拖红了。
+ *   所以这里改成**并行**：立刻 listen，工作区在后台装载，只有 /mcp 才 await 它。
+ *   工作的边界是：/api/* 与工作区无关 ⇒ 一秒都不该为它等；/mcp 与它有关 ⇒ 必须等到底。
+ */
+let workspaceState = {
+  ok: false,
+  loading: true,
+  error: '装载中（服务已开始监听，工作区在后台装载）',
+  filePath: WORKSPACE_PATH,
+};
+const workspaceLoading = openWorkspace({
+  filePath: WORKSPACE_PATH,
+  owner: 'local-open',
+  account: 'local-open',
+  onEvent: (e) => auth.audit(e),
+})
+  .then((s) => {
+    workspaceState = s;
+    return s;
+  })
+  .catch((e) => {
+    // 例如数据目录只读：不允许因此拒绝启动（/api/* 与工作区无关），但必须如实记下。
+    workspaceState = { ok: false, error: String(e?.message ?? e), filePath: WORKSPACE_PATH };
+    /**
+     * ⚠ 这里**必须**再包一层 try —— 这一行真咬过人：
+     *   数据目录不可写时（admin 验收专门造了这个场景：路径某一层是文件 ⇒ ENOTDIR），
+     *   `auth.audit` 自己就会抛（它要 mkdirSync + appendFileSync）。那句抛错发生在
+     *   `.catch()` 回调内部 ⇒ 于是这个 promise 变成 **rejected** 且无人接 ⇒
+     *   Node 15+ 默认把未处理的 promise 拒绝当成致命错误 ⇒ **整个服务进程被杀掉**。
+     *   症状是"服务凭空消失"：/api/health 直接 ECONNREFUSED，而日志里只有
+     *   一行看不出因果的堆栈。工作区坏掉只该让 /mcp 的两个工具报
+     *   WORKSPACE_UNAVAILABLE，**绝不该让 /api/* 一起陪葬**。
+     *   （"审计写不进去"这件事本身已经在 /api/health 的 dataWritable 里如实报出。）
+     */
+    try {
+      auth.audit({ actor: null, action: 'workspace.load', result: 'fail', error: workspaceState.error });
+    } catch {
+      /* 见上：审计落不下盘不是新故障，已有渠道如实报出 */
+    }
+    return workspaceState;
+  });
+
+/**
+ * /mcp 取工作区状态的唯一入口：**await 到底**再返回。
+ * 工具因此永远不会看到"装载中"那个中间态 —— 要么拿到真工作区，要么拿到确定的失败原因。
+ */
+const getWorkspaceState = async () => {
+  await workspaceLoading;
+  return workspaceState;
+};
+
+/** `/mcp` 的唯一处理器（同进程挂载，不新增服务进程）。 */
+const handleMcp = createMcpHandler({ auth, getWorkspaceState, audit: (e) => auth.audit(e) });
 
 
 const PROVIDERS = {
@@ -433,7 +525,20 @@ function requireAuth(req, res, pathname, opts = {}) {
   }
   if (PUBLIC_API.has(pathname)) return { ok: true, account: null, mode: 'accounts' };
   const token = bearer(req);
-  const acc = auth.authenticate(token);
+  /**
+   * 凭据只有两种，且**都在这里**认：
+   *   ① 会话 token（登录得到，12h TTL）—— authenticate()
+   *   ② 长期 token / PAT（机器用，P10.0 S2）—— authenticateToken()
+   * 两者映射到的都是**同一个 account**，之后的 role/canManage/canDesign 判定完全共用下面的代码。
+   *
+   * 为什么 PAT 必须也走这里，而不是只在 /mcp 认：
+   *   如果 PAT 只能在 /mcp 使用，就等于存在第二条认证路径 —— 而权限一旦有两处判定，
+   *   两处迟早会不一致。让同一种凭据过同一道门，是本文件开头那条"鉴权判定集中在一处"的延续。
+   *
+   * 附注：拿 PAT 调 /api/auth/logout 不会撤销自己（logout 只清会话），返回 ok 但实际 no-op；
+   * 撤销长期 token 的正确动作是 DELETE /api/account/tokens。
+   */
+  const acc = auth.authenticate(token) ?? auth.authenticateToken(token);
   if (!acc) {
     json(res, 401, { ok: false, error: '未登录或会话已过期', code: 'UNAUTHORIZED', mode: 'accounts' });
     return { ok: false };
@@ -497,6 +602,24 @@ async function handleApi(req, res, pathname) {
       accountCount: auth.data.accounts.length,
       /** 数据目录可写性。写不进去时登录照样 200，这里必须能被机器查见 */
       dataWritable: DATA_WRITABLE,
+      /**
+       * MCP 基础层自述（P10.0 S2）：如实报出**本阶段**暴露了哪两个只读工具，
+       * 而不是让客户端去猜。写工具在本阶段一律没有 —— 列表就是证据。
+       */
+      mcp: { enabled: true, path: '/mcp', transport: 'streamable-http', tools: ALLOWED_TOOLS },
+      /**
+       * 服务端工作区状态。`ok:false` 表示装载失败（损坏/不可读），此时 MCP 只读工具
+       * 会返回 WORKSPACE_UNAVAILABLE —— **不静默重建**，所以这里必须能查见。
+       * `loading:true` 是**正常的启动中间态**（工作区在后台装载，见文件头"为什么不 await"）：
+       * 服务已经能服务 /api/*，只是 /mcp 还没到可用的时候，如实说出来而不是假装就绪。
+       */
+      workspace: {
+        ok: workspaceState.ok === true,
+        loading: workspaceState.loading === true,
+        filePath: workspaceState.filePath,
+        workspaceId: workspaceState.workspace?.workspaceId ?? null,
+        error: workspaceState.ok === true ? null : (workspaceState.error ?? null),
+      },
       time: new Date().toISOString(),
     });
   }
@@ -698,6 +821,51 @@ async function handleApi(req, res, pathname) {
     const r = auth.revokeAllSessions(String(body.id ?? ''), actor);
     if (!r.ok) return json(res, 404, { ok: false, error: r.error });
     return json(res, 200, { ok: true, ...r });
+  }
+
+  /**
+   * 长期 API token（PAT，P10.0 S2）。
+   *
+   * 为什么需要：MCP 客户端是**机器**，不能拿"人登录一次得到的 12 小时会话"当长期凭据。
+   *
+   * 权限：这三条路由都落在 `/api/account/` 前缀下 ⇒ 自动继承既有的 canManage 闸
+   * （见上方 managePaths 判定），viewer/designer 一律 403 —— **不新增任何权限分支**。
+   * token 的创建/校验/撤销全部由 AuthStore 一处实现，HTTP 只是它的一个适配器。
+   *
+   * 明文 token 只在 POST 响应里出现**一次**；GET 只回短 id 与标签，**永不含哈希**。
+   */
+  if (pathname === '/api/account/tokens' && req.method === 'GET') {
+    const url = new URL(req.url ?? '/', 'http://x');
+    const id = String(url.searchParams.get('accountId') ?? '').trim();
+    if (!id) return json(res, 400, { ok: false, error: '缺少 accountId' });
+    const r = auth.listTokens(id);
+    if (!r.ok) return json(res, 404, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, accountId: id, ...r });
+  }
+
+  if (pathname === '/api/account/tokens' && req.method === 'POST') {
+    const body = await readBody(req);
+    const id = String(body.accountId ?? '').trim();
+    if (!id) return json(res, 400, { ok: false, error: '缺少 accountId' });
+    const r = auth.createToken(id, { label: body.label ?? '', actor });
+    if (!r.ok) return json(res, r.error === 'ACCOUNT_NOT_FOUND' ? 404 : 400, { ok: false, error: r.error });
+    return json(res, 200, {
+      ok: true,
+      accountId: id,
+      token: r.token,
+      tokenInfo: r.record,
+      note: '明文 token 只返回这一次，请立即保存；服务端只存哈希（记录写进审计的是 tokenId，不是 token）。',
+    });
+  }
+
+  if (pathname === '/api/account/tokens' && req.method === 'DELETE') {
+    const body = await readBody(req);
+    const id = String(body.accountId ?? '').trim();
+    const tokenId = String(body.tokenId ?? '').trim();
+    if (!id || !tokenId) return json(res, 400, { ok: false, error: '缺少 accountId / tokenId' });
+    const r = auth.revokeToken(id, tokenId, actor);
+    if (!r.ok) return json(res, 404, { ok: false, error: r.error });
+    return json(res, 200, { ok: true, accountId: id, ...r });
   }
 
   // ───────────────────────── 用量 / 审计 / 安全自述 ─────────────────────────
@@ -1848,6 +2016,30 @@ function serveStatic(req, res, pathname) {
 
 const server = createServer((req, res) => {
   const pathname = (req.url ?? '/').split('?')[0];
+  /**
+   * `/mcp` 必须先于下面那道全局 OPTIONS 短路 —— 否则 MCP 客户端的预检会被
+   * 通用的 `Access-Control-Allow-Headers: Content-Type` 答掉，而它需要的是
+   * `Authorization` / `Mcp-Session-Id`。让 MCP 处理器自己回预检（见 mcp.mjs）。
+   * 这不是新接口，只是把同一台服务上的另一个入口排在正确的位置。
+   */
+  if (pathname === '/mcp') {
+    /**
+     * 与 /api/* 同一条纪律：**不允许出现未处理的异步拒绝**。
+     * 一个没人接的 rejected promise 在 Node 15+ 上会直接终结进程 ——
+     * 而"审计写不进去 / 请求半途断开"这类事，恰恰最可能在 /mcp 里发生。
+     */
+    handleMcp(req, res).catch((e) => {
+      if (!res.headersSent) json(res, 500, { ok: false, error: String(e?.message ?? e) });
+      else {
+        try {
+          res.end();
+        } catch {
+          /* 已结束 */
+        }
+      }
+    });
+    return;
+  }
   if (req.method === 'OPTIONS') {
     cors(res);
     res.writeHead(204);
@@ -1896,6 +2088,8 @@ server.listen(PORT, HOST, () => {
   console.log(`  记忆文件  ${MEM_PATH}`);
   console.log(`  账号库    ${ACCOUNTS_PATH}`);
   console.log(`  审计日志  ${AUDIT_PATH}`);
+  console.log(`  工作区    ${WORKSPACE_PATH}（后台装载中，/mcp 取数前会等到装载结束）`);
+  console.log(`  MCP       http://${HOST}:${PORT}/mcp  · 只读工具：${ALLOWED_TOOLS.join(' / ')}`);
   console.log(`  账号模式  ${auth.mode}${auth.enabled ? `（${auth.data.accounts.length} 个账号）` : '  ← 还没有账号，全部接口免登录'}`);
   console.log(
     DATA_WRITABLE
@@ -1912,10 +2106,19 @@ server.listen(PORT, HOST, () => {
   console.log('        POST /api/auth/register-email · POST /api/auth/register-email/verify');
   console.log('        GET|POST /api/account/accounts · PATCH /api/account/account');
   console.log('        GET /api/usage · GET /api/security/policy · GET /api/security/audit');
+  console.log('        GET|POST|DELETE /api/account/tokens  ·  POST /mcp（MCP 只读工具，P10.0 S2）');
   console.log('        GET|PUT /api/settings/smtp · POST /api/settings/smtp/test');
   if (process.env.APP_ENV_PATH || process.env.APP_MEM_PATH || process.env.APP_ACCOUNTS_PATH || process.env.APP_AUDIT_PATH) {
     console.log('  （本次运行使用了 APP_*_PATH 覆盖，未落在项目默认位置）');
   }
+  // 工作区是后台装载的：结果出来再补一行，好让运维一眼看到 /mcp 现在到底能不能用。
+  workspaceLoading.then((s) => {
+    console.log(
+      s.ok
+        ? `  ✓ 工作区已装载（${s.workspace.workspaceId}，liveModelVersion=${s.workspace.getLiveModelVersion()}）`
+        : `  ⚠ 工作区装载失败：${s.error}\n            /mcp 的两个只读工具会返回 WORKSPACE_UNAVAILABLE，且**不会**重建该文件。`
+    );
+  });
   if (!IS_LOOPBACK) {
     console.log('');
     console.log('  ⚠⚠⚠ 正在监听非回环地址：接口已暴露到容器/网络。');

@@ -81,11 +81,20 @@ const IMPORT_PATTERNS: Array<{ re: RegExp; specGroup: number; typeGroup: number 
 
 interface RelImport {
   spec: string; // 原始说明符
-  rel: string | null; // 解析后的仓库相对路径；null = 解析不到
+  rel: string | null; // 解析后的仓库相对路径；null = 裸模块（npm 包 / node: 内置）或解析不到的相对路径
   typeOnly: boolean; // `import type` / `export type` ⇒ strip-types 下被擦除
 }
 
-/** 唯一的 import 解析实现（一种形状只许一处判断）：剥注释 → 匹配三类 import → 解析相对路径 */
+/**
+ * 唯一的 import 解析实现（一种形状只许一处判断）：剥注释 → 匹配三类 import。
+ *
+ * ⚠ 2026-10-02（P10.0 S2）修掉一个**恒真断言**：此前这里写着
+ *   `if (!spec.startsWith('.')) continue;` —— 裸模块说明符（`node:fs`、`@scope/pkg/…`）
+ *   被直接丢掉 ⇒ 下游 `closure.bare` 永远是空数组 ⇒ "闭包只依赖 node: 内置模块"
+ *   这条断言（A6）无论怎么改依赖都是绿的。它看起来在守"运行镜像不需要额外 npm 依赖"，
+ *   实际上什么都没守。现在裸模块照常收集，由调用方分辨"内置 / 生产依赖 / 缺声明"。
+ *   （判据：`bare: string[]` 非空时才谈得上判定；空的"通过"等于没跑。）
+ */
 function importsOf(fileRel: string): RelImport[] {
   const text = stripComments(readFileSync(join(APP, fileRel), 'utf8'));
   const out: RelImport[] = [];
@@ -94,12 +103,18 @@ function importsOf(fileRel: string): RelImport[] {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
       const spec = m[specGroup];
-      if (!spec || !spec.startsWith('.')) continue;
+      if (!spec) continue;
+      const typeOnly = typeGroup === null ? false : Boolean(m[typeGroup]);
+      if (!spec.startsWith('.')) {
+        // 裸模块：node: 内置 / npm 包 —— 同样要收集，否则"依赖了什么"根本没人看
+        out.push({ spec, rel: null, typeOnly });
+        continue;
+      }
       const abs = resolveSpecifier(join(APP, fileRel), spec);
       out.push({
         spec,
         rel: abs === null ? null : abs.replace(/\\/g, '/').slice(APP.replace(/\\/g, '/').length + 1),
-        typeOnly: typeGroup === null ? false : Boolean(m[typeGroup]),
+        typeOnly,
       });
     }
   }
@@ -538,7 +553,12 @@ section('F 成对完整性 / 镜像内 import 逃逸登记');
   for (const f of inImage) {
     for (const im of importsOf(f)) {
       if (im.typeOnly) continue;
-      if (im.rel === null || imagePathFor(view, im.rel) === null) escapes.push({ file: f, target: im.rel ?? `(解析不到 ${im.spec})` });
+      if (im.rel === null) {
+        // 裸模块（node 内置 / npm 包）不算"镜像内逃逸"；只有解析不到的**相对**路径才算
+        if (im.spec.startsWith('.')) escapes.push({ file: f, target: `(解析不到 ${im.spec})` });
+        continue;
+      }
+      if (imagePathFor(view, im.rel) === null) escapes.push({ file: f, target: im.rel });
     }
   }
   const onExportPath = escapes.filter((e) => closure.runtime.includes(e.file));
@@ -548,6 +568,90 @@ section('F 成对完整性 / 镜像内 import 逃逸登记');
   });
   console.log(`    · 登记：镜像内因惰性死代码造成的 import 逃逸 ${escapes.length} 处（不在导出路径上，可接受）：`);
   for (const e of escapes.slice(0, 10)) console.log(`        ${e.file} -> ${e.target}`);
+}
+
+// ═══════════════════════════ G 服务端运行期闭包（P10.0 S2）═══════════════════════════
+/**
+ * 为什么 S2 必须加这一段：
+ *   A~F 段的闭包是从**两个 emit 入口**算的。而 S2 让 `server/server.mjs` 长出了
+ *   第二条运行期依赖链（workspaceHost 动态 import src/workspace/workspace.ts，
+ *   mcp.mjs 又 import @modelcontextprotocol/sdk）。这条链**完全不经过 emit 入口**，
+ *   于是它落在 A~F 的视野之外 —— 与 S0 那个"镜像里没有 scripts/src、而 58 个
+ *   验收脚本全在源码树跑"的结构性盲区是同一个形状。这里给服务端也装一盏灯。
+ */
+section('G 服务端运行期闭包（server/server.mjs）');
+const SERVER_ENTRY = 'server/server.mjs';
+const serverClosure = computeRuntimeClosure([SERVER_ENTRY]);
+const PKG = JSON.parse(readFileSync(join(APP, 'package.json'), 'utf8')) as {
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+const PROD_DEPS = Object.keys(PKG.dependencies ?? {});
+/** 裸说明符 → 包名（作用域包取前两段） */
+const packageRootOf = (spec: string): string => {
+  const parts = spec.split('/');
+  return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
+};
+console.log(`    服务端闭包文件数 = ${serverClosure.runtime.length}（另 ${serverClosure.erased.length} 个 type-only 擦除）`);
+console.log(`    服务端闭包裸模块 = ${serverClosure.bare.join(', ') || '(无)'}`);
+console.log(`    生产依赖 = ${PROD_DEPS.join(', ') || '(无)'}`);
+
+ok('G1. 服务端闭包非空且无解析失败的相对路径', serverClosure.runtime.length > 0 && serverClosure.unresolved.length === 0, {
+  unresolved: serverClosure.unresolved,
+});
+{
+  const uncovered = serverClosure.runtime.filter((f) => imagePathFor(view, f) === null);
+  ok('G2. 服务端闭包里每个仓库内文件都被运行阶段 COPY 覆盖（漏拷 ⇒ 生产 /mcp 静默降级）', uncovered.length === 0, { uncovered });
+}
+{
+  // 裸模块必须要么是 node: 内置，要么是 dependencies 里声明过的生产依赖
+  // （devDependencies 在 `npm ci --omit=dev` 下不装 ⇒ 出现在运行期依赖链上就是生产事故）
+  const bad = serverClosure.bare.filter((b) => !b.startsWith('node:') && !PROD_DEPS.includes(packageRootOf(b)));
+  ok('G3. 服务端闭包的裸模块全部是 node: 内置或 package.json 的**生产**依赖', bad.length === 0, {
+    bad,
+    hint: 'devDependencies 不进运行镜像（npm ci --omit=dev）',
+  });
+  const devOnly = serverClosure.bare.filter((b) => !b.startsWith('node:') && (PKG.devDependencies ?? {})[packageRootOf(b)] && !PROD_DEPS.includes(packageRootOf(b)));
+  ok('G3b. 没有任何运行期裸模块只声明在 devDependencies 里', devOnly.length === 0, { devOnly });
+}
+{
+  const f = 'src/workspace/workspace.ts';
+  ok('G4. src/workspace/workspace.ts 在服务端闭包内且被 COPY 覆盖（S2 的 Workspace 实体）', serverClosure.runtime.includes(f) && imagePathFor(view, f) === '/app/src/workspace/workspace.ts', {
+    inClosure: serverClosure.runtime.includes(f),
+    imagePath: imagePathFor(view, f),
+  });
+}
+{
+  const leak = serverClosure.runtime.filter((f) => FRONTEND_DIRS.some((d) => f.startsWith(d)) || FRONTEND_FILES.includes(f) || f.endsWith('.tsx'));
+  ok('G5. 服务端闭包内不含任何前端源码（ui/state/viewport/main.tsx/styles.css/.tsx）', leak.length === 0, { leak });
+}
+{
+  const allowed = ['src/core/', 'src/export/', 'src/workspace/', 'src/ai/'];
+  const dirs = [...new Set(serverClosure.runtime.filter((f) => f.startsWith('src/')).map((f) => f.split('/').slice(0, 2).join('/') + '/'))];
+  const escaped = dirs.filter((d) => !allowed.includes(d));
+  ok('G6. 服务端闭包涉及的 src/ 目录都是已在 Dockerfile 里明确处理过的（新目录必须先做决定）', escaped.length === 0, {
+    dirs,
+    escaped,
+    hint: '新增 src/<新目录>/ 依赖时，Dockerfile 要么 COPY 它，要么在本清单里显式登记',
+  });
+}
+{
+  // G 段自检（反恒真）：合成一个"照旧只拷 core/export/ai、漏掉 src/workspace"的 Dockerfile，
+  // 证明 G2 的覆盖判定真的会报未覆盖。没有这一段，G2 有可能只是永远绿。
+  const noWorkspace = parseDockerfile(`
+FROM node:22-slim
+WORKDIR /app
+COPY server ./server
+COPY shared ./shared
+COPY scripts ./scripts
+COPY src/core ./src/core
+COPY src/export ./src/export
+COPY src/ai/memory.ts ./src/ai/memory.ts
+`);
+  const uncovered = serverClosure.runtime.filter((f) => imagePathFor(noWorkspace, f) === null);
+  ok('G7. 合成 Dockerfile（漏 COPY src/workspace）⇒ 服务端闭包覆盖判定必须报未覆盖', uncovered.includes('src/workspace/workspace.ts'), {
+    uncovered: uncovered.slice(0, 6),
+  });
 }
 
 // ═══════════════════════════ 汇总 ═══════════════════════════

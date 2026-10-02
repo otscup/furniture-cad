@@ -37,6 +37,10 @@ services:
       APP_ACCOUNTS_PATH: /app/data/accounts.json
       APP_AUDIT_PATH: /app/data/audit.jsonl
       APP_REGISTRATIONS_PATH: /app/data/pending-registrations.json
+      # 服务端 Workspace 持久实体（P10.0 S2 的 /mcp 只读工具从它取数）。
+      # 不写也行（默认取 accounts.json 同目录），写出来是为了让"数据到底落在哪"一目了然：
+      # 它必须和账号库一起落在卷里，否则重建容器 = 工作区消失。
+      APP_WORKSPACE_PATH: /app/data/workspace.json
       # 落盘发信模式的默认落点也放进卷（管理后台可改 SMTP_FILE_OUT）
       SMTP_FILE_OUT: /app/data/outbox.jsonl
     volumes:

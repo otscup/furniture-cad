@@ -21,9 +21,9 @@
  *   从而天然满足 S1-E 的「并发写保护」且不把 .mjs 拖进 tsc 检查面。
  * ══════════════════════════════════════════════════════════════════════
  */
-import type { Project, RuleSet } from '../core/types.ts';
+import type { Issue, Project, RuleSet } from '../core/types.ts';
 import { CommandBus } from '../core/commandBus.ts';
-import type { Command, ExecResult } from '../core/commandBus.ts';
+import type { Command, DerivedSummary, ExecResult } from '../core/commandBus.ts';
 import { serializeProjectFile, parseProjectFile } from '../core/projectFile.ts';
 import { sampleProject } from '../core/docFactory.ts';
 
@@ -239,6 +239,49 @@ export class WorkspaceStore {
   }
   getFilePath(): string {
     return this.filePath;
+  }
+  /**
+   * 只读：底层 CommandBus 的内部 modelVersion。
+   * 与 liveModelVersion 是**两层**：前者是总线自己的版本计数（每次提交 +1），
+   * 后者是 Workspace 的并发版本（draft 乐观锁依据）。两者都如实报出，不做归一化。
+   */
+  getModelVersion(): number {
+    return this.bus.getVersion();
+  }
+
+  /**
+   * 只读：当前 live 语义模型的**深拷贝**。
+   *
+   * 为什么返回拷贝而不是内部引用：只读消费者（MCP `cad.get_state` / `cad.validate`）
+   * 拿到的对象绝不允许成为改模型的旁路 —— 直接递出 `bus.getState()` 就等于
+   * 把"唯一写入口"这条宪法开了个后门。拷贝代价在只读路径上可以接受。
+   */
+  getProjectSnapshot(): Project {
+    return structuredClone(this.bus.getState());
+  }
+
+  /**
+   * 只读校验 / 派生：跑**现有** CommandBus.derive()（其内部已含 validateCabinet、
+   * 转角干涉、装配关系、空间校验）并取派生汇总。
+   * · 不新建 validator、不另立一套验证体系；
+   * · 不改 live、不落盘、无副作用（derive 结果按 modelVersion 缓存，读多少次都一样）。
+   */
+  validate(): { issues: Issue[]; derived: DerivedSummary; blockingErrors: number } {
+    const d = this.bus.derive();
+    return {
+      issues: d.issues,
+      // 派生汇总同样只从总线取（sumDerived 的唯一实现），不在下游重算
+      derived: this.bus.derivedSummary(),
+      blockingErrors: d.issues.filter((i) => i.severity === 'ERROR').length,
+    };
+  }
+
+  /**
+   * 把当前 live 状态落盘一次（首次建立实体时调用；不改变模型内容，只写文件）。
+   * 写入仍经注入的 persist ⇒ 走同一个进程内串行写队列。
+   */
+  async save(): Promise<void> {
+    await this.flush();
   }
 
   private async flush(): Promise<void> {

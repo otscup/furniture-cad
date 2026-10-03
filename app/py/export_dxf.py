@@ -50,6 +50,43 @@ LAYER_COLOR_RULES = [
 ]
 DEFAULT_COLOR = 9       # 未知图层 → 灰（而不是 7）
 
+# ── 标准 DXF 图层（对标生产图纸）──
+#   内部图层 → 标准图层 的映射。生产下单的 DXF 必须用这套标准层，
+#   而不是 views.ts 的 F- 前缀内部层。
+STD_LAYERS = {
+    # name: (aci_color, linetype, lineweight_1_100mm)
+    "OUTLINE": (7, "Continuous", 70),   # 轮廓线：白，0.7mm
+    "DIM": (3, "Continuous", 25),       # 尺寸标注：绿，0.25mm
+    "HIDDEN": (8, "Dashed", 25),        # 虚线：灰，0.25mm
+    "TEXT": (7, "Continuous", 25),      # 文字：白
+    "CENTER": (1, "Center", 25),        # 中心线：红，0.25mm
+}
+
+# 内部图层 → 标准图层（注意：长前缀在前，避免 F-CAB 吞掉 F-CAB-HIDDEN）
+LAYER_MAP = [
+    ("F-CAB-HIDDEN", "HIDDEN"),
+    ("F-CAB-FRONT", "OUTLINE"),
+    ("F-CAB-HW", "OUTLINE"),
+    ("F-CAB", "OUTLINE"),
+    ("A-WALL", "OUTLINE"),
+    ("PANEL_", "OUTLINE"),
+    ("EDGE_", "OUTLINE"),
+    ("F-DIM", "DIM"),
+    ("DIM", "DIM"),
+    ("F-VIEW", "CENTER"),
+    ("F-TEXT", "TEXT"),
+    ("TEXT", "TEXT"),
+    ("A-TEXT", "TEXT"),
+]
+
+
+def std_layer_for(layer: str) -> str:
+    """内部图层名 → 标准 DXF 图层名。"""
+    for prefix, std in LAYER_MAP:
+        if layer.startswith(prefix):
+            return std
+    return "OUTLINE"  # 未知 → 轮廓线（可见，不断线）
+
 
 def color_for(layer: str) -> int:
     for prefix, c in LAYER_COLOR_RULES:
@@ -91,17 +128,23 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
         doc.styles.add(TXT_STYLE, font="simfang.ttf")   # 仿宋，中文制图标准字体
     doc.styles.get(TXT_STYLE).dxf.bigfont = ""
 
-    # 图层按需创建：图元里出现过才建，不预先写一大堆用不上的层
+    # ── 标准图层：预先创建 5 个生产标准层 ──
+    for std_name, (aci, ltype, lw) in STD_LAYERS.items():
+        if std_name not in doc.layers:
+            # linetype 必须存在：setup=True 自带 Continuous/Center/Dashed 等标准线型
+            try:
+                doc.layers.add(std_name, color=aci, linetype=ltype)
+            except Exception:
+                doc.layers.add(std_name, color=aci)
+            doc.layers.get(std_name).dxf.lineweight = lw
+
+    # 图层按需映射：内部图层 → 标准图层（F-CAB 等内部名不进 DXF）
     layers: dict[str, None] = {}
     for sh in data.get("sheets", []) or []:
         for pr in sh.get("prims", []) or []:
             # 缺 layer / 非对象的坏图元不在此处裸崩，交给下方逐图元处理统一给出「图元损坏」结构化报错
             if isinstance(pr, dict) and pr.get("layer"):
-                layers.setdefault(pr["layer"], None)
-    for name in layers:
-        ltype = "CONTINUOUS"
-        if name not in doc.layers:
-            doc.layers.add(name, color=color_for(name), linetype=ltype)
+                layers.setdefault(std_layer_for(pr["layer"]), None)
 
     msp = doc.modelspace()
 
@@ -118,6 +161,8 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                 raise ValueError(
                     f"图元损坏：sheet[{si}] prim[{pi}] 缺少必填字段 layer/k（kind={pr.get('k') if isinstance(pr, dict) else '?'}）"
                 ) from e
+            # 内部图层 → 标准 DXF 图层（生产规范）
+            layer = std_layer_for(layer)
             try:
                 if kind == "poly":
                     pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
@@ -135,10 +180,11 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
                     if len(pts) < 3:
                         continue
-                    hatch = msp.add_hatch(color=color_for(layer), dxfattribs={"layer": layer})
+                    std_aci = STD_LAYERS.get(layer, (9, "Continuous", 25))[0]
+                    hatch = msp.add_hatch(color=std_aci, dxfattribs={"layer": layer})
                     hatch.paths.add_polyline_path(pts, is_closed=True)
                     try:
-                        hatch.set_solid_fill(color=color_for(layer))
+                        hatch.set_solid_fill(color=std_aci)
                     except Exception:
                         pass
                     stats["fill"] += 1

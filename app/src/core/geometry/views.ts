@@ -194,6 +194,119 @@ function makePainter(out: Prim[], map: Mapper): ViewPainter {
   };
 }
 
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  尺寸布局器（防重叠）
+ *
+ *  问题：pushDim 用硬编码偏移（460/620/360），分区窄或多尺寸链时，
+ *  尺寸线/文字会互相重叠。
+ *
+ *  做法：
+ *    · 收集该视图所有尺寸意图 {p0, p1, txt, orientation, side, baseOffset}
+ *    · 按 side 分组，同组内按轴向位置排序
+ *    · 区间（text 宽度计入）重叠的分配不同 level：offset = baseOffset + level * 280
+ *    · 用现有 pushDim 发射，只是位置由布局器决定
+ *
+ *  不改 Prim 格式，不改调用方语义，只换内部排版。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+export interface DimIntent {
+  /** 被测区间的两端（图纸坐标，几何上的点） */
+  p0: Vec2;
+  p1: Vec2;
+  txt: string;
+  /** 尺寸线方向：'h' = 水平线，'v' = 竖直线 */
+  orientation: 'h' | 'v';
+  /** 尺寸线在被测体的哪一侧 */
+  side: 'top' | 'bottom' | 'left' | 'right';
+  /** 基础偏移（第一层尺寸线距几何的距离，mm） */
+  baseOffset: number;
+  /**
+   * 链标识：同 side 下不同链（如总宽链 vs 分区链）互不干扰，
+   * 各自独立做区间染色。缺省 ''。
+   */
+  chain?: string;
+  textOffset?: number;
+  rot?: number;
+}
+
+/** 层间距（mm）：重叠的尺寸线逐层外移的步长 */
+export const DIM_LEVEL_STEP = 280;
+/** 文字宽度估算：size 110 的数字约 0.55 * size 每字符 */
+const DIM_TEXT_CHAR_W = 0.55;
+
+export class DimLayout {
+  private intents: DimIntent[] = [];
+
+  add(intent: DimIntent): void {
+    this.intents.push(intent);
+  }
+
+  /**
+   * 发射所有尺寸。用区间染色法分配 level：
+   * 同 side 组内，按轴向排序，text 宽度计入区间，重叠的进不同 level。
+   */
+  emit(out: Prim[]): void {
+    // 按 side + chain 分组：不同链（如总宽链 vs 分区链）互不干扰，各自独立染色
+    const groups = new Map<string, DimIntent[]>();
+    for (const it of this.intents) {
+      const key = `${it.side}|${it.chain ?? ''}`;
+      const g = groups.get(key) ?? [];
+      g.push(it);
+      groups.set(key, g);
+    }
+
+    for (const [, items] of groups) {
+      // 按轴向起始位置排序（'h' 按 x，'v' 按 y）
+      const axial = (it: DimIntent): number =>
+        it.orientation === 'h' ? Math.min(it.p0.x, it.p1.x) : Math.min(it.p0.y, it.p1.y);
+      const axialEnd = (it: DimIntent): number =>
+        it.orientation === 'h' ? Math.max(it.p0.x, it.p1.x) : Math.max(it.p0.y, it.p1.y);
+      // text 半宽计入区间：窄分区时文字比区间宽，按纯区间判不重叠但文字会压住
+      const textHalf = (it: DimIntent): number => (it.txt.length * 110 * DIM_TEXT_CHAR_W) / 2;
+
+      const sorted = [...items].sort((a, b) => axial(a) - axial(b));
+      const levelEnds: number[] = [];
+      const levels: number[] = [];
+
+      for (const it of sorted) {
+        const s = axial(it) - textHalf(it);
+        const e = axialEnd(it) + textHalf(it);
+        let lv = 0;
+        while (lv < levelEnds.length && s < levelEnds[lv]!) lv++;
+        levels.push(lv);
+        if (lv >= levelEnds.length) levelEnds.push(e);
+        else levelEnds[lv] = Math.max(levelEnds[lv]!, e);
+      }
+
+      // 发射：按 level 计算偏移，构造尺寸线位置后调 pushDim
+      for (let i = 0; i < sorted.length; i++) {
+        const it = sorted[i]!;
+        const lv = levels[i]!;
+        const off = it.baseOffset + lv * DIM_LEVEL_STEP;
+        let a: Vec2;
+        let b: Vec2;
+        if (it.orientation === 'h') {
+          const y0 = Math.min(it.p0.y, it.p1.y);
+          const y = it.side === 'top' ? y0 + off : y0 - off;
+          a = { x: Math.min(it.p0.x, it.p1.x), y };
+          b = { x: Math.max(it.p0.x, it.p1.x), y };
+        } else {
+          const x0 = Math.min(it.p0.x, it.p1.x);
+          const x = it.side === 'right' ? x0 + off : x0 - off;
+          a = { x, y: Math.min(it.p0.y, it.p1.y) };
+          b = { x, y: Math.max(it.p0.y, it.p1.y) };
+        }
+        pushDim(out, a, b, it.txt, it.textOffset, it.rot);
+      }
+    }
+  }
+
+  clear(): void {
+    this.intents = [];
+  }
+}
+
 /** 一条带界线与箭头的尺寸线（图纸坐标，绝对位置） */
 function pushDim(out: Prim[], a: Vec2, b: Vec2, txt: string, textOffset = 150, rot?: number): void {
   const dx = b.x - a.x;
@@ -675,15 +788,36 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     labels.push({ k: 'text', p: { x, y }, text: s, size, layer: L_TEXT, align: 'c' });
   };
 
+  // 尺寸走布局器（防重叠）：意图只声明"测哪段、在哪侧、基础偏移"，具体层级由 DimLayout 定
+  const dims = new DimLayout();
   // 正视图：总高（左侧）
-  pushDim(labels, { x: fx - 460, y: fy }, { x: fx - 460, y: fy + H }, `${H}`, 190, 90);
+  dims.add({ p0: { x: fx, y: fy }, p1: { x: fx, y: fy + H }, txt: `${H}`, orientation: 'v', side: 'left', baseOffset: 460, textOffset: 190, rot: 90 });
   // 俯视图：总宽（下方）+ 总深（右侧）
-  pushDim(labels, { x: fx, y: ty0 - D - 620 }, { x: fx + W, y: ty0 - D - 620 }, `${W}`, -170);
-  pushDim(labels, { x: fx + W + 360, y: ty0 }, { x: fx + W + 360, y: ty0 - D }, `${D}`, 210, 90);
+  dims.add({ p0: { x: fx, y: ty0 - D }, p1: { x: fx + W, y: ty0 - D }, txt: `${W}`, orientation: 'h', side: 'bottom', baseOffset: 620, textOffset: -170 });
+  dims.add({ p0: { x: fx + W, y: ty0 }, p1: { x: fx + W, y: ty0 - D }, txt: `${D}`, orientation: 'v', side: 'right', baseOffset: 360, textOffset: 210, rot: 90 });
   // 侧视图：总深（下方）
-  pushDim(labels, { x: sx0, y: fy - 460 }, { x: sx0 + D, y: fy - 460 }, `${D}`, -170);
+  dims.add({ p0: { x: sx0, y: fy }, p1: { x: sx0 + D, y: fy }, txt: `${D}`, orientation: 'h', side: 'bottom', baseOffset: 460, textOffset: -170 });
   // 内部图：总宽（上方）
-  pushDim(labels, { x: ix0, y: fy + H + 460 }, { x: ix0 + W, y: fy + H + 460 }, `${W}`, 170);
+  dims.add({ p0: { x: ix0, y: fy + H }, p1: { x: ix0 + W, y: fy + H }, txt: `${W}`, orientation: 'h', side: 'top', baseOffset: 460, textOffset: 170 });
+  // 内部图：各分区净宽尺寸链（上方第二层，chain 隔离不干扰总宽链）
+  const dimRowCtxs = multiRow ? L.rows.map((_, ri) => ({ ctx: rowCtxs[ri]!, tag: `R${ri + 1} `, chain: `partition-R${ri + 1}`, base: 900 + ri * 400 })) : [{ ctx: rowCtxs[0]!, tag: '', chain: 'partition', base: 900 }];
+  for (const { ctx, tag, chain, base } of dimRowCtxs) {
+    for (let i = 0; i < ctx.units.length; i++) {
+      const x0 = ctx.unitX0[i]!;
+      const nw = ctx.nets[i]!;
+      dims.add({
+        p0: { x: ix0 + x0, y: fy + H },
+        p1: { x: ix0 + x0 + nw, y: fy + H },
+        txt: `${tag}${nw}`,
+        orientation: 'h',
+        side: 'top',
+        chain,
+        baseOffset: base,
+        textOffset: 150,
+      });
+    }
+  }
+  dims.emit(labels);
 
   title(fx + W / 2, fy + H + 340, VIEW_NAME.front, 150);
   title(fx + W / 2, fy + H + 130, VIEW_NOTE.front, 95);
@@ -929,6 +1063,28 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
             const zTop = rowZ0 + dr.gapOuter;
             const zBot = rowZ0 + rowNH - dr.gapOuter;
             P.rect(left, right, zTop, zBot, L_FRONT, withFronts ? 1.8 : 1.2, hidden);
+
+            /**
+             * 拉手符号（对标生产图纸）。
+             * 每扇门配 HW_HANDLE_128（见 generate.ts），图上画 96mm 长小矩形，
+             * 距开门侧门边 50mm，竖向居中。只在外观图画（withFronts）。
+             * 免拉手工艺暂无模型字段，全部门默认画拉手。
+             */
+            if (withFronts) {
+              const HANDLE_LEN = 96;
+              const HANDLE_W = 18;
+              const HANDLE_EDGE = 50;
+              // 开门侧：单扇按 hingeSide；双扇对开时左扇右手、右扇左手（中间相遇）
+              let handleX: number;
+              if (widths.length === 2) {
+                handleX = k === 0 ? right - HANDLE_EDGE - HANDLE_W : left + HANDLE_EDGE;
+              } else {
+                const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
+                handleX = hingeLeft ? right - HANDLE_EDGE - HANDLE_W : left + HANDLE_EDGE;
+              }
+              const handleZ = (zTop + zBot) / 2 - HANDLE_LEN / 2;
+              P.rect(handleX, handleX + HANDLE_W, handleZ, handleZ + HANDLE_LEN, L_HW, 1.2);
+            }
 
             if (withFronts && isGlass) {
               // 斜线只表示材质（灰玻），不表示开向 —— 开向仍由下方对角线表达。

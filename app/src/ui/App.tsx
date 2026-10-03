@@ -97,9 +97,10 @@ export function App() {
   const [cmdOpen, setCmdOpen] = useState(false);
   const [lastMsg, setLastMsg] = useState('');
   /**
-   * 登录 token 放在 sessionStorage（不是 localStorage）：关掉标签页即失效，
-   * 也不跨标签页共享。代价是每次开新标签要重新登录 —— 换来的是
-   * "共用这台电脑的另一个人打开浏览器拿不到你的会话"。
+   * 登录 token 放在 localStorage（2026-10-03 从 sessionStorage 迁过来）：
+   * 关掉标签页重开、新标签页、浏览器自动化都不再要求重复登录。
+   * 代价是共用这台电脑的人能拿到会话 —— 个人 NAS 部署可接受，
+   * 不想要就点「退出登录」（会清掉）。
    */
   const [token, setTokenRaw] = useState<string | null>(() => loadToken());
   const setToken = useCallback((t: string | null) => {

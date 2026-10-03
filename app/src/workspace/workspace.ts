@@ -24,7 +24,7 @@
 import type { Issue, Project, RuleSet } from '../core/types.ts';
 import { CommandBus } from '../core/commandBus.ts';
 import type { Command, DerivedSummary, ExecResult } from '../core/commandBus.ts';
-import { serializeProjectFile, parseProjectFile } from '../core/projectFile.ts';
+import { serializeProjectFile, parseProjectFile, migrateDuplicateUnitIds } from '../core/projectFile.ts';
 import { sampleProject } from '../core/docFactory.ts';
 
 /** 落盘函数：调用方把「内存真相」序列化成字符串传入，队列只负责原子有序写。 */
@@ -271,13 +271,27 @@ export class WorkspaceStore {
     loadDrafts?: DraftLoadFn;
   }): WorkspaceStore {
     const raw = opts.readRaw();
-    const parsed = parseProjectFile(raw);
+    let parsed = parseProjectFile(raw);
+    let effectiveRaw = raw;
     if (!parsed.ok) {
-      throw new Error(`Workspace 文件不是合法项目文件：${parsed.error}`);
+      // 2026-10-03 紧急迁移：Bug 1 修之前的遗留数据（分区 id 重复 unit_001）
+      // 会导致加载失败。尝试自动迁移，成功则用迁移后的内容继续。
+      const mig = migrateDuplicateUnitIds(raw);
+      if (mig.fixed && mig.content) {
+        // 落盘迁移后的文件（经串行写队列），下次启动直接过
+        void opts.persist(mig.content).catch(() => {});
+        parsed = parseProjectFile(mig.content);
+        if (!parsed.ok) {
+          throw new Error(`Workspace 文件不是合法项目文件（迁移后仍失败）：${parsed.error}`);
+        }
+        effectiveRaw = mig.content;
+      } else {
+        throw new Error(`Workspace 文件不是合法项目文件：${parsed.error}`);
+      }
     }
     let env: Record<string, unknown>;
     try {
-      env = JSON.parse(raw) as Record<string, unknown>;
+      env = JSON.parse(effectiveRaw) as Record<string, unknown>;
     } catch {
       throw new Error('Workspace 文件 JSON 解析失败');
     }

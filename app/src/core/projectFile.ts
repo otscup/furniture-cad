@@ -430,3 +430,73 @@ export function parseProjectFile(raw: string): ParseResult {
   const savedAt = typeof o.savedAt === 'string' ? o.savedAt : '';
   return { ok: true, project: p, savedAt, warnings };
 }
+
+/**
+ * 数据迁移：修复重复的分区 id（2026-10-03 紧急）。
+ *
+ * 背景：Bug 1 修之前，MCP 写入的柜体分区 id 全是 `unit_001`（跨柜重复）。
+ * parseProjectFile 的 `checkIdsUnique` 会拒收这种文件，导致 workspace
+ * 加载失败、MCP 全不可用。
+ *
+ * 策略：把重复的分区 id 重命名为全局唯一（`{cabinetId}_u{序号}`），
+ * 保持确定性（同一文件每次迁移结果一致）。分区 id 无外部引用，改名安全。
+ *
+ * @returns { fixed: true, migrated: 迁移的分区数 } 或 { fixed: false, error }
+ */
+export function migrateDuplicateUnitIds(raw: string): { fixed: boolean; content?: string; migrated?: number; error?: string } {
+  let env: unknown;
+  try {
+    env = JSON.parse(raw);
+  } catch (e) {
+    return { fixed: false, error: `不是合法的 JSON：${(e as Error).message}` };
+  }
+  const o = env as Record<string, unknown>;
+  const p = o.project as Record<string, unknown> | undefined;
+  if (!p || !Array.isArray(p.cabinets)) {
+    return { fixed: false, error: 'project.cabinets 不是数组' };
+  }
+
+  const seen = new Set<string>();
+  let migrated = 0;
+
+  const fixUnits = (units: Array<Record<string, unknown>>, cabId: string): void => {
+    for (let i = 0; i < units.length; i++) {
+      const u = units[i];
+      const id = String(u.id ?? '');
+      if (seen.has(id)) {
+        // 重复：重命名为 {cabId}_u{序号}
+        const newId = `${cabId}_u${String(i + 1).padStart(2, '0')}`;
+        u.id = newId;
+        seen.add(newId);
+        migrated++;
+      } else {
+        seen.add(id);
+      }
+    }
+  };
+
+  for (const cab of p.cabinets as Array<Record<string, unknown>>) {
+    const cabId = String(cab.id ?? 'cab');
+    const layout = cab.layout as Record<string, unknown> | undefined;
+    if (!layout) continue;
+    if (Array.isArray(layout.units)) {
+      fixUnits(layout.units as Array<Record<string, unknown>>, cabId);
+    }
+    if (Array.isArray(layout.rows)) {
+      for (const row of layout.rows as Array<Record<string, unknown>>) {
+        if (Array.isArray(row.units)) {
+          fixUnits(row.units as Array<Record<string, unknown>>, cabId);
+        }
+      }
+    }
+    if (Array.isArray(layout.backUnits)) {
+      fixUnits(layout.backUnits as Array<Record<string, unknown>>, cabId);
+    }
+  }
+
+  if (migrated === 0) {
+    return { fixed: false, error: '没有发现重复的分区 id' };
+  }
+
+  return { fixed: true, content: JSON.stringify(env), migrated };
+}

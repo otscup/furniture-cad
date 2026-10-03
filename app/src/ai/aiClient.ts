@@ -522,7 +522,10 @@ const TOKEN_KEY = 'furniture-cad.auth.token';
 
 export function loadToken(): string | null {
   try {
-    return sessionStorage.getItem(TOKEN_KEY);
+    // 2026-10-03：从 sessionStorage 换成 localStorage —— 浏览器自动化/
+    // 新标签页不再要求重复登录。安全权衡：这是个人 NAS 部署，共用电脑
+    // 的场景由用户自己点「退出登录」清掉（saveToken(null) 会删）。
+    return localStorage.getItem(TOKEN_KEY) ?? sessionStorage.getItem(TOKEN_KEY);
   } catch {
     return null;
   }
@@ -530,9 +533,12 @@ export function loadToken(): string | null {
 
 export function saveToken(t: string | null): void {
   try {
-    if (t) sessionStorage.setItem(TOKEN_KEY, t);
-    else sessionStorage.removeItem(TOKEN_KEY);
+    if (t) localStorage.setItem(TOKEN_KEY, t);
+    else {
+      localStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(TOKEN_KEY);
+    }
   } catch {
-    /* 隐私模式下 sessionStorage 可能不可用 —— 那就只能不记住登录，正常工作仍不受影响 */
+    /* 隐私模式下 storage 可能不可用 —— 那就只能不记住登录，正常工作仍不受影响 */
   }
 }

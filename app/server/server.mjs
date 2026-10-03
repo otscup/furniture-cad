@@ -630,7 +630,8 @@ async function handleApi(req, res, pathname) {
     pathname === '/api/ai/plan' ||
     pathname === '/api/ai/design' ||
     pathname === '/api/ai/vision' ||
-    pathname === '/api/ai/vision/fetch';
+    pathname === '/api/ai/vision/fetch' ||
+    pathname === '/api/ai/agent';
   const gate = requireAuth(req, res, pathname, { manage: managePaths, design: designPaths });
   if (!gate.ok) return;
   const actor = gate.account ? gate.account.id : null;
@@ -1473,6 +1474,53 @@ async function handleApi(req, res, pathname) {
     await ws.workspace.deleteDraftFile(draftId);
     auth.audit({ action: 'draft.discard', actor: gate.account?.id, draftId, result: 'ok' });
     return json(res, 200, { ok: true });
+  }
+
+  /**
+   * Agent 循环（内置 AI Agent 模式）。
+   * 用户意图 → AI 调 MCP 工具 → 失败重试（3 轮）→ validate → 返回步骤+总结。
+   * 复用 MCP 工具链（localhost HTTP）、vision 链路、AI 网关配置。
+   */
+  if (pathname === '/api/ai/agent' && req.method === 'POST') {
+    const body = await readBody(req);
+    const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
+    const key = env.AI_API_KEY || '';
+    const model = body.model || env.AI_MODEL || s.model;
+    if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
+    if (typeof body.intent !== 'string' || !body.intent.trim()) {
+      return json(res, 400, { ok: false, error: 'intent 不能为空' });
+    }
+    // 额度检查（走对话额度，不算生成次数）
+    if (gate.account) {
+      const q = auth.checkQuota(gate.account.id, { generation: false });
+      if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code });
+    }
+    const { runAgentLoop } = await import('./agentLoop.mjs');
+    // MCP 地址：本机回环
+    const mcpBaseUrl = `http://127.0.0.1:${PORT}`;
+    // 用户 token：从 Authorization 头透传给 MCP
+    const userToken = bearer(req);
+    try {
+      const result = await runAgentLoop({
+        intent: body.intent.trim(),
+        imageData: body.imageData || null,
+        visionResult: body.visionResult || null,
+        draftId: body.draftId || null,
+        token: userToken,
+        mcpBaseUrl,
+        aiConfig: {
+          baseUrl,
+          apiKey: key,
+          model,
+          timeoutMs: Number(env.AI_TIMEOUT_MS ?? 120000),
+        },
+      });
+      // 记账
+      if (gate.account) auth.recordUsage(gate.account.id, { generation: false });
+      return json(res, 200, { ok: true, ...result });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: `Agent 执行失败：${e?.message ?? e}`, code: 'AGENT_FAILED' });
+    }
   }
 
   if (pathname === '/api/ai/vision' && req.method === 'POST') {

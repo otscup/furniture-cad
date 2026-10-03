@@ -765,6 +765,21 @@ a.tb-btn { text-decoration: none; }
 .chat-image img { border-radius: 4px; border: 1px solid var(--line); }
 .chat-vision { margin-top: 4px; }
 .chat-vision summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+/* Agent 执行步骤 */
+.chat-agent { margin-top: 6px; border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+.chat-agent summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.agent-steps { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.agent-step { border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; font-size: 12px; }
+.agent-step.ok { border-left: 3px solid #22a06b; }
+.agent-step.fail { border-left: 3px solid #d33; }
+.agent-step-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.agent-step-num { color: var(--muted); font-size: 11px; }
+.agent-step code { background: var(--code-bg, #f0f1f4); padding: 1px 6px; border-radius: 3px; font-size: 11px; }
+.ok-tag { color: #22a06b; font-weight: 600; }
+.fail-tag { color: #d33; font-weight: 600; }
+.agent-step details { margin-top: 4px; }
+.agent-step summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+.agent-error { color: #d33; margin-top: 4px; font-size: 12px; }
 .ai-input { width: 100%; min-height: 62px; border: 1px solid var(--line); border-radius: 5px; padding: 7px 8px; font: inherit; font-size: 12px; line-height: 1.55; resize: vertical; box-sizing: border-box; }
 .ai-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 

@@ -124,7 +124,7 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * @param opts.onStep 步骤回调（流式推送给前端，可选）
  */
 export async function runAgentLoop(opts) {
-  const { intent, imageData, visionResult, draftId, token, mcpBaseUrl, aiConfig, onStep } = opts;
+  const { intent, imageData, visionResult, draftId, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
   const steps = [];
   let currentDraftId = draftId || null;
   let round = 0;
@@ -154,8 +154,18 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
 
   const messages = [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: intent },
   ];
+  // 历史对话（上下文）：让 Agent 理解追问
+  if (history && Array.isArray(history) && history.length > 0) {
+    messages.push({
+      role: 'system',
+      content: `以下是之前的对话历史（最近 ${history.length} 轮），用于理解用户的追问和指代：\n` +
+        history.map((h, i) =>
+          `[${i + 1}] ${h.role === 'user' ? '用户' : 'AI'}：${h.text}${h.agentSummary ? `\n    （${h.agentSummary}）` : ''}`
+        ).join('\n'),
+    });
+  }
+  messages.push({ role: 'user', content: intent });
 
   // 3. 主循环
   while (round < MAX_ROUNDS) {

@@ -100,6 +100,16 @@ export interface RoomBookCabinet {
   boardMaterial: string;
   backMaterial: string;
   doorMaterial: string | null;
+  /** 壁挂安装高度（mm，0=落地柜） */
+  mountHeight: number;
+  /** 见光板：none/left/right/both */
+  finishedEnds: string;
+  /**
+   * 工艺标注（对标生产图纸）：
+   * 如 ["灯带居中", "黑框灰玻", "柜体色免拉手"]
+   * 从分区 ledStrip、门板材质、五金等派生
+   */
+  craftNotes: string[];
   planSvg: string;
   frontSvg: string;
   internalSvg: string;
@@ -145,8 +155,30 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
   const buildCab = (cab: Cabinet, index: number): RoomBookCabinet => {
     const g = geom.cabinets[cab.id]!;
     const vs = buildCabinetViews(cab, rules);
-    const doorUnit = allUnits(cab.layout).find((u) => u.doors);
+    const units = allUnits(cab.layout);
+    const doorUnit = units.find((u) => u.doors);
     const doorMatName = doorUnit?.doors?.material ? (rules.materials[doorUnit.doors.material]?.name ?? doorUnit.doors.material) : null;
+    // ── 工艺标注（对标生产图纸）──
+    const craftNotes: string[] = [];
+    // 灯带：收集所有分区的 ledStrip，去重后转中文
+    const ledPositions = new Set<string>();
+    for (const u of units) {
+      const ls = u.shelves?.ledStrip;
+      if (ls && ls !== 'none') ledPositions.add(ls);
+    }
+    const LED_ZH: Record<string, string> = { center: '灯带居中', front: '灯带靠前', angled45: '45°斜光灯带' };
+    for (const pos of ledPositions) {
+      if (LED_ZH[pos]) craftNotes.push(LED_ZH[pos]);
+    }
+    // 门板材质：玻璃门特别标注
+    if (doorUnit?.doors?.material) {
+      const mat = rules.materials[doorUnit.doors.material];
+      if (mat?.kind === 'glass') craftNotes.push(mat.name ?? '玻璃门');
+    }
+    // 见光板
+    const fe = cab.params.finishedEnds;
+    if (fe === 'left' || fe === 'right') craftNotes.push(`${fe === 'left' ? '左' : '右'}见光板`);
+    else if (fe === 'both') craftNotes.push('双侧见光板');
     return {
       id: cab.id,
       name: cab.name,
@@ -157,6 +189,9 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       boardMaterial: rules.materials[cab.params.boardMaterial]?.name ?? cab.params.boardMaterial,
       backMaterial: rules.materials[cab.params.backPanel.material]?.name ?? cab.params.backPanel.material,
       doorMaterial: doorMatName,
+      mountHeight: cab.params.mountHeight ?? 0,
+      finishedEnds: fe ?? 'none',
+      craftNotes,
       planSvg: primsToSvg(g.plan, 'dwg'),
       frontSvg: primsToSvg(vs.prims.front, 'dwg'),
       internalSvg: primsToSvg(vs.prims.internal, 'dwg'),
@@ -233,6 +268,10 @@ const CSS = `
   .triptych svg { width: 100%; height: 62mm; border: 0.5pt solid #999; background: #fff; }
   .triptych figcaption { font-size: 8.5pt; text-align: center; color: #444; padding: 0.8mm 0; }
   .mat-line { font-size: 9pt; margin: 1.5mm 0; }
+  .cabinet-meta { margin: 2mm 0; font-size: 9pt; }
+  .cabinet-meta th { background: #f0f1f4; width: 14mm; }
+  .cabinet-meta td { min-width: 28mm; }
+  .cabinet-foot { font-size: 8pt; color: #666; margin: 2mm 0; border-top: 0.5pt solid #999; padding-top: 1mm; display: flex; justify-content: space-between; }
   @page { size: A4 landscape; margin: 0; }
   @media print { .no-print { display: none; } }
   .print-hint { background: #fffbe6; border: 0.5pt solid #e0c96b; padding: 2mm 3mm; font-size: 9pt; margin-bottom: 3mm; }
@@ -260,9 +299,18 @@ export function roomBookHtml(book: RoomBook): string {
     parts.push(`<section class="page">`);
     parts.push(`<h2>${esc(sec.roomName)}</h2>`);
     for (const c of sec.cabinets) {
-      parts.push(`<div class="cabinet-head"><h3 style="margin:2mm 0">${esc(c.name)} <span style="color:#666;font-size:9pt">${esc(c.id)}</span></h3>`);
-      parts.push(`<div class="cabinet-spec">W ${c.width} × H ${c.height} × D ${c.depth} mm</div></div>`);
-      parts.push(`<div class="mat-line">板材：${esc(c.boardMaterial)}　背板：${esc(c.backMaterial)}${c.doorMaterial ? `　门板：${esc(c.doorMaterial)}` : ''}</div>`);
+      // ── 柜体表头（对标生产图纸：工艺/材质/规格/封边）──
+      parts.push(`<table class="cabinet-meta"><tr>`);
+      parts.push(`<th>柜体</th><td>${esc(c.name)}</td>`);
+      parts.push(`<th>规格</th><td>W${c.width}×H${c.height}×D${c.depth}</td>`);
+      parts.push(`<th>板材</th><td>${esc(c.boardMaterial)}</td>`);
+      parts.push(`<th>封边</th><td>同色</td>`);
+      parts.push(`</tr><tr>`);
+      parts.push(`<th>门板</th><td>${c.doorMaterial ? esc(c.doorMaterial) : '—'}</td>`);
+      parts.push(`<th>背板</th><td>${esc(c.backMaterial)}</td>`);
+      parts.push(`<th>工艺</th><td>${c.craftNotes.length > 0 ? c.craftNotes.map(esc).join(' / ') : '标准'}</td>`);
+      parts.push(`<th>安装</th><td>${c.mountHeight > 0 ? `壁挂，底离地 ${c.mountHeight}mm` : '落地'}</td>`);
+      parts.push(`</tr></table>`);
       parts.push(`<div class="triptych">`);
       parts.push(`<figure>${c.planSvg}<figcaption>平面图</figcaption></figure>`);
       parts.push(`<figure>${c.frontSvg}<figcaption>立面外观（门板图）</figcaption></figure>`);
@@ -278,6 +326,8 @@ export function roomBookHtml(book: RoomBook): string {
         for (const p of c.purchased) parts.push(`<tr><td>${esc(p.nameZh)}</td><td>${esc(p.material)}</td><td>${esc(p.spec)}</td><td>${p.qty}</td></tr>`);
         parts.push(`</table>`);
       }
+      // ── 柜体页脚（对标生产图纸：备注/签字栏）──
+      parts.push(`<div class="cabinet-foot"><span>备注：${c.hardware.length > 0 ? '五金见上表' : '—'}</span><span>客户签字：</span><span>日期：</span></div>`);
     }
     parts.push(`</section>`);
   }

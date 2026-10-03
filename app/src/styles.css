@@ -780,6 +780,29 @@ a.tb-btn { text-decoration: none; }
 .agent-step details { margin-top: 4px; }
 .agent-step summary { cursor: pointer; font-size: 11px; color: var(--muted); }
 .agent-error { color: #d33; margin-top: 4px; font-size: 12px; }
+/* 项目目录 */
+.projects-panel { padding: 8px; }
+.projects-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.projects-title { font-weight: 600; font-size: 13px; }
+.projects-new { margin-bottom: 8px; padding: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg-soft, #f8f9fa); }
+.projects-new .tb-input { width: 100%; margin-bottom: 6px; }
+.projects-tree { display: flex; flex-direction: column; gap: 8px; }
+.project-node { border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+.project-node.active { border-color: var(--accent); background: var(--accent-soft, #f0f7ff); }
+.project-head { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.project-icon { font-size: 14px; }
+.project-name { font-weight: 600; font-size: 13px; flex: 1; }
+.active-tag { color: var(--accent); font-size: 11px; font-weight: normal; }
+.project-meta { font-size: 11px; }
+.project-rooms { margin: 6px 0 6px 20px; display: flex; flex-direction: column; gap: 4px; }
+.project-rooms.collapsed { margin-left: 20px; }
+.room-node { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 3px; cursor: pointer; font-size: 12px; }
+.room-node:hover { background: var(--hover-bg, #eef0f3); }
+.room-icon { font-size: 12px; }
+.room-new { margin-top: 6px; padding: 6px; border: 1px dashed var(--line); border-radius: 3px; }
+.room-new .tb-input { width: 100%; margin-bottom: 6px; font-size: 12px; }
+.project-actions { margin-top: 6px; }
+.projects-hint { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
 .ai-input { width: 100%; min-height: 62px; border: 1px solid var(--line); border-radius: 5px; padding: 7px 8px; font: inherit; font-size: 12px; line-height: 1.55; resize: vertical; box-sizing: border-box; }
 .ai-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 

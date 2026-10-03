@@ -631,7 +631,9 @@ async function handleApi(req, res, pathname) {
     pathname === '/api/ai/design' ||
     pathname === '/api/ai/vision' ||
     pathname === '/api/ai/vision/fetch' ||
-    pathname === '/api/ai/agent';
+    pathname === '/api/ai/agent' ||
+    pathname === '/api/projects' ||
+    pathname.startsWith('/api/projects/');
   const gate = requireAuth(req, res, pathname, { manage: managePaths, design: designPaths });
   if (!gate.ok) return;
   const actor = gate.account ? gate.account.id : null;
@@ -1506,6 +1508,7 @@ async function handleApi(req, res, pathname) {
         imageData: body.imageData || null,
         visionResult: body.visionResult || null,
         draftId: body.draftId || null,
+        history: Array.isArray(body.history) ? body.history : null,
         token: userToken,
         mcpBaseUrl,
         aiConfig: {
@@ -1520,6 +1523,60 @@ async function handleApi(req, res, pathname) {
       return json(res, 200, { ok: true, ...result });
     } catch (e) {
       return json(res, 500, { ok: false, error: `Agent 执行失败：${e?.message ?? e}`, code: 'AGENT_FAILED' });
+    }
+  }
+
+  /**
+   * 项目目录管理（多项目）。
+   * GET  /api/projects              列出项目
+   * POST /api/projects              创建项目 {name}
+   * POST /api/projects/:id/activate 切换当前项目（需重启 workspace）
+   * DELETE /api/projects/:id        删除项目
+   */
+  const DATA_DIR = dirname(ACCOUNTS_PATH);
+  if (pathname === '/api/projects' && req.method === 'GET') {
+    const { listProjects, migrateIfNeeded } = await import('./projects.mjs');
+    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    const projects = listProjects(DATA_DIR);
+    return json(res, 200, { ok: true, projects });
+  }
+  if (pathname === '/api/projects' && req.method === 'POST') {
+    const body = await readBody(req);
+    const { createProject, listProjects, migrateIfNeeded } = await import('./projects.mjs');
+    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    if (typeof body.name !== 'string' || !body.name.trim()) {
+      return json(res, 400, { ok: false, error: '项目名称不能为空' });
+    }
+    const p = createProject(DATA_DIR, body.name);
+    return json(res, 200, { ok: true, project: p, projects: listProjects(DATA_DIR) });
+  }
+  const activateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/activate$/);
+  if (activateMatch && req.method === 'POST') {
+    const { setActiveProject, getProjectFilePath } = await import('./projects.mjs');
+    const projectId = decodeURIComponent(activateMatch[1]);
+    try {
+      setActiveProject(DATA_DIR, projectId);
+      // 注意：切换项目后需要重启服务才能加载新 workspace（workspace 在启动时打开）
+      // 这里返回新路径，前端提示用户刷新
+      return json(res, 200, {
+        ok: true,
+        activeId: projectId,
+        needReload: true,
+        message: '已切换项目，请刷新页面加载新项目',
+      });
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e?.message ?? '切换失败' });
+    }
+  }
+  const deleteMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (deleteMatch && req.method === 'DELETE') {
+    const { deleteProject, listProjects } = await import('./projects.mjs');
+    const projectId = decodeURIComponent(deleteMatch[1]);
+    try {
+      deleteProject(DATA_DIR, projectId);
+      return json(res, 200, { ok: true, projects: listProjects(DATA_DIR) });
+    } catch (e) {
+      return json(res, 400, { ok: false, error: e?.message ?? '删除失败' });
     }
   }
 

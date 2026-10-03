@@ -814,7 +814,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         rotation,
         rules,
         ...(action.origin ? { origin: action.origin } : {}),
-        params: { width, height, depth },
+        params: { width, height, depth, ...(p.mountHeight !== undefined ? { mountHeight: Number(p.mountHeight) } : {}) },
         units,
         backUnits,
         rows,

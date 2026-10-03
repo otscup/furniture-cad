@@ -241,6 +241,15 @@ export interface CabinetParams {
     clearance: number;
   };
   bodyLift: number;
+  /**
+   * 壁挂安装高度（mm）：柜体底板离地高度。
+   *   · 落地柜恒为 0（bodyLift 管踢脚）；
+   *   · 壁挂柜（吊柜）按需给，如 1400。
+   * 不叫 `z` 是故意的：placement 明确没有 Z（见 ConnectionKind 注释），
+   * 这是参数层的语义字段，不是 3D 坐标。几何引擎不读它，
+   * 只进清单/图纸标注（安装高度）。
+   */
+  mountHeight?: number;
   shelfFrontClearance: number;
   /**
    * 见光板（圆弧见光，Phase E 表达异形）。

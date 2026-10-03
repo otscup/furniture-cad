@@ -379,7 +379,7 @@ const WRITABLE: Record<string, RegExp[]> = {
    */
   'cabinet.resize': [/^params\.(width|height|depth)$/, /^placement\.(x|y)$/],
   'cabinet.update': [
-    /^params\.(width|height|depth|bodyLift|shelfFrontClearance|finishedEnds)$/,
+    /^params\.(width|height|depth|bodyLift|mountHeight|shelfFrontClearance|finishedEnds)$/,
     /^params\.backPanel\.(grooveDepth|grooveSetback|clearance|material|method)$/,
     /^params\.boardMaterial$/,
   ],
@@ -519,6 +519,7 @@ function sanitize(change: Change): { value: unknown; note?: string } {
   if (key === 'x' || key === 'y') return clampTo(-100000, 100000, '世界坐标 mm');
   if (key === 'width' || key === 'height' || key === 'depth') return clampTo(100, 6000, '100~6000mm');
   if (key === 'bodyLift') return clampTo(0, 300, '踢脚高 0~300mm');
+  if (key === 'mountHeight') return clampTo(0, 3000, '壁挂安装高度 0~3000mm');
   if (key === 'shelfFrontClearance') return clampTo(0, 100, '前沿让位');
   if (key === 'runnerLength') return clampTo(200, 600, '滑轨长度');
   if (key === 'gap' || key === 'gapOuter' || key === 'gapMid') return clampTo(0, 20, '缝隙');

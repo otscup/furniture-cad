@@ -361,6 +361,7 @@ export const ACTIONS = {
       },
       units: UNIT_INTENT_DOC,
       backUnits: { ...UNIT_INTENT_DOC, desc: '背面分区（从左到右）。给了就建**双面柜（岛台）**：前后两排背靠背、共用中板、没有背板。岛台/吧台这类两面临走的柜子才用' },
+      mountHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', optional: true, desc: '壁挂安装高度：柜体底板离地高度。吊柜给（如 1400）；落地柜不给（=0）。' },
       /**
        * 垂直行（v0.3 / P1 形状；P3 起设计方案也能表达）。
        * "上面挂衣服、下面放鞋"这种**上下分层**用 rows；units 是左右并排。

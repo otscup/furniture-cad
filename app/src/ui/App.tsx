@@ -36,7 +36,7 @@ import { DraftsPanel } from './panels/DraftsPanel.tsx';
 import { ImportPanel } from './panels/ImportPanel.tsx';
 import { KnowledgePanel } from './panels/KnowledgePanel.tsx';
 import { ManufacturingPanel } from './panels/ManufacturingPanel.tsx';
-import { RoomsPanel } from './panels/RoomsPanel.tsx';
+import { ProjectsPanel } from './panels/ProjectsPanel.tsx';
 import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
@@ -87,7 +87,7 @@ export function App() {
   const [pendingMove, setPendingMove] = useState<{ base: Vec2 | null } | null>(null);
   const [rightTab, setRightTab] = useState<RightTab>('props');
   /** 房间页的两种状态：列表 / 新建表单。放在这里是因为面板按需挂载，卸载会丢 state */
-  const [roomsView, setRoomsView] = useState<'list' | 'new'>('list');
+  const [_roomsView, _setRoomsView] = useState<'list' | 'new'>('list');
   const [leftTab, setLeftTab] = useState<'tree' | 'layers'>('tree');
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [fitSignal, setFitSignal] = useState(0);
@@ -424,7 +424,7 @@ export function App() {
    */
   const onNewRoom = useCallback(() => {
     setRightTab('rooms');
-    setRoomsView('new');
+    // 新版：在项目树下点「新建房间」（ProjectsPanel 自带表单）
   }, []);
 
   /** 房间真被创建出来之后：收起工具、重新取景 */
@@ -1047,7 +1047,7 @@ export function App() {
               视图
             </button>
             <button type="button" className={rightTab === 'rooms' ? 'on' : ''} onClick={() => setRightTab('rooms')}>
-              房间{projectRooms > 0 ? <span className="tab-badge">{projectRooms}</span> : null}
+              项目{projectRooms > 0 ? <span className="tab-badge">{projectRooms}</span> : null}
             </button>
             <button type="button" className={rightTab === 'variant' ? 'on' : ''} onClick={() => setRightTab('variant')}>
               方案
@@ -1099,15 +1099,37 @@ export function App() {
             <ViewsPanel bus={bus} version={version} mode={mode} setMode={setMode} explode={explode} setExplode={setExplode} />
           ) : null}
           {rightTab === 'rooms' ? (
-            <RoomsPanel
-              bus={bus}
-              version={version}
-              run={run}
+            <ProjectsPanel
+              token={token}
+              rooms={bus.getState().rooms.map(r => ({ id: r.id, name: r.name }))}
               onToast={toast}
               onFocusRoom={focusRoomById}
-              view={roomsView}
-              onViewChange={setRoomsView}
-              onCreated={onRoomCreated}
+              onCreateRoom={(name) => {
+                // 在当前项目下新建房间（默认 4000×3000mm，用户可后续调整）
+                const project = bus.getState();
+                const takenIds = new Set<string>();
+                for (const r of project.rooms) {
+                  takenIds.add(r.id);
+                  for (const wl of r.walls) takenIds.add(wl.id);
+                }
+                // 找个空位：放在现有房间右侧
+                let x = 0;
+                for (const r of project.rooms) {
+                  for (const w of r.walls) {
+                    x = Math.max(x, w.start.x, w.end.x);
+                  }
+                }
+                x += 500; // 间隔 500mm
+                import('../core/docFactory.ts').then(({ rectRoom }) => {
+                  const room = rectRoom({ name, x, y: 0, w: 4000, h: 3000, takenIds });
+                  if (run(CMD.createRoomCommand(room))) {
+                    toast('ok', `已在当前项目下新建房间「${name}」`);
+                    onRoomCreated();
+                  } else {
+                    toast('error', '新建房间被总线拒绝');
+                  }
+                });
+              }}
             />
           ) : null}
           {rightTab === 'variant' ? (

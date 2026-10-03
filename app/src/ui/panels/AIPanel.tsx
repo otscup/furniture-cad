@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
 import type { Issue } from '../../core/types.ts';
 import { ACTION_NAMES, ACTIONS } from '../../../shared/aiContract.mjs';
-import { api, requestChat, requestDesign, requestPlan, type ChatTurn, type DesignResponse, type PlanRejection } from '../../ai/aiClient.ts';
+import { api, requestChat, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
 import type { QuotaView } from '../../ai/quotaTypes.ts';
 import { QuotaMeter } from '../QuotaMeter.tsx';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
@@ -11,15 +11,11 @@ import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
 import { parseImageVisionImport } from '../../ai/import/imageVisionAdapter.ts';
 import { compileImport } from '../../ai/import/compileImport.ts';
 import {
-  addDraftRound,
-  draftSnapshot,
   finalizeDraft,
-  startDraft,
   undoLastRound,
   type DraftSession,
 } from '../../ai/draftSession.ts';
-import { validateProposal, type DesignProposal } from '../../ai/proposal.ts';
-import { compileProposal } from '../../ai/compileProposal.ts';
+import { type DesignProposal } from '../../ai/proposal.ts';
 import type { AiAction } from '../../ai/compile.ts';
 import { PlanRunView } from './PlanRunView.tsx';
 import { CandidateComparePanel } from './candidateCompare.tsx';
@@ -27,7 +23,7 @@ import { resolveSelection, type StoredCandidateSelection } from './candidateComp
 import { candidateKey } from '../../core/candidateLayout/generate.ts';
 import { planCandidates, type PlannerPlan } from '../../core/planner/index.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
-import { currentKnowledge, resolveKnowledge, knowledgeDigest as knowledgeDigestOf } from '../../ai/knowledge/index.ts';
+import { currentKnowledge } from '../../ai/knowledge/index.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
 import { DraftPreview } from './DraftPreview.tsx';
 
@@ -547,6 +543,13 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     setPendingImage(null);
     setBusyKind('agent');
     try {
+      // 带上历史对话（最近 10 轮），Agent 能理解追问（"再高一点"、"改成三抽屉"）
+      const history = chat.slice(-10).map(t => ({
+        role: t.role,
+        text: t.text?.slice(0, 500) || '',
+        // Agent 上轮做了什么（工具调用摘要），帮助理解上下文
+        agentSummary: t.agentSteps ? `上轮 Agent 执行${t.agentOk ? '成功' : '失败'}，步骤：${t.agentSteps.slice(0, 300)}` : undefined,
+      }));
       const r = await fetch('/api/ai/agent', {
         method: 'POST',
         headers: {
@@ -557,6 +560,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           intent: q,
           imageData,
           visionResult: visionResult ? JSON.parse(visionResult) : null,
+          history,
         }),
       });
       const j = await r.json();
@@ -710,38 +714,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
   // ── 计划 ──
 
-  const generatePlan = useCallback(async () => {
-    const q = text.trim();
-    if (!q || busy) return;
-    setBusyKind('plan');
-    setPlan({ reply: '', rejected: [], rawReply: '', reasoning: '', meta: null, err: '', lastApply: '', run: null });
-    try {
-      const r = await requestPlan({ text: `${scopePrefix}${q}`, snapshot, token: props.token });
-      if (r.quota) setQuota(r.quota);
-      setPlan({
-        reply: r.reply,
-        rejected: r.rejected,
-        rawReply: r.raw ?? '',
-        reasoning: r.reasoning ?? '',
-        meta: { model: r.model, tokens: r.usage?.total_tokens, reasoningTokens: r.usage?.reasoning_tokens, ms: r.ms },
-      });
-      if (!r.ok) {
-        setPlan({ err: r.error ?? '规划失败' });
-        props.onToast?.('error', r.error ?? '规划失败');
-        return;
-      }
-      if (r.actions.length === 0) {
-        setPlan({ err: '' });
-        props.onToast?.('info', 'AI 认为不需要改动模型（它只回了一句话）');
-        return;
-      }
-      // 干跑：拿真总线上的记忆门，跑在沙盒模型上
-      const g = compiledRules().gate;
-      setPlan({ run: dryRunPlan({ bus, actions: r.actions, gate: g, selection: props.selection }) });
-    } finally {
-      setBusyKind('');
-    }
-  }, [bus, busy, props, scopePrefix, setPlan, snapshot, text]);
+
 
   const apply = useCallback(() => {
     const run = convo.plan.run;
@@ -898,68 +871,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * 修订：把上一轮的（用户原话 + AI 给的标题/说明）作为 history 再生成一次，
    * 模型就能在原有方案上"加一句"而不用从头来。
    */
-  const generateDesign = useCallback(async () => {
-    const q = text.trim();
-    if (!q || busy) return;
-    setBusyKind('design');
-    setDesign({
-      proposal: null,
-      lastText: q,
-      reasoning: '',
-      meta: null,
-      err: '',
-      issues: [],
-      notes: [],
-      openQuestions: [],
-      run: null,
-      lastApply: '',
-    });
-    try {
-      const history: Array<{ role: 'user' | 'assistant'; text: string }> = design?.lastText
-        ? [
-            { role: 'user', text: design.lastText },
-            { role: 'assistant', text: `${design.proposal?.title ?? ''} ${design.proposal?.summary ?? ''}`.trim() },
-          ]
-        : [];
-      const r: DesignResponse = await requestDesign({
-        text: `${scopePrefix}${q}`,
-        snapshot,
-        history: history.slice(-6),
-        token: props.token,
-        // P6：把适用知识（含冲突警告）作为参考上下文交给 AI —— 产出仍是
-        // DesignProposal，仍走同一套校验/干跑/确认，知识不给 AI 任何特权。
-        knowledgeDigest: knowledgeDigestOf(resolveKnowledge({ roomName: activeRoom?.name }, currentKnowledge())),
-      });
-      if (r.quota) setQuota(r.quota);
-      if (!r.ok) {
-        setDesign({ err: r.error ?? '设计方案生成失败', reasoning: r.reasoning ?? '' });
-        props.onToast?.('error', r.error ?? '设计方案生成失败');
-        return;
-      }
-      const p = r.proposal as DesignProposal;
-      const project = bus.getState();
-      const issues = validateProposal(p, project);
-      const compiled = compileProposal(p, project, bus.getRules());
-      const patch: Partial<DesignBundle> = {
-        proposal: p,
-        reasoning: r.reasoning ?? '',
-        meta: { model: r.model, tokens: r.usage?.total_tokens, reasoningTokens: r.usage?.reasoning_tokens, ms: r.ms },
-        issues,
-        notes: compiled.ok ? compiled.notes : [],
-        openQuestions: p.questions ?? [],
-      };
-      if (!compiled.ok) {
-        setDesign({ ...patch, err: compiled.blockedReason ?? '这份方案还不能编译成动作' });
-        props.onToast?.('warn', compiled.blockedReason ?? '这份方案还不能编译成动作');
-        return;
-      }
-      // 干跑：拿真总线上的记忆门，跑在沙盒模型上 —— 与计划通道同一条纪律
-      const g = compiledRules().gate;
-      setDesign({ ...patch, run: dryRunPlan({ bus, actions: compiled.actions, gate: g, selection: props.selection }) });
-    } finally {
-      setBusyKind('');
-    }
-  }, [bus, busy, design, props, scopePrefix, setDesign, snapshot, text]);
+
 
   const applyDesign = useCallback(() => {
     const run = convo.design.run;
@@ -986,77 +898,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * **发给 AI 的是草案当前的样子**，不是真项目。少了这一句，第二轮的
    * "把刚才那个柜子加宽"就没有任何着落 —— AI 看不见自己上一轮建的东西。
    */
-  const generateDraft = useCallback(async () => {
-    const q = text.trim();
-    if (!q || busy) return;
-    setBusyKind('draft');
-    try {
-      const session = draft ?? startDraft(bus);
-      const snap = draftSnapshot(session, bus.getRules());
-      const history = session.rounds.flatMap((r) => [
-        { role: 'user' as const, text: r.text },
-        { role: 'assistant' as const, text: r.reply },
-      ]);
-      const r = await requestPlan({ text: `${scopePrefix}${q}`, snapshot: snap, history, token: props.token });
-      if (r.quota) setQuota(r.quota);
-      if (!r.ok) {
-        setConvo({ chat: [...chat, { role: 'user', text: q }, { role: 'assistant', text: '', error: r.error, draftRound: { round: (draft?.rounds.length ?? 0) + 1, merged: false, actions: [], rejected: r.rejected.length, note: '这一轮没有进入草案' } }] });
-        props.onToast?.('error', r.error ?? '草案生成失败');
-        setText('');
-        return;
-      }
-      if (r.actions.length === 0) {
-        // AI 只说话不动手 —— 话要留在会话里（这也是历史的一部分），草案不动
-        setConvo({ chat: [...chat, { role: 'user', text: q }, { role: 'assistant', text: r.reply }] });
-        props.onToast?.('info', 'AI 认为这一句不需要改动草案（它只回了一句话）');
-        setText('');
-        return;
-      }
-      const next = addDraftRound(session, {
-        text: q,
-        reply: r.reply,
-        actions: r.actions,
-        rejected: r.rejected,
-        rules: bus.getRules(),
-        gate: compiledRules().gate,
-        selection: props.selection,
-      });
-      const last = next.rounds[next.rounds.length - 1];
-      const failText = last.run.steps
-        .filter((s) => !s.ok)
-        .map((s) => s.error ?? '')
-        .join('；')
-        .slice(0, 240);
-      setConvo({
-        chat: [
-          ...chat,
-          { role: 'user', text: q },
-          {
-            role: 'assistant',
-            text: r.reply,
-            model: r.model,
-            usage: r.usage,
-            ms: r.ms,
-            reasoning: r.reasoning,
-            draftRound: {
-              round: last.index,
-              merged: last.merged,
-              actions: last.run.steps.map((s) => s.action.action),
-              rejected: last.rejected.length,
-              note: last.merged ? '' : failText || '这一步会在 strict 模式下引入新的 ERROR，因此整轮被拒',
-            },
-          },
-        ],
-        draft: next,
-      });
-      setText('');
-      if (!last.merged) {
-        props.onToast?.('warn', `第 ${last.index} 轮没有并进草案 —— 看会话里那条标红的原因`);
-      }
-    } finally {
-      setBusyKind('');
-    }
-  }, [bus, busy, chat, draft, props, scopePrefix, setConvo, setText, text]);
+
 
   const finalize = useCallback(() => {
     if (!draft) return;
@@ -1459,8 +1301,8 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
-              // Ctrl+Enter = 对话（轻量的那个）；加 Shift 才是生成计划 —— 改模型要多按一个键
-              if (e.shiftKey) void generatePlan();
+              // Ctrl+Enter = 对话（轻量的那个）；Ctrl+Shift+Enter = Agent 执行
+              if (e.shiftKey) void sendAgent();
               else void sendChat();
             }
           }}
@@ -1488,45 +1330,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           >
             {busyKind === 'agent' ? `Agent 执行中… ${waited}s` : '🤖 Agent 执行'}
           </button>
-          <button
-            type="button"
-            className="tb-btn primary ai-btn-plan"
-            disabled={busy || !text.trim() || !!quota?.blockedBy}
-            onClick={() => void generatePlan()}
-            title={
-              quota?.blockedBy
-                ? `额度已用完，不能生成：${quota.blockReason}`
-                : '生成动作清单并干跑预览。在你点「应用」之前不会修改模型。'
-            }
-          >
-            {busyKind === 'plan' ? `规划中… ${waited}s` : '生成编辑计划'}
-          </button>
-          <button
-            type="button"
-            className="tb-btn primary ai-btn-draft"
-            disabled={busy || !text.trim() || !!quota?.blockedBy}
-            onClick={() => void generateDraft()}
-            title={
-              quota?.blockedBy
-                ? `额度已用完，不能生成：${quota.blockReason}`
-                : '把这一句叠到草案上：AI 看得见之前几轮的结果，可以一句一句改到满意，最后再定稿。'
-            }
-          >
-            {busyKind === 'draft' ? `改草案中… ${waited}s` : draft ? '继续改草案' : '改草案（多轮）'}
-          </button>
-          <button
-            type="button"
-            className="tb-btn primary ai-btn-design"
-            disabled={busy || !text.trim() || !!quota?.blockedBy}
-            onClick={() => void generateDesign()}
-            title={
-              quota?.blockedBy
-                ? `额度已用完，不能生成：${quota.blockReason}`
-                : '先用自然语言描述需求，AI 给出一个可确认的设计方案（柜体结构 / 组合 / 假设 / 待确认问题），确认后才写进模型。'
-            }
-          >
-            {busyKind === 'design' ? `设计方案生成中… ${waited}s` : design?.proposal ? '重新设计方案' : '设计方案'}
-          </button>
+          {/* Agent 模式已覆盖：生成编辑计划 / 改草案 / 设计方案 —— 由 Agent 统一执行，不再单独设按钮 */}
           <button
             type="button"
             className="tb-btn"
@@ -1541,7 +1345,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           </button>
         </div>
         <div className="muted-sm">
-          Ctrl+Enter 对话 · Ctrl+Shift+Enter 生成计划
+          Ctrl+Enter 对话 · Ctrl+Shift+Enter Agent 执行
           {busy ? <span className="ai-waiting">　·　已等待 {waited} 秒（推理模型单次可能要十几到几十秒）</span> : null}
         </div>
         <div className="chips">

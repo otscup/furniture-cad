@@ -58,6 +58,16 @@ export interface ProposalUnit {
    *    要么**显式透传**（本字段 + `stripUnit` 复制），要么**显式拒绝**；**不许静默丢**。
    */
   doorMaterial?: string | null;
+  /**
+   * 灯带安装位（仅 shelves 分区）：'none' | 'center' | 'front' | 'angled45'。
+   * 不给 = 不装。
+   *
+   * ── P9.9 约束一：禁止静默丢字段 ──
+   *    与 doorMaterial 同理：契约 `UNIT_INTENT_ITEM` 支持它，方案层必须
+   *    显式透传（本字段 + `stripUnit` 复制 + `compileProposal` 转 AiAction），
+   *    非法值由 `unitsFromIntents` 显式拒绝；不许静默丢。
+   */
+  ledStrip?: 'none' | 'center' | 'front' | 'angled45' | null;
   /** 挂衣区挂杆高 */
   rodHeight?: number | null;
   // ── 电器格（kind='appliance'）──

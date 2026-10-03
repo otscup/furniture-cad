@@ -229,6 +229,16 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; t
       const dm = checkDoorMaterial(opts.rules, String(it.doorMaterial));
       if (dm) return `units 第 ${i + 1} 项的门板材质：${dm}`;
     }
+    // 灯带（P9.9 约束一）：非法值显式拒绝，不许静默丢（"warm" 这种会进这里报错）
+    const LED_STRIP_VALUES = ['none', 'center', 'front', 'angled45'] as const;
+    let ledStrip: 'none' | 'center' | 'front' | 'angled45' | undefined;
+    if (it.ledStrip !== undefined && it.ledStrip !== null) {
+      const v = String(it.ledStrip);
+      if (!(LED_STRIP_VALUES as readonly string[]).includes(v)) {
+        return `units 第 ${i + 1} 项的灯带 ledStrip = ${JSON.stringify(v)} 不合法（可用：${LED_STRIP_VALUES.join(' / ')}）`;
+      }
+      ledStrip = v as 'none' | 'center' | 'front' | 'angled45';
+    }
     let unit: UnitSpec;
     try {
       unit = makeUnit({
@@ -241,8 +251,8 @@ function unitsFromIntents(raw: unknown, opts: { rules: RuleSet; depth: number; t
         rodHeight: it.rodHeight === undefined ? undefined : Number(it.rodHeight),
         doors: doorIntentOf(it.doorCount, it.doorMaterial),
         takenIds: taken,
-        // 灯带（Bug 2 修）：仅 shelves 有效，makeUnit 里缺省 'none'
-        ledStrip: it.ledStrip === undefined ? undefined : String(it.ledStrip) as 'none' | 'center' | 'front' | 'angled45',
+        // 灯带：上面已校验合法值，这里直接透传（undefined = 不装，makeUnit 缺省 'none'）
+        ledStrip,
         appliance:
           kind === 'appliance'
             ? {

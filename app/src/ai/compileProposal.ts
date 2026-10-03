@@ -251,6 +251,8 @@ function stripUnit(u: ProposalUnit): Record<string, unknown> {
   if (u.doorCount !== undefined && u.doorCount !== null) out.doorCount = Number(u.doorCount);
   // ★ P9.9 约束一：门板材质是业务语义字段，必须**显式透传**（此前被静默丢弃 ⇒ 玻璃门降级成木门）
   if (u.doorMaterial !== undefined && u.doorMaterial !== null) out.doorMaterial = String(u.doorMaterial);
+  // ★ P9.9 约束一：灯带同理，必须**显式透传**（此前被静默丢弃 ⇒ 灯带变 none）
+  if (u.ledStrip !== undefined && u.ledStrip !== null) out.ledStrip = String(u.ledStrip);
   if (u.rodHeight !== undefined && u.rodHeight !== null) out.rodHeight = Number(u.rodHeight);
   if (u.applianceName) out.applianceName = String(u.applianceName);
   if (u.openingWidth !== undefined && u.openingWidth !== null) out.openingWidth = Number(u.openingWidth);

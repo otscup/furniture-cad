@@ -19,7 +19,8 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-const MAX_ROUNDS = 3;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const MAX_TOTAL_STEPS = 15;
 
 /**
  * MCP 工具定义（给 AI 看的 function calling schema）。
@@ -168,11 +169,17 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
   messages.push({ role: 'user', content: intent });
 
   // 3. 主循环
-  while (round < MAX_ROUNDS) {
+  // ── 修正：MAX_ROUNDS 原误用为"总调用次数"，导致 3 次成功调用后判失败。
+  // 现在：consecutiveFailures 记连续失败（成功清零），totalSteps 防无限循环。
+  let consecutiveFailures = 0;
+  let totalSteps = 0;
+
+  while (totalSteps < MAX_TOTAL_STEPS) {
     round++;
+    totalSteps++;
     const aiMsg = await callAiWithTools(aiConfig, messages, agentTools);
 
-    // AI 说完了（没有工具调用）
+    // AI 说完了（没有工具调用）→ 成功
     if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
       const summary = aiMsg.content || '完成';
       return { ok: true, steps, summary, draftId: currentDraftId, rounds: round };
@@ -202,10 +209,12 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
       step.result = result.data;
       // 记录 draftId
       if (result.data?.draftId) currentDraftId = result.data.draftId;
+      consecutiveFailures = 0; // 成功清零
     } else {
       step.ok = false;
       step.error = result.error;
       step.code = result.code;
+      consecutiveFailures++;
     }
     steps.push(step);
     if (onStep) onStep(step);
@@ -222,22 +231,33 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
       content: JSON.stringify(result.ok ? result.data : { error: result.error, code: result.code }),
     });
 
-    // 如果工具调用失败且已达最大轮数，停下
-    if (!result.ok && round >= MAX_ROUNDS) {
+    // 连续 3 次失败 → 停下，尝试清理 draft（回滚半截变更）
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      // 回滚：删除本轮创建的 draft，避免脏数据残留
+      if (currentDraftId) {
+        try {
+          await callMcpTool(mcpBaseUrl, token, 'cad.discard_draft', { draftId: currentDraftId });
+          steps.push({ round, tool: 'cad.discard_draft', args: { draftId: currentDraftId }, ok: true, result: { note: '已回滚半截变更' } });
+        } catch {
+          /* 回滚失败不掩盖主错误 */
+        }
+        currentDraftId = null;
+      }
       return {
         ok: false,
         steps,
-        summary: `3 轮重试后仍失败，最后错误：${result.error}。请检查参数或换个说法。`,
-        draftId: currentDraftId,
+        summary: `连续 3 次失败，已回滚。最后错误：${result.error}。请检查参数或换个说法。`,
+        draftId: null,
         rounds: round,
       };
     }
   }
 
+  // 达到总步数上限（AI 一直在调工具但不说完成）
   return {
     ok: false,
     steps,
-    summary: '达到最大轮数仍未完成，请简化意图后重试。',
+    summary: `已执行 ${MAX_TOTAL_STEPS} 步仍未完成，AI 似乎陷入循环。请简化意图后重试。`,
     draftId: currentDraftId,
     rounds: round,
   };

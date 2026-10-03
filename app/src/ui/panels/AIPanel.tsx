@@ -123,6 +123,10 @@ interface Turn extends ChatTurn {
   imageMode?: 'render' | 'dimension';
   /** vision 识别结果（JSON 字符串，折叠展示） */
   visionResult?: string;
+  /** Agent 执行步骤（JSON 字符串，折叠展示） */
+  agentSteps?: string;
+  /** Agent 执行是否成功 */
+  agentOk?: boolean;
 }
 
 /** 把 VisionResult 转成人类可读的摘要 */
@@ -313,7 +317,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * 谁在跑。同一个模型通道，**同时只允许一个请求**：
    * 并发发两个不但会让用量账目混乱，还会让用户分不清哪个回答对应哪句话。
    */
-  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft' | 'design' | 'vision'>('');
+  const [busyKind, setBusyKind] = useState<'' | 'chat' | 'plan' | 'draft' | 'design' | 'vision' | 'agent'>('');
   const busy = busyKind !== '';
   /** 已等待秒数 —— 见文件头"为什么有一个计时器" */
   const [waited, setWaited] = useState(0);
@@ -517,6 +521,64 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   }, [busy, chat, props.token, scopePrefix, setConvo, snapshot, text]);
 
   const clearChat = useCallback(() => setConvo({ chat: [] }), [setConvo]);
+
+  // ── Agent 循环模式 ──
+
+  /** 发送意图给 Agent，Agent 自主调 MCP 工具完成任务 */
+  const sendAgent = useCallback(async () => {
+    const q = text.trim();
+    if (!q || busy) return;
+    // 如果有待处理的图片，先做 vision 识别，结果喂给 Agent
+    let visionResult: string | null = null;
+    let imageData: string | null = null;
+    if (pendingImage) {
+      imageData = pendingImage;
+      // 这里简化：图片直接传给 Agent，后端会调 vision
+      // 实际流程：前端先调 /api/ai/vision 拿到结构化数据，再一起发给 /api/ai/agent
+    }
+    const userTurn: Turn = { role: 'user', text: q };
+    if (pendingImage) {
+      userTurn.image = pendingImage;
+      userTurn.imageMode = imageMode;
+    }
+    const next: Turn[] = [...chat, userTurn];
+    setConvo({ chat: next });
+    setText('');
+    setPendingImage(null);
+    setBusyKind('agent');
+    try {
+      const r = await fetch('/api/ai/agent', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}),
+        },
+        body: JSON.stringify({
+          intent: q,
+          imageData,
+          visionResult: visionResult ? JSON.parse(visionResult) : null,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || 'Agent 执行失败');
+      const agentTurn: Turn = {
+        role: 'assistant',
+        text: j.summary || (j.ok ? 'Agent 执行完成' : 'Agent 执行失败'),
+        agentSteps: JSON.stringify(j.steps, null, 2),
+        agentOk: j.ok,
+      };
+      setConvo({ chat: [...next, agentTurn] });
+    } catch (e) {
+      const errTurn: Turn = {
+        role: 'assistant',
+        text: `Agent 执行出错：${e instanceof Error ? e.message : e}`,
+        agentOk: false,
+      };
+      setConvo({ chat: [...next, errTurn] });
+    } finally {
+      setBusyKind('');
+    }
+  }, [busy, chat, text, pendingImage, imageMode, props.token, setConvo]);
 
   // ── P10.1 识图 ──
 
@@ -1187,6 +1249,50 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                       </div>
                     </>
                   ) : null}
+                  {/* Agent 执行步骤（折叠） */}
+                  {m.agentSteps ? (
+                    <details className="chat-agent" open={!m.agentOk}>
+                      <summary>
+                        {m.agentOk ? '✅' : '❌'} Agent 执行步骤（{(() => {
+                          try {
+                            const s = JSON.parse(m.agentSteps!);
+                            return Array.isArray(s) ? s.length : 0;
+                          } catch { return 0; }
+                        })()} 步）
+                      </summary>
+                      <div className="agent-steps">
+                        {(() => {
+                          try {
+                            const steps = JSON.parse(m.agentSteps!);
+                            if (!Array.isArray(steps)) return <div>步骤数据异常</div>;
+                            return steps.map((s: any, i: number) => (
+                              <div key={i} className={`agent-step ${s.ok ? 'ok' : 'fail'}`}>
+                                <div className="agent-step-head">
+                                  <span className="agent-step-num">第 {s.round} 轮</span>
+                                  <code>{s.tool}</code>
+                                  <span className={s.ok ? 'ok-tag' : 'fail-tag'}>{s.ok ? '成功' : '失败'}</span>
+                                </div>
+                                <details>
+                                  <summary>参数</summary>
+                                  <pre className="code">{JSON.stringify(s.args, null, 2)}</pre>
+                                </details>
+                                {s.ok ? (
+                                  <details>
+                                    <summary>结果</summary>
+                                    <pre className="code">{JSON.stringify(s.result, null, 2).slice(0, 1000)}</pre>
+                                  </details>
+                                ) : (
+                                  <div className="agent-error">错误：{s.error} {s.code ? `(${s.code})` : ''}</div>
+                                )}
+                              </div>
+                            ));
+                          } catch {
+                            return <div>步骤解析失败</div>;
+                          }
+                        })()}
+                      </div>
+                    </details>
+                  ) : null}
                   {/* 待确认的 vision 导入 */}
                   {pendingVisionRun && m.role === 'assistant' && m.text.includes('干跑完成') ? (
                     <div className="btn-row">
@@ -1368,6 +1474,19 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             title="问与答。不会修改模型。"
           >
             {busyKind === 'chat' ? `AI 正在思考… ${waited}s` : '对话（不改模型）'}
+          </button>
+          <button
+            type="button"
+            className="tb-btn primary ai-btn-agent"
+            disabled={busy || !text.trim() || !!quota?.blockedBy}
+            onClick={() => void sendAgent()}
+            title={
+              quota?.blockedBy
+                ? `额度已用完，不能执行：${quota.blockReason}`
+                : 'Agent 自主执行：理解意图后直接调 MCP 工具搭建/修改柜体，失败自动重试（3 轮），validate 通过后呈现结果。'
+            }
+          >
+            {busyKind === 'agent' ? `Agent 执行中… ${waited}s` : '🤖 Agent 执行'}
           </button>
           <button
             type="button"

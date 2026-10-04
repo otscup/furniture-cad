@@ -1505,7 +1505,7 @@ async function handleApi(req, res, pathname) {
     try {
       const result = await runAgentLoop({
         intent: body.intent.trim(),
-        imageData: body.imageData || null,
+        images: Array.isArray(body.images) ? body.images : null,
         visionResult: body.visionResult || null,
         draftId: body.draftId || null,
         history: Array.isArray(body.history) ? body.history : null,

@@ -206,19 +206,32 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
   };
 
   const groups = groupByRoom(project);
-  const sections: RoomBookSection[] = groups.map((g) => {
-    // 家具生产图（与 DXF 同源）
+  // v9 修复：柜体明细表必须包含项目全部柜子。
+  // v8 的 ternary（project.cabinets.length > g.cabinets.length）在单房间时
+  // 取 g.cabinets，若 project.cabinets 本身不全仍会漏；且多房间时每个 section
+  // 都塞 10 个导致总数翻倍。这里恒用 project.cabinets，并在下面去重 section。
+  const allCabinets = project.cabinets;
+  let sections: RoomBookSection[] = groups.map((g) => {
+    // 家具生产图（与 DXF 同源）—— 按房间分组画图不变
     const sheet = buildFurnitureSheet(g.room, g.cabinets, project, rules);
-    // v8 修复：柜体明细表必须包含项目全部柜子，不能只按房间分组
-    // （实测有 4 个柜子因 roomId 缺失被分到别的组，表格里少了）
-    const allCabs = project.cabinets.length > g.cabinets.length ? project.cabinets : g.cabinets;
     return {
       roomId: g.room.id,
       roomName: g.room.name,
-      cabinets: allCabs.map((c, i) => buildCab(c, i + 1)),
+      cabinets: allCabinets.map((c, i) => buildCab(c, i + 1)),
       sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
     };
   });
+  // 去重：若多个 section 的柜体 ID 集合完全相同（allCabinets 导致），只保留第一个，
+  // 避免表格重复、总数翻倍。
+  {
+    const seen = new Set<string>();
+    sections = sections.filter((s) => {
+      const key = s.cabinets.map((c) => c.id).sort().join(',');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
 
   const summary = sections.flatMap((s) =>
     s.cabinets.map((c) => {

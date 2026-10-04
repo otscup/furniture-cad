@@ -157,7 +157,161 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
 
     msp = doc.modelspace()
 
-    stats = {"poly": 0, "fill": 0, "text": 0, "sheets": 0}
+    stats = {"poly": 0, "fill": 0, "text": 0, "sheets": 0, "dimension": 0, "leader": 0}
+
+    # ── v8 修复：收集同一 sheet 内 (0,0) 的柜名 TEXT，分散排布 ──
+    # 10 个柜名（冰箱柜、地柜四门等）坐标全是 (0,0)，堆在一起。
+    # 这里按 sheet 内出现顺序，垂直列表排布在图纸左上角空白处。
+    def distribute_zero_texts(prims_list):
+        zero_texts = [pr for pr in prims_list
+                      if isinstance(pr, dict) and pr.get("k") == "text"
+                      and pr.get("p") and float(pr["p"].get("x", 0)) == 0
+                      and float(pr["p"].get("y", 0)) == 0]
+        if not zero_texts:
+            return
+        # 按文本去重排序，保持稳定顺序
+        seen = []
+        for pr in zero_texts:
+            t = pr.get("text", "")
+            if t not in seen:
+                seen.append(t)
+        # 垂直列表：x=500 起，每行间隔 400
+        base_x, base_y, step = 500, 9000, 400
+        idx = 0
+        for pr in prims_list:
+            if (isinstance(pr, dict) and pr.get("k") == "text" and pr.get("p")
+                    and float(pr["p"].get("x", 0)) == 0 and float(pr["p"].get("y", 0)) == 0):
+                pr["p"] = {"x": base_x, "y": base_y - idx * step}
+                idx += 1
+
+    # ── v8 修复：DIMENSION 和 LEADER 实体生成 ──
+    # TS 侧把尺寸画成 poly+text（F-DIM 层），引线画成 poly+text（F-ANNOT-RED 层）。
+    # 这里把它们转成真正的 DXF DIMENSION / LEADER 实体，否则下游 CAD 软件认不出。
+    def build_dimensions(target_space, prims_list, std_layer_fn):
+        """从 F-DIM 层的 poly+text 生成 DXF DIMENSION 实体。"""
+        import re
+        # 收集 DIM 层的 text（数字）和 poly（直线）
+        dim_texts = []  # (x, y, text)
+        dim_lines = []  # [(x1,y1),(x2,y2)]
+        for pr in prims_list:
+            if not isinstance(pr, dict):
+                continue
+            layer = pr.get("layer", "")
+            std = std_layer_fn(layer)
+            if std != "DIM":
+                continue
+            if pr.get("k") == "text":
+                t = str(pr.get("text", "")).strip()
+                # 尺寸数字：纯数字（可能带小数）
+                if re.fullmatch(r'\d+(\.\d+)?', t):
+                    p = pr.get("p", {})
+                    dim_texts.append((float(p.get("x", 0)), float(p.get("y", 0)), t))
+            elif pr.get("k") == "poly":
+                pts = pr.get("pts", [])
+                if len(pts) == 2:
+                    dim_lines.append((
+                        (float(pts[0]["x"]), float(pts[0]["y"])),
+                        (float(pts[1]["x"]), float(pts[1]["y"])),
+                    ))
+        if not dim_texts or not dim_lines:
+            return 0
+        count = 0
+        for tx, ty, txt in dim_texts:
+            # 找最近的直线（距离文本中心最近的线段中点）
+            best = None
+            best_d = float('inf')
+            for (x1, y1), (x2, y2) in dim_lines:
+                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+                d = ((mx - tx) ** 2 + (my - ty) ** 2) ** 0.5
+                # 只考虑长度 >50 的直线（排除箭头小线）
+                seg_len = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+                if seg_len < 50:
+                    continue
+                if d < best_d:
+                    best_d = d
+                    best = ((x1, y1), (x2, y2))
+            if best is None:
+                continue
+            (x1, y1), (x2, y2) = best
+            try:
+                # 用文本位置作为尺寸线位置，线段端点作为界线原点
+                dim = target_space.add_linear_dim(
+                    base=(tx, ty),
+                    p1=(x1, y1),
+                    p2=(x2, y2),
+                    text=txt,
+                    dxfattribs={"layer": "DIM"},
+                )
+                dim.render()
+                count += 1
+            except Exception:
+                # DIMENSION 生成失败不阻断导出（poly+text 本体已在）
+                continue
+        return count
+
+    def build_leaders(target_space, prims_list, std_layer_fn):
+        """从 F-ANNOT-RED 层的 poly+text 生成 DXF LEADER 实体。"""
+        annot_texts = []  # (x, y, text)
+        annot_lines = []  # [(x1,y1),(x2,y2)]
+        for pr in prims_list:
+            if not isinstance(pr, dict):
+                continue
+            layer = pr.get("layer", "")
+            std = std_layer_fn(layer)
+            if std != "ANNOT_RED":
+                continue
+            if pr.get("k") == "text":
+                t = str(pr.get("text", "")).strip()
+                if t:
+                    p = pr.get("p", {})
+                    annot_texts.append((float(p.get("x", 0)), float(p.get("y", 0)), t))
+            elif pr.get("k") == "poly":
+                pts = pr.get("pts", [])
+                if len(pts) == 2 and not pr.get("closed"):
+                    annot_lines.append((
+                        (float(pts[0]["x"]), float(pts[0]["y"])),
+                        (float(pts[1]["x"]), float(pts[1]["y"])),
+                    ))
+        if not annot_texts:
+            return 0
+        count = 0
+        for tx, ty, txt in annot_texts:
+            # 找最近的引线（文本下方 500 范围内的垂直线优先）
+            best = None
+            best_d = float('inf')
+            for (x1, y1), (x2, y2) in annot_lines:
+                # 引线一端应在文本附近
+                d1 = ((x1 - tx) ** 2 + (y1 - ty) ** 2) ** 0.5
+                d2 = ((x2 - tx) ** 2 + (y2 - ty) ** 2) ** 0.5
+                d = min(d1, d2)
+                if d < best_d and d < 800:
+                    best_d = d
+                    best = ((x1, y1), (x2, y2))
+            if best is None:
+                continue
+            (x1, y1), (x2, y2) = best
+            try:
+                # LEADER：从文本位置指向引线远端
+                # 确定哪端离文本远（目标点），哪端近（文本端）
+                d1 = ((x1 - tx) ** 2 + (y1 - ty) ** 2) ** 0.5
+                far = (x2, y2) if d1 < ((x2 - tx) ** 2 + (y2 - ty) ** 2) ** 0.5 else (x1, y1)
+                leader = target_space.add_leader(
+                    vertices=[(tx, ty - 40), far],
+                    dxfattribs={"layer": "ANNOT_RED"},
+                )
+                # 关联文本注解
+                try:
+                    leader.set_annotation(
+                        target_space.add_text(txt, height=170,
+                                            dxfattribs={"layer": "ANNOT_RED"}),
+                        leader_style="mtext",
+                    )
+                except Exception:
+                    pass
+                count += 1
+            except Exception:
+                continue
+        return count
 
     # ── 多 sheet：一张图纸一个 paper space layout ──
     # 旧逻辑把所有 sheet 的图元都扔进 modelspace，会重叠。
@@ -172,6 +326,8 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
 
     for si, sh in enumerate(data.get("sheets", []) or []):
         sheet_name = str(sh.get("name", f"SHEET_{si}"))
+        # v8：先分散 (0,0) 的柜名 TEXT
+        distribute_zero_texts(sh.get("prims", []) or [])
         # PLAN 进 modelspace，其余进 paper space layout
         if sheet_name == "PLAN":
             target_space = msp
@@ -259,6 +415,10 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                 raise ValueError(
                     f"图元损坏：sheet[{si}] prim[{pi}] kind={kind!r} 字段缺失或类型错误：{e}"
                 ) from e
+
+        # v8：生成 DIMENSION 和 LEADER 实体（TS 侧只给了 poly+text，这里转成真实体）
+        stats["dimension"] += build_dimensions(target_space, sh.get("prims", []) or [], std_layer_for)
+        stats["leader"] += build_leaders(target_space, sh.get("prims", []) or [], std_layer_for)
 
     # 生产数据三件套写进文件的自定义属性：模型版本 + 生成器版本 + 规则集版本。
     # 主方案红线：交付物必须能完整复现，光靠一个文件名做不到 —— 文件会被改名。

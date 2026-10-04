@@ -21,7 +21,7 @@
  */
 import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
-import { buildFurnitureSheet, groupByRoom, type RoomGroup } from './furnitureSheet.ts';
+import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
 

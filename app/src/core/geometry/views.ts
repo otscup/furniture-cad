@@ -1260,8 +1260,23 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 }
               } else if (widths.length === 1) {
                 // 开向对角线指向开门侧：铰链在左 → 门往右开 → 线从右上到左下
-                if ((dr.hingeSide ?? 'left') === 'left') diag(right, zTop, left, zBot);
+                const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
+                if (hingeLeft) diag(right, zTop, left, zBot);
                 else diag(left, zTop, right, zBot);
+                // 虚线箭头：从铰链侧中部指向开门侧，放在门板中央
+                const ax0 = hingeLeft ? left + w * 0.3 : right - w * 0.3;
+                const ax1 = hingeLeft ? right - w * 0.2 : left + w * 0.2;
+                const ay = (zTop + zBot) / 2;
+                // 虚线
+                P.line(ax0, ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
+                // 箭头三角形（指向开门侧）
+                const dir = hingeLeft ? 1 : -1;
+                const ah = 60;  // 箭头长度
+                const aw = 35;  // 箭头半宽
+                const tipX = ax1;
+                P.line(tipX, tipX - dir * ah, ay, ay + aw, L_HW, 0.9);
+                P.line(tipX, tipX - dir * ah, ay, ay - aw, L_HW, 0.9);
+                P.line(tipX - dir * ah, tipX - dir * ah, ay + aw, ay - aw, L_HW, 0.9);
               } else {
                 const side = (dr.hingeSide ?? 'left') === 'left';
                 for (let j = 0; j < widths.length; j++) {

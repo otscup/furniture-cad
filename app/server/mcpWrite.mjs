@@ -197,7 +197,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -263,7 +263,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -350,7 +350,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -424,7 +424,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -476,7 +476,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const { compileProposalMod, proposal: proposalMod, planRunner, compile } = await core();
@@ -547,7 +547,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async () => {
       const deny = requirePerm(principal, 'view');
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const drafts = ws.listDrafts();
@@ -570,7 +570,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = requirePerm(principal, 'manage');
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const h = ws.getDraft(args.draftId);
@@ -608,7 +608,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args) => {
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const h = ws.getDraft(args.draftId);
@@ -655,7 +655,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -722,7 +722,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);
@@ -794,7 +794,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async (args) => {
       const deny = needDesign();
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
       const d = await withDraft(ws, args.draftId, principal.actor);

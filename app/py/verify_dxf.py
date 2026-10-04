@@ -29,15 +29,25 @@ def main() -> int:
         return 2
     p = Path(sys.argv[1])
     doc = ezdxf.readfile(str(p))
-    msp = doc.modelspace()
 
-    counts = Counter(e.dxftype() for e in msp)
-    texts = [e.plain_text() for e in msp if e.dxftype() == "TEXT"]
+    # ── 多 sheet：一张图纸一个 layout ──
+    # 检查所有空间：modelspace（PLAN）+ paper space layouts（SHEET_*）
+    all_entities = []
+    msp = doc.modelspace()
+    all_entities.extend(msp)
+    layout_names = []
+    for layout in doc.layouts:
+        if layout.name not in ("Model",):
+            layout_names.append(layout.name)
+            all_entities.extend(layout)
+
+    counts = Counter(e.dxftype() for e in all_entities)
+    texts = [e.plain_text() for e in all_entities if e.dxftype() == "TEXT"]
     escaped = [t for t in texts if "\\U+" in t]
 
     # 只查**承载图元**的图层。DXF 必备的 '0' 层与打印不输出的 'Defpoints'
     # 默认就是 7，但它们上面什么都没有 —— 把它们算进去，断言就永远红不了也永远绿不了。
-    used_layers = {e.dxf.layer for e in msp}
+    used_layers = {e.dxf.layer for e in all_entities}
     used_layer_colors = {doc.layers.get(l).dxf.color for l in used_layers}
     all_layer_colors = {layer.dxf.color for layer in doc.layers}
 
@@ -55,7 +65,9 @@ def main() -> int:
     out = {
         "file": str(p),
         "dxfversion": doc.dxfversion,
-        "entities": len(msp),
+        "entities": len(all_entities),
+        "modelspaceEntities": len(msp),
+        "layouts": layout_names,
         "counts": dict(counts),
         "layers": len(doc.layers),
         "usedLayers": sorted(used_layers),

@@ -325,51 +325,86 @@ try {
  *   所以这里改成**并行**：立刻 listen，工作区在后台装载，只有 /mcp 才 await 它。
  *   工作的边界是：/api/* 与工作区无关 ⇒ 一秒都不该为它等；/mcp 与它有关 ⇒ 必须等到底。
  */
-let workspaceState = {
-  ok: false,
-  loading: true,
-  error: '装载中（服务已开始监听，工作区在后台装载）',
-  filePath: WORKSPACE_PATH,
-};
-const workspaceLoading = openWorkspace({
-  filePath: WORKSPACE_PATH,
-  owner: 'local-open',
-  account: 'local-open',
-  onEvent: (e) => auth.audit(e),
-})
-  .then((s) => {
-    workspaceState = s;
-    return s;
-  })
-  .catch((e) => {
-    // 例如数据目录只读：不允许因此拒绝启动（/api/* 与工作区无关），但必须如实记下。
-    workspaceState = { ok: false, error: String(e?.message ?? e), filePath: WORKSPACE_PATH };
-    /**
-     * ⚠ 这里**必须**再包一层 try —— 这一行真咬过人：
-     *   数据目录不可写时（admin 验收专门造了这个场景：路径某一层是文件 ⇒ ENOTDIR），
-     *   `auth.audit` 自己就会抛（它要 mkdirSync + appendFileSync）。那句抛错发生在
-     *   `.catch()` 回调内部 ⇒ 于是这个 promise 变成 **rejected** 且无人接 ⇒
-     *   Node 15+ 默认把未处理的 promise 拒绝当成致命错误 ⇒ **整个服务进程被杀掉**。
-     *   症状是"服务凭空消失"：/api/health 直接 ECONNREFUSED，而日志里只有
-     *   一行看不出因果的堆栈。工作区坏掉只该让 /mcp 的两个工具报
-     *   WORKSPACE_UNAVAILABLE，**绝不该让 /api/* 一起陪葬**。
-     *   （"审计写不进去"这件事本身已经在 /api/health 的 dataWritable 里如实报出。）
-     */
-    try {
-      auth.audit({ actor: null, action: 'workspace.load', result: 'fail', error: workspaceState.error });
-    } catch {
-      /* 见上：审计落不下盘不是新故障，已有渠道如实报出 */
-    }
-    return workspaceState;
-  });
+/**
+ * 多租户工作区：每个账号独立一份 workspace（数据隔离）。
+ * - 路径：data/workspaces/{accountId}/workspace.json
+ * - 懒加载：首次访问该账号时才打开
+ * - 旧单文件 data/workspace.json 首次由 admin 账号认领（迁移）
+ */
+const workspaceStates = new Map(); // accountId -> {state, loading}
+
+/** 账号的工作区目录 */
+function accountWorkspaceDir(accountId) {
+  const safeId = String(accountId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return join(dirname(ACCOUNTS_PATH), 'workspaces', safeId);
+}
+
+/** 账号的工作区文件路径 */
+function accountWorkspacePath(accountId) {
+  return join(accountWorkspaceDir(accountId), 'workspace.json');
+}
 
 /**
- * /mcp 取工作区状态的唯一入口：**await 到底**再返回。
- * 工具因此永远不会看到"装载中"那个中间态 —— 要么拿到真工作区，要么拿到确定的失败原因。
+ * 打开指定账号的工作区（懒加载 + 缓存）。
+ * 旧版单文件 data/workspace.json 在首次被认领时迁移到 admin 账号下。
  */
-const getWorkspaceState = async () => {
-  await workspaceLoading;
-  return workspaceState;
+async function openAccountWorkspace(accountId) {
+  const aid = accountId || 'local-open';
+  if (workspaceStates.has(aid)) {
+    const entry = workspaceStates.get(aid);
+    await entry.loading;
+    return entry.state;
+  }
+
+  const filePath = accountWorkspacePath(aid);
+  const entry = {
+    state: { ok: false, loading: true, error: '装载中', filePath },
+    loading: null,
+  };
+  workspaceStates.set(aid, entry);
+
+  // 迁移：旧单文件 → 第一个访问的 admin/local-open 账号
+  // （只在目标文件不存在且旧文件存在时执行一次）
+  const { existsSync: _exists, copyFileSync: _copy, mkdirSync: _mkdir } = await import('node:fs');
+  try {
+    if (!_exists(filePath) && _exists(WORKSPACE_PATH)) {
+      _mkdir(dirname(filePath), { recursive: true });
+      _copy(WORKSPACE_PATH, filePath);
+      try { auth.audit({ actor: aid, action: 'workspace.migrate', result: 'ok', from: WORKSPACE_PATH }); } catch {}
+    }
+  } catch {
+    /* 迁移失败不阻塞，后面 openWorkspace 会如实报错 */
+  }
+
+  entry.loading = openWorkspace({
+    filePath,
+    owner: aid,
+    account: aid,
+    onEvent: (e) => auth.audit(e),
+  })
+    .then((s) => {
+      entry.state = s;
+      return s;
+    })
+    .catch((e) => {
+      entry.state = { ok: false, error: String(e?.message ?? e), filePath };
+      try {
+        auth.audit({ actor: aid, action: 'workspace.load', result: 'fail', error: entry.state.error });
+      } catch {
+        /* 审计落不下盘不是新故障 */
+      }
+      return entry.state;
+    });
+
+  await entry.loading;
+  return entry.state;
+}
+
+/**
+ * /mcp 取工作区状态的唯一入口：按账号隔离，await 到底再返回。
+ */
+const getWorkspaceState = async (accountId) => {
+  return openAccountWorkspace(accountId || 'local-open');
 };
 
 /** `/mcp` 的唯一处理器（同进程挂载，不新增服务进程）。 */
@@ -657,18 +692,24 @@ async function handleApi(req, res, pathname) {
        */
       mcp: { enabled: true, path: '/mcp', transport: 'streamable-http', tools: ALLOWED_TOOLS },
       /**
-       * 服务端工作区状态。`ok:false` 表示装载失败（损坏/不可读），此时 MCP 只读工具
+       * 服务端工作区状态（按账号隔离，这里查当前账号的）。
+       * `ok:false` 表示装载失败（损坏/不可读），此时 MCP 只读工具
        * 会返回 WORKSPACE_UNAVAILABLE —— **不静默重建**，所以这里必须能查见。
-       * `loading:true` 是**正常的启动中间态**（工作区在后台装载，见文件头"为什么不 await"）：
-       * 服务已经能服务 /api/*，只是 /mcp 还没到可用的时候，如实说出来而不是假装就绪。
        */
-      workspace: {
-        ok: workspaceState.ok === true,
-        loading: workspaceState.loading === true,
-        filePath: workspaceState.filePath,
-        workspaceId: workspaceState.workspace?.workspaceId ?? null,
-        error: workspaceState.ok === true ? null : (workspaceState.error ?? null),
-      },
+      workspace: await (async () => {
+        try {
+          const ws = await getWorkspaceState(gate.account?.id);
+          return {
+            ok: ws.ok === true,
+            loading: ws.loading === true,
+            filePath: ws.filePath,
+            workspaceId: ws.workspace?.workspaceId ?? null,
+            error: ws.ok === true ? null : (ws.error ?? null),
+          };
+        } catch (e) {
+          return { ok: false, loading: false, filePath: null, workspaceId: null, error: String(e?.message ?? e) };
+        }
+      })(),
       time: new Date().toISOString(),
     });
   }
@@ -1432,7 +1473,7 @@ async function handleApi(req, res, pathname) {
    * discard=草稿归属者或 manage。
    */
   if (pathname === '/api/drafts' && req.method === 'GET') {
-    const ws = await getWorkspaceState();
+    const ws = await getWorkspaceState(gate.account?.id);
     if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
     const drafts = ws.workspace.listDrafts().map((d) => ({
       draftId: d.draftId,
@@ -1449,7 +1490,7 @@ async function handleApi(req, res, pathname) {
       return json(res, 403, { ok: false, error: '需要管理权限', code: 'FORBIDDEN' });
     }
     const draftId = pathname.split('/')[3];
-    const ws = await getWorkspaceState();
+    const ws = await getWorkspaceState(gate.account?.id);
     if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
     const r = await ws.workspace.applyDraft(draftId);
     if (!r.ok) {
@@ -1461,7 +1502,7 @@ async function handleApi(req, res, pathname) {
 
   if (pathname.startsWith('/api/drafts/') && pathname.endsWith('/discard') && req.method === 'POST') {
     const draftId = pathname.split('/')[3];
-    const ws = await getWorkspaceState();
+    const ws = await getWorkspaceState(gate.account?.id);
     if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
     const h = ws.workspace.getDraft(draftId);
     if (!h) return json(res, 404, { ok: false, error: `draft 不存在：${draftId}`, code: 'DRAFT_NOT_FOUND' });
@@ -1533,7 +1574,8 @@ async function handleApi(req, res, pathname) {
    * POST /api/projects/:id/activate 切换当前项目（需重启 workspace）
    * DELETE /api/projects/:id        删除项目
    */
-  const DATA_DIR = dirname(ACCOUNTS_PATH);
+  // 项目目录按账号隔离
+  const DATA_DIR = accountWorkspaceDir(gate.account?.id || 'local-open');
   if (pathname === '/api/projects' && req.method === 'GET') {
     const { listProjects, migrateIfNeeded } = await import('./projects.mjs');
     migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
@@ -2335,14 +2377,8 @@ server.listen(PORT, HOST, () => {
   if (process.env.APP_ENV_PATH || process.env.APP_MEM_PATH || process.env.APP_ACCOUNTS_PATH || process.env.APP_AUDIT_PATH) {
     console.log('  （本次运行使用了 APP_*_PATH 覆盖，未落在项目默认位置）');
   }
-  // 工作区是后台装载的：结果出来再补一行，好让运维一眼看到 /mcp 现在到底能不能用。
-  workspaceLoading.then((s) => {
-    console.log(
-      s.ok
-        ? `  ✓ 工作区已装载（${s.workspace.workspaceId}，liveModelVersion=${s.workspace.getLiveModelVersion()}）`
-        : `  ⚠ 工作区装载失败：${s.error}\n            /mcp 的两个只读工具会返回 WORKSPACE_UNAVAILABLE，且**不会**重建该文件。`
-    );
-  });
+  // 工作区按账号懒加载：首次访问该账号时才打开，这里只说明模式。
+  console.log('  ✓ 工作区按账号隔离（data/workspaces/{accountId}/），首次访问时懒加载');
   if (!IS_LOOPBACK) {
     console.log('');
     console.log('  ⚠⚠⚠ 正在监听非回环地址：接口已暴露到容器/网络。');

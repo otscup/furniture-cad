@@ -1468,6 +1468,24 @@ async function handleApi(req, res, pathname) {
   ];
 
   /**
+   * 服务端工作区读取（P10.2）。
+   * 前端工作台启动时从 localStorage 恢复草稿，与服务端（MCP 写入的）数据不一致。
+   * 这个接口让前端能拉取服务端当前账号的 live 项目。
+   * 权限：登录即可（只能看自己的）。
+   */
+  if (pathname === '/api/workspace' && req.method === 'GET') {
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    const project = ws.workspace.getProjectSnapshot();
+    return json(res, 200, {
+      ok: true,
+      project,
+      liveModelVersion: ws.workspace.getLiveModelVersion(),
+      workspaceId: ws.workspace.workspaceId,
+    });
+  }
+
+  /**
    * 草稿管理 HTTP 接口（P10.1）。
    * MCP 的 draft 在服务端，工作台之前没有入口看 —— 这三个接口补上。
    * 权限与 MCP 工具对齐：list=登录即可看；apply=manage（admin+）；

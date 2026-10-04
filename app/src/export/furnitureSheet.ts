@@ -28,8 +28,6 @@ import { buildCabinetViews, DimLayout } from '../core/geometry/views.ts';
 import { allUnits } from '../core/layoutModel.ts';
 
 // ── 图层 ──
-const L_FRAME = 'F-CAB';
-const L_DIM = 'F-DIM';
 const L_TEXT = 'F-TEXT';
 /** 红色工艺标注（DXF 映射为红色，HTML 渲染为红色） */
 const L_ANNOT_RED = 'F-ANNOT-RED';
@@ -50,7 +48,6 @@ const SZ_TITLE = 220;      // 家具名标题
 const SZ_VIEW_TITLE = 170; // 视图标题（地柜平面结构图等）
 const SZ_TABLE_H = 130;    // 表格表头
 const SZ_TABLE = 120;      // 表格内容
-const SZ_DIM = 110;        // 尺寸数字（与 views.ts 一致）
 const SZ_ANNOT = 130;      // 红色工艺标注
 
 // ─────────────────────────── 基础工具 ───────────────────────────
@@ -524,7 +521,7 @@ function drawFrame(
   prims: Prim[],
   L: SheetLayout,
   furnitureName: string,
-  roomName: string,
+  _roomName: string,
   project: Project,
   cabinets: Cabinet[],
   rules: RuleSet
@@ -600,7 +597,6 @@ function drawSidebar(
   // 从第一个柜体取材质信息
   const firstCab = cabinets[0];
   const boardMat = firstCab ? (rules.materials[firstCab.params.boardMaterial]?.name ?? '') : '';
-  const backMat = firstCab ? (rules.materials[firstCab.params.backPanel.material]?.name ?? '') : '';
 
   drawRow('设计师');
   drawRow('联系电话');
@@ -646,7 +642,7 @@ function drawSidebar(
 /**
  * 底部客户信息栏。
  */
-function drawBottomBar(prims: Prim[], x: number, y: number, w: number, h: number, project: Project): void {
+function drawBottomBar(prims: Prim[], x: number, y: number, w: number, h: number, _project: Project): void {
   prims.push(rectPrim(x, y, x + w, y + h, L_BORDER, 1.5));
 
   const rowH = h / 4;

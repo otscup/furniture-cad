@@ -1040,9 +1040,7 @@ export function App() {
             <button type="button" className={rightTab === 'history' ? 'on' : ''} onClick={() => setRightTab('history')}>
               历史
             </button>
-            <button type="button" className={rightTab === 'layers' ? 'on' : ''} onClick={() => setRightTab('layers')}>
-              图层
-            </button>
+            {/* 图层已在左侧对象树旁，不再重复 */}
             <button type="button" className={rightTab === 'views' ? 'on' : ''} onClick={() => setRightTab('views')}>
               视图
             </button>
@@ -1081,6 +1079,7 @@ export function App() {
               账号
             </button>
           </div>
+          <div className="panel-scroll">
           {rightTab === 'props' ? (
             <PropertiesPanel bus={bus} version={version} selection={selection} setSelection={setSelection} onToast={toast} />
           ) : null}
@@ -1088,13 +1087,6 @@ export function App() {
             <IssuesPanel bus={bus} version={version} setSelection={setSelection} applyFix={applyFix} />
           ) : null}
           {rightTab === 'history' ? <HistoryPanel bus={bus} version={version} /> : null}
-          {rightTab === 'layers' ? (
-            <LayersPanel
-              hiddenLayers={hiddenLayers}
-              toggle={toggleLayer}
-              setAll={(hidden) => setHiddenLayers(hidden ? new Set(defaultHiddenLayers()) : new Set())}
-            />
-          ) : null}
           {rightTab === 'views' ? (
             <ViewsPanel bus={bus} version={version} mode={mode} setMode={setMode} explode={explode} setExplode={setExplode} />
           ) : null}
@@ -1158,6 +1150,7 @@ export function App() {
           {rightTab === 'knowledge' ? <KnowledgePanel bus={bus} version={version} onToast={toast} /> : null}
           {rightTab === 'manufacturing' ? <ManufacturingPanel bus={bus} version={version} /> : null}
           {rightTab === 'account' ? <AccountPanel token={token} setToken={setToken} onToast={toast} onLogout={doLogout} /> : null}
+          </div>
         </aside>
       </div>
 

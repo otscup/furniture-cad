@@ -53,17 +53,22 @@ DEFAULT_COLOR = 9       # 未知图层 → 灰（而不是 7）
 # ── 标准 DXF 图层（对标生产图纸）──
 #   内部图层 → 标准图层 的映射。生产下单的 DXF 必须用这套标准层，
 #   而不是 views.ts 的 F- 前缀内部层。
+#   注意：刻意避开 ACI 7（黑/白随背景反转，白底打印会隐形）——
+#   用 8（深灰）在黑白背景下都可见。
 STD_LAYERS = {
     # name: (aci_color, linetype, lineweight_1_100mm)
-    "OUTLINE": (7, "Continuous", 70),   # 轮廓线：白，0.7mm
+    "OUTLINE": (8, "Continuous", 70),   # 轮廓线：深灰，0.7mm
     "DIM": (3, "Continuous", 25),       # 尺寸标注：绿，0.25mm
     "HIDDEN": (8, "Dashed", 25),        # 虚线：灰，0.25mm
-    "TEXT": (7, "Continuous", 25),      # 文字：白
+    "TEXT": (8, "Continuous", 25),      # 文字：深灰
     "CENTER": (1, "Center", 25),        # 中心线：红，0.25mm
+    "ANNOT_RED": (1, "Continuous", 25), # 红色工艺标注：红，0.25mm
 }
 
 # 内部图层 → 标准图层（注意：长前缀在前，避免 F-CAB 吞掉 F-CAB-HIDDEN）
 LAYER_MAP = [
+    ("F-ANNOT-RED", "ANNOT_RED"),  # 红色工艺标注 → 红色层
+    ("F-BORDER", "OUTLINE"),      # 图框 → 轮廓线
     ("F-CAB-HIDDEN", "HIDDEN"),
     ("F-CAB-FRONT", "OUTLINE"),
     ("F-CAB-HW", "OUTLINE"),
@@ -148,9 +153,38 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
 
     msp = doc.modelspace()
 
-    stats = {"poly": 0, "fill": 0, "text": 0}
+    stats = {"poly": 0, "fill": 0, "text": 0, "sheets": 0}
+
+    # ── 多 sheet：一张图纸一个 paper space layout ──
+    # 旧逻辑把所有 sheet 的图元都扔进 modelspace，会重叠。
+    # 现在每个 sheet 独立一个 layout（图纸空间），互不干扰。
+    # PLAN（平面布置图）保留在 modelspace（它是 1:1 的建筑底图）；
+    # SHEET_*（家具生产图）进各自的 paper space layout。
+    def sanitize_layout_name(name: str, idx: int) -> str:
+        # DXF layout 名：去特殊字符，限长
+        safe = "".join(c if (c.isalnum() or c in "_-") else "_" for c in name)
+        safe = safe[:50] or f"SHEET_{idx}"
+        return safe
 
     for si, sh in enumerate(data.get("sheets", []) or []):
+        sheet_name = str(sh.get("name", f"SHEET_{si}"))
+        # PLAN 进 modelspace，其余进 paper space layout
+        if sheet_name == "PLAN":
+            target_space = msp
+            space_label = "modelspace"
+        else:
+            layout_name = sanitize_layout_name(sh.get("nameZh") or sheet_name, si)
+            # 重名时加后缀
+            base_name = layout_name
+            suffix = 1
+            while layout_name in doc.layouts:
+                suffix += 1
+                layout_name = f"{base_name}_{suffix}"
+            doc.layouts.new(layout_name)
+            target_space = doc.layouts.get(layout_name)
+            space_label = f"layout:{layout_name}"
+        stats["sheets"] += 1
+
         for pi, pr in enumerate(sh.get("prims", []) or []):
             if not isinstance(pr, dict):
                 raise ValueError(f"图元损坏：sheet[{si}] prim[{pi}] 不是对象")
@@ -172,7 +206,7 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     if pr.get("dash"):
                         attribs["linetype"] = "DASHED"
                     # 闭合是构造参数，不是 dxf 属性（pl.dxf.closed 会直接抛 DXFAttributeError）
-                    pl = msp.add_lwpolyline(pts, close=bool(pr.get("closed")), dxfattribs=attribs)
+                    pl = target_space.add_lwpolyline(pts, close=bool(pr.get("closed")), dxfattribs=attribs)
                     pl.dxf.lineweight = lineweight_for(float(pr.get("lw", 1)))
                     stats["poly"] += 1
 
@@ -181,7 +215,7 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     if len(pts) < 3:
                         continue
                     std_aci = STD_LAYERS.get(layer, (9, "Continuous", 25))[0]
-                    hatch = msp.add_hatch(color=std_aci, dxfattribs={"layer": layer})
+                    hatch = target_space.add_hatch(color=std_aci, dxfattribs={"layer": layer})
                     hatch.paths.add_polyline_path(pts, is_closed=True)
                     try:
                         hatch.set_solid_fill(color=std_aci)
@@ -193,7 +227,7 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     t = pr["text"]
                     if not t:
                         continue
-                    e = msp.add_text(
+                    e = target_space.add_text(
                         t,
                         height=float(pr.get("size", 90)),
                         dxfattribs={"style": TXT_STYLE, "layer": layer},
@@ -238,12 +272,21 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(str(out_path))
 
+    # 实体总数：modelspace + 所有 paper space layouts
+    total_entities = len(msp)
+    layout_names = []
+    for layout in doc.layouts:
+        if layout.name not in ("Model",):
+            total_entities += len(layout)
+            layout_names.append(layout.name)
+
     return {
         "out": str(out_path),
         "dxfversion": doc.dxfversion,
         "encoding": doc.encoding,
-        "entities": len(msp),
+        "entities": total_entities,
         "layers": len(layers),
+        "layouts": layout_names,
         "primStats": stats,
         "warnings": meta.get("warnings", []),
     }

@@ -29,10 +29,10 @@ import { allUnits } from '../core/layoutModel.ts';
 
 /** 图层 → 颜色。打印件：结构黑、隐藏浅灰、五金中灰、红标注红（虚线在 Prim 上自带） */
 function strokeOf(layer: string): string {
-  if (layer.includes('ANNOT_RED')) return '#d62728';
-  if (layer.includes('HIDDEN')) return '#b0b7c3';
-  if (layer.includes('HW')) return '#555b66';
-  if (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT') || layer.startsWith('F-BORDER')) return '#333a45';
+  if (layer && layer.includes('ANNOT_RED')) return '#FF0000';
+  if (layer && layer.includes('HIDDEN')) return '#b0b7c3';
+  if (layer && layer.includes('HW')) return '#555b66';
+  if (layer && (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT') || layer.startsWith('F-BORDER'))) return '#333a45';
   return '#111318';
 }
 function fillOf(layer: string): string {

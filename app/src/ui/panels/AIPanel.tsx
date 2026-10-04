@@ -117,6 +117,8 @@ interface Turn extends ChatTurn {
   image?: string;
   /** 图片类型：render=效果图 | dimension=尺寸图（决定 vision prompt） */
   imageMode?: 'render' | 'dimension';
+  /** 多图：一次发多张，各自独立类型 */
+  images?: Array<{ dataUrl: string; name: string; mode: 'render' | 'dimension' }>;
   /** vision 识别结果（JSON 字符串，折叠展示） */
   visionResult?: string;
   /** Agent 执行步骤（JSON 字符串，折叠展示） */
@@ -301,9 +303,9 @@ function loadRoomId(): string {
 export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
-  // ── P10.1 识图：待发送的图片（data URL）与类型 ──
-  const [pendingImage, setPendingImage] = useState<string | null>(null);
-  const [pendingImageName, setPendingImageName] = useState('');
+  // ── P10.1 识图：待发送的图片列表（data URL）与各自类型 ──
+  // 支持同时上传效果图+尺寸图等多张，各自独立设类型
+  const [pendingImages, setPendingImages] = useState<Array<{ id: string; dataUrl: string; name: string; mode: 'render' | 'dimension' }>>([]);
   const [imageMode, setImageMode] = useState<'render' | 'dimension'>('render');
   const [imageUrl, setImageUrl] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -524,23 +526,16 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   const sendAgent = useCallback(async () => {
     const q = text.trim();
     if (!q || busy) return;
-    // 如果有待处理的图片，先做 vision 识别，结果喂给 Agent
-    let visionResult: string | null = null;
-    let imageData: string | null = null;
-    if (pendingImage) {
-      imageData = pendingImage;
-      // 这里简化：图片直接传给 Agent，后端会调 vision
-      // 实际流程：前端先调 /api/ai/vision 拿到结构化数据，再一起发给 /api/ai/agent
-    }
+    // 如果有待处理的图片，一起传给 Agent（后端逐张做 vision）
+    const imgs = [...pendingImages];
     const userTurn: Turn = { role: 'user', text: q };
-    if (pendingImage) {
-      userTurn.image = pendingImage;
-      userTurn.imageMode = imageMode;
+    if (imgs.length > 0) {
+      userTurn.images = imgs.map(i => ({ dataUrl: i.dataUrl, name: i.name, mode: i.mode }));
     }
     const next: Turn[] = [...chat, userTurn];
     setConvo({ chat: next });
     setText('');
-    setPendingImage(null);
+    setPendingImages([]);
     setBusyKind('agent');
     try {
       // 带上历史对话（最近 10 轮），Agent 能理解追问（"再高一点"、"改成三抽屉"）
@@ -558,8 +553,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         },
         body: JSON.stringify({
           intent: q,
-          imageData,
-          visionResult: visionResult ? JSON.parse(visionResult) : null,
+          images: imgs.map(i => ({ dataUrl: i.dataUrl, mode: i.mode, name: i.name })),
           history,
         }),
       });
@@ -582,7 +576,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     } finally {
       setBusyKind('');
     }
-  }, [busy, chat, text, pendingImage, imageMode, props.token, setConvo]);
+  }, [busy, chat, text, pendingImages, props.token, setConvo]);
 
   // ── P10.1 识图 ──
 
@@ -599,12 +593,12 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     }
     const reader = new FileReader();
     reader.onload = () => {
-      setPendingImage(reader.result as string);
-      setPendingImageName(f.name);
+      const id = `img_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      setPendingImages(prev => [...prev, { id, dataUrl: reader.result as string, name: f.name, mode: imageMode }]);
       setImageUrl('');
     };
     reader.readAsDataURL(f);
-  }, [props]);
+  }, [props, imageMode]);
 
   /** 图片链接 → 服务端下载 → data URL */
   const handleImageUrl = useCallback(async () => {
@@ -622,54 +616,62 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         props.onToast?.('error', j.error ?? '图片下载失败');
         return;
       }
-      setPendingImage(j.dataUrl);
-      setPendingImageName(u.slice(0, 40));
+      const id = `img_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+      setPendingImages(prev => [...prev, { id, dataUrl: j.dataUrl, name: u.slice(0, 40), mode: imageMode }]);
+      setImageUrl('');
     } finally {
       setBusyKind('');
     }
-  }, [imageUrl, props]);
+  }, [imageUrl, imageMode, props]);
 
-  /** 发送图片做 vision 识别 */
+  /** 发送图片做 vision 识别（多张逐张识别，各自用自己的 mode） */
   const sendImageVision = useCallback(async () => {
-    if (!pendingImage || busy) return;
-    const img = pendingImage;
-    const mode = imageMode;
+    if (pendingImages.length === 0 || busy) return;
+    const imgs = [...pendingImages];
     const hint = text.trim();
-    const next: Turn[] = [...chat, { role: 'user', text: hint || (mode === 'dimension' ? '请识别这张尺寸图' : '请识别这张效果图'), image: img, imageMode: mode }];
+    // 先把所有图片作为用户 turn 发出去
+    const userTurn: Turn = {
+      role: 'user',
+      text: hint || `请识别这 ${imgs.length} 张图`,
+      images: imgs.map(i => ({ dataUrl: i.dataUrl, name: i.name, mode: i.mode })),
+    };
+    const next: Turn[] = [...chat, userTurn];
     setConvo({ chat: next });
     setText('');
-    setPendingImage(null);
-    setPendingImageName('');
+    setPendingImages([]);
     setImageUrl('');
     setBusyKind('vision');
     try {
-      const r = await fetch('/api/ai/vision', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
-        body: JSON.stringify({ image: img, mode, hint: hint || undefined }),
-      });
-      const j = await r.json();
-      if (!j.ok) {
-        setConvo({ chat: [...next, { role: 'assistant', text: '', error: j.error ?? '识别失败' }] });
-        return;
-      }
-      const vr = j.result;
-      const summary = summarizeVision(vr, mode);
-      setConvo({
-        chat: [...next, {
+      // 逐张识别
+      let convo = next;
+      for (const img of imgs) {
+        const r = await fetch('/api/ai/vision', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
+          body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: hint || undefined }),
+        });
+        const j = await r.json();
+        if (!j.ok) {
+          convo = [...convo, { role: 'assistant', text: '', error: `${img.name} 识别失败：${j.error ?? '未知错误'}` }];
+          continue;
+        }
+        const vr = j.result;
+        const summary = summarizeVision(vr, img.mode);
+        convo = [...convo, {
           role: 'assistant',
-          text: summary,
+          text: `【${img.name}｜${img.mode === 'dimension' ? '尺寸图' : '效果图'}】${summary}`,
           visionResult: JSON.stringify(vr, null, 2),
           model: j.model, ms: j.ms,
-        }],
-      });
-      if (j.quota) setQuota(j.quota);
+        }];
+        if (j.quota) setQuota(j.quota);
+      }
+      setConvo({ chat: convo });
     } catch (e) {
       setConvo({ chat: [...next, { role: 'assistant', text: '', error: `识别失败：${(e as Error).message}` }] });
     } finally {
       setBusyKind('');
     }
-  }, [pendingImage, imageMode, text, busy, chat, props]);
+  }, [pendingImages, text, busy, chat, props]);
 
   /** vision 结果一键导入建模（复用 P4 import 链：vision → normalized → compile → 干跑 → 确认） */
   const importVisionToModel = useCallback(async (visionJson: string) => {
@@ -1063,11 +1065,21 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
               <div key={i} className={`chat-msg chat-${m.role}`}>
                 <div className="chat-role">{m.role === 'user' ? '你' : 'AI'}</div>
                 <div className="chat-body">
-                  {/* P10.1：消息附带的图片 */}
+                  {/* P10.1：消息附带的图片（单张兼容 + 多张） */}
                   {m.image ? (
                     <div className="chat-image">
                       <img src={m.image} alt="用户图片" style={{ maxWidth: 300, maxHeight: 220 }} />
                       <span className="muted-sm">（{m.imageMode === 'dimension' ? '尺寸图' : '效果图'}）</span>
+                    </div>
+                  ) : null}
+                  {m.images && m.images.length > 0 ? (
+                    <div className="chat-images">
+                      {m.images.map((img, idx) => (
+                        <div key={idx} className="chat-image">
+                          <img src={img.dataUrl} alt={img.name || '用户图片'} style={{ maxWidth: 220, maxHeight: 160 }} />
+                          <span className="muted-sm">（{img.mode === 'dimension' ? '尺寸图' : '效果图'}）</span>
+                        </div>
+                      ))}
                     </div>
                   ) : null}
                   {m.text ? <div className="chat-text">{m.text}</div> : null}
@@ -1270,23 +1282,44 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             /> 尺寸图
           </label>
         </div>
-        {/* 待发送的图片预览 */}
-        {pendingImage ? (
-          <div className="ai-pending-image">
-            <img src={pendingImage} alt={pendingImageName} style={{ maxWidth: 200, maxHeight: 150 }} />
-            <div className="ai-pending-meta">
-              <span className="muted-sm">{pendingImageName}（{imageMode === 'render' ? '效果图' : '尺寸图'}）</span>
-              <button type="button" className="tb-btn" disabled={busy} onClick={() => { setPendingImage(null); setPendingImageName(''); }}>
-                移除
-              </button>
+        {/* 待发送的图片预览（多图） */}
+        {pendingImages.length > 0 ? (
+          <div className="ai-pending-images">
+            {pendingImages.map(img => (
+              <div key={img.id} className="ai-pending-image">
+                <img src={img.dataUrl} alt={img.name} style={{ maxWidth: 160, maxHeight: 120 }} />
+                <div className="ai-pending-meta">
+                  <span className="muted-sm" title={img.name}>{img.name.slice(0, 18)}</span>
+                  <select
+                    value={img.mode}
+                    disabled={busy}
+                    onChange={e => setPendingImages(prev => prev.map(p => p.id === img.id ? { ...p, mode: e.target.value as 'render' | 'dimension' } : p))}
+                    title="图片类型"
+                  >
+                    <option value="render">效果图</option>
+                    <option value="dimension">尺寸图</option>
+                  </select>
+                  <button
+                    type="button" className="tb-btn small" disabled={busy}
+                    onClick={() => setPendingImages(prev => prev.filter(p => p.id !== img.id))}
+                  >
+                    移除
+                  </button>
+                </div>
+              </div>
+            ))}
+            <div className="ai-pending-actions btn-row">
               <button
                 type="button"
                 className="tb-btn primary"
                 disabled={busy}
                 onClick={() => void sendImageVision()}
-                title="AI 识别图片中的柜体与尺寸"
+                title="AI 逐张识别图片中的柜体与尺寸"
               >
-                {busyKind === 'vision' ? '识别中…' : '🔍 识别并建模'}
+                {busyKind === 'vision' ? '识别中…' : `🔍 识别并建模（${pendingImages.length} 张）`}
+              </button>
+              <button type="button" className="tb-btn" disabled={busy} onClick={() => setPendingImages([])}>
+                全部清除
               </button>
             </div>
           </div>

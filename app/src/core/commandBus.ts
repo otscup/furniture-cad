@@ -1903,7 +1903,7 @@ export class CommandBus {
     for (const cab of p.cabinets) {
       const g = geom.cabinets[cab.id];
       if (!g) continue; // 生成器已为它报了 GEN-ERROR，不再继续校验
-      issues.push(...validateCabinet(cab, g, this.rules));
+      issues.push(...validateCabinet(cab, g, this.rules, p.customerHeight));
     }
     // 跨柜规则（Phase E）：L 型转角处铰链门开门撞邻柜的软建议
     issues.push(...validateCornerInterference(p, this.rules));

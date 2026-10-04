@@ -1,6 +1,6 @@
 import type { BBox, Issue, Panel, Prim, Project, PurchasedItem, RuleSet, Vec2 } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
-import { buildProjectViews } from '../core/geometry/views.ts';
+import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -79,7 +79,7 @@ export interface NeutralExport {
   stats: { panelKinds: number; totalPieces: number; boardAreaM2: number; estWeightKg: number };
 }
 
-export const GENERATOR_VERSION = 'neutral-0.1';
+export const GENERATOR_VERSION = 'neutral-0.2';
 
 const toNeutralPrim = (p: Prim): NeutralPrim => {
   // Prim 与 NeutralPrim 结构一致；这里逐个字段写出来，是为了让"两边结构漂移"
@@ -166,13 +166,28 @@ export function toNeutralExport(
   }
 
   if (which.includes('sheet')) {
-    const vs = buildProjectViews(project, rules);
-    sheets.push({
-      name: 'SHEET',
-      nameZh: '四视图图幅',
-      bbox: vs.bbox,
-      prims: vs.prims.map(toNeutralPrim),
+    // ── 一页一件家具：按房间分组，每个房间一张生产图纸 ──
+    // 旧的 buildProjectViews 把所有柜子横向排成一排（cursor 累加），DXF 坐标飞到 X: -650~56140。
+    // 现在每个房间独立成图：地柜平面 + 吊柜平面 + 立面外观 + 立面结构 + 图框，坐标控制在 0~10000 内。
+    const groups = groupByRoom(project);
+    groups.forEach((g, i) => {
+      const sheet = buildFurnitureSheet(g.room, g.cabinets, project, rules);
+      sheets.push({
+        name: `SHEET_${i + 1}`,
+        nameZh: `${g.room.name}·家具生产图`,
+        bbox: sheet.bbox,
+        prims: sheet.prims.map(toNeutralPrim),
+      });
     });
+    // 没有任何柜体的项目：给一张空图，避免"导出成功但文件是空的"的误导
+    if (groups.length === 0) {
+      sheets.push({
+        name: 'SHEET_1',
+        nameZh: '家具生产图（空）',
+        bbox: null,
+        prims: [],
+      });
+    }
   }
 
   const blocking = geom.issues.filter((i) => i.severity === 'ERROR');

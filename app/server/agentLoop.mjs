@@ -116,7 +116,7 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * Agent 主循环。
  *
  * @param opts.intent 用户意图（文字）
- * @param opts.imageData 图片 data URL（可选，vision 用）
+ * @param opts.images 图片数组 [{dataUrl, mode, name}]（可选，Agent 直接看图）
  * @param opts.visionResult vision 识别结果（可选，已识别好的结构化数据）
  * @param opts.draftId 继续的 draft（可选）
  * @param opts.token 用户 Bearer token（调 MCP 用）
@@ -125,7 +125,7 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * @param opts.onStep 步骤回调（流式推送给前端，可选）
  */
 export async function runAgentLoop(opts) {
-  const { intent, imageData, visionResult, draftId, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
+  const { intent, images, visionResult, draftId, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
   const steps = [];
   let currentDraftId = draftId || null;
   let round = 0;
@@ -150,7 +150,7 @@ export async function runAgentLoop(opts) {
 - 完成后调用 cad.validate 确认 0 错误。
 - 不要编造数据：尺寸不确定就问用户，不要猜。
 
-${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}\n` : ''}
+${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}\n` : ''}${images && images.length > 0 ? `用户附了 ${images.length} 张图（${images.map(i => `${i.name || '图片'}:${i.mode === 'dimension' ? '尺寸图' : '效果图'}`).join('、')}），请结合图片理解意图。尺寸图上的标注数字优先采用。\n` : ''}
 当前 draft：${currentDraftId ?? '无（工具会自动创建）'}`;
 
   const messages = [
@@ -166,7 +166,16 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
         ).join('\n'),
     });
   }
-  messages.push({ role: 'user', content: intent });
+  // 用户消息：文字 + 图片（OpenAI vision 格式）
+  if (images && images.length > 0) {
+    const content = [{ type: 'text', text: intent }];
+    for (const img of images) {
+      content.push({ type: 'image_url', image_url: { url: img.dataUrl } });
+    }
+    messages.push({ role: 'user', content });
+  } else {
+    messages.push({ role: 'user', content: intent });
+  }
 
   // 3. 主循环
   // ── 修正：MAX_ROUNDS 原误用为"总调用次数"，导致 3 次成功调用后判失败。

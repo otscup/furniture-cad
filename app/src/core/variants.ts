@@ -204,7 +204,7 @@ export function buildVariants(spec: VariantSpec, rules: RuleSet): VariantDraft[]
     // ① 板件与校验（这一步失败 = 这份方案本身不成立，必须报出来）
     try {
       const geom = generateCabinet(cabinet, rules);
-      draft.issues = mergeIssues(geom.issues, validateCabinet(cabinet, geom, rules));
+      draft.issues = mergeIssues(geom.issues, validateCabinet(cabinet, geom, rules, undefined));
       draft.stats = {
         panelKinds: geom.stats.panelKinds,
         pieces: geom.stats.totalPieces,

@@ -65,7 +65,7 @@ export function registerExportTools(server, ctx) {
 
   /** 取 live project 快照（服务端真相源；structuredClone 拷贝，不会成为写旁路）。 */
   const liveProject = async () => {
-    const r = workspaceOrError(await getWorkspaceState());
+    const r = workspaceOrError(await getWorkspaceState(principal.actor));
     if (r.error) return { error: r.error };
     const ws = r.workspace;
     const project = ws.getProjectSnapshot?.();

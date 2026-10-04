@@ -76,7 +76,12 @@ export function primsToSvg(prims: Prim[], cls: string): string {
     if (p.k === 'poly') {
       const pts = p.pts.map((q) => `${q.x},${q.y}`).join(' ');
       const dash = p.dash ? ` stroke-dasharray="${p.dash.join(' ')}"` : '';
-      body.push(`<polyline points="${pts}" fill="none" stroke="${strokeOf(p.layer)}" stroke-width="${p.lw * 1.6}"${dash}/>`);
+      // 2026-10-04：closed 的 poly 用 polygon 渲染，确保框闭合（之前用 polyline 有缺口）
+      if ((p as any).closed) {
+        body.push(`<polygon points="${pts}" fill="none" stroke="${strokeOf(p.layer)}" stroke-width="${p.lw * 1.6}"${dash}/>`);
+      } else {
+        body.push(`<polyline points="${pts}" fill="none" stroke="${strokeOf(p.layer)}" stroke-width="${p.lw * 1.6}"${dash}/>`);
+      }
     } else if (p.k === 'fill') {
       const pts = p.pts.map((q) => `${q.x},${q.y}`).join(' ');
       body.push(`<polygon points="${pts}" fill="${fillOf(p.layer)}" fill-opacity="${p.alpha}" stroke="none"/>`);

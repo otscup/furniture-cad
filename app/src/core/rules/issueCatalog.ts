@@ -1124,6 +1124,35 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: () => '预览里逐项「已知晓」后才会生成；它们会随 Cabinet 来源归属留痕（深度/板厚等若为估计值，下料前请复核）。',
     manual: 'Vision 不编造看不见的生产结构：这些项不是被猜掉的，而是交回给你定。',
   },
+  // ─────────────── 人体工学类（按客户身高）───────────────
+  'ERGO-DRAWER-HEIGHT': {
+    title: '抽屉装太高，够不着',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」的抽屉安装高度 ${num(c, 'drawerH')}mm，超过客户身高 ${num(c, 'height')}mm 对应的建议上限 ${num(c, 'limit')}mm（身高-300）—— 拉出后拿不到里面的东西。`,
+    hint: (c) => `把抽屉降到 ${num(c, 'limit')}mm 以下，或把高处改成翻门/开放格。`,
+    manual: '抽屉放哪层属于设计决定。',
+  },
+  'ERGO-ROD-HEIGHT': {
+    title: '挂衣杆太高，挂不到',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」的挂衣杆高度 ${num(c, 'rodH')}mm，超过客户身高 ${num(c, 'height')}mm 对应的建议上限 ${num(c, 'limit')}mm（身高+200）—— 挂衣服要踮脚。`,
+    hint: (c) => `把挂衣杆降到 ${num(c, 'limit')}mm 以下，或加装升降挂衣杆（在图纸上注明）。`,
+    manual: '挂衣杆高度属于设计决定。',
+  },
+  'ERGO-ROD-CLEARANCE': {
+    title: '挂衣杆离上方层板太近',
+    severity: 'ERROR',
+    message: (c) => `「${str(c, 'cabName')}」的挂衣杆离上方层板只有 ${num(c, 'gap')}mm，小于最小 ${num(c, 'min')}mm —— 衣服挂不进去。`,
+    hint: () => '把挂衣杆下移或把上方层板上移，留出至少 100mm。',
+    manual: '怎么调属于设计决定。',
+  },
+  'ERGO-HANG-ZONE': {
+    title: '挂衣区净高不够',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」的${str(c, 'zoneType')}区净高 ${num(c, 'netH')}mm，小于建议 ${num(c, 'min')}mm —— ${str(c, 'zoneType')}会拖地或顶住。`,
+    hint: (c) => `把${str(c, 'zoneType')}区净高做到 ${num(c, 'min')}mm 以上（长衣≥1400，短衣≥900）。`,
+    manual: '分区高度属于设计决定。',
+  },
 };
 
 export const RULE_CODES = Object.keys(RULE_CARDS);

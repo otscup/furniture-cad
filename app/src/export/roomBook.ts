@@ -4,12 +4,13 @@
  *
  *  ── 它是什么 ──
  *  把"多房间多柜体的项目"编排成一份可打印的图纸册：
- *    封面（项目 + 客户表 + 版本三件套）→ 每房间一节 → 每柜一页
- *    （三图组合：平面 / 门板外观 / 内部结构）→ 尾页汇总清单。
+ *    封面（项目 + 客户表 + 版本三件套）→ 每房间一页
+ *    （家具生产图：地柜平面 + 吊柜平面 + 立面外观 + 立面结构 + 图框，
+ *     与 DXF 导出同一套图元）→ 尾页汇总清单。
  *
  *  ── 它不是什么 ──
- *  **零新几何**。三图全部来自既有派生链（CabinetGeometry.plan +
- *  buildCabinetViews），本文件只做"编排 + 排版"。
+ *  **零新几何**。图纸图元全部来自 furnitureSheet.ts（与 DXF 导出同源），
+ *  本文件只做"编排 + Prim→SVG + 打印 HTML"。
  *  排序也不发明规则：房间按 rooms 数组顺序（模型顺序即语义），
  *  房内柜体按 (y, x) 排序 —— 全部来自模型，导出器不做主。
  *
@@ -20,17 +21,18 @@
  */
 import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
-import { buildCabinetViews } from '../core/geometry/views.ts';
+import { buildFurnitureSheet, groupByRoom, type RoomGroup } from './furnitureSheet.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
 
 // ─────────────────────────── SVG（Y 向上 CAD → Y 向下 SVG）───────────────────────────
 
-/** 图层 → 颜色。打印件：结构黑、隐藏浅灰、五金中灰（虚线在 Prim 上自带） */
+/** 图层 → 颜色。打印件：结构黑、隐藏浅灰、五金中灰、红标注红（虚线在 Prim 上自带） */
 function strokeOf(layer: string): string {
+  if (layer.includes('ANNOT_RED')) return '#d62728';
   if (layer.includes('HIDDEN')) return '#b0b7c3';
   if (layer.includes('HW')) return '#555b66';
-  if (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT')) return '#333a45';
+  if (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT') || layer.startsWith('F-BORDER')) return '#333a45';
   return '#111318';
 }
 function fillOf(layer: string): string {
@@ -110,9 +112,6 @@ export interface RoomBookCabinet {
    * 从分区 ledStrip、门板材质、五金等派生
    */
   craftNotes: string[];
-  planSvg: string;
-  frontSvg: string;
-  internalSvg: string;
   panelKinds: number;
   panelPieces: number;
   hardware: Array<{ nameZh: string; qty: number; spec: string }>;
@@ -123,6 +122,8 @@ export interface RoomBookSection {
   roomId: string;
   roomName: string;
   cabinets: RoomBookCabinet[];
+  /** 家具生产图 SVG（与 DXF 同源，一页一件家具） */
+  sheetSvg: string;
 }
 
 export interface RoomBook {
@@ -148,13 +149,13 @@ export interface RoomBook {
 /**
  * 编排：房间按 rooms 数组顺序，房内柜体按 (y, x) 排序。
  * 没有归属房间的柜体进「未分配」节（放最后，明确标出 —— 不静默丢）。
+ * 每房间一页家具生产图（与 DXF 导出同一套图元）。
  */
 export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: string): RoomBook {
   const geom = generateProject(project, rules);
 
   const buildCab = (cab: Cabinet, index: number): RoomBookCabinet => {
     const g = geom.cabinets[cab.id]!;
-    const vs = buildCabinetViews(cab, rules);
     const units = allUnits(cab.layout);
     const doorUnit = units.find((u) => u.doors);
     const doorMatName = doorUnit?.doors?.material ? (rules.materials[doorUnit.doors.material]?.name ?? doorUnit.doors.material) : null;
@@ -192,9 +193,6 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       mountHeight: cab.params.mountHeight ?? 0,
       finishedEnds: fe ?? 'none',
       craftNotes,
-      planSvg: primsToSvg(g.plan, 'dwg'),
-      frontSvg: primsToSvg(vs.prims.front, 'dwg'),
-      internalSvg: primsToSvg(vs.prims.internal, 'dwg'),
       panelKinds: g.stats.panelKinds,
       panelPieces: g.stats.totalPieces,
       hardware: g.hardware.map((h) => ({ nameZh: h.nameZh, qty: h.qty, spec: h.spec })),
@@ -202,17 +200,17 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     };
   };
 
-  const sections: RoomBookSection[] = [];
-  for (const room of project.rooms) {
-    const inRoom = project.cabinets
-      .filter((c) => c.roomId === room.id)
-      .sort((a, b) => a.placement.y - b.placement.y || a.placement.x - b.placement.x);
-    sections.push({ roomId: room.id, roomName: room.name, cabinets: inRoom.map((c, i) => buildCab(c, i + 1)) });
-  }
-  const orphans = project.cabinets.filter((c) => !project.rooms.some((r) => r.id === c.roomId));
-  if (orphans.length > 0) {
-    sections.push({ roomId: '', roomName: '未分配房间', cabinets: orphans.map((c, i) => buildCab(c, i + 1)) });
-  }
+  const groups = groupByRoom(project);
+  const sections: RoomBookSection[] = groups.map((g) => {
+    // 家具生产图（与 DXF 同源）
+    const sheet = buildFurnitureSheet(g.room, g.cabinets, project, rules);
+    return {
+      roomId: g.room.id,
+      roomName: g.room.name,
+      cabinets: g.cabinets.map((c, i) => buildCab(c, i + 1)),
+      sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
+    };
+  });
 
   const summary = sections.flatMap((s) =>
     s.cabinets.map((c) => {
@@ -263,6 +261,9 @@ const CSS = `
   .cover-table td { height: 10mm; }
   .cabinet-head { display: flex; justify-content: space-between; align-items: baseline; }
   .cabinet-spec { font-size: 10pt; }
+  .sheet-wrap { margin: 2mm 0; border: 0.5pt solid #999; background: #fff; }
+  .sheet-wrap svg { width: 100%; height: 120mm; display: block; }
+  h3 { font-size: 11pt; margin: 3mm 0 1.5mm; }
   .triptych { display: flex; gap: 3mm; margin: 2mm 0; }
   .triptych figure { margin: 0; flex: 1; min-width: 0; }
   .triptych svg { width: 100%; height: 62mm; border: 0.5pt solid #999; background: #fff; }
@@ -294,40 +295,39 @@ export function roomBookHtml(book: RoomBook): string {
   parts.push(`<table><tr><th>房间数</th><td>${book.sections.filter((s) => s.roomId !== '').length}</td><th>柜体数</th><td>${book.totals.cabinets}</td><th>板件种类</th><td>${book.totals.panelKinds}</td><th>板件总数</th><td>${book.totals.panelPieces}</td><th>甲购件</th><td>${book.totals.purchased}</td></tr></table>`);
   parts.push(`</section>`);
 
-  // ── 每房间每柜 ──
+  // ── 每房间一页：家具生产图（与 DXF 同源）──
   for (const sec of book.sections) {
     parts.push(`<section class="page">`);
-    parts.push(`<h2>${esc(sec.roomName)}</h2>`);
+    parts.push(`<h2>${esc(sec.roomName)} · 家具生产图</h2>`);
+    // 整张生产图（地柜平面 + 吊柜平面 + 立面外观 + 立面结构 + 图框）
+    parts.push(`<div class="sheet-wrap">${sec.sheetSvg}</div>`);
+    // 柜体明细表（材质/工艺/安装）
+    parts.push(`<h3>柜体明细</h3>`);
+    parts.push(`<table class="cabinet-meta"><tr><th>柜体</th><th>规格</th><th>板材</th><th>门板</th><th>背板</th><th>工艺</th><th>安装</th></tr>`);
     for (const c of sec.cabinets) {
-      // ── 柜体表头（对标生产图纸：工艺/材质/规格/封边）──
-      parts.push(`<table class="cabinet-meta"><tr>`);
-      parts.push(`<th>柜体</th><td>${esc(c.name)}</td>`);
-      parts.push(`<th>规格</th><td>W${c.width}×H${c.height}×D${c.depth}</td>`);
-      parts.push(`<th>板材</th><td>${esc(c.boardMaterial)}</td>`);
-      parts.push(`<th>封边</th><td>同色</td>`);
-      parts.push(`</tr><tr>`);
-      parts.push(`<th>门板</th><td>${c.doorMaterial ? esc(c.doorMaterial) : '—'}</td>`);
-      parts.push(`<th>背板</th><td>${esc(c.backMaterial)}</td>`);
-      parts.push(`<th>工艺</th><td>${c.craftNotes.length > 0 ? c.craftNotes.map(esc).join(' / ') : '标准'}</td>`);
-      parts.push(`<th>安装</th><td>${c.mountHeight > 0 ? `壁挂，底离地 ${c.mountHeight}mm` : '落地'}</td>`);
-      parts.push(`</tr></table>`);
-      parts.push(`<div class="triptych">`);
-      parts.push(`<figure>${c.planSvg}<figcaption>平面图</figcaption></figure>`);
-      parts.push(`<figure>${c.frontSvg}<figcaption>立面外观（门板图）</figcaption></figure>`);
-      parts.push(`<figure>${c.internalSvg}<figcaption>立面结构（内视图）</figcaption></figure>`);
-      parts.push(`</div>`);
-      if (c.hardware.length > 0) {
-        parts.push(`<table><tr><th>五金</th><th>数量</th><th>规格</th></tr>`);
-        for (const h of c.hardware) parts.push(`<tr><td>${esc(h.nameZh)}</td><td>${h.qty}</td><td>${esc(h.spec)}</td></tr>`);
-        parts.push(`</table>`);
-      }
-      if (c.purchased.length > 0) {
-        parts.push(`<table style="margin-top:1.5mm"><tr><th>甲购/外采件</th><th>材质</th><th>规格</th><th>数量</th></tr>`);
-        for (const p of c.purchased) parts.push(`<tr><td>${esc(p.nameZh)}</td><td>${esc(p.material)}</td><td>${esc(p.spec)}</td><td>${p.qty}</td></tr>`);
-        parts.push(`</table>`);
-      }
-      // ── 柜体页脚（对标生产图纸：备注/签字栏）──
-      parts.push(`<div class="cabinet-foot"><span>备注：${c.hardware.length > 0 ? '五金见上表' : '—'}</span><span>客户签字：</span><span>日期：</span></div>`);
+      parts.push(`<tr>`);
+      parts.push(`<td>${esc(c.name)}</td>`);
+      parts.push(`<td>W${c.width}×H${c.height}×D${c.depth}</td>`);
+      parts.push(`<td>${esc(c.boardMaterial)}</td>`);
+      parts.push(`<td>${c.doorMaterial ? esc(c.doorMaterial) : '—'}</td>`);
+      parts.push(`<td>${esc(c.backMaterial)}</td>`);
+      parts.push(`<td>${c.craftNotes.length > 0 ? c.craftNotes.map(esc).join(' / ') : '标准'}</td>`);
+      parts.push(`<td>${c.mountHeight > 0 ? `壁挂，底离地 ${c.mountHeight}mm` : '落地'}</td>`);
+      parts.push(`</tr>`);
+    }
+    parts.push(`</table>`);
+    // 五金与甲购件汇总
+    const allHardware = sec.cabinets.flatMap((c) => c.hardware);
+    if (allHardware.length > 0) {
+      parts.push(`<table style="margin-top:2mm"><tr><th>五金</th><th>数量</th><th>规格</th></tr>`);
+      for (const h of allHardware) parts.push(`<tr><td>${esc(h.nameZh)}</td><td>${h.qty}</td><td>${esc(h.spec)}</td></tr>`);
+      parts.push(`</table>`);
+    }
+    const allPurchased = sec.cabinets.flatMap((c) => c.purchased);
+    if (allPurchased.length > 0) {
+      parts.push(`<table style="margin-top:1.5mm"><tr><th>甲购/外采件</th><th>材质</th><th>规格</th><th>数量</th></tr>`);
+      for (const p of allPurchased) parts.push(`<tr><td>${esc(p.nameZh)}</td><td>${esc(p.material)}</td><td>${esc(p.spec)}</td><td>${p.qty}</td></tr>`);
+      parts.push(`</table>`);
     }
     parts.push(`</section>`);
   }

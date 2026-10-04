@@ -87,6 +87,10 @@ LAYER_MAP = [
 
 def std_layer_for(layer: str) -> str:
     """内部图层名 → 标准 DXF 图层名。"""
+    # 防御：数字图层名（如 '100'、'285'）是非法的，直接归到 OUTLINE
+    # （疑似某处把尺寸数值当成了 layer 名，根因待查，这里先保证 DXF 干净）
+    if not isinstance(layer, str) or layer.strip().isdigit():
+        return "OUTLINE"
     for prefix, std in LAYER_MAP:
         if layer.startswith(prefix):
             return std
@@ -211,17 +215,16 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     stats["poly"] += 1
 
                 elif kind == "fill":
+                    # 问题5修复：不做实心 HATCH（手机看图软件渲染成灰块，看不到线条）
+                    # 改画闭合轮廓线（线框模式）。玻璃等需要填充的由 TS 侧用斜线表达。
                     pts = [(float(p["x"]), float(p["y"])) for p in pr["pts"]]
                     if len(pts) < 3:
                         continue
-                    std_aci = STD_LAYERS.get(layer, (9, "Continuous", 25))[0]
-                    hatch = target_space.add_hatch(color=std_aci, dxfattribs={"layer": layer})
-                    hatch.paths.add_polyline_path(pts, is_closed=True)
-                    try:
-                        hatch.set_solid_fill(color=std_aci)
-                    except Exception:
-                        pass
+                    attribs = {"layer": layer}
+                    pl = target_space.add_lwpolyline(pts, close=True, dxfattribs=attribs)
+                    pl.dxf.lineweight = lineweight_for(float(pr.get("lw", 1)))
                     stats["fill"] += 1
+                    stats["poly"] += 1
 
                 elif kind == "text":
                     t = pr["text"]

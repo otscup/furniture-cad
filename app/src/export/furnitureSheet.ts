@@ -43,8 +43,9 @@ const MARGIN = 250;
 
 const DRAW_X = BIND_W + MARGIN;
 const DRAW_W = SHEET_W - BIND_W - MARGIN - SIDE_W - MARGIN;
-const DRAW_Y = BOT_H + 600;  // 底部留 600 给立面标题（标题 240 + 间距）
-const DRAW_H = SHEET_H - BOT_H - 600 - MARGIN;
+// v8 修复：底部从 600 加到 1200，给立面底部两排尺寸链留空间，避免压住客户信息表格
+const DRAW_Y = BOT_H + 1200;
+const DRAW_H = SHEET_H - BOT_H - 1200 - MARGIN;
 
 // 2x2 布局：上下两排，左右两列
 const VIEW_GAP_X = 500;       // 左右视图间距
@@ -316,16 +317,18 @@ export function buildFurnitureSheet(
   const eiBox = placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
 
   // ── 视图标题（在视图下方，与尺寸链间距 ≥300）──
-  // 平面标题：平面底部尺寸链在 pbBox.y - 350，标题在 pbBox.y - 700（间距 350）
-  const planTitleY = planY - 700;
+  // 平面标题：平面底部尺寸链在 pbBox.y - 350（L0），L1 在 pbBox.y - 350 - 800
+  // v8 修复：标题从 planY-700 下移到 planY-1400，避开两排尺寸链
+  const planTitleY = planY - 1400;
   if (pbBox.w > 0) {
     prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
   if (pwBox.w > 0) {
     prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
-  // 立面标题：立面底部无尺寸链，标题在 elevY - 350（底部栏上方）
-  const elevTitleY = elevY - 350;
+  // 立面标题：立面底部尺寸链 L0 在 elevY - 350
+  // v8 修复：标题从 elevY-350 下移到 elevY-700，与尺寸链错开 350
+  const elevTitleY = elevY - 700;
   prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '立面外观图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   prims.push(textPrim(eiBox.x + eiBox.w / 2, elevTitleY, '立面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
 
@@ -480,7 +483,8 @@ function drawFrame(prims: Prim[], furnitureName: string, _project: Project): voi
   prims.push(rectPrim(100, 100, W - 100, H - 100, L_BORDER, 1));
 
   // 装订线：纸张最左边缘，不压图（在外框 60 之外）
-  const bx = 30;
+  // v8 修复：x 从 30 移到 10，避开左侧 700/1800 垂直尺寸线
+  const bx = 10;
   prims.push(linePrim(bx, 200, bx, H - 200, L_BORDER, 0.8, true));
   const chars = ['装', '订', '线'];
   chars.forEach((ch, i) => {
@@ -526,7 +530,8 @@ function drawFrame(prims: Prim[], furnitureName: string, _project: Project): voi
     const saveSx = sx;
     for (const [label, value] of rows) {
       prims.push(textPrim(vX + 190, ty, '  ' + label, SZ_TABLE, L_TEXT, 'l'));
-      if (value) prims.push(textPrim(vX + 740, ty, value, SZ_TABLE, L_TEXT, 'l'));
+      // v8 修复：值从 vX+740 左移到 vX+450，"25□ 18□ 9□ 5□"等长文本不再超出右框线
+      if (value) prims.push(textPrim(vX + 450, ty, value, SZ_TABLE, L_TEXT, 'l'));
       prims.push(linePrim(vX + 110, ty - 100, SIDE_R, ty - 100, L_BORDER, 0.6));
       ty -= rowH;
     }

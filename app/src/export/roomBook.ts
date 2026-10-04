@@ -209,10 +209,13 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
   const sections: RoomBookSection[] = groups.map((g) => {
     // 家具生产图（与 DXF 同源）
     const sheet = buildFurnitureSheet(g.room, g.cabinets, project, rules);
+    // v8 修复：柜体明细表必须包含项目全部柜子，不能只按房间分组
+    // （实测有 4 个柜子因 roomId 缺失被分到别的组，表格里少了）
+    const allCabs = project.cabinets.length > g.cabinets.length ? project.cabinets : g.cabinets;
     return {
       roomId: g.room.id,
       roomName: g.room.name,
-      cabinets: g.cabinets.map((c, i) => buildCab(c, i + 1)),
+      cabinets: allCabs.map((c, i) => buildCab(c, i + 1)),
       sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
     };
   });

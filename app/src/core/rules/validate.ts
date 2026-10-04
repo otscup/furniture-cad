@@ -15,7 +15,7 @@ import { buildIssue, type IssueCtx } from './issueCatalog.ts';
  *       严重度、人话描述、修复建议一律由目录给，这里只负责把"差多少 mm"算对 ——
  *       于是"每条报错都带人话和修法"是结构性成立的，不靠谁记得写。
  */
-export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: RuleSet): Issue[] {
+export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: RuleSet, customerHeight?: number): Issue[] {
   const out: Issue[] = [];
   const p = cab.params;
   const L = geom.layout;
@@ -147,22 +147,23 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
    * 单行柜下这就是原来那一项（label 为空），v0.2 的报错文案一字不变；
    * 多行柜才带上"第 N 行" —— 否则两条报错长得一模一样，用户不知道该去哪一行改。
    */
-  const unitRows: Array<{ units: UnitSpec[]; netsRow: number[]; netHRow: number; label: string; rowLabel: string; basePath: string }> = [
+  const unitRows: Array<{ units: UnitSpec[]; netsRow: number[]; netHRow: number; z0Row: number; label: string; rowLabel: string; basePath: string }> = [
     ...L.rows.map((r, i) => ({
       units: r.units,
       netsRow: r.nets,
       netHRow: r.netH,
+      z0Row: r.z0,
       label: L.rows.length > 1 ? `（第${i + 1}行）` : '',
       rowLabel: L.rows.length > 1 ? `（第${i + 1}行）` : '',
       // 一键修复的写路径前缀：多行柜必须带 row 段落，否则"修第 2 行"会改到第 1 行
       basePath: unitPathPrefix(cab.layout, i),
     })),
     ...(DB
-      ? [{ units: cab.layout.backUnits!, netsRow: DB.backNets, netHRow: L.innerH, label: '（背面排）', rowLabel: '', basePath: BACK_UNITS_PATH }]
+      ? [{ units: cab.layout.backUnits!, netsRow: DB.backNets, netHRow: L.innerH, z0Row: L.rows[L.rows.length - 1]?.z0 ?? 0, label: '（背面排）', rowLabel: '', basePath: BACK_UNITS_PATH }]
       : []),
   ];
 
-  for (const { units, netsRow, netHRow, label, rowLabel, basePath } of unitRows) {
+  for (const { units, netsRow, netHRow, z0Row, label, rowLabel, basePath } of unitRows) {
     units.forEach((u, ui) => {
       const netW = netsRow[ui];
       // 电器格：洞口上面的抽屉只拥有"该行净高 − 洞口高 − 过梁板"这段净高
@@ -268,6 +269,73 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
             rowDepth,
             needD: a.openingDepth + t,
           });
+        }
+      }
+
+      // ── 人体工学（按客户身高；未提供身高时跳过）──
+      if (customerHeight !== undefined && customerHeight > 0) {
+        const cabName = cab.name;
+        const height = Math.round(customerHeight);
+
+        // 抽屉：取最上方抽屉的中心高度（够不着的临界点）
+        if (u.drawers && u.drawers.count > 0) {
+          const cells = drawerCellHeights(u, netH, rules);
+          const gap = u.drawers.gap;
+          // 抽屉自下而上排列：gap + cell[0] + gap + cell[1] + ... 
+          // 最上方抽屉的底部 Z = z0 + gap + Σ(前n-1个cell + gap)
+          let topDrawerBottomZ = z0Row + gap;
+          for (let di = 0; di < cells.length - 1; di++) {
+            topDrawerBottomZ += cells[di]! + gap;
+          }
+          const topCellH = cells[cells.length - 1] ?? 0;
+          const drawerH = Math.round(topDrawerBottomZ + topCellH / 2);
+          const limit = height - 300;
+          if (drawerH > limit) {
+            emit('ERGO-DRAWER-HEIGHT', `${cab.id}.${u.id}`, 'unit', {
+              ...ctxBase,
+              cabName,
+              drawerH,
+              height,
+              limit,
+            });
+          }
+        }
+
+        // 挂衣杆：高度 + 与上方层板间隙 + 挂衣区净高
+        if (u.rod && u.rod.count > 0) {
+          const rodH = Math.round(z0Row + u.rod.heightFromBottom);
+          const rodLimit = height + 200;
+          if (rodH > rodLimit) {
+            emit('ERGO-ROD-HEIGHT', `${cab.id}.${u.id}`, 'unit', {
+              ...ctxBase,
+              cabName,
+              rodH,
+              height,
+              limit: rodLimit,
+            });
+          }
+          // 杆到分区顶的间隙（衣服挂不进去的硬限制）
+          const gap = Math.round(netH - u.rod.heightFromBottom);
+          if (gap < 100) {
+            emit('ERGO-ROD-CLEARANCE', `${cab.id}.${u.id}`, 'unit', {
+              ...ctxBase,
+              cabName,
+              gap,
+              min: 100,
+            });
+          }
+          // 挂衣区净高：≥1200 算长衣区，<1200 算短衣区
+          const zoneType = netH >= 1200 ? '长衣' : '短衣';
+          const minNetH = zoneType === '长衣' ? 1400 : 900;
+          if (Math.round(netH) < minNetH) {
+            emit('ERGO-HANG-ZONE', `${cab.id}.${u.id}`, 'unit', {
+              ...ctxBase,
+              cabName,
+              zoneType,
+              netH: Math.round(netH),
+              min: minNetH,
+            });
+          }
         }
       }
     });

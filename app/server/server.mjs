@@ -363,13 +363,14 @@ async function openAccountWorkspace(accountId) {
   };
   workspaceStates.set(aid, entry);
 
-  // 迁移：旧单文件 → 第一个访问的 admin/local-open 账号
-  // （只在目标文件不存在且旧文件存在时执行一次）
-  const { existsSync: _exists, copyFileSync: _copy, mkdirSync: _mkdir } = await import('node:fs');
+  // 迁移：旧单文件 → 第一个访问的账号（只执行一次，成功后重命名旧文件防重复）
+  const { existsSync: _exists, copyFileSync: _copy, mkdirSync: _mkdir, renameSync: _rename } = await import('node:fs');
   try {
     if (!_exists(filePath) && _exists(WORKSPACE_PATH)) {
       _mkdir(dirname(filePath), { recursive: true });
       _copy(WORKSPACE_PATH, filePath);
+      // 重命名旧文件，防止其他账号重复认领
+      try { _rename(WORKSPACE_PATH, WORKSPACE_PATH + '.migrated'); } catch {}
       try { auth.audit({ actor: aid, action: 'workspace.migrate', result: 'ok', from: WORKSPACE_PATH }); } catch {}
     }
   } catch {

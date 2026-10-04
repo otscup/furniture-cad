@@ -231,7 +231,7 @@ export interface DimIntent {
 }
 
 /** 层间距（mm）：重叠的尺寸线逐层外移的步长 */
-export const DIM_LEVEL_STEP = 280;
+export const DIM_LEVEL_STEP = 600;  // 2026-10-04：用户说 400 还挤，拉到 600
 /** 文字宽度估算：size 110 的数字约 0.55 * size 每字符 */
 const DIM_TEXT_CHAR_W = 0.55;
 
@@ -1188,7 +1188,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         }
 
         // 门板：整块 + 开向对角线（行业画法）。门板高度按**本行净高**排。
-        if (u.doors) {
+        // 2026-10-04：appliance（冰箱等嵌入式电器）不画门板，前面敞开
+        if (u.doors && u.kind !== 'appliance') {
           const dr = u.doors;
           const widths = doorWidths(u, netW, rules);
           // 玻璃门：材质 kind='glass' → 门板图画「黑框灰玻」斜线填充（销售图纸同款）
@@ -1244,25 +1245,36 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                *   · 单扇按 hingeSide：铰链在左 → 门往右开 → 线从右上到左下（指向开门侧）；
                *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
                * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
+               * 2026-10-04：用户要求去掉 X 实线，diag 函数已删除，只保留虚线箭头
                */
-              const diag = (x1: number, z1: number, x2: number, z2: number): void => {
-                P.line(x1, x2, z1, z2, L_FRONT, 0.9);
-              };
               if (widths.length === 2) {
-                // 对开 X 形：整个门洞画一个大 X，两条线跨过门缝在中点交叉
-                // （行业画法；与铰链侧无关 —— 两扇铰链天然在两侧）。
-                // 注意必须用门洞边界而非循环内的扇叶边界，否则 X 会被门缝切成两个小 X。
+                // 对开 X 形：用户要求去掉 X 实线，只保留虚线箭头（2026-10-04）
+                // 原 X 线已删除，虚线箭头在下方绘制
                 if (k === 0) {
                   const openL = x0 + dr.gapOuter;
-                  const openR = openL + widths[0]! + dr.gapMid + widths[1]!;
-                  diag(openL, zBot, openR, zTop);
-                  diag(openL, zTop, openR, zBot);
+                  // const openR = openL + widths[0]! + dr.gapMid + widths[1]!;  // 已删除：X 实线用
+                  // diag(openL, zBot, openR, zTop);  // 已删除：X 实线
+                  // diag(openL, zTop, openR, zBot);  // 已删除：X 实线
+                  // 双扇对开虚线箭头：左扇向左开，右扇向右开
+                  const ay = (zTop + zBot) / 2;
+                  const w0 = widths[0]!, w1 = widths[1]!;
+                  // 左扇箭头（铰链在左，向左开 → 箭头指向左）
+                  const l_ax0 = openL + w0 * 0.7, l_ax1 = openL + w0 * 0.2;
+                  P.line(l_ax0, l_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_ax1, l_ax1 + 60, ay, ay + 35, L_HW, 0.9);
+                  P.line(l_ax1, l_ax1 + 60, ay, ay - 35, L_HW, 0.9);
+                  // 右扇箭头（铰链在右，向右开 → 箭头指向右）
+                  const r_x0 = openL + w0 + dr.gapMid;
+                  const r_ax0 = r_x0 + w1 * 0.3, r_ax1 = r_x0 + w1 * 0.8;
+                  P.line(r_ax0, r_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_ax1, r_ax1 - 60, ay, ay + 35, L_HW, 0.9);
+                  P.line(r_ax1, r_ax1 - 60, ay, ay - 35, L_HW, 0.9);
                 }
               } else if (widths.length === 1) {
-                // 开向对角线指向开门侧：铰链在左 → 门往右开 → 线从右上到左下
+                // 单扇门：用户要求去掉对角线实线，只保留虚线箭头（2026-10-04）
                 const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
-                if (hingeLeft) diag(right, zTop, left, zBot);
-                else diag(left, zTop, right, zBot);
+                // if (hingeLeft) diag(right, zTop, left, zBot);  // 已删除
+                // else diag(left, zTop, right, zBot);  // 已删除
                 // 虚线箭头：从铰链侧中部指向开门侧，放在门板中央
                 const ax0 = hingeLeft ? left + w * 0.3 : right - w * 0.3;
                 const ax1 = hingeLeft ? right - w * 0.2 : left + w * 0.2;
@@ -1282,8 +1294,17 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 for (let j = 0; j < widths.length; j++) {
                   const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
                   const r2 = l2 + widths[j];
-                  if (side) diag(r2, zTop, l2, zBot);
-                  else diag(l2, zTop, r2, zBot);
+                  // if (side) diag(r2, zTop, l2, zBot);  // 已删除：X 实线
+                  // else diag(l2, zTop, r2, zBot);  // 已删除：X 实线
+                  // 多扇门虚线箭头：每扇独立，方向同 side
+                  const wj = widths[j]!;
+                  const ay = (zTop + zBot) / 2;
+                  const j_ax0 = side ? l2 + wj * 0.3 : r2 - wj * 0.3;
+                  const j_ax1 = side ? r2 - wj * 0.2 : l2 + wj * 0.2;
+                  const dir = side ? 1 : -1;
+                  P.line(j_ax0, j_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_ax1, j_ax1 - dir * 60, ay, ay + 35, L_HW, 0.9);
+                  P.line(j_ax1, j_ax1 - dir * 60, ay, ay - 35, L_HW, 0.9);
                 }
               }
             }

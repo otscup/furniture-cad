@@ -160,7 +160,10 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
   const geom = generateProject(project, rules);
 
   const buildCab = (cab: Cabinet, index: number): RoomBookCabinet => {
-    const g = geom.cabinets[cab.id]!;
+    // 容错：若 generateCabinet 对该柜抛错（generateProject 已吞错记 issue），
+    // geom.cabinets[cab.id] 为 undefined。此时不崩，表格仍列出该柜（0 件），
+    // 而不是让整个导出挂掉或静默丢柜。
+    const g = geom.cabinets[cab.id];
     const units = allUnits(cab.layout);
     const doorUnit = units.find((u) => u.doors);
     const doorMatName = doorUnit?.doors?.material ? (rules.materials[doorUnit.doors.material]?.name ?? doorUnit.doors.material) : null;
@@ -198,10 +201,10 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       mountHeight: cab.params.mountHeight ?? 0,
       finishedEnds: fe ?? 'none',
       craftNotes,
-      panelKinds: g.stats.panelKinds,
-      panelPieces: g.stats.totalPieces,
-      hardware: g.hardware.map((h) => ({ nameZh: h.nameZh, qty: h.qty, spec: h.spec })),
-      purchased: g.purchased,
+      panelKinds: g?.stats.panelKinds ?? 0,
+      panelPieces: g?.stats.totalPieces ?? 0,
+      hardware: (g?.hardware ?? []).map((h) => ({ nameZh: h.nameZh, qty: h.qty, spec: h.spec })),
+      purchased: g?.purchased ?? [],
     };
   };
 
@@ -235,14 +238,14 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
 
   const summary = sections.flatMap((s) =>
     s.cabinets.map((c) => {
-      const g = geom.cabinets[c.id]!;
+      const g = geom.cabinets[c.id];
       return {
         cabinet: c.name,
         room: s.roomName,
         panelKinds: c.panelKinds,
         panelPieces: c.panelPieces,
-        hardwareKinds: g.hardware.length,
-        hardwarePieces: g.hardware.reduce((a, h) => a + h.qty, 0),
+        hardwareKinds: g?.hardware.length ?? 0,
+        hardwarePieces: (g?.hardware ?? []).reduce((a, h) => a + h.qty, 0),
         purchased: c.purchased.length,
       };
     })
@@ -283,7 +286,7 @@ const CSS = `
   .cabinet-head { display: flex; justify-content: space-between; align-items: baseline; }
   .cabinet-spec { font-size: 10pt; }
   .sheet-wrap { margin: 2mm 0; border: 0.5pt solid #999; background: #fff; }
-  .sheet-wrap svg { width: 100%; height: 120mm; display: block; }
+  .sheet-wrap svg { width: 100%; height: 155mm; display: block; }
   h3 { font-size: 11pt; margin: 3mm 0 1.5mm; }
   .triptych { display: flex; gap: 3mm; margin: 2mm 0; }
   .triptych figure { margin: 0; flex: 1; min-width: 0; }

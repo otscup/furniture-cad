@@ -68,6 +68,11 @@ export interface Project {
    *   缺省 = 没有任何意图（旧文件逐字节兼容）。
    */
   designIntents?: DesignIntent[];
+  /**
+   * 客户身高（mm，可选）—— 人体工学校验的输入。
+   * 缺省 = 不做人体工学校验（旧文件兼容）。
+   */
+  customerHeight?: number;
 }
 
 export interface Room {

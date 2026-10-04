@@ -57,7 +57,7 @@ const SZ_TITLE = 320;
 const SZ_VIEW_TITLE = 240;
 const SZ_TABLE = 150;
 const SZ_ANNOT = 170;
-const SZ_SIDEBAR_SECTION = 220;  // 侧边栏分区大标题
+// SZ_SIDEBAR_SECTION 已废弃：2026-10-04 改竖排小字，不再用横排大标题
 
 // ─────────────────────────── 基础工具 ───────────────────────────
 
@@ -166,6 +166,45 @@ function buildRawView(
     // 红色工艺标注由 buildFurnitureSheet 统一加引线标注
     if (viewKind === 'internal') {
       viewPrims = viewPrims.filter((p) => p.k !== 'text');
+      // 层板线稀疏化：只保留每柜 1-2 条关键横线（顶部、底部、中部），其余横线去掉
+      // 参考 PDF 风格：留白+稀疏，不堆砌
+      const isHorizontalLine = (p: Prim): boolean => {
+        const pp = p as any;
+        if (p.k !== 'poly' || pp.closed || pp.dash) return false;
+        if (!pp.pts || pp.pts.length !== 2) return false;
+        const [a, b] = pp.pts;
+        return Math.abs(a.y - b.y) < 5 && Math.abs(a.x - b.x) > 100;
+      };
+      const horiz = viewPrims.filter(isHorizontalLine);
+      if (horiz.length > 3) {
+        // 按 Y 排序，保留顶部、底部、中部各一条
+        const sorted = [...horiz].sort((a, b) => {
+          const ya = (a as any).pts[0].y;
+          const yb = (b as any).pts[0].y;
+          return ya - yb;
+        });
+        const keep = new Set<Prim>();
+        keep.add(sorted[0]!);
+        keep.add(sorted[sorted.length - 1]!);
+        keep.add(sorted[Math.floor(sorted.length / 2)]!);
+        viewPrims = viewPrims.filter((p) => !isHorizontalLine(p) || keep.has(p));
+      }
+    }
+    // front 视图：去掉门板 X 交叉实线，只保留虚线开向箭头
+    // 用户要求：门板开向用虚线箭头，不用 X 实线
+    if (viewKind === 'front') {
+      viewPrims = viewPrims.filter((p) => {
+        const pp = p as any;
+        // 保留虚线（箭头），去掉实线对角线（X）
+        if (p.k !== 'poly' || pp.closed || pp.dash) return true;
+        if (!pp.pts || pp.pts.length !== 2) return true;
+        const [a, b] = pp.pts;
+        const dx = Math.abs(a.x - b.x);
+        const dy = Math.abs(a.y - b.y);
+        // 对角线：dx 和 dy 都显著 → X 线，去掉
+        if (dx > 150 && dy > 150) return false;
+        return true;
+      });
     }
     const origin = vs.meta[viewKind].origin;
     const dy = yOffset(cab);
@@ -277,8 +316,8 @@ export function buildFurnitureSheet(
   const eiBox = placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
 
   // ── 视图标题（在视图下方，与尺寸链间距 ≥300）──
-  // 平面标题：平面底部尺寸链在 pbBox.y - 250，标题在 pbBox.y - 550
-  const planTitleY = planY - 550;
+  // 平面标题：平面底部尺寸链在 pbBox.y - 350，标题在 pbBox.y - 700（间距 350）
+  const planTitleY = planY - 700;
   if (pbBox.w > 0) {
     prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
@@ -440,38 +479,58 @@ function drawFrame(prims: Prim[], furnitureName: string, _project: Project): voi
   prims.push(rectPrim(60, 60, W - 60, H - 60, L_BORDER, 2));
   prims.push(rectPrim(100, 100, W - 100, H - 100, L_BORDER, 1));
 
-  // 装订线
-  const bx = BIND_W / 2;
+  // 装订线：纸张最左边缘，不压图（在外框 60 之外）
+  const bx = 30;
   prims.push(linePrim(bx, 200, bx, H - 200, L_BORDER, 0.8, true));
   const chars = ['装', '订', '线'];
   chars.forEach((ch, i) => {
     prims.push(textPrim(bx, H / 2 + 200 - i * 320, ch, 260, L_TEXT, 'c'));
   });
 
-  // ── 右侧边栏 ──
+  // ── 右侧边栏（右边缘与内框对齐 W-100，不超出）──
   const sx = W - SIDE_W;
+  const SIDE_R = W - 100;  // 侧边栏右边缘 = 内框线
   const sy = H - 100;
-  prims.push(textPrim(sx + SIDE_W / 2, sy - 300, furnitureName, SZ_TITLE, L_TEXT, 'c'));
-  prims.push(linePrim(sx, sy - 550, sx + SIDE_W, sy - 550, L_BORDER, 1));
+  // 侧边栏左侧竖线（与主区隔开），从顶部到底部客户栏
+  prims.push(linePrim(sx, 100, sx, H - 100, L_BORDER, 1));
+  prims.push(textPrim(sx + (SIDE_R - sx) / 2, sy - 300, furnitureName, SZ_TITLE, L_TEXT, 'c'));
+  prims.push(linePrim(sx, sy - 550, SIDE_R, sy - 550, L_BORDER, 1));
 
   let ty = sy - 700;
-  const rowH = 260;
+  const rowH = 220;  // 压缩行高，填满侧边栏
 
   const drawRow = (label: string, value: string = ''): void => {
     prims.push(textPrim(sx + 80, ty, label, SZ_TABLE, L_TEXT, 'l'));
     if (value) prims.push(textPrim(sx + 650, ty, value, SZ_TABLE, L_TEXT, 'l'));
-    prims.push(linePrim(sx, ty - 100, sx + SIDE_W, ty - 100, L_BORDER, 0.6));
+    prims.push(linePrim(sx, ty - 100, SIDE_R, ty - 100, L_BORDER, 0.6));
     ty -= rowH;
   };
 
-  // 分区大标题（横排）：加粗底线，与下方行拉开
+  // 分区标题：竖排小字在左侧（对标参考 PDF），内容行右移
+  // 参考 PDF：柜体/移门/掩门/线条 竖排在分区左侧作标题
   const drawSection = (title: string, rows: Array<[string, string?]>): void => {
-    prims.push(textPrim(sx + 80, ty, title, SZ_SIDEBAR_SECTION, L_TEXT, 'l'));
-    prims.push(linePrim(sx + 80, ty - 110, sx + SIDE_W - 80, ty - 110, L_BORDER, 1.2));
-    ty -= rowH;
-    for (const [label, value] of rows) {
-      drawRow('  ' + label, value ?? '');
+    const vSize = 150;  // 竖排小字
+    const vX = sx + 60;  // 左侧竖排位置
+    const n = title.length;
+    // 竖排：逐字从上往下，垂直居中于整个分区
+    const sectionH = rows.length * rowH;
+    const startY = ty + 40 - (n * vSize * 0.6);  // 居中偏移
+    for (let i = 0; i < n; i++) {
+      prims.push(textPrim(vX, startY - i * vSize, title[i]!, vSize, L_TEXT, 'c'));
     }
+    // 分区左侧竖线（标题与内容分隔）
+    const secTop = ty + 80;
+    const secBot = ty - sectionH + 40;
+    prims.push(linePrim(vX + 110, secTop, vX + 110, secBot, L_BORDER, 0.8));
+    // 内容行：x 右移避开竖排标题
+    const saveSx = sx;
+    for (const [label, value] of rows) {
+      prims.push(textPrim(vX + 190, ty, '  ' + label, SZ_TABLE, L_TEXT, 'l'));
+      if (value) prims.push(textPrim(vX + 740, ty, value, SZ_TABLE, L_TEXT, 'l'));
+      prims.push(linePrim(vX + 110, ty - 100, SIDE_R, ty - 100, L_BORDER, 0.6));
+      ty -= rowH;
+    }
+    void saveSx;
   };
 
   drawRow('设计师');

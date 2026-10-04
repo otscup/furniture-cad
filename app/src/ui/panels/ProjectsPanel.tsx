@@ -34,6 +34,8 @@ interface Props {
   onToast?: (kind: 'info' | 'error' | 'ok' | 'warn', msg: string) => void;
   /** 切换项目后回调（需刷新） */
   onProjectSwitched?: () => void;
+  /** 从服务端载入工作区后回调（父组件用 bus.replaceProject 装载） */
+  onWorkspaceLoaded?: (project: any) => void;
   /** 新建房间：调用方提供实现（走命令总线） */
   onCreateRoom?: (name: string) => void;
   /** 点击房间回调 */
@@ -64,6 +66,25 @@ export function ProjectsPanel(props: Props) {
   }, [props.token]);
 
   useEffect(() => { void fetchProjects(); }, [fetchProjects]);
+
+  const [loadingWs, setLoadingWs] = useState(false);
+  const loadFromServer = useCallback(async () => {
+    if (!confirm('从服务端载入当前账号的工作区？\n\n本地未保存的修改会被服务端版本覆盖。')) return;
+    setLoadingWs(true);
+    try {
+      const r = await fetch('/api/workspace', {
+        headers: props.token ? { Authorization: `Bearer ${props.token}` } : {},
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || '载入失败');
+      props.onWorkspaceLoaded?.(j.project);
+      props.onToast?.('ok', `已从服务端载入：${j.project.rooms?.length ?? 0} 房间 / ${j.project.cabinets?.length ?? 0} 柜体（live v${j.liveModelVersion}）`);
+    } catch (e) {
+      props.onToast?.('error', `载入失败：${e instanceof Error ? e.message : e}`);
+    } finally {
+      setLoadingWs(false);
+    }
+  }, [props]);
 
   const createProject = useCallback(async () => {
     const name = newName.trim();
@@ -131,6 +152,15 @@ export function ProjectsPanel(props: Props) {
     <div className="projects-panel">
       <div className="projects-head">
         <span className="projects-title">项目目录</span>
+        <button
+          type="button"
+          className="tb-btn small"
+          onClick={() => void loadFromServer()}
+          disabled={loadingWs}
+          title="从服务端拉取当前账号的工作区（MCP/其他端写入的数据）"
+        >
+          {loadingWs ? '载入中…' : '⟳ 从服务端载入'}
+        </button>
         <button
           type="button"
           className="tb-btn small"

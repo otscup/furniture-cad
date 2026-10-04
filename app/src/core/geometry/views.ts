@@ -231,7 +231,7 @@ export interface DimIntent {
 }
 
 /** 层间距（mm）：重叠的尺寸线逐层外移的步长 */
-export const DIM_LEVEL_STEP = 600;  // 2026-10-04：用户说 400 还挤，拉到 600
+export const DIM_LEVEL_STEP = 800;  // 2026-10-04 v8：用户说 600 还挤，拉到 800
 /** 文字宽度估算：size 110 的数字约 0.55 * size 每字符 */
 const DIM_TEXT_CHAR_W = 0.55;
 
@@ -1245,66 +1245,64 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                *   · 单扇按 hingeSide：铰链在左 → 门往右开 → 线从右上到左下（指向开门侧）；
                *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
                * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
-               * 2026-10-04：用户要求去掉 X 实线，diag 函数已删除，只保留虚线箭头
+               * 2026-10-04 v8：X 线加回来（v7 误删），对标参考 PDF 门板 X 交叉线
                */
+              // v8：恢复 diag 函数（画门板 X 交叉线，实线）
+              const diag = (x1: number, y1: number, x2: number, y2: number): void => {
+                P.line(x1, x2, y1, y2, L_FRONT, 0.8);
+              };
               if (widths.length === 2) {
-                // 对开 X 形：用户要求去掉 X 实线，只保留虚线箭头（2026-10-04）
-                // 原 X 线已删除，虚线箭头在下方绘制
+                // 对开 X 形：v8 恢复（对标参考 PDF）
                 if (k === 0) {
                   const openL = x0 + dr.gapOuter;
-                  // const openR = openL + widths[0]! + dr.gapMid + widths[1]!;  // 已删除：X 实线用
-                  // diag(openL, zBot, openR, zTop);  // 已删除：X 实线
-                  // diag(openL, zTop, openR, zBot);  // 已删除：X 实线
-                  // 双扇对开虚线箭头：左扇向左开，右扇向右开
+                  const openR = openL + widths[0]! + dr.gapMid + widths[1]!;  // v8 恢复
+                  diag(openL, zBot, openR, zTop);  // v8 恢复：X 实线
+                  diag(openL, zTop, openR, zBot);  // v8 恢复：X 实线
+                  // v8：双扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
                   const ay = (zTop + zBot) / 2;
                   const w0 = widths[0]!, w1 = widths[1]!;
-                  // 左扇箭头（铰链在左，向左开 → 箭头指向左）
-                  const l_ax0 = openL + w0 * 0.7, l_ax1 = openL + w0 * 0.2;
-                  P.line(l_ax0, l_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_ax1, l_ax1 + 60, ay, ay + 35, L_HW, 0.9);
-                  P.line(l_ax1, l_ax1 + 60, ay, ay - 35, L_HW, 0.9);
-                  // 右扇箭头（铰链在右，向右开 → 箭头指向右）
+                  // 左扇：竖向虚线箭头，指向上下
+                  const l_cx = openL + w0 / 2;
+                  const l_ay0 = ay - (zBot - zTop) * 0.2, l_ay1 = ay + (zBot - zTop) * 0.2;
+                  P.line(l_cx, l_cx, l_ay0, l_ay1, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx - 35, l_ay1, l_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx + 35, l_ay1, l_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  // 右扇：竖向虚线箭头，指向上下
                   const r_x0 = openL + w0 + dr.gapMid;
-                  const r_ax0 = r_x0 + w1 * 0.3, r_ax1 = r_x0 + w1 * 0.8;
-                  P.line(r_ax0, r_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_ax1, r_ax1 - 60, ay, ay + 35, L_HW, 0.9);
-                  P.line(r_ax1, r_ax1 - 60, ay, ay - 35, L_HW, 0.9);
+                  const r_cx = r_x0 + w1 / 2;
+                  const r_ay0 = ay - (zBot - zTop) * 0.2, r_ay1 = ay + (zBot - zTop) * 0.2;
+                  P.line(r_cx, r_cx, r_ay0, r_ay1, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx - 35, r_ay1, r_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx + 35, r_ay1, r_ay1 - 60, L_HW, 0.9, HINGE_DASH);
                 }
               } else if (widths.length === 1) {
-                // 单扇门：用户要求去掉对角线实线，只保留虚线箭头（2026-10-04）
+                // 单扇门：v8 恢复 X 对角线（对标参考 PDF）
                 const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
-                // if (hingeLeft) diag(right, zTop, left, zBot);  // 已删除
-                // else diag(left, zTop, right, zBot);  // 已删除
-                // 虚线箭头：从铰链侧中部指向开门侧，放在门板中央
-                const ax0 = hingeLeft ? left + w * 0.3 : right - w * 0.3;
-                const ax1 = hingeLeft ? right - w * 0.2 : left + w * 0.2;
+                if (hingeLeft) diag(right, zTop, left, zBot);  // v8 恢复
+                else diag(left, zTop, right, zBot);  // v8 恢复
+                // v8：虚线箭头改竖向（上下开门方向，对标参考 PDF）
+                const cx = (left + right) / 2;
                 const ay = (zTop + zBot) / 2;
-                // 虚线
-                P.line(ax0, ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
-                // 箭头三角形（指向开门侧）
-                const dir = hingeLeft ? 1 : -1;
-                const ah = 60;  // 箭头长度
-                const aw = 35;  // 箭头半宽
-                const tipX = ax1;
-                P.line(tipX, tipX - dir * ah, ay, ay + aw, L_HW, 0.9);
-                P.line(tipX, tipX - dir * ah, ay, ay - aw, L_HW, 0.9);
-                P.line(tipX - dir * ah, tipX - dir * ah, ay + aw, ay - aw, L_HW, 0.9);
+                const ay0 = ay - (zBot - zTop) * 0.2, ay1 = ay + (zBot - zTop) * 0.2;
+                // 竖向虚线
+                P.line(cx, cx, ay0, ay1, L_HW, 0.9, HINGE_DASH);
+                // 箭头（指向上），虚线
+                P.line(cx, cx - 35, ay1, ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                P.line(cx, cx + 35, ay1, ay1 - 60, L_HW, 0.9, HINGE_DASH);
               } else {
                 const side = (dr.hingeSide ?? 'left') === 'left';
                 for (let j = 0; j < widths.length; j++) {
                   const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
                   const r2 = l2 + widths[j];
-                  // if (side) diag(r2, zTop, l2, zBot);  // 已删除：X 实线
-                  // else diag(l2, zTop, r2, zBot);  // 已删除：X 实线
-                  // 多扇门虚线箭头：每扇独立，方向同 side
-                  const wj = widths[j]!;
+                  if (side) diag(r2, zTop, l2, zBot);  // v8 恢复：X 实线
+                  else diag(l2, zTop, r2, zBot);  // v8 恢复：X 实线
+                  // v8：多扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
                   const ay = (zTop + zBot) / 2;
-                  const j_ax0 = side ? l2 + wj * 0.3 : r2 - wj * 0.3;
-                  const j_ax1 = side ? r2 - wj * 0.2 : l2 + wj * 0.2;
-                  const dir = side ? 1 : -1;
-                  P.line(j_ax0, j_ax1, ay, ay, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_ax1, j_ax1 - dir * 60, ay, ay + 35, L_HW, 0.9);
-                  P.line(j_ax1, j_ax1 - dir * 60, ay, ay - 35, L_HW, 0.9);
+                  const j_cx = (l2 + r2) / 2;
+                  const j_ay0 = ay - (zBot - zTop) * 0.2, j_ay1 = ay + (zBot - zTop) * 0.2;
+                  P.line(j_cx, j_cx, j_ay0, j_ay1, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx - 35, j_ay1, j_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx + 35, j_ay1, j_ay1 - 60, L_HW, 0.9, HINGE_DASH);
                 }
               }
             }

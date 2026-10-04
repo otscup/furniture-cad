@@ -25,7 +25,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,7 +116,9 @@ async function startServer(opts: {
   const dir = mkdtempSync(join(TMP, 'srv-'));
   const accountsPath = join(dir, 'accounts.json');
   const auditPath = join(dir, 'audit.jsonl');
-  const wsPath = join(dir, 'workspace.json');
+  // 工作区按账号隔离：local-open 模式下实际路径为 {dir}/workspaces/local-open/workspace.json
+  const wsPath = join(dir, 'workspaces', 'local-open', 'workspace.json');
+  const legacyWsPath = join(dir, 'workspace.json');
 
   if (opts.accounts) {
     const a = new AuthStore({ accountsPath, auditPath });
@@ -124,7 +126,11 @@ async function startServer(opts: {
     a.create({ username: 'designer', password: 'des-pass-1234', role: 'designer', actor: 'owner' });
     a.create({ username: 'viewer', password: 'view-pass-1234', role: 'viewer', actor: 'owner' });
   }
-  if (opts.seedWorkspace) writeWorkspaceFixture(wsPath);
+  if (opts.seedWorkspace) {
+    // 直接写到 per-account 路径（mkdir -p 确保目录存在）
+    mkdirSync(dirname(wsPath), { recursive: true });
+    writeWorkspaceFixture(wsPath);
+  }
 
   const port = nextPort++;
   const child = spawn(process.execPath, [join(root, 'server', 'server.mjs')], {
@@ -136,7 +142,7 @@ async function startServer(opts: {
       APP_MEM_PATH: join(dir, 'corrections.jsonl'),
       APP_ACCOUNTS_PATH: accountsPath,
       APP_AUDIT_PATH: auditPath,
-      APP_WORKSPACE_PATH: wsPath,
+      APP_WORKSPACE_PATH: legacyWsPath,
       ...(opts.extraEnv ?? {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -485,7 +491,9 @@ section('③ 工作区装载失败 ⇒ 结构化 WORKSPACE_UNAVAILABLE（**不�
 
 {
   const badDir = mkdtempSync(join(TMP, 'badws-'));
-  const badWs = join(badDir, 'workspace.json');
+  // 损坏文件直接写到 per-account 路径（不经过迁移）
+  const badWs = join(badDir, 'workspaces', 'local-open', 'workspace.json');
+  mkdirSync(dirname(badWs), { recursive: true });
   writeFileSync(badWs, '{ 这不是合法项目文件', 'utf8');
   const badAccounts = join(badDir, 'accounts.json');
   const badAudit = join(badDir, 'audit.jsonl');
@@ -591,7 +599,9 @@ let TOKEN_ID_OWNER = '';
   const viaSession = await mcp(A.port, { jsonrpc: '2.0', id: 11, method: 'tools/list', params: {} }, { token: T_OWNER_SESSION });
   ok('④4b 既有登录会话 token 也能过（**没有**新增第二套身份体系）', viaSession.status === 200, `status=${viaSession.status}`);
   const callViaPat = await mcp(A.port, { jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'cad.get_state', arguments: {} } }, { token: PAT_OWNER });
-  ok('④4c PAT 能真正调用只读工具并拿到真实工作区', callViaPat.status === 200 && toolPayload(callViaPat.json)?.workspaceId === 'ws_fixture_s2', `status=${callViaPat.status} ${callViaPat.text.slice(0, 200)}`);
+  // 按账号隔离后，owner 账号有自己独立的工作区（不再是 local-open 的 fixture）。
+  // 这里只断言"能拿到真实工作区"（有 workspaceId），不绑定具体 ID。
+  ok('④4c PAT 能真正调用只读工具并拿到真实工作区', callViaPat.status === 200 && typeof toolPayload(callViaPat.json)?.workspaceId === 'string', `status=${callViaPat.status} ${callViaPat.text.slice(0, 200)}`);
 }
 
 // ── viewer / designer 权限与既有链一致 ──

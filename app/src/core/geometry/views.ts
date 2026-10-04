@@ -1099,6 +1099,12 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   function drawFrontLike(P: ViewPainter, withFronts: boolean): void {
     const hidden = withFronts ? undefined : HIDDEN_DASH;
 
+    // 电器柜（冰箱等嵌入式电器）：只画最外框线表示嵌入位置，不画任何板件线，前面完全敞开
+    // 用户反馈：冰箱外面不应有柜子包住
+    const isApplianceCab = L.rows.every((r) => r.units.length > 0 && r.units.every((u) => u.kind === 'appliance'));
+    if (isApplianceCab) {
+      P.rect(0, W, 0, H, L_VIEW, 1);
+    } else {
     // 箱体骨架（外框）两种图都画 —— 这是同一个柜子
     P.rect(t, W - t, 0, bodyLift, layerOfThickness(t), 1); // 踢脚板
     P.rect(0, t, bodyLift, H, layerOfThickness(t), 1); // 左侧板
@@ -1117,6 +1123,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     if (feFront === 'right' || feFront === 'both') {
       P.arc(W - t, H, R36, Math.PI * 1.5, Math.PI * 2, layerOfThickness(t), 1.2); // 右上角圆弧向右上
     }
+    } // end else: 非电器柜才画板件骨架
 
     /**
      * ── 正视图是【门板图】，不是"结构图加门"（一次真实缺陷的修正）──
@@ -1259,21 +1266,23 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                   diag(openL, zBot, openR, zTop);  // v8 恢复：X 实线
                   diag(openL, zTop, openR, zBot);  // v8 恢复：X 实线
                   // v8：双扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
-                  const ay = (zTop + zBot) / 2;
+                  // 用户要求：虚线双向 <> 覆盖整个门板
                   const w0 = widths[0]!, w1 = widths[1]!;
-                  // 左扇：竖向虚线箭头，指向上下
+                  // 左扇：虚线双向箭头，覆盖整个门板高度
                   const l_cx = openL + w0 / 2;
-                  const l_ay0 = ay - (zBot - zTop) * 0.2, l_ay1 = ay + (zBot - zTop) * 0.2;
-                  P.line(l_cx, l_cx, l_ay0, l_ay1, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx - 35, l_ay1, l_ay1 - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx + 35, l_ay1, l_ay1 - 60, L_HW, 0.9, HINGE_DASH);
-                  // 右扇：竖向虚线箭头，指向上下
+                  P.line(l_cx, l_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(l_cx, l_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
+                  // 右扇：虚线双向箭头，覆盖整个门板高度
                   const r_x0 = openL + w0 + dr.gapMid;
                   const r_cx = r_x0 + w1 / 2;
-                  const r_ay0 = ay - (zBot - zTop) * 0.2, r_ay1 = ay + (zBot - zTop) * 0.2;
-                  P.line(r_cx, r_cx, r_ay0, r_ay1, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx - 35, r_ay1, r_ay1 - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx + 35, r_ay1, r_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(r_cx, r_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
                 }
               } else if (widths.length === 1) {
                 // 单扇门：v8 恢复 X 对角线（对标参考 PDF）
@@ -1281,14 +1290,16 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 if (hingeLeft) diag(right, zTop, left, zBot);  // v8 恢复
                 else diag(left, zTop, right, zBot);  // v8 恢复
                 // v8：虚线箭头改竖向（上下开门方向，对标参考 PDF）
+                // 用户要求：虚线双向 <> 覆盖整个门板
                 const cx = (left + right) / 2;
-                const ay = (zTop + zBot) / 2;
-                const ay0 = ay - (zBot - zTop) * 0.2, ay1 = ay + (zBot - zTop) * 0.2;
-                // 竖向虚线
-                P.line(cx, cx, ay0, ay1, L_HW, 0.9, HINGE_DASH);
-                // 箭头（指向上），虚线
-                P.line(cx, cx - 35, ay1, ay1 - 60, L_HW, 0.9, HINGE_DASH);
-                P.line(cx, cx + 35, ay1, ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                // 竖向虚线，覆盖整个门板高度
+                P.line(cx, cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
+                // 上箭头（指向上），虚线
+                P.line(cx, cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                P.line(cx, cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                // 下箭头（指向下），虚线
+                P.line(cx, cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
+                P.line(cx, cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
               } else {
                 const side = (dr.hingeSide ?? 'left') === 'left';
                 for (let j = 0; j < widths.length; j++) {
@@ -1297,12 +1308,13 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                   if (side) diag(r2, zTop, l2, zBot);  // v8 恢复：X 实线
                   else diag(l2, zTop, r2, zBot);  // v8 恢复：X 实线
                   // v8：多扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
-                  const ay = (zTop + zBot) / 2;
+                  // 用户要求：虚线双向 <> 覆盖整个门板
                   const j_cx = (l2 + r2) / 2;
-                  const j_ay0 = ay - (zBot - zTop) * 0.2, j_ay1 = ay + (zBot - zTop) * 0.2;
-                  P.line(j_cx, j_cx, j_ay0, j_ay1, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx - 35, j_ay1, j_ay1 - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx + 35, j_ay1, j_ay1 - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
+                  P.line(j_cx, j_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
                 }
               }
             }

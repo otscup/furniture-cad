@@ -186,6 +186,14 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                 layout_name = f"{base_name}_{suffix}"
             doc.layouts.new(layout_name)
             target_space = doc.layouts.get(layout_name)
+            # 2026-10-04：删掉 ezdxf 自动创建的视口（用户说左下角缩略图看着像 bug）
+            for vp in list(target_space.query('VIEWPORT')):
+                # 保留主视口 (*Active)，删掉其他的
+                # 实际上新 layout 只有一个视口，直接删掉避免缩略图
+                try:
+                    target_space.delete_entity(vp)
+                except Exception:
+                    pass
             space_label = f"layout:{layout_name}"
         stats["sheets"] += 1
 

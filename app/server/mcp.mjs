@@ -141,7 +141,7 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) {
         auditToolCall(principal, TOOL_GET_STATE, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
         return r.error;
@@ -177,7 +177,7 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
-      const r = workspaceOrError(await getWorkspaceState());
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) {
         auditToolCall(principal, TOOL_VALIDATE, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
         return r.error;

@@ -133,9 +133,10 @@ const check = JSON.parse(await runPy([VERIFY_DXF_PY, dxfPath]));
 ok('DXF 版本是 R2007（AC1021，原生 UTF-8）', check.dxfversion === 'AC1021', check.dxfversion);
 ok(`实体总数 ${check.entities} 与 neutral 图元数一致`, check.entities === neutral.sheets.reduce((a, s) => a + s.prims.length, 0), `DXF ${check.entities} vs neutral ${neutral.sheets.reduce((a, s) => a + s.prims.length, 0)}`);
 ok(
-  '【关键】逐类对上：poly→LWPOLYLINE / fill→HATCH / text→TEXT（少一个就是丢一条线）',
-  (check.counts.LWPOLYLINE ?? 0) === neutral.sheets.reduce((a, s) => a + s.prims.filter((p) => p.k === 'poly').length, 0) &&
-    (check.counts.HATCH ?? 0) === neutral.sheets.reduce((a, s) => a + s.prims.filter((p) => p.k === 'fill').length, 0) &&
+  '【关键】逐类对上：poly→LWPOLYLINE / fill→LWPOLYLINE轮廓 / text→TEXT（少一个就是丢一条线）',
+  // fill 走线框模式：转成闭合 LWPOLYLINE，不再是 HATCH（手机看图软件会把实心 HATCH 渲染成灰块）
+  (check.counts.LWPOLYLINE ?? 0) === neutral.sheets.reduce((a, s) => a + s.prims.filter((p) => p.k === 'poly' || p.k === 'fill').length, 0) &&
+    (check.counts.HATCH ?? 0) === 0 &&
     (check.counts.TEXT ?? 0) === neutral.sheets.reduce((a, s) => a + s.prims.filter((p) => p.k === 'text').length, 0),
   JSON.stringify({ dxf: check.counts, neutral: neutral.sheets.map((s) => s.prims.reduce((a, p) => ((a[p.k] = (a[p.k] ?? 0) + 1), a), {})) })
 );

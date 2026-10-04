@@ -1122,6 +1122,10 @@ export function App() {
                   }
                 });
               }}
+              onWorkspaceLoaded={(project) => {
+                // 从服务端载入工作区：替换本地项目（MCP/其他端写入的数据）
+                bus.replaceProject(project, '从服务端载入工作区');
+              }}
             />
           ) : null}
           {rightTab === 'variant' ? (

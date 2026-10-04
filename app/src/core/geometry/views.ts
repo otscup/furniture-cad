@@ -749,6 +749,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   }
   I.rect(0, W, 0, H, L_FRAME, 1.8);
   drawFrontLike(I, false);
+  drawLifestyleItems(I);
   const labelUnfitted = drawInternalLabels(I);
 
   // ═══════════════ 5. 投影衔接线 ═══════════════
@@ -957,6 +958,143 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     pickLines,
   };
 
+  // ── 内部结构图的生活物品示意（生活化展示）──
+  // 只在内部图画（internal），外观图（front）不画。
+  // 用细线（0.7），图层 L_HW，不遮挡结构线。所有坐标均为柜体局部（X, Z），经 P 映射。
+  function drawLifestyleItems(P: ViewPainter): void {
+    const LW = 0.7;
+    // 柜体是否算"高柜"（衣柜/顶柜语境）：总高 ≥ 1800
+    const isTallCab = H >= 1800;
+    // 是否算"矮柜"（餐边柜/阳台柜语境）：总高 < 1200
+    const isLowCab = H < 1200;
+
+    rowCtxs.forEach((ctx) => {
+      const rowZ0 = ctx.z0;
+      const rowNH = ctx.netH;
+
+      ctx.units.forEach((u, i) => {
+        const x0 = ctx.unitX0[i]!;
+        const netW = ctx.nets[i]!;
+        if (netW < 150) return; // 太窄不画，避免糊成一团
+
+        // ── 1. 挂衣区：2-3 件挂着的衣服（衣架 + 衣服轮廓）──
+        if (u.rod && u.rod.count > 0) {
+          const rodZ = rowZ0 + u.rod.heightFromBottom;
+          const n = Math.min(3, Math.max(2, Math.floor(netW / 350)));
+          const isLong = rowNH >= 1200; // 长衣/短衣按净高区分
+          const garmentH = isLong ? Math.min(900, rowNH - u.rod.heightFromBottom - 50) : Math.min(600, rowNH - u.rod.heightFromBottom - 50);
+          if (garmentH > 200) {
+            for (let k = 0; k < n; k++) {
+              const hx = x0 + (netW * (k + 1)) / (n + 1);
+              const hw = Math.min(90, netW / (n + 1) / 2); // 半宽
+              // 衣架钩（杆上小竖线）
+              P.line(hx, hx, rodZ, rodZ + 25, L_HW, LW);
+              // 衣架肩（两条斜线）
+              P.line(hx, hx - hw, rodZ + 25, rodZ + 70, L_HW, LW);
+              P.line(hx, hx + hw, rodZ + 25, rodZ + 70, L_HW, LW);
+              // 衣服轮廓（梯形：肩宽 → 下摆稍宽）
+              const shoulderZ = rodZ + 70;
+              const hemZ = shoulderZ + garmentH;
+              const hemHW = hw + 25;
+              P.poly(
+                [
+                  { x: hx - hw, y: shoulderZ },
+                  { x: hx + hw, y: shoulderZ },
+                  { x: hx + hemHW, y: hemZ },
+                  { x: hx - hemHW, y: hemZ },
+                ],
+                L_HW,
+                LW,
+                true
+              );
+            }
+          }
+        }
+
+        // ── 2. 叠放区：层板上画 2-3 条横线表示叠放衣物（无杆的层板格）──
+        if (u.shelves && u.shelves.count > 0 && !(u.rod && u.rod.count > 0)) {
+          const positions = equalSpacing(rowNH, u.shelves.count);
+          // 在每块层板上方画一叠（取前 2 块板，避免画满）
+          const stackCount = Math.min(2, positions.length);
+          for (let s = 0; s < stackCount; s++) {
+            const shelfZ = rowZ0 + positions[s]! + t; // 层板顶面
+            const stackW = Math.min(220, netW * 0.5);
+            const sx = x0 + (netW - stackW) / 2;
+            // 3 条横线 = 一叠衣服
+            for (let l = 0; l < 3; l++) {
+              const lz = shelfZ + 15 + l * 28;
+              // 别顶到上一块板
+              const nextShelfZ = s + 1 < positions.length ? rowZ0 + positions[s + 1]! : rowZ0 + rowNH;
+              if (lz + 10 < nextShelfZ) {
+                P.line(sx, sx + stackW, lz, lz, L_HW, LW);
+              }
+            }
+          }
+          // 顶柜（高处层板格）：画被子/枕头示意（圆角矩形用 poly 近似）
+          if (isTallCab && rowZ0 > 1500) {
+            const qw = Math.min(300, netW * 0.6);
+            const qx = x0 + (netW - qw) / 2;
+            const qz0 = rowZ0 + 20;
+            const qz1 = Math.min(rowZ0 + 220, rowZ0 + rowNH - 20);
+            if (qz1 - qz0 > 80) {
+              // 被子：矩形 + 中间一道折痕线
+              P.rect(qx, qx + qw, qz0, qz1, L_HW, LW);
+              P.line(qx, qx + qw, (qz0 + qz1) / 2, (qz0 + qz1) / 2, L_HW, LW);
+            }
+          }
+        }
+
+        // ── 3. 电器位：冰箱 / 洗衣机轮廓 ──
+        if (u.kind === 'appliance' && u.appliance) {
+          const a = u.appliance;
+          const ow = Math.min(a.openingWidth, netW);
+          const ax0 = x0 + (netW - ow) / 2;
+          const az = apertureZIn(ctx, u);
+          if (az) {
+            const oh = az.z1 - az.z0;
+            if (oh >= 1200) {
+              // 冰箱：外框 + 中线（对开门）+ 上下门缝线
+              P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, LW);
+              P.line(ax0 + ow / 2, ax0 + ow / 2, az.z0, az.z1, L_HW, LW);
+              P.line(ax0, ax0 + ow, az.z0 + oh * 0.65, az.z0 + oh * 0.65, L_HW, LW);
+            } else {
+              // 洗衣机：外框 + 圆形门
+              P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, LW);
+              const cx = ax0 + ow / 2;
+              const cy = (az.z0 + az.z1) / 2;
+              const r = Math.min(ow, oh) * 0.28;
+              if (r > 30) {
+                P.arc(cx, cy, r, 0, Math.PI * 2, L_HW, LW);
+              }
+            }
+          }
+        }
+
+        // ── 4. 餐边柜开放格：酒瓶 / 摆件示意（矮柜 + 开放格 + 无电器）──
+        if (isLowCab && !u.doors && !u.drawers && u.kind !== 'appliance' && u.shelves && u.shelves.count > 0) {
+          const positions = equalSpacing(rowNH, u.shelves.count);
+          if (positions.length > 0) {
+            const shelfZ = rowZ0 + positions[0]! + t;
+            // 画 2 个酒瓶：瓶身矩形 + 瓶颈
+            const n = Math.min(2, Math.max(1, Math.floor(netW / 250)));
+            for (let b = 0; b < n; b++) {
+              const bx = x0 + (netW * (b + 1)) / (n + 1);
+              const bodyW = 55;
+              const bodyH = 170;
+              const neckW = 20;
+              const neckH = 70;
+              const bz0 = shelfZ;
+              // 瓶身
+              P.rect(bx - bodyW / 2, bx + bodyW / 2, bz0, bz0 + bodyH, L_HW, LW);
+              // 瓶颈
+              P.rect(bx - neckW / 2, bx + neckW / 2, bz0 + bodyH, bz0 + bodyH + neckH, L_HW, LW);
+            }
+          }
+        }
+      });
+    });
+  }
+
   // ── 正视图 / 内部图共用的箱体绘制（两者方向完全相同，只差门 / 抽面画不画）──
   function drawFrontLike(P: ViewPainter, withFronts: boolean): void {
     const hidden = withFronts ? undefined : HIDDEN_DASH;
@@ -1103,7 +1241,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
               /**
                * 开向对角线 —— 与销售图纸同款：
                *   · 双扇对开画 X 形（左扇 ↘、右扇 ↗，两条线在门缝处交叉）；
-               *   · 单扇按 hingeSide：铰链在左 → 线从左上到右下；
+               *   · 单扇按 hingeSide：铰链在左 → 门往右开 → 线从右上到左下（指向开门侧）；
                *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
                * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
                */
@@ -1121,15 +1259,16 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                   diag(openL, zTop, openR, zBot);
                 }
               } else if (widths.length === 1) {
-                if ((dr.hingeSide ?? 'left') === 'left') diag(left, zTop, right, zBot);
-                else diag(right, zTop, left, zBot);
+                // 开向对角线指向开门侧：铰链在左 → 门往右开 → 线从右上到左下
+                if ((dr.hingeSide ?? 'left') === 'left') diag(right, zTop, left, zBot);
+                else diag(left, zTop, right, zBot);
               } else {
                 const side = (dr.hingeSide ?? 'left') === 'left';
                 for (let j = 0; j < widths.length; j++) {
                   const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
                   const r2 = l2 + widths[j];
-                  if (side) diag(l2, zTop, r2, zBot);
-                  else diag(r2, zTop, l2, zBot);
+                  if (side) diag(r2, zTop, l2, zBot);
+                  else diag(l2, zTop, r2, zBot);
                 }
               }
             }

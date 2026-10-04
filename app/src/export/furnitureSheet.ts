@@ -197,10 +197,17 @@ function layoutRow(
   yOffset: (cab: Cabinet) => number = () => 0
 ): PlacedView {
   const prims: Prim[] = [];
-  let cursor = 0;
   let maxH = 0;
+  let minX = Infinity;
+  let maxX = -Infinity;
 
-  for (const cab of cabinets) {
+  // 按柜体在房间里的实际 placement.x 定位，不按宽度首尾相接硬排
+  // （否则 10 个 2000mm 的柜子会排成 20000mm，DXF 坐标飞掉）
+  const sorted = [...cabinets].sort((a, b) => a.placement.x - b.placement.x);
+  // 归一化：最左边的柜子从 x=0 开始
+  const x0 = sorted.length > 0 ? sorted[0]!.placement.x : 0;
+
+  for (const cab of sorted) {
     let vs;
     try {
       // 用 0 间距生成，然后按 meta.origin 归一化到原点
@@ -212,18 +219,19 @@ function layoutRow(
     const origin = vs.meta[viewKind].origin;
     const dy = yOffset(cab);
 
-    // 归一化到原点，再摆到 cursor 位置
-    const placed = translatePrims(viewPrims, cursor - origin.x, dy - origin.y);
+    // 归一化到原点，再摆到实际房间 X 位置（减去 x0 归一化）
+    const px = cab.placement.x - x0;
+    const placed = translatePrims(viewPrims, px - origin.x, dy - origin.y);
     prims.push(...placed);
 
     const w = vs.meta[viewKind].w;
     const h = vs.meta[viewKind].h;
-    cursor += w + CAB_GAP;
+    minX = Math.min(minX, px);
+    maxX = Math.max(maxX, px + w);
     maxH = Math.max(maxH, h + dy);
   }
 
-  // 去掉最后一个多余的间距
-  const totalW = cabinets.length > 0 ? cursor - CAB_GAP : 0;
+  const totalW = sorted.length > 0 ? maxX - minX : 0;
 
   return { prims, x: 0, y: 0, w: totalW, h: maxH };
 }
@@ -342,10 +350,14 @@ export function buildFurnitureSheet(
     chainPrefix: string
   ): void => {
     if (cabs.length === 0) return;
-    let cx = startX;
-    let totalW = 0;
-    cabs.forEach((cab, i) => {
+    // 按 placement.x 排序并归一化，与 layoutRow 的摆位一致
+    const sorted = [...cabs].sort((a, b) => a.placement.x - b.placement.x);
+    const x0 = sorted[0]!.placement.x;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    sorted.forEach((cab) => {
       const w = cab.params.width;
+      const cx = startX + (cab.placement.x - x0);
       dims.add({
         p0: { x: cx, y },
         p1: { x: cx + w, y },
@@ -356,9 +368,10 @@ export function buildFurnitureSheet(
         baseOffset,
         textOffset: side === 'top' ? 170 : -170,
       });
-      cx += w + CAB_GAP;
-      totalW += w + (i < cabs.length - 1 ? CAB_GAP : 0);
+      minX = Math.min(minX, cx);
+      maxX = Math.max(maxX, cx + w);
     });
+    const totalW = maxX - minX;
     // 总宽
     dims.add({
       p0: { x: startX, y },

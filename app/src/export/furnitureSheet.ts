@@ -317,20 +317,7 @@ export function buildFurnitureSheet(
   const eiBox = placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
 
   // ── 视图标题（在视图下方，与尺寸链间距 ≥300）──
-  // 平面标题：平面底部尺寸链在 pbBox.y - 350（L0），L1 在 pbBox.y - 350 - 800
-  // v8 修复：标题从 planY-700 下移到 planY-1400，避开两排尺寸链
-  const planTitleY = planY - 1400;
-  if (pbBox.w > 0) {
-    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
-  }
-  if (pwBox.w > 0) {
-    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
-  }
-  // 立面标题：立面底部尺寸链 L0 在 elevY - 350
-  // v8 修复：标题从 elevY-350 下移到 elevY-700，与尺寸链错开 350
-  const elevTitleY = elevY - 700;
-  prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '立面外观图', SZ_VIEW_TITLE, L_TEXT, 'c'));
-  prims.push(textPrim(eiBox.x + eiBox.w / 2, elevTitleY, '立面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  // v9 修复：标题 Y 动态计算，见 dims.emit() 之后。
 
   // ── 尺寸链（稀疏：每视图 3 条 —— 顶部总宽、底部各段、两侧）──
   const dims = new DimLayout();
@@ -399,6 +386,36 @@ export function buildFurnitureSheet(
 
   const dimPrims: Prim[] = [];
   dims.emit(dimPrims);
+
+  // ── 视图标题（v9 修复）：按实际尺寸链最低位置动态定 Y ──
+  // 取所有 Y < planY（平面视图下方）的尺寸图元最低点，标题放在其下方 450 处，
+  // 确保标题（字号240）与最近的尺寸线/文字之间 ≥300 间距。
+  // 之前硬编码 planY-1400，但 L1 尺寸文字在 planY-1300，直接压标题。
+  const minDimYBelow = (refY: number): number => {
+    let m = refY;
+    for (const p of dimPrims) {
+      if ((p as any).k === 'poly') {
+        const pts = (p as any).pts as Array<{ x: number; y: number }>;
+        for (const q of pts) if (q.y < refY && q.y < m) m = q.y;
+      } else if ((p as any).k === 'text') {
+        const y = (p as any).p.y as number;
+        // 尺寸文字字号110，半高~55，往下再探 60
+        if (y < refY && y - 60 < m) m = y - 60;
+      }
+    }
+    return m;
+  };
+  const planTitleY = minDimYBelow(planY) - 450;
+  if (pbBox.w > 0) {
+    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  }
+  if (pwBox.w > 0) {
+    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  }
+  const elevTitleY = minDimYBelow(elevY) - 450;
+  prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '立面外观图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  prims.push(textPrim(eiBox.x + eiBox.w / 2, elevTitleY, '立面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+
   prims.push(...dimPrims);
 
   // ── 红色工艺标注（短引线，标注放在目标附近）──

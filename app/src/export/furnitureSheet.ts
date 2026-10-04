@@ -1,23 +1,26 @@
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  家具生产图纸 v4（一页一件家具，对标工厂标准版式）
+ *  家具生产图纸 v5（一页一件家具，对标工厂标准版式）
  *
- *  ── 版式（横向 A3，Y 轴向上，单位：1/10mm）──
+ *  ── 版式（横向，Y 轴向上，单位：1/10mm）──
  *
  *      ┌──────┬─────────────────────────────┬──────────────┐
  *      │装订线 │ 地柜平面结构图 │ 吊柜平面结构图 │              │
- *      │      ├─────────────────────────────┤  标题 + 规格表 │
- *      │      │ 立面外观图    │ 立面结构图    │   （右侧边栏）  │
+ *      │      │   (标题在下方)  │   (标题在下方)  │  标题 + 规格表 │
+ *      │      ├─────────────────────────────┤   （右侧边栏）  │
+ *      │      │ 立面外观图    │ 立面结构图    │              │
+ *      │      │   (标题在下方)  │   (标题在下方)  │              │
  *      │      ├─────────────────────────────┤              │
  *      │      │ 客户信息栏（底部通栏）        │              │
  *      └──────┴─────────────────────────────┴──────────────┘
  *
  *  ── 核心设计 ──
- *    1. **缩放**：柜体按实际 mm 生成视图，然后按内容尺寸动态缩放，
- *       确保图幅总宽 ≤14000（任务要求 0~15000 内）。
- *    2. **图要大**：四个视图占页面 70%+ 面积，单视图宽 ≈ 可用宽度 45%。
- *    3. **尺寸稀疏**：每视图 3-4 条尺寸链（顶部总宽、底部各段、两侧）。
- *    4. **零新几何**：视图图元来自 buildCabinetViews，只做提取+缩放+摆位。
+ *    1. **2x2 布局**：上=两平面图，下=两立面图，无中间行。
+ *    2. **图要大**：四视图占页面 70%+，单视图宽 ≈ 可用宽度 45%。
+ *    3. **标题在视图下方**，与尺寸链间距 ≥300。
+ *    4. **红色标注带引线**：指向视图内对应位置，不浮空。
+ *    5. **结构图无数字**：只保留红色工艺标注，定位尺寸只出现在尺寸链。
+ *    6. **零新几何**：视图图元来自 buildCabinetViews，只做提取+缩放+摆位。
  * ══════════════════════════════════════════════════════════════════════
  */
 import type { Cabinet, Prim, Project, Room, RuleSet, Vec2 } from '../core/types.ts';
@@ -34,24 +37,27 @@ const L_DIM = 'F-DIM';
 const SHEET_W = 14000;
 const SHEET_H = 10000;
 const BIND_W = 400;
-const SIDE_W = 2200;
-const BOT_H = 1400;
-const MARGIN = 300;
+const SIDE_W = 1800;          // 缩窄边栏，给视图让空间
+const BOT_H = 1600;
+const MARGIN = 250;
 
 const DRAW_X = BIND_W + MARGIN;
 const DRAW_W = SHEET_W - BIND_W - MARGIN - SIDE_W - MARGIN;
-const DRAW_Y = BOT_H + MARGIN;
-const DRAW_H = SHEET_H - BOT_H - MARGIN - MARGIN;
+const DRAW_Y = BOT_H + 600;  // 底部留 600 给立面标题（标题 240 + 间距）
+const DRAW_H = SHEET_H - BOT_H - 600 - MARGIN;
 
-const PLAN_H = Math.floor(DRAW_H * 0.32);
-const ELEV_H = Math.floor(DRAW_H * 0.55);
-const GAP_Y = DRAW_H - PLAN_H - ELEV_H;
-const VIEW_GAP_X = 600;
+// 2x2 布局：上下两排，左右两列
+const VIEW_GAP_X = 500;       // 左右视图间距
+const ROW_GAP_Y = 900;        // 上下排间距（含标题+尺寸链空间）
+
+const PLAN_H = Math.floor((DRAW_H - ROW_GAP_Y) * 0.36);
+const ELEV_H = Math.floor((DRAW_H - ROW_GAP_Y) * 0.64);
 
 const SZ_TITLE = 320;
-const SZ_VIEW_TITLE = 220;
+const SZ_VIEW_TITLE = 240;
 const SZ_TABLE = 150;
-const SZ_ANNOT = 160;
+const SZ_ANNOT = 170;
+const SZ_SIDEBAR_SECTION = 220;  // 侧边栏分区大标题
 
 // ─────────────────────────── 基础工具 ───────────────────────────
 
@@ -114,6 +120,7 @@ function linePrim(x1: number, y1: number, x2: number, y2: number, layer: string,
   return p as Prim;
 }
 
+
 // ─────────────────────────── 柜体分类 ───────────────────────────
 
 function classifyCabinet(cab: Cabinet): 'base' | 'wall' | 'tall' {
@@ -132,9 +139,7 @@ interface RawView {
   h: number;
 }
 
-// 结构图里不需要的板件名称标签（图形已足够表达，去掉避免文字堆叠）
-const PANEL_LABEL_RE = /^(顶板|底板|左侧板|右侧板|踢脚板|中立板\d*|行隔板|层板|斜层板|见光板)/;
-
+// 结构图里去掉所有文字（数字+板件名），只保留图形；红色标注由我们统一加引线
 function buildRawView(
   cabinets: Cabinet[],
   viewKind: 'top' | 'front' | 'internal',
@@ -157,15 +162,10 @@ function buildRawView(
       continue;
     }
     let viewPrims = vs.prims[viewKind];
-    // 问题1修复：internal 视图去掉板件名称标签（避免"顶板/左侧板/..."堆叠）
+    // internal 视图：去掉所有文字（定位尺寸 679/970、板件名等），只留图形
+    // 红色工艺标注由 buildFurnitureSheet 统一加引线标注
     if (viewKind === 'internal') {
-      viewPrims = viewPrims.filter((p) => {
-        if (p.k !== 'text') return true;
-        const t = (p as any).text as string ?? '';
-        // 保留尺寸数字（纯数字）和重要标注，去掉板件名称
-        if (/^\d+$/.test(t.trim())) return true;
-        return !PANEL_LABEL_RE.test(t.trim());
-      });
+      viewPrims = viewPrims.filter((p) => p.k !== 'text');
     }
     const origin = vs.meta[viewKind].origin;
     const dy = yOffset(cab);
@@ -228,7 +228,7 @@ export function buildFurnitureSheet(
   const elevFront = buildRawView(cabinets, 'front', rules, mountY);
   const elevInternal = buildRawView(cabinets, 'internal', rules, mountY);
 
-  // ── 缩放 ──
+  // ── 缩放：四视图统一缩放，确保占满 70%+ 页面 ──
   const availViewW = (DRAW_W - VIEW_GAP_X) / 2;
   const contentMaxW = Math.max(planBase.w, planWall.w, elevFront.w, elevInternal.w, 1);
   const contentPlanH = Math.max(planBase.h, planWall.h, 1);
@@ -240,122 +240,189 @@ export function buildFurnitureSheet(
   const scale = Math.min(sW, sPlanH, sElevH, 2.0);
   const s = Math.max(scale, 0.1);
 
-  const planY = DRAW_Y + ELEV_H + GAP_Y;
+  // 2x2 布局：
+  //   上排：planBase (左) | planWall (右)
+  //   下排：elevFront (左) | elevInternal (右)
+  //
+  // 垂直排布（Y 轴向上，从下往上）：
+  //   DRAW_Y                                    立面视图底部
+  //   DRAW_Y + vElevH                           立面视图顶部
+  //   + 250                                     立面顶部尺寸链
+  //   + 350                                     红色标注（引线指向立面视图）
+  //   + ROW_GAP_Y                               间距
+  //   planY                                     平面视图底部
+  //   planY + vPlanH                            平面视图顶部
+  //   + 250                                     平面顶部尺寸链
+  //
+  // 标题在视图下方：
+  //   平面标题 at planY - 550（平面底部尺寸链在 planY - 250，标题再往下 300）
+  //   立面标题 at DRAW_Y - 550（立面底部无尺寸链，直接放标题）
   const elevY = DRAW_Y;
+  const ANNOT_H = 500;  // 红色标注区高度
+  const planY = elevY + contentElevH * s + 250 + 350 + ANNOT_H + ROW_GAP_Y;
 
-  const placeScaled = (view: RawView, tx: number, ty: number): void => {
-    if (view.prims.length === 0) return;
+  const placeScaled = (view: RawView, tx: number, ty: number): { x: number; y: number; w: number; h: number } => {
+    if (view.prims.length === 0) return { x: tx, y: ty, w: 0, h: 0 };
     const bb = primsBBox(view.prims);
     let p = translatePrims(view.prims, -bb.minX, -bb.minY);
     p = scalePrims(p, s);
     p = translatePrims(p, tx, ty);
     prims.push(...p);
+    return { x: tx, y: ty, w: (bb.maxX - bb.minX) * s, h: (bb.maxY - bb.minY) * s };
   };
 
-  placeScaled(planBase, DRAW_X, planY);
-  placeScaled(planWall, DRAW_X + availViewW + VIEW_GAP_X, planY);
-  placeScaled(elevFront, DRAW_X, elevY);
-  placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
+  const pbBox = placeScaled(planBase, DRAW_X, planY);
+  const pwBox = placeScaled(planWall, DRAW_X + availViewW + VIEW_GAP_X, planY);
+  const efBox = placeScaled(elevFront, DRAW_X, elevY);
+  const eiBox = placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
 
-  const vW = contentMaxW * s;
-  const vPlanH = contentPlanH * s;
-  const vElevH = contentElevH * s;
-
-  // ── 视图标题 ──
-  if (planBase.prims.length > 0) {
-    prims.push(textPrim(DRAW_X + vW / 2, planY - 260, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  // ── 视图标题（在视图下方，与尺寸链间距 ≥300）──
+  // 平面标题：平面底部尺寸链在 pbBox.y - 250，标题在 pbBox.y - 550
+  const planTitleY = planY - 550;
+  if (pbBox.w > 0) {
+    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '地柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
-  if (planWall.prims.length > 0) {
-    prims.push(textPrim(DRAW_X + availViewW + VIEW_GAP_X + vW / 2, planY - 260, '吊柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  if (pwBox.w > 0) {
+    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
-  prims.push(textPrim(DRAW_X + vW / 2, elevY - 260, '立面外观图', SZ_VIEW_TITLE, L_TEXT, 'c'));
-  prims.push(textPrim(DRAW_X + availViewW + VIEW_GAP_X + vW / 2, elevY - 260, '立面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  // 立面标题：立面底部无尺寸链，标题在 elevY - 350（底部栏上方）
+  const elevTitleY = elevY - 350;
+  prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '立面外观图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+  prims.push(textPrim(eiBox.x + eiBox.w / 2, elevTitleY, '立面结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
 
-  // ── 尺寸链（稀疏）──
+  // ── 尺寸链（稀疏：每视图 3 条 —— 顶部总宽、底部各段、两侧）──
   const dims = new DimLayout();
+  const DIM_OFF = 350;  // 尺寸线与视图的间距
+
+  // 水平尺寸链：顶部总宽 + 底部各段
   const addHDims = (
-    cabs: Cabinet[], viewX: number, y: number, side: 'top' | 'bottom', prefix: string
+    cabs: Cabinet[], box: { x: number; y: number; w: number; h: number }, prefix: string
   ): void => {
-    if (cabs.length === 0) return;
+    if (cabs.length === 0 || box.w <= 0) return;
     const sorted = [...cabs].sort((a, b) => a.placement.x - b.placement.x);
     const x0 = sorted[0]!.placement.x;
-    let minX = Infinity, maxX = -Infinity;
-    for (const cab of sorted) {
-      const wMm = cab.params.width;
-      const cx = viewX + (cab.placement.x - x0) * s;
-      const cw = wMm * s;
-      dims.add({
-        p0: { x: cx, y }, p1: { x: cx + cw, y },
-        txt: `${Math.round(wMm)}`, orientation: 'h', side,
-        chain: `${prefix}-seg`, baseOffset: 250, textOffset: side === 'top' ? 150 : -150,
-      });
-      minX = Math.min(minX, cx);
-      maxX = Math.max(maxX, cx + cw);
-    }
+    // 顶部：总宽
     dims.add({
-      p0: { x: viewX, y }, p1: { x: viewX + (maxX - minX), y },
-      txt: `${Math.round((maxX - minX) / s)}`, orientation: 'h', side,
-      chain: `${prefix}-total`, baseOffset: 700, textOffset: side === 'top' ? 150 : -150,
+      p0: { x: box.x, y: box.y + box.h }, p1: { x: box.x + box.w, y: box.y + box.h },
+      txt: `${Math.round(box.w / s)}`, orientation: 'h', side: 'top',
+      chain: `${prefix}-total`, baseOffset: DIM_OFF, textOffset: 150,
+    });
+    // 底部：各段
+    for (const cab of sorted) {
+      const cx = box.x + (cab.placement.x - x0) * s;
+      const cw = cab.params.width * s;
+      dims.add({
+        p0: { x: cx, y: box.y }, p1: { x: cx + cw, y: box.y },
+        txt: `${Math.round(cab.params.width)}`, orientation: 'h', side: 'bottom',
+        chain: `${prefix}-seg`, baseOffset: DIM_OFF, textOffset: -150,
+      });
+    }
+  };
+
+  // 垂直尺寸链：左侧高度/深度
+  const addVDims = (
+    box: { x: number; y: number; w: number; h: number }, totalTxt: string, prefix: string
+  ): void => {
+    if (box.w <= 0) return;
+    dims.add({
+      p0: { x: box.x, y: box.y }, p1: { x: box.x, y: box.y + box.h },
+      txt: totalTxt, orientation: 'v', side: 'left',
+      chain: `${prefix}-v`, baseOffset: DIM_OFF, textOffset: 150, rot: 90,
     });
   };
 
-  if (planCabs.length > 0) {
-    const bx = DRAW_X, by = planY;
-    addHDims(planCabs, bx, by + vPlanH + 100, 'top', 'pb');
-    addHDims(planCabs, bx, by - 100, 'bottom', 'pb-b');
+  if (pbBox.w > 0) {
+    addHDims(planCabs, pbBox, 'pb');
     const maxD = Math.max(...planCabs.map((c) => c.params.depth));
-    dims.add({ p0: { x: bx - 100, y: by }, p1: { x: bx - 100, y: by + maxD * s },
-      txt: `${maxD}`, orientation: 'v', side: 'left', baseOffset: 250, textOffset: 150, rot: 90 });
-    dims.add({ p0: { x: bx + vW + 100, y: by }, p1: { x: bx + vW + 100, y: by + maxD * s },
-      txt: `${maxD}`, orientation: 'v', side: 'right', baseOffset: 250, textOffset: 150, rot: 90 });
+    addVDims(pbBox, `${maxD}`, 'pb');
   }
-  if (wallCabs.length > 0) {
-    const bx = DRAW_X + availViewW + VIEW_GAP_X, by = planY;
-    addHDims(wallCabs, bx, by + vPlanH + 100, 'top', 'pw');
-    addHDims(wallCabs, bx, by - 100, 'bottom', 'pw-b');
+  if (pwBox.w > 0) {
+    addHDims(wallCabs, pwBox, 'pw');
+    const maxD = Math.max(...wallCabs.map((c) => c.params.depth));
+    addVDims(pwBox, `${maxD}`, 'pw');
   }
+  addHDims(cabinets, efBox, 'ef');
   {
-    const bx = DRAW_X, by = elevY;
-    addHDims(cabinets, bx, by + vElevH + 100, 'top', 'ef');
-    addHDims(cabinets, bx, by - 100, 'bottom', 'ef-b');
     const maxH = Math.max(...cabinets.map((c) => c.params.height + (c.params.mountHeight ?? 0)));
-    dims.add({ p0: { x: bx - 100, y: by }, p1: { x: bx - 100, y: by + maxH * s },
-      txt: `${maxH}`, orientation: 'v', side: 'left', baseOffset: 250, textOffset: 150, rot: 90 });
-    const ex = DRAW_X + availViewW + VIEW_GAP_X;
-    dims.add({ p0: { x: ex + vW + 100, y: by }, p1: { x: ex + vW + 100, y: by + maxH * s },
-      txt: `${maxH}`, orientation: 'v', side: 'right', baseOffset: 250, textOffset: 150, rot: 90 });
+    addVDims(efBox, `${maxH}`, 'ef');
   }
+  // 立面结构图：只加顶部总宽和左侧高度，不加底部各段（避免与外观图重复）
+  if (eiBox.w > 0) {
+    dims.add({
+      p0: { x: eiBox.x, y: eiBox.y + eiBox.h }, p1: { x: eiBox.x + eiBox.w, y: eiBox.y + eiBox.h },
+      txt: `${Math.round(eiBox.w / s)}`, orientation: 'h', side: 'top',
+      chain: 'ei-total', baseOffset: DIM_OFF, textOffset: 150,
+    });
+  }
+
   const dimPrims: Prim[] = [];
   dims.emit(dimPrims);
   prims.push(...dimPrims);
 
-  // ── 红色工艺标注 ──
-  const annotY = elevY + vElevH / 2;
+  // ── 红色工艺标注（短引线，标注放在目标附近）──
+  // 每个标注的文字放在目标点上方 400 处，引线垂直向下不超过 800
+
   const hasGlass = cabinets.some((cab) =>
     allUnits(cab.layout).some((u: any) => {
       const m = (u.doors as any)?.material as string ?? '';
       return m.toLowerCase().includes('glass');
     }));
-  if (hasGlass) prims.push(textPrim(DRAW_X + vW / 2, annotY + 400, '黑框灰玻', SZ_ANNOT, L_ANNOT_RED, 'c'));
   const hasLed = cabinets.some((cab) =>
     allUnits(cab.layout).some((u: any) => (u as any).ledStrip && (u as any).ledStrip !== 'none'));
-  if (hasLed) prims.push(textPrim(DRAW_X + vW / 2, annotY + 200, '灯带居中', SZ_ANNOT, L_ANNOT_RED, 'c'));
   const hasDrawer = cabinets.some((cab) =>
     allUnits(cab.layout).some((u: any) => (u as any).drawers));
-  if (hasDrawer) prims.push(textPrim(DRAW_X + vW / 2, annotY, '托底抽', SZ_ANNOT, L_ANNOT_RED, 'c'));
   const hasShelf = cabinets.some((cab) =>
     allUnits(cab.layout).some((u: any) => ((u as any).shelves ?? []).length > 0));
-  if (hasShelf) prims.push(textPrim(DRAW_X + availViewW + VIEW_GAP_X + vW / 2, annotY, '活动层板', SZ_ANNOT, L_ANNOT_RED, 'c'));
-  prims.push(textPrim(DRAW_X + availViewW + VIEW_GAP_X + vW / 2, annotY - 200, '18mm背板', SZ_ANNOT, L_ANNOT_RED, 'c'));
+
+  // 引线目标：立面外观图/结构图内的对应位置（短引线，垂直为主）
+  const efCX = efBox.x + efBox.w / 2;
+  const eiCX = eiBox.x + eiBox.w / 2;
+  const efMidY = efBox.y + efBox.h * 0.55;
+  const efBotY = efBox.y + efBox.h * 0.25;
+  const efTopInY = efBox.y + efBox.h * 0.85;
+
+  // 短引线标注：文字在目标正上方 350 处，引线垂直，长度 350
+  const shortAnnot = (px: number, py: number, text: string): void => {
+    const tx = px, ty = py + 350;
+    // 短垂直引线
+    prims.push(linePrim(tx, ty - 40, px, py, L_ANNOT_RED, 0.8));
+    // 目标点小圆点
+    const dot = 50;
+    prims.push({
+      k: 'poly',
+      pts: [
+        { x: px - dot, y: py }, { x: px, y: py + dot },
+        { x: px + dot, y: py }, { x: px, y: py - dot },
+      ],
+      closed: true, layer: L_ANNOT_RED, lw: 0.8,
+    } as Prim);
+    prims.push(textPrim(tx, ty, text, SZ_ANNOT, L_ANNOT_RED, 'c'));
+  };
+
+  if (hasGlass) {
+    shortAnnot(efCX - efBox.w * 0.25, efTopInY, '黑框灰玻');
+  }
+  if (hasLed) {
+    shortAnnot(efCX, efTopInY - efBox.h * 0.1, '灯带居中');
+  }
+  if (hasDrawer) {
+    shortAnnot(efCX + efBox.w * 0.2, efBotY, '托底抽');
+  }
+  if (hasShelf) {
+    shortAnnot(eiCX, efMidY, '活动层板');
+  }
+  if (eiBox.w > 0) {
+    shortAnnot(eiCX + eiBox.w * 0.15, efMidY + 300, '18mm背板');
+  }
 
   // ── 图框 ──
   drawFrame(prims, furnitureName, project);
 
-  // 防御：检查数字图层名（疑似某处把尺寸数值当成了 layer）
+  // 防御：检查数字图层名
   for (const p of prims as any[]) {
     const layer = p.layer as string;
     if (typeof layer === 'string' && /^\d+$/.test(layer.trim())) {
-      console.warn(`[furnitureSheet] 发现数字图层名 '${layer}'，已修正为 F-CAB (text=${p.text ?? ''})`);
+      console.warn(`[furnitureSheet] 发现数字图层名 '${layer}'，已修正为 F-CAB`);
       p.layer = 'F-CAB';
     }
   }
@@ -373,6 +440,7 @@ function drawFrame(prims: Prim[], furnitureName: string, _project: Project): voi
   prims.push(rectPrim(60, 60, W - 60, H - 60, L_BORDER, 2));
   prims.push(rectPrim(100, 100, W - 100, H - 100, L_BORDER, 1));
 
+  // 装订线
   const bx = BIND_W / 2;
   prims.push(linePrim(bx, 200, bx, H - 200, L_BORDER, 0.8, true));
   const chars = ['装', '订', '线'];
@@ -380,81 +448,72 @@ function drawFrame(prims: Prim[], furnitureName: string, _project: Project): voi
     prims.push(textPrim(bx, H / 2 + 200 - i * 320, ch, 260, L_TEXT, 'c'));
   });
 
+  // ── 右侧边栏 ──
   const sx = W - SIDE_W;
   const sy = H - 100;
   prims.push(textPrim(sx + SIDE_W / 2, sy - 300, furnitureName, SZ_TITLE, L_TEXT, 'c'));
   prims.push(linePrim(sx, sy - 550, sx + SIDE_W, sy - 550, L_BORDER, 1));
 
   let ty = sy - 700;
-  const rowH = 240;  // 问题6修复：从280降到240，侧边栏不超出图幅
-  const drawSpecRow = (label: string, value: string = ''): void => {
-    prims.push(textPrim(sx + 60, ty, label, SZ_TABLE, L_TEXT, 'l'));
-    if (value) prims.push(textPrim(sx + 700, ty, value, SZ_TABLE, L_TEXT, 'l'));
-    prims.push(linePrim(sx, ty - 90, sx + SIDE_W, ty - 90, L_BORDER, 0.6));
+  const rowH = 260;
+
+  const drawRow = (label: string, value: string = ''): void => {
+    prims.push(textPrim(sx + 80, ty, label, SZ_TABLE, L_TEXT, 'l'));
+    if (value) prims.push(textPrim(sx + 650, ty, value, SZ_TABLE, L_TEXT, 'l'));
+    prims.push(linePrim(sx, ty - 100, sx + SIDE_W, ty - 100, L_BORDER, 0.6));
     ty -= rowH;
   };
 
-  drawSpecRow('设计师');
-  drawSpecRow('联系电话');
-  drawSpecRow('销售地址');
-  drawSpecRow('销售人员');
-  drawSpecRow('柜体工艺', '标准□  新工艺□');
-  // 大标题独占两行高度，避免与规格行重叠
-  prims.push(textPrim(sx + 60, ty + 40, '柜', 280, L_TEXT, 'l'));
-  prims.push(textPrim(sx + 60, ty - 240, '体', 280, L_TEXT, 'l'));
-  ty -= 560;  // 大标题占用的垂直空间（问题6修复：从620降到560）
-  drawSpecRow('  颜色');
-  drawSpecRow('  材质');
-  drawSpecRow('  规格', '25□ 18□ 9□ 5□');
-  drawSpecRow('  封边', '同色带字□ 同色□');
-  prims.push(textPrim(sx + 60, ty + 40, '移', 280, L_TEXT, 'l'));
-  prims.push(textPrim(sx + 60, ty - 240, '门', 280, L_TEXT, 'l'));
-  ty -= 620;
-  drawSpecRow('  型号');
-  drawSpecRow('  颜色');
-  drawSpecRow('  边框');
-  drawSpecRow('  芯板');
-  drawSpecRow('  玻璃');
-  prims.push(textPrim(sx + 60, ty + 40, '掩', 280, L_TEXT, 'l'));
-  prims.push(textPrim(sx + 60, ty - 240, '门', 280, L_TEXT, 'l'));
-  ty -= 620;
-  drawSpecRow('  型号');
-  drawSpecRow('  材质');
-  drawSpecRow('  颜色');
-  drawSpecRow('  看面');
-  drawSpecRow('  玻璃');
-  prims.push(textPrim(sx + 60, ty + 40, '线', 280, L_TEXT, 'l'));
-  prims.push(textPrim(sx + 60, ty - 240, '条', 280, L_TEXT, 'l'));
-  ty -= 620;
-  drawSpecRow('  罗马柱');
-  drawSpecRow('  顶线');
-  drawSpecRow('  楣板');
-  drawSpecRow('  围脚', '平板□ 造型□');
-  drawSpecRow('下单日期');
-  drawSpecRow('交货日期');
+  // 分区大标题（横排）：加粗底线，与下方行拉开
+  const drawSection = (title: string, rows: Array<[string, string?]>): void => {
+    prims.push(textPrim(sx + 80, ty, title, SZ_SIDEBAR_SECTION, L_TEXT, 'l'));
+    prims.push(linePrim(sx + 80, ty - 110, sx + SIDE_W - 80, ty - 110, L_BORDER, 1.2));
+    ty -= rowH;
+    for (const [label, value] of rows) {
+      drawRow('  ' + label, value ?? '');
+    }
+  };
 
+  drawRow('设计师');
+  drawRow('联系电话');
+  drawRow('销售地址');
+  drawRow('销售人员');
+  drawRow('柜体工艺', '标准□  新工艺□');
+  drawSection('柜体', [
+    ['颜色'], ['材质'], ['规格', '25□ 18□ 9□ 5□'], ['封边', '同色带字□ 同色□'],
+  ]);
+  drawSection('移门', [
+    ['型号'], ['颜色'], ['边框'], ['芯板'], ['玻璃'],
+  ]);
+  drawSection('掩门', [
+    ['型号'], ['材质'], ['颜色'], ['看面'], ['玻璃'],
+  ]);
+  drawSection('线条', [
+    ['罗马柱'], ['顶线'], ['楣板'], ['围脚', '平板□ 造型□'],
+  ]);
+  drawRow('下单日期');
+  drawRow('交货日期');
+
+  // ── 底部客户信息栏 ──
   const by = BOT_H;
   prims.push(linePrim(100, by, W - 100, by, L_BORDER, 1.2));
-  let byy = by - 260;
-  const browH = 250;  // 问题6修复：行高从320降到250，确保4行不超出 BOT_H
+  const botCols = [150, 3600, 7100, 10600];
+  let byy = by - 300;
+  const browH = 300;
   const drawBotRow = (cells: Array<[string, string]>): void => {
-    let cx = 160;
-    for (const [label, val] of cells) {
-      prims.push(textPrim(cx, byy, label, SZ_TABLE, L_TEXT, 'l'));
-      if (val) prims.push(textPrim(cx + 420, byy, val, SZ_TABLE, L_TEXT, 'l'));
-      cx += 1400;
-    }
-    prims.push(linePrim(100, byy - 110, W - 100, byy - 110, L_BORDER, 0.6));
+    cells.forEach(([label, val], i) => {
+      const cx = botCols[i]!;
+      if (i > 0) prims.push(linePrim(cx - 80, byy + 80, cx - 80, byy - 200, L_BORDER, 0.6));
+      prims.push(textPrim(cx, byy, label, 140, L_TEXT, 'l'));
+      if (val) prims.push(textPrim(cx + 950, byy, val, 140, L_TEXT, 'l'));
+    });
+    prims.push(linePrim(100, byy - 140, W - 100, byy - 140, L_BORDER, 0.6));
     byy -= browH;
   };
   drawBotRow([['客户姓名', ''], ['联系电话', ''], ['客户地址', ''], ['发货□ 送货□ 安装□', '']]);
   drawBotRow([['滑轨', '标配□'], ['试衣镜', '标配□'], ['平开门拉手', ''], ['备注', '']]);
-  drawBotRow([['门铰', '标配□'], ['内抽拉手', ''], ['榻榻米铺板拉手', '']]);
-  drawBotRow([['衣杆', '标配□'], ['外抽拉手', ''], ['页码', '']]);
-  // 签名放在底部栏右下角，确保 y > 0
-  const sigY = Math.max(byy + 40, 120);
-  prims.push(textPrim(W - 400, sigY, '客户签字：', SZ_TABLE, L_TEXT, 'l'));
+  drawBotRow([['门铰', '标配□'], ['内抽拉手', ''], ['榻榻米铺板拉手', ''], ['客户签字：', '']]);
+  drawBotRow([['衣杆', '标配□'], ['外抽拉手', ''], ['页码', '1/1'], ['下单日期', '']]);
 
-  // 引用 L_DIM 避免未使用警告（尺寸链图层在 DimLayout 内部使用）
   void L_DIM;
 }

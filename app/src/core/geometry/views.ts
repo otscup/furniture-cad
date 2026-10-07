@@ -51,19 +51,19 @@ import { LabelPlacer, primVisualExtent } from './labels.ts';
 
 export type ViewKind = 'front' | 'top' | 'side' | 'internal';
 
-export const VIEW_KINDS: ViewKind[] = ['front', 'top', 'side', 'internal'];
+export const VIEW_KINDS: ViewKind[] = ['front', 'internal'];
 
 export const VIEW_NAME: Record<ViewKind, string> = {
-  front: '正视图',
+  front: '立面外观图',
   top: '俯视图',
   side: '侧视图',
-  internal: '内部结构图',
+  internal: '立面结构图',
 };
 
 export const VIEW_NOTE: Record<ViewKind, string> = {
   front: '从前向后看 · 含门 / 抽面',
-  top: '从上向下看 · 置于正视图正下方（长对正）',
-  side: '从左向右看 · 置于正视图正右方（高平齐）',
+  top: '从上向下看',
+  side: '从左向右看',
   internal: '同正视图方向 · 移去门 / 抽面 · 标注板件',
 };
 
@@ -1522,26 +1522,30 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
   const placements: Record<string, Vec2> = {};
   const titles: ProjectViewSet['titles'] = [];
   const seen = new Map<string, number>();
-  let cursor = 0;
+  // PDF 式排版：每个柜子一个块（立面外观 + 立面结构并排），块与块上下叠放，
+  // 不再是所有柜子挤成一横排。
+  let cursorY = 0;
 
   for (const cab of project.cabinets) {
     let vs: ViewSet;
     try {
-      vs = buildCabinetViews(cab, rules, { x: cursor, y: 0 });
+      vs = buildCabinetViews(cab, rules, { x: 0, y: cursorY });
     } catch {
       continue; // 单柜派生失败不能拖垮整幅图（与 generateProject 同样的容错策略）
     }
-    const { W, D } = vs.dims;
-    const occupied = W + vs.gaps.gapSide + D + vs.gaps.gapInt + W;
+    const { W, H } = vs.dims;
+    // 块内：立面外观在左，立面结构在右（PDF 排版）
+    const blockW = W + vs.gaps.gapInt + W;
+    const blockH = H;
 
-    prims.push(...vs.prims.front, ...vs.prims.top, ...vs.prims.side, ...vs.prims.internal, ...vs.hinge, ...vs.labels);
+    prims.push(...vs.prims.front, ...vs.prims.internal, ...vs.hinge, ...vs.labels);
     pickLines.push(...vs.pickLines);
 
-    placements[cab.id] = { x: cursor, y: 0 };
-    titles.push({ cabinetId: cab.id, name: cab.name, at: { x: cursor + occupied / 2, y: 0 } });
+    placements[cab.id] = { x: 0, y: cursorY };
+    titles.push({ cabinetId: cab.id, name: cab.name, at: { x: blockW / 2, y: cursorY } });
     for (const a of vs.assumptions) seen.set(a, (seen.get(a) ?? 0) + 1);
 
-    cursor += occupied + CABINET_VIEW_GAP;
+    cursorY += blockH + CABINET_VIEW_GAP;
   }
 
   /**

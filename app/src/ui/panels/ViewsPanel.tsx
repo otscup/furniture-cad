@@ -84,9 +84,7 @@ export function ViewsPanel(props: {
               ))}
             </div>
             <div className="hint-line">
-              排布依据：第一角投影（GB / ISO-E）。俯视图置于正视图正下方 → <b>长对正</b>；侧视图置于正视图正右方 →{' '}
-              <b>高平齐</b>；俯视图进深跨度 = 侧视图进深跨度 = 柜深 → <b>宽相等</b>。三条都是结构性的映射不变量，
-              由 <Text mono>verify/views-acceptance.ts</Text> 逐条断言（含 6 个负样本）。
+              排版：立面外观图 + 立面结构图并排，每柜一块、上下叠放（PDF 式）。
             </div>
           </>
         )}

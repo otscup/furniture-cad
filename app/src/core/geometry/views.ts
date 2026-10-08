@@ -1538,7 +1538,35 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
     const blockW = W + vs.gaps.gapInt + W;
     const blockH = H;
 
-    prims.push(...vs.prims.front, ...vs.prims.internal, ...vs.hinge, ...vs.labels);
+    // 只取 front + internal 的图元；labels/hinge 按位置过滤掉顶视图/侧视图的
+    // （buildCabinetViews 仍生成四视图的 labels，但三视图模式下只用其中两视图的）
+    const fx = 0, fy = cursorY;
+    const ix0 = fx + W + vs.gaps.gapInt;
+    const M = 700; // 过滤边距：小于最小视图间距 780，确保顶/侧视图的标注被排除
+    const inFrontOrInternal = (x: number, y: number): boolean => {
+      const inFront = x >= fx - M && x <= fx + W + M && y >= fy - M && y <= fy + H + 1200;
+      const inInternal = x >= ix0 - M && x <= ix0 + W + M && y >= fy - M && y <= fy + H + 1200;
+      return inFront || inInternal;
+    };
+    const labelPos = (pr: Prim): { x: number; y: number } | null => {
+      if (pr.k === 'text') return pr.p;
+      if (pr.k === 'poly' && pr.pts.length) {
+        const xs = pr.pts.map(p => p.x), ys = pr.pts.map(p => p.y);
+        return { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
+      }
+      return null;
+    };
+    const filteredLabels = vs.labels.filter(pr => {
+      const pos = labelPos(pr);
+      return pos ? inFrontOrInternal(pos.x, pos.y) : true;
+    });
+    // hinge：只保留正视图的垂直对正线和正视/内部的高平齐线，去掉顶/侧视图的宽相等线
+    const filteredHinge = vs.hinge.filter(pr => {
+      const pos = labelPos(pr);
+      return pos ? inFrontOrInternal(pos.x, pos.y) : true;
+    });
+
+    prims.push(...vs.prims.front, ...vs.prims.internal, ...filteredHinge, ...filteredLabels);
     pickLines.push(...vs.pickLines);
 
     placements[cab.id] = { x: 0, y: cursorY };

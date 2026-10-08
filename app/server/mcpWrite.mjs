@@ -454,7 +454,13 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       if (!er.ok) return fail(er.error ?? '命令被拒绝');
       await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_DELETE_OBJECT, 'ok', { draftId: d.draftId, target: args.targetId });
-      return toolText({ ok: true, draftId: d.draftId, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
+      return toolText({
+        ok: true,
+        draftId: d.draftId,
+        label: cmd.label ?? '',
+        note: '已在 draft 中删除，未影响 live。如需生效请走 cad.validate → cad.apply_draft；用 cad.get_state 查看时仍会看到旧数据（它读的是 live）。',
+        ...staleHint(ws, d.handle),
+      });
     }
   );
 

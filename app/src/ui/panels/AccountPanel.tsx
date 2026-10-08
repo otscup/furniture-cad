@@ -365,6 +365,7 @@ export function AccountPanel(props: {
 
       {(!props.token && mode === 'local-open') || !props.token ? (
         <Section title={mode === 'local-open' ? '建立第一个账号（所有者）' : '登录'} defaultOpen>
+          <form onSubmit={(e) => { e.preventDefault(); void (mode === 'local-open' ? doRegister() : doLogin()); }}>
           <Row label="用户名">
             <input className="input" value={u} onChange={(e) => setU(e.target.value)} placeholder="3~32 位字母数字 _ . @ -" autoComplete="username" />
           </Row>
@@ -377,13 +378,13 @@ export function AccountPanel(props: {
             </Row>
           ) : null}
           <button
-            type="button"
+            type="submit"
             className="tb-btn primary"
             disabled={busy || !u.trim() || !p}
-            onClick={() => void (mode === 'local-open' ? doRegister() : doLogin())}
           >
             {mode === 'local-open' ? '建立账号并进入账号模式' : '登录'}
           </button>
+          </form>
         </Section>
       ) : null}
 
@@ -403,7 +404,7 @@ export function AccountPanel(props: {
             />
           </Row>
           {codeSent ? (
-            <>
+            <form onSubmit={(e) => { e.preventDefault(); void doEmailRegister(); }}>
               <Row label="验证码" hint={`${codeSent.expiresInMin} 分钟内有效`}>
                 <input className="input" value={regCode} placeholder="6 位数字" inputMode="numeric" onChange={(e) => setRegCode(e.target.value)} />
               </Row>
@@ -417,18 +418,20 @@ export function AccountPanel(props: {
                 <input className="input" type="password" value={regPass} autoComplete="new-password" onChange={(e) => setRegPass(e.target.value)} />
               </Row>
               <div className="btn-row">
-                <button type="button" className="tb-btn primary" disabled={busy || !regCode.trim() || !regPass} onClick={() => void doEmailRegister()}>
+                <button type="submit" className="tb-btn primary" disabled={busy || !regCode.trim() || !regPass}>
                   创建账号并登录
                 </button>
                 <button type="button" className="tb-btn" disabled={busy || !regEmail.trim()} onClick={() => void sendRegCode()}>
                   重新发送验证码
                 </button>
               </div>
-            </>
+            </form>
           ) : (
-            <button type="button" className="tb-btn primary" disabled={busy || !regEmail.trim()} onClick={() => void sendRegCode()}>
-              发送验证码
-            </button>
+            <form onSubmit={(e) => { e.preventDefault(); void sendRegCode(); }}>
+              <button type="submit" className="tb-btn primary" disabled={busy || !regEmail.trim()}>
+                发送验证码
+              </button>
+            </form>
           )}
         </Section>
       ) : null}
@@ -436,6 +439,7 @@ export function AccountPanel(props: {
       {props.token ? (
         <Section title="修改我的口令" defaultOpen={false}>
           <p className="note">改完会<b>踢掉所有会话（含当前这条）</b>，需要重新登录 —— 这是有意的：口令变更必须让旧凭据立即失效。</p>
+          <form onSubmit={(e) => { e.preventDefault(); void doChangePassword(); }}>
           <Row label="当前口令">
             <input className="input" type="password" value={curP} onChange={(e) => setCurP(e.target.value)} autoComplete="current-password" />
           </Row>
@@ -444,9 +448,10 @@ export function AccountPanel(props: {
           </Row>
           {pwErr ? <div className="alert alert-error">{pwErr}<br />口令没有改动，请照上面提示重来。</div> : null}
           {pwMsg ? <div className="alert alert-info">{pwMsg}</div> : null}
-          <button type="button" className="tb-btn" disabled={!curP || !newP} onClick={() => void doChangePassword()}>
+          <button type="submit" className="tb-btn" disabled={!curP || !newP}>
             修改口令
           </button>
+          </form>
         </Section>
       ) : null}
 

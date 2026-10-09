@@ -145,6 +145,13 @@ function enoughDoorCount(netW: number, limit: number, gapOuter: number, gapMid: 
 }
 
 const RULE_CARDS: Record<string, RuleCard> = {
+  'RULE-SHARED-PANEL-BLOCKED': {
+    title: '跨柜共享板尚不能生产',
+    severity: 'ERROR',
+    message: (c) => `共享板「${str(c, 'panelId')}」不能进入生产导出：${str(c, 'reasons')}。`,
+    hint: () => '补齐并人工确认成员柜、几何/尺寸、材料饰面、封边、外挑、接缝分段、支撑及 CNC 孔位；成员或确认字段变化后须重新核对。参考孔位不是 CNC 数据。',
+    manual: '系统只验证显式共享对象及其确认快照，不从相邻柜推断共享范围、拼缝、支撑或加工孔位。',
+  },
   // ─────────────── 程序缺陷类：绝不给一键修复 ───────────────
   'IDENTITY-FAIL': {
     title: '程序自检没过',
@@ -213,6 +220,20 @@ const RULE_CARDS: Record<string, RuleCard> = {
     message: (c) => `「${str(c, 'cabName')}」没能生成出来：${str(c, 'reason')}。界面上它暂时没有图纸和清单。`,
     hint: (c) => `具体原因：${str(c, 'reason')}。请反馈；不要手改几何。`,
     manual: '生成过程抛了异常（程序缺陷）。请把这条反馈给开发者。',
+  },
+  'DRAWING-SOURCE-STALE': {
+    title: '手工覆盖引用的模型图元已变化',
+    severity: 'ERROR',
+    message: (c) => `二维覆盖「${str(c, 'editId')}」引用的${str(c, 'space') === 'sheet' ? '柜体图纸' : '房间平面'}模型图元已变化或消失；旧引用未隐藏任何当前生成图元。`,
+    hint: () => '请检查图纸上的旧覆盖：确认后删除它，或重新选择当前生成图元并创建新覆盖；处理前禁止正式导出。',
+    manual: '来源几何发生变化后无法安全推断旧覆盖应绑定到哪条新线；旧引用已失效，不会自动迁移。',
+  },
+  'DRAWING-SOURCE-AMBIGUOUS': {
+    title: '手工覆盖对应多个候选图元',
+    severity: 'ERROR',
+    message: (c) => `二维覆盖「${str(c, 'editId')}」的来源指纹匹配到多个相同模型图元或多个覆盖；为避免错线，当前没有隐藏任何候选。`,
+    hint: () => '请检查并清理重复源图元/重复覆盖，使来源唯一后重新绑定；处理前禁止正式导出。',
+    manual: '完全相同的几何无法仅凭可见图元证明实体身份；系统选择报错并保留全部候选，不猜测要隐藏哪一个。',
   },
 
   // ─────────────── 设计问题：可判定 → 给一键修复 ───────────────
@@ -426,6 +447,13 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: () => '加大柜体深度，或检查背板槽位置与前沿让位参数。',
     manual: '加多少深度属于设计决定。',
   },
+  'RULE-PANEL-NONPOSITIVE-DIMENSION': {
+    title: '板件尺寸无效，已阻断生产导出',
+    severity: 'ERROR',
+    message: (c) => `「${str(c, 'cabName')}」的板件「${str(c, 'panelName')}」尺寸为长 ${num(c, 'length')}×宽 ${num(c, 'width')}×厚 ${num(c, 'thickness')}mm（无效字段：${str(c, 'invalidDimensions')}）；制造板件长、宽、厚必须都是有限正数。`,
+    hint: () => '请修正柜体尺寸/结构并重新生成，使每块制造板件的长、宽、厚都大于 0；此错误会阻断 CSV、PDF 和 DXF 正式导出。',
+    manual: '非正尺寸板件不能开料；不要绕过导出拦截，也不要把零尺寸件当作警告处理。',
+  },
   'RULE-MIN-PANEL': {
     title: '板件太小，是边角料',
     severity: 'WARNING',
@@ -487,6 +515,27 @@ const RULE_CARDS: Record<string, RuleCard> = {
       `「${str(c, 'nameA')}」和「${str(c, 'nameB')}」在平面上重叠了 ${num(c, 'area')}mm² —— 装进去必然打架。`,
     hint: (c) => `挪开其中一个（点这条会选中这两个柜，可以直接拖），或把柜体做窄 ${num(c, 'needW')}mm。`,
     manual: '动哪个柜、往哪挪，属于设计决定，系统不能替你选。',
+  },
+  'RULE-CABINET-TYPE-MOUNT': {
+    title: '柜体类型与安装标高不匹配',
+    severity: 'ERROR',
+    message: (c) => `「${str(c, 'cabName')}」的柜型「${str(c, 'cabinetType')}」与安装底标高 ${num(c, 'mountHeight')}mm 不匹配。`,
+    hint: (c) => str(c, 'cabinetType') === 'wall' ? '吊柜必须设置正数 mountHeight（柜体底板离地高度）；地柜/高柜/岛台应设为 0。' : '只有吊柜可以设置正数 mountHeight；检查 cabinetType 与 mountHeight。',
+    manual: '请根据房间标高和实际安装方案填写柜型与安装高度。',
+  },
+  'RULE-COUNTERTOP-CUTOUT-OUT-OF-BOUNDS': {
+    title: '台面预留超出柜体范围',
+    severity: 'ERROR',
+    message: (c) => `「${str(c, 'cabName')}」的「${str(c, 'cutoutName')}」预留 ${num(c, 'width')}×${num(c, 'depth')}mm 超出台面可用范围。`,
+    hint: (c) => `预留位置需满足 x≥18、x+width≤${num(c, 'cabWidth') - 18}、y≥0、y+depth≤${num(c, 'cabDepth')}mm。`,
+    manual: '调整预留位置和尺寸；系统不会自动改动水槽或灶具尺寸。',
+  },
+  'RULE-COUNTERTOP-CUTOUT-PLACEHOLDER': {
+    title: '参考预留｜非 CNC 开孔｜待拆单确认',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」包含 ${num(c, 'count')} 个台面参考预留；虚线仅为定位参考，非 CNC 开孔，也不代表顶板已加工。`,
+    hint: () => '下单前由台面供应商复核水槽/灶具模板、边距与边缘工艺，并完成拆单；当前图纸不能作为 CNC 真开孔指令。',
+    manual: '状态必须保持「参考预留｜非 CNC 开孔｜待拆单确认」，直至供应商完成复核并生成正式生产图。',
   },
   'RULE-CABINET-IN-WALL': {
     title: '柜子和墙打架',

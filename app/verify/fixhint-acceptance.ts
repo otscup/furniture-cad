@@ -23,14 +23,16 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import type { Cabinet, RuleSet } from '../src/core/types.ts';
+import type { Cabinet, Project, RuleSet, SharedPanel } from '../src/core/types.ts';
 import { CommandBus } from '../src/core/commandBus.ts';
-import { createCabinet, makeUnit, sampleProject } from '../src/core/docFactory.ts';
+import { createCabinet, makeUnit, rectRoom, sampleProject } from '../src/core/docFactory.ts';
 import * as CMD from '../src/core/commands.ts';
 import { generateCabinet } from '../src/core/geometry/generate.ts';
+import { generateProject } from '../src/core/geometry/project.ts';
 import { doorWidths } from '../src/core/geometry/layout.ts';
 import { validateCabinet } from '../src/core/rules/validate.ts';
 import { RULE_CODES, buildIssue, ruleCard, type RuleCard } from '../src/core/rules/issueCatalog.ts';
+import { confirmSharedPanel, validateSharedPanels } from '../src/core/sharedPanels.ts';
 
 /** 取一张规则卡（少了它，下面几处断言会退化成"能取到就绿"） */
 const BUILD = (code: string) => {
@@ -123,36 +125,6 @@ const VAGUE = ['检查一下', '调整一下', '自行处理', '请确认后处�
  * 两类都不许出现 undefined / NaN / "[object ...]"，都不许是"检查一下"这类空话。
  */
 /**
- * 报不出数字的例外：这几条是**语义/结构矛盾**，根本没有"差多少 mm"这个概念
- * （电器洞口本就不该有门、双面柜本就该有背面、单面柜本就不该有背面）。
- * 对它们硬要求数字反而是塞水；但要求它们明说"这是你要定的事"。
- *
- * IMPORT-SHAPE 同类：形状门（"这不是柜体清单的形状"）是结构矛盾，
- * 真实 detail 来自 aiContract.proposalShapeError（字段名，不含 mm）；
- * 硬造一个数字反而是在形状报错里塞水。它带 manual（形状门复用契约实现），
- * 满足"本就报不出数字就明说"的出口。
- */
-const NO_NUMBER_OK = new Set([
-  'RULE-APPLIANCE-DOOR',
-  'RULE-DOUBLE-NO-BACK',
-  'RULE-ROW-WITH-BACK',
-  'IMPORT-SHAPE',
-  // 以下导入家族都是「外部数据完整性 / 结构」问题，没有"差多少 mm"的概念；
-  // 真有数时由 NUM_CTX 断言数字确实出现，缺失时由下方"缺失≠0"断言强制报"无法识别"。
-  'IMPORT-EMPTY',
-  'IMPORT-OPEN-QUESTIONS',
-  'IMPORT-UNCERTAINTY',
-  'IMPORT-CAVEAT',
-  'IMPORT-LOW-CONFIDENCE',
-  // ── P8.7 空间语义：结构/语义矛盾类（无"差多少 mm"概念；都有 manual「要你定」）──
-  // 带数字的空间码（OPENING-SPAN / CABINET-OPENING）不在此列，走 NUM_CTX 强断言。
-  'SPATIAL-WALL-ZERO',
-  'SPATIAL-ROOM-OPEN',
-  'SPATIAL-ROOM-SHAPE',
-  'SPATIAL-CABINET-OUTSIDE',
-]);
-
-/**
  * 数字型 ctx：这几条卡的"差多少"来自派生（间隙 mm / 夹角 / 成员数 / 高度），
  * 通用 sampleCtx 里没有，光靠 `/\d/` 会**因为兜底 0 而假绿**
  * （num() 缺值时返回 0，于是"成员数 0 个"也算带数字 —— 这正是本项目反复踩的假绿）。
@@ -221,11 +193,75 @@ const NUM_CTX: Record<string, Record<string, unknown>> = {
   'DESIGN-CABINET-DOOR-SWING': { cabName: '挡扇柜', wallName: '北墙', openingName: '门洞', width: 917, hingeZh: '终点侧', dirZh: '室外', intrusion: 613 },
 };
 
+/**
+ * 显式量化断言清单：只有这些尺寸、几何、间隙、幅面/超差类规则要求 message/hint 带数字。
+ * NUM_CTX 是逐规则数值元数据；下列其余规则没有派生型辨识值，但其问题本身可量化。
+ * 不从 program 标记或「非 program」大类推导，也不靠堆叠无数字例外来决定断言范围。
+ */
+const QUANTITATIVE_CODES = new Set<string>([
+  ...Object.keys(NUM_CTX),
+  'RULE-RUNNER-TOO-LONG',
+  'RULE-APPLIANCE-FIT-W',
+  'RULE-APPLIANCE-FIT-H',
+  'RULE-APPLIANCE-FIT-D',
+  'RULE-DOOR-MAX-WIDTH',
+  'RULE-DOOR-MAX-HEIGHT',
+  'RULE-DRAWER-TALL-FRONT',
+  'RULE-ROW-FILL-OVERFLOW',
+  'RULE-ROW-HEIGHT-SUM',
+  'RULE-ROW-HEIGHT-BAD',
+  'RULE-DRAWER-NO-ROOM',
+  'RULE-SHELF-DEPTH',
+  'RULE-PANEL-NONPOSITIVE-DIMENSION',
+  'RULE-MIN-PANEL',
+  'RULE-PANEL-OVER-SHEET',
+  'RULE-PANEL-WEIGHT',
+  'RULE-CABINET-SPLIT-HEIGHT',
+  'RULE-CABINET-SPLIT-WIDTH',
+  'RULE-SHELF-SPAN',
+  'RULE-CABINET-OVERLAP',
+  'RULE-COUNTERTOP-CUTOUT-OUT-OF-BOUNDS',
+  'RULE-CABINET-IN-WALL',
+  'SPATIAL-OPENING-SPAN',
+  'SPATIAL-CABINET-OPENING',
+  'CORNER-DOOR-SWING',
+  'ALLOC-FIT-TOTAL',
+  'RULE-DOOR-TALL',
+  'RULE-BACKPANEL-SPLIT',
+  'PROPOSAL-SIZE-RANGE',
+  'DESIGN-FRONT-BLOCKED',
+  'DESIGN-ORIENTATION-SUSPECT',
+  'DESIGN-CABINET-WALL-CONFLICT',
+  'DESIGN-CABINET-FRONT-WALL',
+  'DESIGN-CABINET-NEAR-WALL',
+  'DESIGN-CABINET-FLOATING',
+  'DESIGN-CABINET-NEAR-DOOR',
+  'DESIGN-WINDOW-BEHIND-CABINET',
+  'DESIGN-ATTACH-NOT-TOUCHING',
+  'DESIGN-ATTACH-FACE-MISMATCH',
+  'DESIGN-ATTACH-OFFSET-MISMATCH',
+  'DESIGN-CABINET-DOOR-SWING',
+  'ERGO-DRAWER-HEIGHT',
+  'ERGO-ROD-HEIGHT',
+  'ERGO-ROD-CLEARANCE',
+  'ERGO-HANG-ZONE',
+]);
+
+/** 聚合规则用真实业务上下文，不用通用 sampleCtx 凭空构造空 panelId/reasons。 */
+const SPECIAL_CTX: Record<string, Record<string, unknown>> = {
+  'RULE-SHARED-PANEL-BLOCKED': {
+    panelId: 'SP_B48_MANUAL_UNCONFIRMED',
+    reasons: '共享件关键制造信息未确认，或确认后字段已变化（stale）',
+  },
+};
+
 const rows: Array<{ code: string; ok: boolean; why: string }> = [];
 const numberShown: Array<{ code: string; why: string }> = [];
+const unregisteredQuantitativeCodes = [...QUANTITATIVE_CODES].filter((code) => !RULE_CODES.includes(code));
+ok('显式量化规则集合中的规则码均已登记', unregisteredQuantitativeCodes.length === 0, JSON.stringify(unregisteredQuantitativeCodes));
 for (const code of RULE_CODES) {
   const isProgram = BUILD(code).program === true;
-  const ctx = { ...sampleCtx, ...(NUM_CTX[code] ?? {}) };
+  const ctx = { ...sampleCtx, ...(NUM_CTX[code] ?? {}), ...(SPECIAL_CTX[code] ?? {}) };
   let issue;
   try {
     issue = buildIssue(code, { target: 'c_test.unit_1', targetKind: 'unit', ctx });
@@ -245,15 +281,8 @@ for (const code of RULE_CODES) {
   if (isProgram) {
     if (!/程序|生成器/.test(msg + hint + manual)) why.push('没说明这是程序缺陷（会误导用户以为是自己的问题）');
     // 程序缺陷类用 NaN 作"没有值"的显示是有意的（比 ? 更容易暴露问题），不断言 NaN
-  } else {
-    if (NO_NUMBER_OK.has(code)) {
-      // 这几条与尺寸无关（结构矛盾 / 语义错误）：
-      // 要么给得出一键修（电器洞口那格去掉门），要么明说"要你定" —— 不许两头都没有
-      if (!manual && !BUILD(code).fix) why.push('这条本就报不出数字，就该明说"要你决定"或给个按钮，不能两头都没有');
-    } else if (!/\d/.test(msg + hint)) {
-      why.push('没给出任何具体数字（说不清差多少）');
-    }
   }
+  if (QUANTITATIVE_CODES.has(code) && !/\d/.test(msg + hint)) why.push('该规则属于显式量化集合，但 message/fixHint 没给出具体数字');
   // 派生喂进去的**每个**数字都必须真的出现在 message 上：
   // 只断言"有数字"会被 num() 的兜底 0 顶替（"成员数 0 个"也算有数字 = 假绿）
   const extra = NUM_CTX[code];
@@ -266,7 +295,143 @@ for (const code of RULE_CODES) {
   rows.push({ code, ok: why.length === 0, why: why.join('；') });
 }
 const bad = rows.filter((r) => !r.ok);
-ok('每条设计类报错都给出具体数字（差多少 / 改到多少）', bad.length === 0, JSON.stringify(bad));
+ok('每条需量化的设计类报错都给出具体数字（差多少 / 改到多少）', bad.length === 0, JSON.stringify(bad));
+
+// SharedPanel blocker 聚合资格/状态原因，不对无尺寸含义的状态码硬塞数字；
+// 但其可量化子原因仍必须把实际值/幅面限值带到 message，且给出可执行的下一步。
+section('B2 SharedPanel blocker：真实状态原因与量化子原因都可读');
+const sharedPanelStateIssue = buildIssue('RULE-SHARED-PANEL-BLOCKED', {
+  target: 'SP_B48_MANUAL_UNCONFIRMED',
+  targetKind: 'project',
+  ctx: { ...SPECIAL_CTX['RULE-SHARED-PANEL-BLOCKED']! },
+});
+ok(
+  'SharedPanel 状态阻断显示 panelId 与未确认/stale 具体原因',
+  sharedPanelStateIssue.message.includes('SP_B48_MANUAL_UNCONFIRMED') && sharedPanelStateIssue.message.includes('共享件关键制造信息未确认') && sharedPanelStateIssue.message.includes('stale'),
+  sharedPanelStateIssue.message
+);
+ok(
+  'SharedPanel 状态阻断给出补齐、人工确认及重新核对的下一步',
+  Boolean(sharedPanelStateIssue.fixHint?.includes('补齐并人工确认') && sharedPanelStateIssue.fixHint.includes('须重新核对')),
+  String(sharedPanelStateIssue.fixHint)
+);
+
+const sharedPanelThicknessIssue = buildIssue('RULE-SHARED-PANEL-BLOCKED', {
+  target: 'SP_B48_THICKNESS_MISMATCH',
+  targetKind: 'project',
+  ctx: { panelId: 'SP_B48_THICKNESS_MISMATCH', reasons: '厚度 37mm 与材料「桦木板」标称 18mm 不一致' },
+});
+ok(
+  'SharedPanel 厚度子原因保留实际值 37mm 与材料限值 18mm',
+  sharedPanelThicknessIssue.message.includes('厚度 37mm') && sharedPanelThicknessIssue.message.includes('标称 18mm'),
+  sharedPanelThicknessIssue.message
+);
+ok(
+  'SharedPanel 厚度超差仍给出补齐/人工确认下一步',
+  Boolean(sharedPanelThicknessIssue.fixHint?.includes('补齐并人工确认') && sharedPanelThicknessIssue.fixHint.includes('材料饰面')),
+  String(sharedPanelThicknessIssue.fixHint)
+);
+
+const sharedPanelSheetIssue = buildIssue('RULE-SHARED-PANEL-BLOCKED', {
+  target: 'SP_B48_OVERSIZED',
+  targetKind: 'project',
+  ctx: { panelId: 'SP_B48_OVERSIZED', reasons: '整件超过板材幅面 2440×1220mm，需由用户确认拼缝并建立分段' },
+});
+ok(
+  'SharedPanel 幅面超差子原因保留实际限制 2440×1220mm',
+  sharedPanelSheetIssue.message.includes('2440×1220mm') && sharedPanelSheetIssue.message.includes('需由用户确认拼缝并建立分段'),
+  sharedPanelSheetIssue.message
+);
+ok(
+  'SharedPanel 幅面超差提示明确要求人工确认接缝分段',
+  Boolean(sharedPanelSheetIssue.fixHint?.includes('人工确认') && sharedPanelSheetIssue.fixHint.includes('接缝分段')),
+  String(sharedPanelSheetIssue.fixHint)
+);
+
+// 集成级证据：真实 Project/SharedPanel fixture 经 validator 与 CommandBus.issues() 生成问题，
+// 不把手工传给 buildIssue 的 panelId/reasons 当作真实共享件验收。
+const sharedPanelBaseProject = sampleProject(rules);
+const sharedPanelRoom = rectRoom({ name: 'fixHint 共享板厨房', x: 0, y: 0, w: 3200, h: 2600, id: 'room_fixhint_shared' });
+const sharedLeft = createCabinet({ id: 'cab_fixhint_shared_left', name: '左柜', roomId: sharedPanelRoom.id, x: 400, y: 60, rules, params: { width: 600, height: 900, depth: 600 } });
+const sharedRight = createCabinet({
+  id: 'cab_fixhint_shared_right', name: '右柜', roomId: sharedPanelRoom.id, x: 1000, y: 60, rules,
+  params: { width: 600, height: 900, depth: 600 },
+  units: sharedLeft.layout.units.map((unit) => ({ ...unit, id: 'unit_fixhint_shared_right' })),
+});
+const sharedPanelProject: Project = {
+  ...sharedPanelBaseProject,
+  id: 'project_fixhint_shared',
+  name: 'fixHint 共享板集成验收',
+  rooms: [sharedPanelRoom],
+  cabinets: [sharedLeft, sharedRight],
+  assemblies: undefined,
+  sharedPanels: undefined,
+};
+const sharedPanelGeometry = generateProject(sharedPanelProject, rules);
+const replacedTopIds = [sharedLeft, sharedRight].map((cabinet) =>
+  sharedPanelGeometry.cabinets[cabinet.id]!.panels.find((panel) => panel.role === 'TopPanel')!.id
+);
+const sharedPanelDraft: SharedPanel = {
+  id: 'SP_FIXHINT_REAL_001',
+  name: '厨房连续台面',
+  memberCabinetIds: [sharedLeft.id, sharedRight.id],
+  replacesPanelIds: replacedTopIds,
+  bounds: { minX: 400, minY: 60, maxX: 1600, maxY: 660 },
+  elevation: 980,
+  length: 1200,
+  width: 600,
+  thickness: 18,
+  material: 'M_BOARD_18_WOOD',
+  finish: '同柜体板材饰面',
+  edgeTreatment: { top: null, bottom: null, left: null, right: null },
+  overhang: { front: 0, back: 0, left: 0, right: 0 },
+  grainDirection: 'length',
+  grain: 'length',
+  segmentation: { confirmed: true, segments: [{ id: 'whole', x: 400, y: 60, length: 1200, width: 600 }] },
+  support: { confirmed: true, method: '两柜侧板连续承托', memberCabinetIds: [sharedLeft.id, sharedRight.id] },
+  machining: { status: 'confirmed-none', holes: [] },
+  memberSnapshots: [],
+  confirmation: { status: 'draft' },
+};
+const confirmedSharedPanel = confirmSharedPanel(sharedPanelDraft, sharedPanelProject);
+function generatedSharedPanelIssues(panel: SharedPanel) {
+  const project: Project = { ...sharedPanelProject, sharedPanels: [panel] };
+  const validatorIssue = validateSharedPanels(project, rules).find((issue) => issue.code === 'RULE-SHARED-PANEL-BLOCKED' && issue.target === panel.id);
+  const busIssue = new CommandBus(project, rules).issues().find((issue) => issue.code === 'RULE-SHARED-PANEL-BLOCKED' && issue.target === panel.id);
+  return { validatorIssue, busIssue };
+}
+
+const unconfirmedPanel: SharedPanel = { ...confirmedSharedPanel, confirmation: { status: 'draft' } };
+const unconfirmedIssues = generatedSharedPanelIssues(unconfirmedPanel);
+const unconfirmedReason = '共享件关键制造信息未确认，或确认后字段已变化（stale）';
+ok(
+  '真实未确认 SharedPanel 经 validateSharedPanels 生成精确状态原因',
+  Boolean(unconfirmedIssues.validatorIssue?.message.includes(unconfirmedPanel.id) && unconfirmedIssues.validatorIssue.message.includes(unconfirmedReason)),
+  unconfirmedIssues.validatorIssue?.message ?? 'validator 未生成对应 SharedPanel blocker'
+);
+ok(
+  '真实未确认 SharedPanel 经 CommandBus.issues() 保留状态原因与具体下一步',
+  Boolean(unconfirmedIssues.busIssue?.message.includes(unconfirmedReason) && unconfirmedIssues.busIssue.fixHint?.includes('补齐并人工确认') && unconfirmedIssues.busIssue.fixHint.includes('须重新核对')) &&
+    unconfirmedIssues.busIssue?.message === unconfirmedIssues.validatorIssue?.message,
+  JSON.stringify({ message: unconfirmedIssues.busIssue?.message, fixHint: unconfirmedIssues.busIssue?.fixHint, validatorMessage: unconfirmedIssues.validatorIssue?.message })
+);
+
+const mismatchedThickness = 37;
+const thicknessPanel = confirmSharedPanel({ ...sharedPanelDraft, thickness: mismatchedThickness }, sharedPanelProject);
+const thicknessIssues = generatedSharedPanelIssues(thicknessPanel);
+const expectedMaterialThickness = rules.materials[thicknessPanel.material]?.thickness;
+const thicknessReason = `厚度 ${mismatchedThickness}mm 与材料「${thicknessPanel.material}」标称 ${expectedMaterialThickness}mm 不一致`;
+ok(
+  '真实已确认 SharedPanel 的 validator 子原因含实际厚度与规则材料限值',
+  typeof expectedMaterialThickness === 'number' && Boolean(thicknessIssues.validatorIssue?.message.includes(thicknessReason)),
+  JSON.stringify({ thicknessReason, message: thicknessIssues.validatorIssue?.message })
+);
+ok(
+  '真实 SharedPanel 厚度 issue 由 CommandBus.issues() 原样给出 validator 的实际值/限值',
+  typeof expectedMaterialThickness === 'number' && thicknessIssues.busIssue?.message === thicknessIssues.validatorIssue?.message &&
+    Boolean(thicknessIssues.busIssue?.message.includes(`${mismatchedThickness}mm`) && thicknessIssues.busIssue.message.includes(`标称 ${expectedMaterialThickness}mm`)),
+  JSON.stringify({ message: thicknessIssues.busIssue?.message, validatorMessage: thicknessIssues.validatorIssue?.message })
+);
 
 // ═══════════════════════ C2 Test Integrity：缺失值不被当成 0 ═══════════════════════
 // 这是 P7.1 的核心加固：num() 缺值兜底 0，会让"字段缺失/未知"被静默说成 0，

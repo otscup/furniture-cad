@@ -1,4 +1,4 @@
-import type { Prim, Project, ProjectGeometry, Vec2 } from '../core/types.ts';
+import type { DrawingEntity, Prim, Project, ProjectGeometry, Vec2 } from '../core/types.ts';
 import { getCabinetFootprint } from '../core/geometry/generate.ts';
 import { wallPolygon } from '../core/geometry/project.ts';
 import type { Camera } from './camera.ts';
@@ -8,6 +8,7 @@ import type { Grip } from './hitTest.ts';
 import { gripsFor } from './hitTest.ts';
 import type { SnapResult } from './snapping.ts';
 import { snapKindLabel } from './snapping.ts';
+import { drawingEntityPrims, drawingPrims, editSelectionId, sourceSelectionId } from '../core/drawingEdits.ts';
 
 /**
  * Canvas 2D 渲染器 —— 只读，且只认一个「场景」。
@@ -42,7 +43,7 @@ export interface RenderInput {
   cam: Camera;
   scene: Scene;
   /**
-   * 'plan' 平面图（可编辑，默认） | 'sheet' 四视图图幅（只读看图）。
+   * 'plan' 平面图 | 'sheet' 四视图图幅（派生投影；尺寸线可编辑、空白处可平移）。
    *
    * 两种模式读的是**同一次 derive 的产物**：plan 读 geom.plan，sheet 读 geom.views。
    * 渲染器不改任何东西，模式只是"看哪一份派生视图"。
@@ -83,6 +84,7 @@ export interface RenderInput {
    * 而不是拖了半天没反应才怀疑软件坏了。
    */
   sheetHover?: { pts: Vec2[]; draggable: boolean } | null;
+  drawingPreview?: DrawingEntity[];
 }
 
 export type P2S = (p: Vec2) => Vec2;
@@ -106,10 +108,15 @@ export function renderScene(inp: RenderInput): void {
   }
 
   if (inp.showGrid) drawGrid(inp, to);
-  drawWalls(inp, to);
-  drawDoorSwing(inp, to);
-  drawCabinets(inp, to);
+  if (inp.scene.project.drawingEdits?.some(e => e.space === 'plan')) {
+    drawPrims(ctx, drawingPrims(inp.scene.project, 'plan', inp.scene.geom.plan, inp.scene.geom.planSourceKeys), to, inp.hiddenLayers, inp.cam.scale);
+  } else {
+    drawWalls(inp, to);
+    drawDoorSwing(inp, to);
+    drawCabinets(inp, to);
+  }
   drawSelectionHighlight(inp, to);
+  drawDrawingSelection(inp, to, 'plan');
   drawGrips(inp, to);
   drawDraftWall(inp, to);
   drawMarquee(inp, to);
@@ -126,6 +133,32 @@ export function renderScene(inp: RenderInput): void {
  * 这里**不做任何布局计算** —— 视图怎么排、衔接线画在哪，都是 views.ts 的事。
  * 渲染器一旦开始"帮忙摆位置"，就又多了一个真相源。
  */
+function drawDrawingSelection(inp: RenderInput, to: P2S, space: 'plan' | 'sheet'): void {
+  const { ctx, scene, selection } = inp;
+  const entities = (scene.project.drawingEdits ?? []).filter(e => e.space === space);
+  ctx.save();
+  ctx.strokeStyle = '#f97316'; ctx.fillStyle = '#f97316'; ctx.lineWidth = 2.8;
+  for (const e of entities) if (selection.includes(editSelectionId(e.id))) {
+    for (const p of drawingEntityPrims(e)) highlightPrim(ctx, p, to);
+  }
+  const sourceKeys = space === 'plan' ? scene.geom.planSourceKeys : scene.geom.views.sourceKeys;
+  const sourcePrims = space === 'plan' ? scene.geom.plan : scene.geom.views.prims;
+  const replaced = new Set(entities.flatMap(e => e.replacesSource ? [e.replacesSource] : []));
+  sourceKeys.forEach((key, i) => {
+    if (!key || replaced.has(key) || !selection.includes(sourceSelectionId(key))) return;
+    const p = sourcePrims[i]; if (p) highlightPrim(ctx, p, to);
+  });
+  ctx.restore();
+}
+
+function highlightPrim(ctx: CanvasRenderingContext2D, p: Prim, to: P2S): void {
+  if (p.k === 'text') { const s = to(p.p); ctx.beginPath(); ctx.arc(s.x, s.y, 7, 0, Math.PI * 2); ctx.fill(); }
+  else if (p.k === 'poly' && p.pts.length > 1) {
+    ctx.beginPath(); p.pts.forEach((q, i) => { const s = to(q); if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y); });
+    if (p.closed) ctx.closePath(); ctx.stroke();
+  }
+}
+
 function drawSheet(inp: RenderInput, to: P2S): void {
   const { ctx, cam, hiddenLayers } = inp;
   const views = inp.scene.geom.views;
@@ -140,7 +173,10 @@ function drawSheet(inp: RenderInput, to: P2S): void {
     ctx.restore();
     return;
   }
-  if (views && views.prims.length > 0) drawPrims(ctx, views.prims, to, hiddenLayers, cam.scale);
+  if (views && views.prims.length > 0) {
+    drawPrims(ctx, drawingPrims(inp.scene.project, 'sheet', views.prims, views.sourceKeys), to, hiddenLayers, cam.scale);
+    drawDrawingSelection(inp, to, 'sheet');
+  }
   // 分解图最后画：它在下方的独立图幅里，与四视图的图元本来就不重叠，
   // 顺序只影响"万一以后两者贴到一起"时的叠压关系 —— 分解图应该在上面。
   if (explode.length > 0) drawPrims(ctx, explode, to, hiddenLayers, cam.scale);

@@ -24,7 +24,7 @@
  *   3. 坐标：语义落位走 placement 引擎（MCP 不算坐标）；显式 x/y 走
  *      cabinet.move + cabinet.rotate（用户授权输入语义）。
  *   4. 审计只记 actor/tool/result，不记 token、不记 project。
- *   5. 每次 draft 变更后必须 await saveDraft 落盘；apply/discard 后删文件。
+ *   5. Store 的 createDraft/draftExecute 先原子落盘候选状态再发布内存；apply/discard 后删文件。
  *      没落盘就不算成功 —— 与 Workspace.execute() 同一条纪律。
  * ══════════════════════════════════════════════════════════════════════
  */
@@ -42,6 +42,25 @@ export const TOOL_DISCARD_DRAFT = 'cad.discard_draft';
 export const TOOL_CREATE_ROOM = 'cad.create_room';
 export const TOOL_DRAW_WALL = 'cad.draw_wall';
 export const TOOL_DUPLICATE_OBJECT = 'cad.duplicate_object';
+export const TOOL_CREATE_ASSEMBLY = 'cad.create_assembly';
+
+const MCP_UNIT = z.object({
+  kind: z.enum(['drawerBank', 'shelves', 'hanging', 'appliance', 'open']),
+  width: z.number().int().min(50).max(6000),
+  count: z.number().int().min(1).max(12).optional(),
+  doorCount: z.number().int().min(0).max(12).optional(),
+  nickname: z.string().max(80).optional(),
+  applianceName: z.string().max(80).optional(),
+  openingWidth: z.number().int().min(200).max(2000).optional(),
+  openingHeight: z.number().int().min(200).max(3000).optional(),
+  openingDepth: z.number().int().min(200).max(2000).optional(),
+  topDrawers: z.number().int().min(0).max(6).optional(),
+});
+const MCP_CUTOUT = z.object({
+  kind: z.enum(['sink', 'cooktop', 'other']), name: z.string().min(1).max(80),
+  x: z.number().int().min(18).max(6000), y: z.number().int().min(0).max(2000),
+  width: z.number().int().min(50).max(2000), depth: z.number().int().min(50).max(2000),
+});
 
 /** S4/S5 新增的全部写工具（ALLOWED_TOOLS 的扩展，走同一套方案纪律）。 */
 export const WRITE_TOOLS = [
@@ -57,6 +76,7 @@ export const WRITE_TOOLS = [
   TOOL_CREATE_ROOM,
   TOOL_DRAW_WALL,
   TOOL_DUPLICATE_OBJECT,
+  TOOL_CREATE_ASSEMBLY,
 ];
 
 // ── .ts 核心模块懒加载（--experimental-strip-types，与 workspaceHost 同一条路）──
@@ -104,10 +124,14 @@ function requirePerm(principal, need) {
   return null;
 }
 
-function workspaceOrError(workspaceState) {
+function workspaceOrError(workspaceState, { allowReadOnly = false } = {}) {
   if (!workspaceState || workspaceState.ok !== true || !workspaceState.workspace) {
     const detail = workspaceState?.error ?? '未装载';
-    return { error: toolError('WORKSPACE_UNAVAILABLE', `服务端工作区不可用：${detail}`) };
+    return { error: toolError(workspaceState?.code ?? 'WORKSPACE_UNAVAILABLE', `服务端工作区不可用：${detail}`) };
+  }
+  if (!allowReadOnly) {
+    const identityConflict = workspaceState.workspace.getUnitIdentityConflict?.();
+    if (identityConflict) return { error: toolError('WORKSPACE_UNIT_ID_CONFLICT', identityConflict) };
   }
   return { workspace: workspaceState.workspace };
 }
@@ -122,15 +146,22 @@ async function withDraft(ws, draftId, actor) {
     if (!h) return { error: toolError('DRAFT_NOT_FOUND', `draft 不存在：${draftId}`) };
     return { ws, draftId, isNew: false, handle: h };
   }
-  const h = ws.createDraft(actor);
-  await ws.saveDraft(h.draftId);
+  const h = await ws.createDraft(actor);
   return { ws, draftId: h.draftId, isNew: true, handle: h };
 }
 
 /** 新建的 draft 若首条命令就失败，顺手清理，避免草稿堆积。 */
 async function cleanupNewDraft(ws, draftId) {
-  ws.discardDraft(draftId);
-  await ws.deleteDraftFile(draftId);
+  await ws.discardDraft(draftId);
+}
+
+/** Store 在真实原子文件操作失败时保持旧 draft；将错误带回 MCP handler 以便新建 draft 清理并明确失败。 */
+async function executeDraftCommand(ws, draftId, command) {
+  try {
+    return await ws.draftExecute(draftId, command);
+  } catch (error) {
+    return { ok: false, error: `草稿持久化失败：${error?.message ?? String(error)}` };
+  }
 }
 
 /** 在 draft 上编译并执行一条 AI 动作（复用 compileAction —— 与内置 AI 同一条编译路）。 */
@@ -141,24 +172,22 @@ async function draftRunAction(ws, draftId, aiAction) {
   if (!project) return { ok: false, error: `draft 不存在：${draftId}` };
   const c = compile.compileAction({ ...aiAction, origin: 'mcp' }, project, rules);
   if (!c.ok) return { ok: false, error: c.error ?? '编译失败' };
-  const r = ws.draftExecute(draftId, c.command);
+  const r = await executeDraftCommand(ws, draftId, c.command);
   if (!r.ok) return { ok: false, error: r.error ?? '命令被拒绝', issues: r.newIssues ?? [] };
-  await ws.saveDraft(draftId);
   return { ok: true, label: c.summary ?? c.command.label ?? '', command: c.command };
 }
 
 /** draft 版本新鲜度提示（append 到过期 draft 上是白干，apply 一定会被拒）。 */
 function staleHint(ws, handle) {
-  const live = ws.getLiveModelVersion();
-  if (handle.baseModelVersion !== live) {
+  const freshness = ws.getDraftFreshness(handle.draftId);
+  if (freshness?.isStale) {
     return {
       baseStale: true,
-      baseModelVersion: handle.baseModelVersion,
-      liveModelVersion: live,
-      hint: '这份草稿基于旧版本，apply 时会被 DRAFT_STALE 拒绝；建议 discard 后重建',
+      ...freshness,
+      hint: '这份草稿基于旧的 live 版本或内容，apply 将返回 DRAFT_STALE 且不会覆盖 live；请重新创建草稿。',
     };
   }
-  return { baseStale: false, baseModelVersion: handle.baseModelVersion, liveModelVersion: live };
+  return { baseStale: false, ...freshness };
 }
 
 /**
@@ -187,6 +216,11 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         width: z.number().optional().describe('mm，缺省按规则默认'),
         height: z.number().optional().describe('mm'),
         depth: z.number().optional().describe('mm'),
+        bodyLift: z.number().int().min(0).max(300).optional().describe('mm，踢脚高度；吊柜通常为 0'),
+        cabinetType: z.enum(['base', 'wall', 'tall', 'island']).optional().describe('wall 吊柜必须同时给 mountHeight'),
+        mountHeight: z.number().int().min(0).max(3000).optional().describe('mm，柜体底板离地高度'),
+        units: z.array(MCP_UNIT).min(1).max(16).optional().describe('由左至右的结构分区；支持抽屉、层板、开放格、电器格'),
+        counterCutouts: z.array(MCP_CUTOUT).max(8).optional().describe('水槽/灶具参考预留；参考预留｜非 CNC 开孔｜待拆单确认，不是生产切孔'),
         rotation: z.number().optional().describe('度，缺省 0'),
         x: z.number().optional().describe('初始 x（mm），缺省自动避让已有柜'),
         y: z.number().optional().describe('初始 y（mm）'),
@@ -206,6 +240,11 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       if (args.width !== undefined) params.width = args.width;
       if (args.height !== undefined) params.height = args.height;
       if (args.depth !== undefined) params.depth = args.depth;
+      if (args.bodyLift !== undefined) params.bodyLift = args.bodyLift;
+      if (args.cabinetType !== undefined) params.cabinetType = args.cabinetType;
+      if (args.mountHeight !== undefined) params.mountHeight = args.mountHeight;
+      if (args.units !== undefined) params.units = args.units;
+      if (args.counterCutouts !== undefined) params.counterCutouts = args.counterCutouts;
       if (args.rotation !== undefined) params.rotation = args.rotation;
       if (args.x !== undefined) params.atX = args.x;
       if (args.y !== undefined) params.atY = args.y;
@@ -232,6 +271,42 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       auditToolCall(TOOL_CREATE_CABINET, 'ok', { draftId: d.draftId, cabinetId });
       return toolText({ ok: true, draftId: d.draftId, cabinetId, label: run.label, ...staleHint(ws, d.handle) });
     }
+  );
+
+  // ── cad.create_assembly ──────────────────────────────────────────
+  server.registerTool(
+    TOOL_CREATE_ASSEMBLY,
+    {
+      title: '创建柜体组合关系（进 draft）',
+      description: '把同一房间内的柜体组织成组合并声明并排/转角/叠放连接，不碰 live。',
+      inputSchema: z.object({
+        name: z.string().min(1).max(120), memberIds: z.array(z.string().min(1)).min(2).max(32),
+        connections: z.array(z.object({
+          kind: z.enum(['corner', 'butt', 'stack']),
+          a: z.union([z.string().min(1), z.object({ cabinetId: z.string().min(1), edge: z.enum(['back', 'front', 'left', 'right']).optional() })]),
+          b: z.union([z.string().min(1), z.object({ cabinetId: z.string().min(1), edge: z.enum(['back', 'front', 'left', 'right']).optional() })]),
+        })).max(64).optional(), draftId: z.string().optional(),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needDesign();
+      if (deny) return deny;
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      if (r.error) return r.error;
+      const ws = r.workspace;
+      const d = await withDraft(ws, args.draftId, principal.actor);
+      if (d.error) return d.error;
+      const run = await draftRunAction(ws, d.draftId, { action: 'assembly.create', target: {}, params: { name: args.name, memberIds: args.memberIds, connections: args.connections ?? [] } });
+      if (!run.ok) {
+        if (d.isNew) await cleanupNewDraft(ws, d.draftId);
+        auditToolCall(TOOL_CREATE_ASSEMBLY, 'fail', { draftId: d.draftId, error: run.error });
+        return toolError('COMMAND_REJECTED', run.error);
+      }
+      const assemblyId = run.command?.payload?.assembly?.id ?? null;
+      auditToolCall(TOOL_CREATE_ASSEMBLY, 'ok', { draftId: d.draftId, assemblyId });
+      return toolText({ ok: true, draftId: d.draftId, assemblyId, label: run.label, ...staleHint(ws, d.handle) });
+    },
   );
 
   // ── cad.place_cabinet ───────────────────────────────────────────
@@ -385,9 +460,8 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         } else {
           return fail('wall 只支持改 thickness/name');
         }
-        const er = ws.draftExecute(d.draftId, cmd);
+        const er = await executeDraftCommand(ws, d.draftId, cmd);
         if (!er.ok) return fail(er.error ?? '命令被拒绝');
-        await ws.saveDraft(d.draftId);
         run = { ok: true, label: cmd.label ?? '' };
       } else {
         const { commands } = await core();
@@ -397,9 +471,8 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         if (args.field !== 'name') return fail('room 只支持改 name');
         const room = proj.rooms[idx];
         const cmd = commands.renameRoomCommand(idx, room.name, String(args.value), 'mcp');
-        const er = ws.draftExecute(d.draftId, cmd);
+        const er = await executeDraftCommand(ws, d.draftId, cmd);
         if (!er.ok) return fail(er.error ?? '命令被拒绝');
-        await ws.saveDraft(d.draftId);
         run = { ok: true, label: cmd.label ?? '' };
       }
       if (!run.ok) return fail(run.error);
@@ -450,9 +523,8 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         if (!room) return fail(`找不到房间：${args.targetId}`);
         cmd = commands.deleteRoomCommand(room.id, room.name, 'mcp');
       }
-      const er = ws.draftExecute(d.draftId, cmd);
+      const er = await executeDraftCommand(ws, d.draftId, cmd);
       if (!er.ok) return fail(er.error ?? '命令被拒绝');
-      await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_DELETE_OBJECT, 'ok', { draftId: d.draftId, target: args.targetId });
       return toolText({
         ok: true,
@@ -531,11 +603,10 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       const labels = [];
       for (const s of run.steps) {
         if (!s.command) continue;
-        const er = ws.draftExecute(d.draftId, s.command);
+        const er = await executeDraftCommand(ws, d.draftId, s.command);
         if (!er.ok) return fail(`draft 执行失败「${s.label}」：${er.error ?? '被拒绝'}`);
         labels.push(s.label);
       }
-      await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_SUBMIT_PROPOSAL, 'ok', { draftId: d.draftId, steps: labels.length });
       return toolText({ ok: true, draftId: d.draftId, steps: labels.length, labels, ...staleHint(ws, d.handle) });
     }
@@ -553,12 +624,23 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     async () => {
       const deny = requirePerm(principal, 'view');
       if (deny) return deny;
-      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      const r = workspaceOrError(await getWorkspaceState(principal.actor), { allowReadOnly: true });
       if (r.error) return r.error;
       const ws = r.workspace;
       const drafts = ws.listDrafts();
+      const identityDiagnostics = ws.getUnitIdentityDiagnostics?.() ?? {
+        readOnly: Boolean(ws.getUnitIdentityConflict?.()),
+        code: ws.getUnitIdentityConflict?.() ? 'WORKSPACE_UNIT_ID_CONFLICT' : null,
+        message: ws.getUnitIdentityConflict?.() ?? null,
+        duplicateUnitIds: [],
+      };
       auditToolCall(TOOL_LIST_DRAFTS, 'ok', { count: drafts.length });
-      return toolText({ ok: true, liveModelVersion: ws.getLiveModelVersion(), drafts });
+      return toolText({
+        ok: true,
+        liveModelVersion: ws.getLiveModelVersion(),
+        identityDiagnostics,
+        drafts,
+      });
     }
   );
 
@@ -568,10 +650,20 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
     {
       title: '应用草稿（写 live）',
       description:
-        '把 draft 应用到 live 模型。乐观锁：仅当 liveModelVersion == draft.baseModelVersion 才应用；' +
-        '否则返回结构化 DRAFT_STALE（不自动 merge、不静默覆盖），由调用方决定重建还是放弃。',
-      inputSchema: z.object({ draftId: z.string().min(1) }),
-      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+        '把 draft 应用到 live 模型。必须提供 DraftsPanel 预览确认快照中的 runId/draftId/revision/draftHash/localVersion/remoteVersion；' +
+        '仅基线 version 与 SHA-256 hash 同时匹配才应用，否则返回结构化 DRAFT_STALE。重试必须复用同一 syncId。',
+      inputSchema: z.object({
+        draftId: z.string().min(1).max(200),
+        runId: z.string().min(1).max(200),
+        revision: z.number().int().nonnegative(),
+        draftHash: z.string().regex(/^[a-f0-9]{64}$/i),
+        localVersion: z.number().int().nonnegative(),
+        remoteVersion: z.number().int().nonnegative(),
+        syncId: z.string().min(1).max(200).optional(),
+        baseModelVersion: z.number().int().nonnegative().optional(),
+        baseProjectHash: z.string().optional(),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args) => {
       const deny = requirePerm(principal, 'manage');
@@ -579,26 +671,62 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) return r.error;
       const ws = r.workspace;
-      const h = ws.getDraft(args.draftId);
-      if (!h) {
-        auditToolCall(TOOL_APPLY_DRAFT, 'fail', { draftId: args.draftId, error: 'DRAFT_NOT_FOUND' });
-        return toolError('DRAFT_NOT_FOUND', `draft 不存在：${args.draftId}`);
+      const required = ['runId', 'draftId', 'revision', 'draftHash', 'localVersion', 'remoteVersion'];
+      const missing = required.filter((field) => args?.[field] === undefined || args?.[field] === null || args?.[field] === '');
+      if (missing.length) return toolError('APPLY_METADATA_REQUIRED', `apply 必须提供完整确认字段：${missing.join('、')}。`);
+      if (typeof args.runId !== 'string' || typeof args.draftId !== 'string'
+        || !Number.isSafeInteger(args.revision) || !/^[a-f0-9]{64}$/i.test(String(args.draftHash))
+        || !Number.isSafeInteger(args.localVersion) || !Number.isSafeInteger(args.remoteVersion)) {
+        return toolError('APPLY_METADATA_INVALID', 'apply 确认元数据格式无效。');
       }
-      const liveBefore = ws.getLiveModelVersion();
-      const ar = await ws.applyDraft(args.draftId);
+      const h = ws.getDraft(args.draftId);
+      let ar;
+      try {
+        ar = await ws.applyDraft(args.draftId, args);
+      } catch (error) {
+        if (error?.code === 'APPLY_COMMITTED_CLEANUP_FAILED') {
+          auditToolCall(TOOL_APPLY_DRAFT, 'committed_cleanup_failed', { draftId: error.draftId, syncId: error.syncId });
+          return toolError(error.code, error.message, {
+            committed: true,
+            retryable: true,
+            syncId: error.syncId,
+            draftId: error.draftId,
+            newVersion: error.newVersion,
+            receipt: error.receipt,
+          });
+        }
+        throw error;
+      }
       if (!ar.ok) {
         auditToolCall(TOOL_APPLY_DRAFT, 'fail', { draftId: args.draftId, error: ar.code });
+        if (!h && ar.code === 'DRAFT_STALE') return toolError('DRAFT_NOT_FOUND', ar.message);
         // §10.2 结构化错误形状
-        return toolError('DRAFT_STALE', ar.message, {
-          baseVersion: h.baseModelVersion,
-          currentVersion: liveBefore,
+        return toolError(ar.code, ar.message, {
+          baseVersion: ar.baseVersion,
+          currentVersion: ar.currentVersion,
+          baseProjectHash: ar.baseProjectHash,
+          currentProjectHash: ar.currentProjectHash,
           draftId: args.draftId,
-          hint: `这份草案基于模型版本 ${h.baseModelVersion}，模型已更新到 ${liveBefore}。请重新出草案，或放弃这份。`,
+          hint: '请基于当前服务器 live 重新创建草稿；本次冲突没有改动 live。',
         });
       }
-      await ws.deleteDraftFile(args.draftId);
       auditToolCall(TOOL_APPLY_DRAFT, 'ok', { draftId: args.draftId, newVersion: ar.newVersion });
-      return toolText({ ok: true, draftId: args.draftId, newVersion: ar.newVersion });
+      return toolText({
+        ok: true,
+        syncId: ar.syncId,
+        draftId: ar.draftId,
+        runId: ar.runId,
+        revision: ar.revision,
+        draftHash: ar.hash,
+        localVersion: ar.localVersion,
+        remoteVersion: ar.remoteVersion,
+        baseModelVersion: ar.baseModelVersion,
+        baseProjectHash: ar.baseProjectHash,
+        newVersion: ar.newVersion,
+        liveModelVersion: ar.newVersion,
+        workspaceId: ar.workspaceId,
+        project: ar.project,
+      });
     }
   );
 
@@ -631,8 +759,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
           return deny;
         }
       }
-      ws.discardDraft(args.draftId);
-      await ws.deleteDraftFile(args.draftId);
+      await ws.discardDraft(args.draftId);
       auditToolCall(TOOL_DISCARD_DRAFT, 'ok', { draftId: args.draftId });
       return toolText({ ok: true, draftId: args.draftId });
     }
@@ -698,9 +825,8 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         return fail(`房间构造失败：${e?.message ?? e}`);
       }
       const cmd = commands.createRoomCommand(room, 'mcp');
-      const er = ws.draftExecute(d.draftId, cmd);
+      const er = await executeDraftCommand(ws, d.draftId, cmd);
       if (!er.ok) return fail(er.error ?? '命令被拒绝');
-      await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_CREATE_ROOM, 'ok', { draftId: d.draftId, roomId: room.id });
       return toolText({ ok: true, draftId: d.draftId, roomId: room.id, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
     }
@@ -762,7 +888,7 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       // 不带 takenIds，会跟房间里已有的墙撞号导致命令被拒
       delete wall.id;
       delete cmd.payload.wall.id;
-      const er = ws.draftExecute(d.draftId, cmd);
+      const er = await executeDraftCommand(ws, d.draftId, cmd);
       if (!er.ok) return fail(er.error ?? '命令被拒绝');
       // 从 draftState 读回 bus 实际分配的 wallId（按用户给的起终点坐标定位）
       let wallId = '';
@@ -775,7 +901,6 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
         );
         if (hit.length) wallId = hit[hit.length - 1].id;
       }
-      await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_DRAW_WALL, 'ok', { draftId: d.draftId, wallId });
       return toolText({ ok: true, draftId: d.draftId, wallId, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
     }
@@ -823,14 +948,13 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       } else {
         newName = cmd.payload.cabinet.name;
       }
-      const er = ws.draftExecute(d.draftId, cmd);
+      const er = await executeDraftCommand(ws, d.draftId, cmd);
       if (!er.ok) return fail(er.error ?? '命令被拒绝');
       // 从 draftState 读回新柜体 ID（按名定位，duplicate 后名字唯一）
       let newId = '';
       const st = ws.draftState(d.draftId);
       const hit = (st?.cabinets ?? []).filter((c) => c.name === newName);
       if (hit.length) newId = hit[hit.length - 1].id;
-      await ws.saveDraft(d.draftId);
       auditToolCall(TOOL_DUPLICATE_OBJECT, 'ok', { draftId: d.draftId, sourceId: args.sourceId, newId });
       return toolText({ ok: true, draftId: d.draftId, newId, newName, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
     }

@@ -16,6 +16,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
+import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,11 +51,28 @@ function stripComments(src: string): string {
 }
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function allocatePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createNetServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      if (!address || typeof address === 'string') {
+        probe.close(() => reject(new Error('无法获取临时测试端口')));
+        return;
+      }
+      const port = address.port;
+      probe.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
 // ── 规格（硬编码） ──
 const EXPECTED_TOOLS = [
   'cad.get_state',
   'cad.validate',
   'cad.create_cabinet',
+  'cad.create_assembly',
   'cad.place_cabinet',
   'cad.update_object',
   'cad.delete_object',
@@ -68,16 +86,21 @@ const EXPECTED_TOOLS = [
   'cad.export_dxf',
   'cad.export_bom_csv',
   'cad.export_roombook',
+  'cad.export_pdf',
 ];
 /** 明令禁止的工具词根：目前无（S6 已做，IR-3 已开放）。保留空数组占位。 */
 const FORBIDDEN_ROOTS = [];
 
 // ── 夹具 ──
 const TMP = mkdtempSync(join(tmpdir(), 'furnicad-s45-'));
-let nextPort = 8980;
 const children: ChildProcess[] = [];
+function cleanup(): void {
+  for (const child of children) { try { child.kill(); } catch {} }
+  try { rmSync(TMP, { recursive: true, force: true }); } catch {}
+}
+process.once('exit', cleanup);
 
-interface Fixture { port: number; child: ChildProcess; dir: string; auditPath: string; wsPath: string; draftsDir: string }
+interface Fixture { port: number; child: ChildProcess; dir: string; auditPath: string; wsPath: string }
 
 function seedAccounts(dir: string): void {
   const a = new AuthStore({ accountsPath: join(dir, 'accounts.json'), auditPath: join(dir, 'audit.jsonl') });
@@ -104,8 +127,7 @@ async function startServer(dir: string): Promise<Fixture> {
   const accountsPath = join(dir, 'accounts.json');
   const auditPath = join(dir, 'audit.jsonl');
   const wsPath = join(dir, 'workspace.json');
-  const draftsDir = join(dir, 'drafts');
-  const port = nextPort++;
+  const port = await allocatePort();
   const child = spawn(process.execPath, [join(root, 'server', 'server.mjs')], {
     env: {
       ...process.env,
@@ -124,8 +146,9 @@ async function startServer(dir: string): Promise<Fixture> {
   child.stderr?.on('data', (d: Buffer) => (log += d.toString()));
   for (let i = 0; i < 150; i++) {
     await wait(100);
+    if (child.exitCode !== null || child.signalCode !== null) break;
     try {
-      if ((await fetch(`http://127.0.0.1:${port}/api/health`)).ok) return { port, child, dir, auditPath, wsPath, draftsDir };
+      if ((await fetch(`http://127.0.0.1:${port}/api/health`)).ok) return { port, child, dir, auditPath, wsPath };
     } catch {}
   }
   throw new Error(`server 未就绪（port=${port}）\n${log}`);
@@ -201,8 +224,26 @@ const PAT_OWNER = await mkPat('owner');
 const PAT_ADMIN = await mkPat('admin');
 const PAT_DESIGNER = await mkPat('designer');
 const PAT_VIEWER = await mkPat('viewer');
+const draftDirFor = (username: string) => join(dir, 'workspaces', idOf(username), 'drafts');
+const draftFilesFor = (username: string) => {
+  const path = draftDirFor(username);
+  return existsSync(path) ? readdirSync(path) : [];
+};
 
 const getState = async (token: string) => (await callTool(port, token, 'cad.get_state', {})).payload;
+async function applyConfirmation(token: string, draftId: string): Promise<Record<string, unknown>> {
+  const listing = await callTool(port, token, 'cad.list_drafts', {});
+  const draft = listing.payload?.drafts?.find((item: any) => item.draftId === draftId);
+  if (!draft) throw new Error(`no list_drafts preview for ${draftId}`);
+  return {
+    draftId: draft.draftId,
+    runId: draft.runId,
+    revision: draft.revision,
+    draftHash: draft.draftHash,
+    localVersion: 0,
+    remoteVersion: draft.liveModelVersion,
+  };
+}
 const snapOf = async (token: string) => {
   const s = await getState(token);
   return JSON.stringify({ v: s?.liveModelVersion, p: s?.project });
@@ -219,15 +260,16 @@ section('① 工具清单');
 
 section('② 权限矩阵（禁止组合：FORBIDDEN + 模型一字节未变）');
 {
-  const before = await snapOf(PAT_OWNER);
+  const viewerBefore = await snapOf(PAT_VIEWER);
+  const designerBefore = await snapOf(PAT_DESIGNER);
   const v1 = await callTool(port, PAT_VIEWER, 'cad.create_cabinet', { name: '非法柜' });
   ok('②1 viewer 调 create_cabinet → FORBIDDEN', v1.err && v1.payload?.code === 'FORBIDDEN', JSON.stringify(v1.payload)?.slice(0, 120));
-  ok('②2 被拒后模型未变', (await snapOf(PAT_OWNER)) === before);
-  const v2 = await callTool(port, PAT_VIEWER, 'cad.apply_draft', { draftId: 'draft_x' });
+  ok('②2 被拒后 viewer 工作区未变', (await snapOf(PAT_VIEWER)) === viewerBefore);
+  const v2 = await callTool(port, PAT_VIEWER, 'cad.apply_draft', { draftId: 'draft_x', runId: 'run_x', revision: 0, draftHash: '0'.repeat(64), localVersion: 0, remoteVersion: 0 });
   ok('②3 viewer 调 apply_draft → FORBIDDEN', v2.err && v2.payload?.code === 'FORBIDDEN', JSON.stringify(v2.payload)?.slice(0, 120));
-  const d1 = await callTool(port, PAT_DESIGNER, 'cad.apply_draft', { draftId: 'draft_x' });
+  const d1 = await callTool(port, PAT_DESIGNER, 'cad.apply_draft', { draftId: 'draft_x', runId: 'run_x', revision: 0, draftHash: '0'.repeat(64), localVersion: 0, remoteVersion: 0 });
   ok('②4 designer 调 apply_draft → FORBIDDEN（要 admin+）', d1.err && d1.payload?.code === 'FORBIDDEN', JSON.stringify(d1.payload)?.slice(0, 120));
-  ok('②5 四轮被拒后模型仍未变', (await snapOf(PAT_OWNER)) === before);
+  ok('②5 被拒请求未改变 viewer/designer 工作区', (await snapOf(PAT_VIEWER)) === viewerBefore && (await snapOf(PAT_DESIGNER)) === designerBefore);
   const v3 = await callTool(port, PAT_VIEWER, 'cad.list_drafts', {});
   ok('②6 viewer 可调 list_drafts（读）', !v3.err && Array.isArray(v3.payload?.drafts), JSON.stringify(v3.payload)?.slice(0, 120));
 }
@@ -236,15 +278,16 @@ section('③ 写隔离：写工具只进 draft，live 不动');
 let DRAFT = '';
 let CAB = '';
 {
-  const before = await snapOf(PAT_OWNER);
+  const before = await snapOf(PAT_DESIGNER);
   const c = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '隔离柜', width: 1500 });
   ok('③1 designer 建柜成功', !c.err && !!c.payload?.draftId, JSON.stringify(c.payload)?.slice(0, 160));
   DRAFT = c.payload.draftId; CAB = c.payload.cabinetId;
-  ok('③2 建柜后 live 未变', (await snapOf(PAT_OWNER)) === before, `live 应仍 ${JSON.parse(before).v}`);
+  ok('③2 建柜后 designer 的 live 未变', (await snapOf(PAT_DESIGNER)) === before, `live 应仍 ${JSON.parse(before).v}`);
   const u = await callTool(port, PAT_DESIGNER, 'cad.update_object', { targetId: CAB, targetType: 'cabinet', field: 'width', value: 1600, draftId: DRAFT });
   ok('③3 draft 内改宽成功', !u.err, JSON.stringify(u.payload)?.slice(0, 160));
-  ok('③4 改宽后 live 仍未变', (await snapOf(PAT_OWNER)) === before);
-  ok('③5 draft 文件已落盘', existsSync(F.draftsDir) && readdirSync(F.draftsDir).some((f) => f.startsWith(DRAFT)), readdirSync(F.draftsDir).join(','));
+  ok('③4 改宽后 live 仍未变', (await snapOf(PAT_DESIGNER)) === before);
+  const draftFiles = draftFilesFor('designer');
+  ok('③5 draft 文件已落盘', draftFiles.some((f) => f.startsWith(DRAFT)), draftFiles.join(','));
 }
 
 section('④ draft 持久化：杀进程 → 重启 → draft 还在');
@@ -264,22 +307,44 @@ section('④ draft 持久化：杀进程 → 重启 → draft 还在');
 
 section('⑤ apply 乐观锁');
 {
-  // 在新 server 上：先让 live 前进（另起 draft 并 apply），再 apply 旧 draft → DRAFT_STALE
-  const dNew = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '新柜' });
-  const apNew = await callTool(port, PAT_ADMIN, 'cad.apply_draft', { draftId: dNew.payload?.draftId });
-  ok('⑤1 admin apply 新 draft 成功', !apNew.err && apNew.payload?.ok === true, JSON.stringify(apNew.payload)?.slice(0, 140));
-  const stale = await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: DRAFT });
-  ok('⑤2 旧 draft apply → DRAFT_STALE 结构化拒绝', stale.err && stale.payload?.code === 'DRAFT_STALE', JSON.stringify(stale.payload)?.slice(0, 200));
-  ok('⑤3 拒绝体带 baseVersion/currentVersion/hint', stale.payload?.baseVersion !== undefined && stale.payload?.currentVersion !== undefined && !!stale.payload?.hint, JSON.stringify(stale.payload)?.slice(0, 200));
-  ok('⑤4 被拒后旧 draft 文件仍在（不丢用户工作）', readdirSync(join(dir, 'drafts')).some((f) => f.startsWith(DRAFT)));
-  // owner 正常 apply 一个新 draft
+  // 同一账号工作区内建立两个同 base 版本的 draft，提交其一后另一个必须过期。
+  const dNew = await callTool(port, PAT_ADMIN, 'cad.create_cabinet', { name: '新柜' });
+  const dStale = await callTool(port, PAT_ADMIN, 'cad.create_cabinet', { name: '过期柜' });
+  ok('⑤1 admin 建立基准草稿成功', !dNew.err && !!dNew.payload?.draftId, JSON.stringify(dNew.payload)?.slice(0, 140));
+  ok('⑤2 admin 建立并行草稿成功', !dStale.err && !!dStale.payload?.draftId, JSON.stringify(dStale.payload)?.slice(0, 140));
+  const exactConfirmation = await applyConfirmation(PAT_ADMIN, dNew.payload?.draftId);
+  const guardBefore = await snapOf(PAT_ADMIN);
+  const noMetadata = await mcp(port, { jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'cad.apply_draft', arguments: { draftId: dNew.payload?.draftId } } }, PAT_ADMIN);
+  const noMetadataRejected = noMetadata.status >= 400 || !!noMetadata.json?.error || noMetadata.json?.result?.isError === true;
+  ok('⑤2a MCP schema拒绝无确认字段请求且模型/version零变化', noMetadataRejected && (await snapOf(PAT_ADMIN)) === guardBefore,
+    `status=${noMetadata.status}; error=${JSON.stringify(noMetadata.json?.error ?? noMetadata.json?.result?.content)?.slice(0, 160)}`);
+  const missingField = { ...exactConfirmation } as Record<string, unknown>;
+  delete missingField.draftHash;
+  const missingMetadata = await mcp(port, { jsonrpc: '2.0', id: 34, method: 'tools/call', params: { name: 'cad.apply_draft', arguments: missingField } }, PAT_ADMIN);
+  const missingRejected = missingMetadata.status >= 400 || !!missingMetadata.json?.error || missingMetadata.json?.result?.isError === true;
+  ok('⑤2b MCP schema拒绝缺draftHash请求且模型/version零变化', missingRejected && (await snapOf(PAT_ADMIN)) === guardBefore,
+    `status=${missingMetadata.status}; error=${JSON.stringify(missingMetadata.json?.error ?? missingMetadata.json?.result?.content)?.slice(0, 160)}`);
+  const wrongHash = await callTool(port, PAT_ADMIN, 'cad.apply_draft', { ...exactConfirmation, draftHash: 'f'.repeat(64) });
+  ok('⑤2c MCP handler拒绝伪造hash且模型/version零变化', wrongHash.err && wrongHash.payload?.code === 'DRAFT_STALE'
+    && (await snapOf(PAT_ADMIN)) === guardBefore, JSON.stringify(wrongHash.payload)?.slice(0, 180));
+  const staleConfirmation = await applyConfirmation(PAT_ADMIN, dStale.payload?.draftId);
+  const apNew = await callTool(port, PAT_ADMIN, 'cad.apply_draft', exactConfirmation);
+  ok('⑤3 admin apply 自己的新 draft 成功', !apNew.err && apNew.payload?.ok === true, JSON.stringify(apNew.payload)?.slice(0, 140));
+  const stale = await callTool(port, PAT_ADMIN, 'cad.apply_draft', staleConfirmation);
+  ok('⑤4 旧 draft apply → DRAFT_STALE 结构化拒绝', stale.err && stale.payload?.code === 'DRAFT_STALE', JSON.stringify(stale.payload)?.slice(0, 200));
+  ok('⑤5 拒绝体带 baseVersion/currentVersion/hint', stale.payload?.baseVersion !== undefined && stale.payload?.currentVersion !== undefined && !!stale.payload?.hint, JSON.stringify(stale.payload)?.slice(0, 200));
+  ok('⑤6 admin stale draft 文件仍在', draftFilesFor('admin').some((f) => f.startsWith(dStale.payload?.draftId)));
+  const crossAccount = await callTool(port, PAT_ADMIN, 'cad.apply_draft', { draftId: DRAFT, runId: 'run_cross_account', revision: 0, draftHash: '0'.repeat(64), localVersion: 0, remoteVersion: 0 });
+  ok('⑤7 admin 看不到 designer 工作区 draft', crossAccount.err && crossAccount.payload?.code === 'DRAFT_NOT_FOUND', JSON.stringify(crossAccount.payload)?.slice(0, 140));
+  ok('⑤8 designer draft 仍保留在自己的工作区', draftFilesFor('designer').some((f) => f.startsWith(DRAFT)));
+  // owner 同样在自己的工作区创建并 apply 新 draft
   const liveBefore = (await getState(PAT_OWNER))?.liveModelVersion;
-  const dOk = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '终柜', width: 900 });
-  const apOk = await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: dOk.payload?.draftId });
-  ok('⑤5 owner apply 新鲜 draft 成功且版本 +1', !apOk.err && apOk.payload?.newVersion === liveBefore + 1, JSON.stringify({ ...apOk.payload, liveBefore }));
-  ok('⑤6 apply 后 draft 文件已删', !readdirSync(join(dir, 'drafts')).some((f) => f.startsWith(dOk.payload?.draftId)));
+  const dOk = await callTool(port, PAT_OWNER, 'cad.create_cabinet', { name: '终柜', width: 900 });
+  const apOk = await callTool(port, PAT_OWNER, 'cad.apply_draft', await applyConfirmation(PAT_OWNER, dOk.payload?.draftId));
+  ok('⑤9 owner apply 新鲜 draft 成功且版本 +1', !apOk.err && apOk.payload?.newVersion === liveBefore + 1, JSON.stringify({ ...apOk.payload, liveBefore }));
+  ok('⑤10 apply 后 owner draft 文件已删', !draftFilesFor('owner').some((f) => f.startsWith(dOk.payload?.draftId)));
   const s2 = await getState(PAT_OWNER);
-  ok('⑤7 live 里真有「终柜」', (s2?.project?.cabinets ?? []).some((c: any) => c.name === '终柜'), (s2?.project?.cabinets ?? []).map((c: any) => c.name).join(','));
+  ok('⑤11 owner live 里真有「终柜」', (s2?.project?.cabinets ?? []).some((c: any) => c.name === '终柜'), (s2?.project?.cabinets ?? []).map((c: any) => c.name).join(','));
 }
 
 section('⑥ discard 归属');
@@ -287,13 +352,18 @@ section('⑥ discard 归属');
   const d = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '待丢柜' });
   const dd = d.payload?.draftId;
   const vDrop = await callTool(port, PAT_VIEWER, 'cad.discard_draft', { draftId: dd });
-  ok('⑥1 viewer 丢别人的 draft → FORBIDDEN', vDrop.err && vDrop.payload?.code === 'FORBIDDEN', JSON.stringify(vDrop.payload)?.slice(0, 120));
+  ok('⑥1 viewer 看不到其他账号 draft', vDrop.err && vDrop.payload?.code === 'DRAFT_NOT_FOUND', JSON.stringify(vDrop.payload)?.slice(0, 120));
   const oDrop = await callTool(port, PAT_DESIGNER, 'cad.discard_draft', { draftId: dd });
   ok('⑥2 创建者丢自己的 draft → ok', !oDrop.err && oDrop.payload?.ok === true, JSON.stringify(oDrop.payload)?.slice(0, 120));
-  ok('⑥3 discard 后文件已删', !readdirSync(join(dir, 'drafts')).some((f) => f.startsWith(dd)));
+  ok('⑥3 discard 后 designer 草稿文件已删', !draftFilesFor('designer').some((f) => f.startsWith(dd)));
   const d2 = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '待丢柜2' });
   const aDrop = await callTool(port, PAT_ADMIN, 'cad.discard_draft', { draftId: d2.payload?.draftId });
-  ok('⑥4 admin 丢别人的 draft → ok（manage）', !aDrop.err, JSON.stringify(aDrop.payload)?.slice(0, 120));
+  ok('⑥4 admin 看不到 designer 工作区 draft', aDrop.err && aDrop.payload?.code === 'DRAFT_NOT_FOUND', JSON.stringify(aDrop.payload)?.slice(0, 120));
+  ok('⑥5 跨账号尝试后 designer draft 仍保留', draftFilesFor('designer').some((f) => f.startsWith(d2.payload?.draftId)));
+  const dAdmin = await callTool(port, PAT_ADMIN, 'cad.create_cabinet', { name: '管理员待丢柜' });
+  const aDropOwn = await callTool(port, PAT_ADMIN, 'cad.discard_draft', { draftId: dAdmin.payload?.draftId });
+  ok('⑥6 admin 可丢弃自己工作区的 draft', !aDropOwn.err && aDropOwn.payload?.ok === true, JSON.stringify(aDropOwn.payload)?.slice(0, 120));
+  ok('⑥7 admin discard 后文件已删', !draftFilesFor('admin').some((f) => f.startsWith(dAdmin.payload?.draftId)));
 }
 
 section('⑦ 结构纪律（源码级）');
@@ -312,8 +382,10 @@ section('⑦ 结构纪律（源码级）');
 
 section('⑧ submit_proposal 复用既有链');
 {
+  const designerProject = (await getState(PAT_DESIGNER))?.project;
+  const roomName = designerProject?.rooms?.[0]?.name ?? '主卧';
   const p = await callTool(port, PAT_DESIGNER, 'cad.submit_proposal', {
-    proposal: { title: '验收提案', room: '客厅', cabinets: [{ ref: 'p1', name: '提案验收柜', width: 1100 }] },
+    proposal: { title: '验收提案', room: roomName, cabinets: [{ ref: 'p1', name: '提案验收柜', width: 1100 }] },
   });
   ok('⑧1 proposal 进 draft', !p.err && !!p.payload?.draftId && p.payload?.steps === 1, JSON.stringify(p.payload)?.slice(0, 200));
   const bad = await callTool(port, PAT_DESIGNER, 'cad.submit_proposal', { proposal: { title: '空', cabinets: [] } });
@@ -322,28 +394,29 @@ section('⑧ submit_proposal 复用既有链');
 
 section('⑨ IR-3：create_room / draw_wall（用户已拍板开放）');
 {
-  const before = await snapOf(PAT_OWNER);
-  // 建矩形房间
-  const cr = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '卧室', x: 0, y: 0, w: 3600, h: 3000 });
-  ok('⑨1 designer 建矩形房间成功', !cr.err && !!cr.payload?.roomId, JSON.stringify(cr.payload)?.slice(0, 160));
+  const before = await snapOf(PAT_ADMIN);
+  // admin 在自己的工作区创建矩形房间，后续同账号验证 apply。
+  const cr = await callTool(port, PAT_ADMIN, 'cad.create_room', { name: '卧室', x: 0, y: 0, w: 3600, h: 3000 });
+  ok('⑨1 admin 建矩形房间成功', !cr.err && !!cr.payload?.roomId, JSON.stringify(cr.payload)?.slice(0, 160));
   const roomId = cr.payload.roomId; const dId = cr.payload.draftId;
-  ok('⑨2 建房间后 live 未变（只进 draft）', (await snapOf(PAT_OWNER)) === before);
+  ok('⑨2 建房间后 admin live 未变（只进 draft）', (await snapOf(PAT_ADMIN)) === before);
   // 在该房间画一面墙
-  const dw = await callTool(port, PAT_DESIGNER, 'cad.draw_wall', {
+  const dw = await callTool(port, PAT_ADMIN, 'cad.draw_wall', {
     roomId, start: { x: 0, y: 0 }, end: { x: 3600, y: 0 }, thickness: 120, draftId: dId });
-  ok('⑨3 designer 画墙成功', !dw.err && !!dw.payload?.wallId, JSON.stringify(dw.payload)?.slice(0, 160));
+  ok('⑨3 admin 画墙成功', !dw.err && !!dw.payload?.wallId, JSON.stringify(dw.payload)?.slice(0, 160));
   // 起终点相同应被拒
-  const bad = await callTool(port, PAT_DESIGNER, 'cad.draw_wall', {
+  const bad = await callTool(port, PAT_ADMIN, 'cad.draw_wall', {
     start: { x: 100, y: 100 }, end: { x: 100, y: 100 }, draftId: dId });
   ok('⑨4 零长度墙被拒', bad.err, JSON.stringify(bad.payload)?.slice(0, 120));
   // viewer 建房间应被拒且模型未变
+  const viewerBefore = await snapOf(PAT_VIEWER);
   const v = await callTool(port, PAT_VIEWER, 'cad.create_room', { name: '非法房间' });
   ok('⑨5 viewer 建房间 → FORBIDDEN', v.err && v.payload?.code === 'FORBIDDEN', JSON.stringify(v.payload)?.slice(0, 120));
-  ok('⑨6 被拒后模型未变', (await snapOf(PAT_OWNER)) === before);
+  ok('⑨6 viewer 被拒后工作区未变', (await snapOf(PAT_VIEWER)) === viewerBefore);
   // apply 进 live
-  const ap = await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: dId });
+  const ap = await callTool(port, PAT_ADMIN, 'cad.apply_draft', await applyConfirmation(PAT_ADMIN, dId));
   ok('⑨7 apply 成功', !ap.err && ap.payload?.ok === true, JSON.stringify(ap.payload)?.slice(0, 120));
-  const gs = await getState(PAT_OWNER);
+  const gs = await getState(PAT_ADMIN);
   const room = (gs?.project?.rooms ?? []).find((r: any) => r.id === roomId);
   ok('⑨8 live 里有新房间且含墙', !!room && room.walls.length >= 5, `walls=${room?.walls?.length}`);
 }
@@ -384,36 +457,36 @@ section('⑩ S6：export_dxf / export_bom_csv / export_roombook（只读，复�
 
 section('⑪ duplicate_object：复制柜体');
 {
-  const before = await snapOf(PAT_OWNER);
-  // 先建一个柜体
-  const cc = await callTool(port, PAT_DESIGNER, 'cad.create_cabinet', { name: '被复制柜', width: 800, height: 2000, depth: 550 });
+  const before = await snapOf(PAT_ADMIN);
+  // 在 admin 自己的工作区创建柜体并完成复制、提交。
+  const cc = await callTool(port, PAT_ADMIN, 'cad.create_cabinet', { name: '被复制柜', width: 800, height: 2000, depth: 550 });
   const srcId = cc.payload.cabinetId; const dId = cc.payload.draftId;
   ok('⑪1 建源柜体成功', !cc.err && !!srcId);
   // 复制
-  const dp = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: srcId, draftId: dId });
-  ok('⑪2 designer 复制成功', !dp.err && !!dp.payload?.newId, JSON.stringify(dp.payload)?.slice(0, 160));
+  const dp = await callTool(port, PAT_ADMIN, 'cad.duplicate_object', { sourceId: srcId, draftId: dId });
+  ok('⑪2 admin 复制成功', !dp.err && !!dp.payload?.newId, JSON.stringify(dp.payload)?.slice(0, 160));
   ok('⑪3 新名默认为"原名 副本"', dp.payload?.newName === '被复制柜 副本', dp.payload?.newName);
   ok('⑪4 新 ID 与源不同', dp.payload?.newId !== srcId);
-  ok('⑪5 复制后 live 未变', (await snapOf(PAT_OWNER)) === before);
+  ok('⑪5 复制后 admin live 未变', (await snapOf(PAT_ADMIN)) === before);
   // 自定义名复制
-  const dp2 = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: srcId, name: '定制名', draftId: dId });
+  const dp2 = await callTool(port, PAT_ADMIN, 'cad.duplicate_object', { sourceId: srcId, name: '定制名', draftId: dId });
   ok('⑪6 自定义名复制成功', !dp2.err && dp2.payload?.newName === '定制名', JSON.stringify(dp2.payload)?.slice(0, 120));
   // 复制不存在的
-  const bad = await callTool(port, PAT_DESIGNER, 'cad.duplicate_object', { sourceId: 'nope', draftId: dId });
+  const bad = await callTool(port, PAT_ADMIN, 'cad.duplicate_object', { sourceId: 'nope', draftId: dId });
   ok('⑪7 复制不存在的被拒', bad.err, JSON.stringify(bad.payload)?.slice(0, 120));
   // viewer 被拒
   const v = await callTool(port, PAT_VIEWER, 'cad.duplicate_object', { sourceId: srcId });
   ok('⑪8 viewer 复制 → FORBIDDEN', v.err && v.payload?.code === 'FORBIDDEN');
   // apply 后 live 里有两个
-  await callTool(port, PAT_OWNER, 'cad.apply_draft', { draftId: dId });
-  const gs = await getState(PAT_OWNER);
+  await callTool(port, PAT_ADMIN, 'cad.apply_draft', await applyConfirmation(PAT_ADMIN, dId));
+  const gs = await getState(PAT_ADMIN);
   const cabs = (gs?.project?.cabinets ?? []).filter((c: any) => c.name === '被复制柜 副本' || c.name === '定制名');
   ok('⑪9 apply 后 live 里有两个副本', cabs.length === 2, `found=${cabs.length}`);
 }
 
 section('⑫ create_room 已有房间时不撞 id（Bug 3）');
 {
-  const before = await snapOf(PAT_OWNER);
+  const before = await snapOf(PAT_DESIGNER);
   // 先建一个房间（room_001）
   const r1 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '房间一' });
   ok('⑫1 建第一个房间成功', !r1.err && !!r1.payload?.roomId, r1.payload?.roomId);
@@ -422,7 +495,7 @@ section('⑫ create_room 已有房间时不撞 id（Bug 3）');
   const r2 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '房间二', draftId: r1.payload.draftId });
   ok('⑫2 已有房间时再建成功', !r2.err && !!r2.payload?.roomId, JSON.stringify(r2.payload)?.slice(0, 120));
   ok('⑫3 新房间 id 与第一个不同', r2.payload?.roomId !== firstId, `${firstId} vs ${r2.payload?.roomId}`);
-  ok('⑫4 建房间后 live 未变', (await snapOf(PAT_OWNER)) === before);
+  ok('⑫4 建房间后 designer live 未变（只进 draft）', (await snapOf(PAT_DESIGNER)) === before);
   // 矩形房间同理
   const r3 = await callTool(port, PAT_DESIGNER, 'cad.create_room', { name: '矩形房', x: 0, y: 0, w: 4000, h: 3000, draftId: r1.payload.draftId });
   ok('⑫5 矩形房间也不撞 id', !r3.err && r3.payload?.roomId !== firstId && r3.payload?.roomId !== r2.payload?.roomId, r3.payload?.roomId);

@@ -222,6 +222,37 @@ export function createMockServer() {
       const user = msgs.find((m) => m.role === 'user')?.content || '';
       /** 通道判定：只有规划通道的 user 消息带这个标记 */
       const isPlan = /【用户这一句要求】/.test(user);
+      const tools = Array.isArray(envelope.tools) ? envelope.tools : [];
+      const isAgent = tools.some((tool) => tool?.function?.name === 'cad.create_cabinet');
+      const hasAgentToolReply = msgs.some((message) => message.role === 'tool');
+      const lastAgentCall = [...msgs].reverse().find((message) =>
+        message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+      )?.tool_calls?.[0];
+      const lastAgentToolName = lastAgentCall?.function?.name || '';
+      const lastAgentReply = [...msgs].reverse().find((message) => message.role === 'tool');
+      let lastAgentReplyData = null;
+      try { lastAgentReplyData = lastAgentReply?.content ? JSON.parse(lastAgentReply.content) : null; } catch { /* malformed tool result stays a hard failure in the probe */ }
+      const isLaundryAgent = /洗衣机柜/.test(String(user));
+      const isSideboardAgent = /餐边柜/.test(String(user));
+      const laundryCabinetArgs = {
+        name: 'AI洗衣机柜', width: 1400, height: 2100, depth: 620, x: 1700, y: 800,
+        units: [
+          { kind: 'appliance', width: 700, applianceName: '洗衣机', openingWidth: 650, openingHeight: 850, openingDepth: 600, topDrawers: 3, nickname: '洗衣机位' },
+          { kind: 'shelves', width: 650, count: 4, doorCount: 2, nickname: '右侧柜' },
+        ],
+      };
+      const sideboardCabinetArgs = {
+        name: 'AI生成柜', width: 1800, height: 1200, depth: 450, x: 1300, y: 1700,
+        units: [
+          { kind: 'drawerBank', width: 600, count: 3, nickname: '左三抽' },
+          { kind: 'shelves', width: 600, count: 2, doorCount: 2, nickname: '中门格' },
+          { kind: 'open', width: 600, nickname: '右开放格' },
+        ],
+      };
+      const toolCall = (id, name, args) => ({
+        role: 'assistant', content: null,
+        tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }],
+      });
 
       let message;
       let usage;
@@ -231,7 +262,29 @@ export function createMockServer() {
        */
       const systemText = msgs.find((m) => m.role === 'system')?.content || '';
       const isDesign = /设计方案/.test(systemText);
-      if (isDesign) {
+      if (isAgent) {
+        const makeCreateCall = (id, args) => toolCall(id, 'cad.create_cabinet', args);
+        if (isLaundryAgent || isSideboardAgent) {
+          const fixture = isLaundryAgent
+            ? { prefix: 'laundry', args: laundryCabinetArgs, name: '洗衣机柜' }
+            : { prefix: 'sideboard', args: sideboardCabinetArgs, name: '餐边柜' };
+          if (lastAgentToolName === 'cad.create_cabinet' && lastAgentReplyData?.draftId) {
+            message = toolCall(`agent-${fixture.prefix}-validate`, 'cad.validate', {});
+          } else if (lastAgentToolName === 'cad.validate') {
+            const valid = lastAgentReplyData?.blockingErrors === 0;
+            message = { role: 'assistant', content: valid
+              ? `已在服务端草稿中创建${fixture.name}并完成校验，等待你确认应用。`
+              : `已尝试创建${fixture.name}，但校验未通过；请检查步骤结果。` };
+          } else {
+            message = makeCreateCall(`agent-${fixture.prefix}-create`, fixture.args);
+          }
+        } else if (!hasAgentToolReply) {
+          message = makeCreateCall('agent-sync-ui-create-1', { name: 'Agent同步验收柜', width: 900, height: 2100, depth: 450 });
+        } else {
+          message = { role: 'assistant', content: 'Agent 同步验收柜已创建为服务器草稿。' };
+        }
+        usage = { prompt_tokens: 1600, completion_tokens: 80, total_tokens: 1680 };
+      } else if (isDesign) {
         const snapM = /```json\s*([\s\S]*?)```/.exec(user);
         let snap = null;
         try {
@@ -260,11 +313,11 @@ export function createMockServer() {
       }
 
       const payload = {
-        id: `chatcmpl-mock-${isPlan ? 'plan' : 'chat'}`,
+        id: `chatcmpl-mock-${isAgent ? 'agent' : isPlan ? 'plan' : 'chat'}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: 'mock-model-1',
-        choices: [{ index: 0, message, finish_reason: 'stop' }],
+        choices: [{ index: 0, message, finish_reason: message?.tool_calls?.length ? 'tool_calls' : 'stop' }],
         usage,
       };
       const text = JSON.stringify(payload);

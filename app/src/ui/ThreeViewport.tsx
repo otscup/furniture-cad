@@ -28,6 +28,7 @@ const ROLE_COLOR: Record<string, number> = {
   door: 0xc9b394,
   drawer: 0xc9b394,
   rod: 0x9a9a9a,
+  countertopCutout: 0xd44d3f,
 };
 const SELECTED_COLOR = 0x4a90d9;
 /** 单位盒：模块级共享（scale 定尺寸），永不 dispose —— 每次重建 new 会漏 GPU 内存 */
@@ -38,9 +39,11 @@ interface Props {
   version: number;
   selection: string[];
   setSelection: (ids: string[]) => void;
+  /** 工作区逐柜预览时只显示这一柜；传统 CAD 3D 视图留空表示全项目。 */
+  cabinetFilterId?: string;
 }
 
-export function ThreeViewport({ bus, version, selection, setSelection }: Props) {
+export function ThreeViewport({ bus, version, selection, setSelection, cabinetFilterId }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasHostRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -52,11 +55,12 @@ export function ThreeViewport({ bus, version, selection, setSelection }: Props) 
 
   const bodies = useMemo<Box3D[]>(() => {
     try {
-      return bus.derive().geom.bodies3d;
+      const all = bus.derive().geom.bodies3d;
+      return cabinetFilterId ? all.filter((body) => body.cabId === cabinetFilterId) : all;
     } catch {
       return [];
     }
-  }, [bus, version]);
+  }, [bus, version, cabinetFilterId]);
 
   // ── 初始化场景（一次）──
   useEffect(() => {
@@ -143,7 +147,8 @@ export function ThreeViewport({ bus, version, selection, setSelection }: Props) 
 
     for (const b of bodies) {
       if (!(b.sx > 0 && b.sy > 0 && b.sz > 0)) continue; // 退化盒不画（验收层会报）
-      const mat = new THREE.MeshLambertMaterial({ color: ROLE_COLOR[b.role] ?? 0xcccccc });
+      const isCutout = b.role === 'countertopCutout';
+      const mat = new THREE.MeshLambertMaterial({ color: ROLE_COLOR[b.role] ?? 0xcccccc, transparent: isCutout, opacity: isCutout ? 0.65 : 1 });
       const mesh = new THREE.Mesh(UNIT_BOX, mat);
       // 世界(x,y,z高度) → three(x, y=z, z=y)
       mesh.position.set(b.cx, b.cz, b.cy);

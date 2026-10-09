@@ -76,6 +76,7 @@ const provList = (e: { placementProvenance?: unknown }): Array<Record<string, un
 const ROOM = rectRoom({ name: '测试房', x: 0, y: 0, w: 9000, h: 6000, thickness: 100, height: 2700 });
 
 function mkCab(id: string, name: string, x: number, y: number, w: number, d: number, rotation = 0): Cabinet {
+  const units = defaultUnits(w, rules, d).map((unit) => ({ ...unit, id: `${id}_${unit.id}` }));
   return createCabinet({
     id,
     name,
@@ -85,11 +86,25 @@ function mkCab(id: string, name: string, x: number, y: number, w: number, d: num
     rotation,
     rules,
     params: { ...defaultCabinetParams(rules), width: w, height: 2200, depth: d },
-    units: defaultUnits(w, rules, d),
+    units,
   });
 }
 
+function assertUniqueUnitIds(cabs: Cabinet[]): void {
+  const ownerByUnitId = new Map<string, string>();
+  for (const cab of cabs) {
+    for (const unit of cab.layout.units) {
+      const previousOwner = ownerByUnitId.get(unit.id);
+      if (previousOwner) {
+        throw new Error(`provenance 验收夹具 Unit ID 必须全局唯一：${unit.id} 同时属于柜体 ${previousOwner} 和 ${cab.id}`);
+      }
+      ownerByUnitId.set(unit.id, cab.id);
+    }
+  }
+}
+
 function mkProject(cabs: Cabinet[], assemblies?: FurnitureAssembly[]): Project {
+  assertUniqueUnitIds(cabs);
   return {
     schemaVersion: '0.3',
     id: 'proj_p85',
@@ -108,12 +123,23 @@ const declAdj = toPlacementIntentDecl(adjIntent);
 
 const atRight = { x: 4200, y: 1560, rotation: 0 };
 
+function executeAndAssertOk(bus: CommandBus, cmd: Command, label: string): void {
+  const result = bus.execute(cmd);
+  const detail = result.ok
+    ? ''
+    : `op=${cmd.op}; commandId=${cmd.id}; source=${cmd.source}; error=${result.error ?? '未提供错误详情'}`;
+  ok(`${label} 执行成功`, result.ok, detail);
+  if (!result.ok) {
+    throw new Error(`[${section_}] ${label} 执行失败：${detail}`);
+  }
+}
+
 // ═══════════════ §1 声明通道：placementIntent 进命令、进 provenance ═══════════════
 section('§1 声明通道：placementIntent 通过 cabinet.place 落到 provenance');
 {
   const project = mkProject([mkCab('cab_A', '主臂A', 2000, 60, 1500, 600), mkCab('cab_B', '副臂B', 4100, 60, 900, 600, 90)]);
   const bus = new CommandBus(project, rules);
-  bus.execute(CMD.placeCabinet(project.cabinets[1]!, atRight, 'ui', '落位副臂B', declAdj));
+  executeAndAssertOk(bus, CMD.placeCabinet(project.cabinets[1]!, atRight, 'ui', '落位副臂B', declAdj), '带 intent 的 cabinet.place');
   const e = bus.log()[bus.log().length - 1]!;
   ok('cabinet.place 带 placementIntent → 产生单条 provenance（不是数组）',
     e.placementProvenance !== undefined && !Array.isArray(e.placementProvenance), JSON.stringify(e.placementProvenance));
@@ -127,7 +153,7 @@ section('§1 声明通道：placementIntent 通过 cabinet.place 落到 provenan
 
   // 不带 placementIntent 的 cabinet.place（例如系统自动贴墙）也会产生 provenance，但 intent = null
   const bus2 = new CommandBus(project, rules);
-  bus2.execute(CMD.placeCabinet(project.cabinets[1]!, { x: 4000, y: 60, rotation: 90 }, 'system'));
+  executeAndAssertOk(bus2, CMD.placeCabinet(project.cabinets[1]!, { x: 4000, y: 60, rotation: 90 }, 'system'), '不带 intent 的 system cabinet.place');
   const e2 = bus2.log()[bus2.log().length - 1]!;
   const prov2 = provList(e2)[0]!;
   ok('不带 intent 的落位也产生 provenance（status 跟踪需要），但 intent = null（不伪造）',
@@ -136,7 +162,7 @@ section('§1 声明通道：placementIntent 通过 cabinet.place 落到 provenan
   // 非落位 op（cabinet.update 改宽，不在 PLACEMENT_OPS）→ 不产生 provenance
   const bus3 = new CommandBus(project, rules);
   const updCmd: Command = { id: 'c_upd', op: 'cabinet.update', source: 'ui', target: { kind: 'cabinet', id: 'cab_B' }, changes: [{ path: 'params.width', op: 'set', value: 1000 }], label: '改宽' };
-  bus3.execute(updCmd);
+  executeAndAssertOk(bus3, updCmd, '非落位 cabinet.update');
   const e3 = bus3.log()[bus3.log().length - 1]!;
   ok('非落位 op（cabinet.update）不写 provenance（undefined）', e3.placementProvenance === undefined, JSON.stringify(e3.placementProvenance));
 }
@@ -147,22 +173,22 @@ section('§2 authority 派生矩阵：source × confirmedPlan → authority');
   const mk2 = () => mkProject([mkCab('cab_A', '主臂A', 2000, 60, 1500, 600), mkCab('cab_B', '副臂B', 4100, 60, 900, 600, 90)]);
 
   const uiBus = new CommandBus(mk2(), rules);
-  uiBus.execute(CMD.placeCabinet(uiBus.getState().cabinets[1]!, atRight, 'ui', 'ui 手动落位', declAdj));
+  executeAndAssertOk(uiBus, CMD.placeCabinet(uiBus.getState().cabinets[1]!, atRight, 'ui', 'ui 手动落位', declAdj), "source='ui' 落位");
   const uiProv = provList(uiBus.log().at(-1)!)[0]!;
   ok("source='ui' → authority=user-authored", uiProv.authority === 'user-authored', String(uiProv.authority));
 
   const mcpBus = new CommandBus(mk2(), rules);
-  mcpBus.execute(CMD.placeCabinet(mcpBus.getState().cabinets[1]!, atRight, 'mcp', 'mcp 代用户落位', declAdj));
+  executeAndAssertOk(mcpBus, CMD.placeCabinet(mcpBus.getState().cabinets[1]!, atRight, 'mcp', 'mcp 代用户落位', declAdj), "source='mcp' 落位");
   const mcpProv = provList(mcpBus.log().at(-1)!)[0]!;
   ok("source='mcp' → authority=user-authored（脚本代用户 = 人的决定）", mcpProv.authority === 'user-authored', String(mcpProv.authority));
 
   const sysBus = new CommandBus(mk2(), rules);
-  sysBus.execute(CMD.placeCabinet(sysBus.getState().cabinets[1]!, atRight, 'system', '系统自动落位', declAdj));
+  executeAndAssertOk(sysBus, CMD.placeCabinet(sysBus.getState().cabinets[1]!, atRight, 'system', '系统自动落位', declAdj), "source='system' 落位");
   const sysProv = provList(sysBus.log().at(-1)!)[0]!;
   ok("source='system' → authority=system-resolved（自动解析/整组平移/撤销）", sysProv.authority === 'system-resolved', String(sysProv.authority));
 
   const aiBus = new CommandBus(mk2(), rules);
-  aiBus.execute(CMD.placeCabinet(aiBus.getState().cabinets[1]!, atRight, 'ai', 'AI 草稿落位', declAdj));
+  executeAndAssertOk(aiBus, CMD.placeCabinet(aiBus.getState().cabinets[1]!, atRight, 'ai', 'AI 草稿落位', declAdj), "source='ai' 未确认落位");
   const aiProv = provList(aiBus.log().at(-1)!)[0]!;
   ok("source='ai' 未确认 → authority=unknown（绝不冒充 user 证据）", aiProv.authority === 'unknown', String(aiProv.authority));
 
@@ -170,7 +196,7 @@ section('§2 authority 派生矩阵：source × confirmedPlan → authority');
   const confBus = new CommandBus(mk2(), rules);
   const confCmd = CMD.placeCabinet(confBus.getState().cabinets[1]!, atRight, 'ai', 'AI 提案经人确认', declAdj);
   confCmd.confirmedPlan = true;
-  confBus.execute(confCmd);
+  executeAndAssertOk(confBus, confCmd, 'confirmedPlan AI 落位');
   const confProv = provList(confBus.log().at(-1)!)[0]!;
   ok("confirmedPlan=true（人点「应用」确认过的 AI 提案）→ authority=user-confirmed",
     confProv.authority === 'user-confirmed', String(confProv.authority));
@@ -218,7 +244,7 @@ section('§3 真实 apply 路径：commitPlan 把 AI 落位提案标成 user-con
 
   // 对比：同一落位语义若不走 commitPlan（直接 ai 源执行）→ unknown
   const rawBus = new CommandBus(project, rules);
-  rawBus.execute(CMD.placeCabinet(rawBus.getState().cabinets[0]!, { x: 500, y: 500, rotation: 0 }, 'ai', 'AI 草稿（未确认）'));
+  executeAndAssertOk(rawBus, CMD.placeCabinet(rawBus.getState().cabinets[0]!, { x: 500, y: 500, rotation: 0 }, 'ai', 'AI 草稿（未确认）'), '未确认 AI 对照落位');
   // 主臂本身已存在，这里只是再 place 一次主臂以制造一个 ai 落位条目用于对照
   const rawProv = provList(rawBus.log().at(-1)!)[0]!;
   ok('同语义但不经 commitPlan（直接 ai 源）→ authority=unknown（对照成立）', rawProv.authority === 'unknown', String(rawProv.authority));
@@ -267,9 +293,9 @@ section('§5 superseded 失效：同一柜多次落位，旧记录自动失效')
   const bus = new CommandBus(project, rules);
   const b = () => bus.getState().cabinets[1]!;
 
-  bus.execute(CMD.placeCabinet(b(), { x: 4200, y: 1560, rotation: 0 }, 'ui', '落位1', declAdj));
-  bus.execute(CMD.rotateCabinet(b(), 270, 'ui'));
-  bus.execute(CMD.moveCabinet(b(), 4300, 1560, 'ui'));
+  executeAndAssertOk(bus, CMD.placeCabinet(b(), { x: 4200, y: 1560, rotation: 0 }, 'ui', '落位1', declAdj), '第一次落位');
+  executeAndAssertOk(bus, CMD.rotateCabinet(b(), 270, 'ui'), '旋转落位');
+  executeAndAssertOk(bus, CMD.moveCabinet(b(), 4300, 1560, 'ui'), '移动落位');
 
   const entries = bus.log().filter((e) => e.placementProvenance);
   ok('三次落位产生三条 provenance 记录', entries.length === 3, String(entries.length));
@@ -284,7 +310,7 @@ section('§5 superseded 失效：同一柜多次落位，旧记录自动失效')
   ok('同一只柜任意时刻仅一条 live', provs.filter((p) => p.status === 'live').length === 1, JSON.stringify(provs.map((p) => p.status)));
 
   // 重跑相同 intent（再 place 一次）→ 旧记录失效，仍只一条 live，intent 等于 decl
-  bus.execute(CMD.placeCabinet(b(), { x: 4500, y: 1560, rotation: 0 }, 'ui', '重跑 intent', declAdj));
+  executeAndAssertOk(bus, CMD.placeCabinet(b(), { x: 4500, y: 1560, rotation: 0 }, 'ui', '重跑 intent', declAdj), '重跑 intent 落位');
   const entries2 = bus.log().filter((e) => e.placementProvenance);
   const provs2 = entries2.map((e) => provList(e)[0]!);
   ok('重跑 intent 后 live 数量仍为 1', provs2.filter((p) => p.status === 'live').length === 1, JSON.stringify(provs2.map((p) => p.status)));
@@ -299,8 +325,8 @@ section('§6 undo/redo 原子同步：provenance 与模型一起回退');
   const project = mkProject([mkCab('cab_A', '主臂A', 2000, 60, 1500, 600), mkCab('cab_B', '副臂B', 4100, 60, 900, 600, 90)]);
   const bus = new CommandBus(project, rules);
   const b = () => bus.getState().cabinets[1]!;
-  bus.execute(CMD.placeCabinet(b(), { x: 4200, y: 1560, rotation: 0 }, 'ui', '落位', declAdj));
-  bus.execute(CMD.rotateCabinet(b(), 270, 'ui'));
+  executeAndAssertOk(bus, CMD.placeCabinet(b(), { x: 4200, y: 1560, rotation: 0 }, 'ui', '落位', declAdj), 'undo/redo 场景初始落位');
+  executeAndAssertOk(bus, CMD.rotateCabinet(b(), 270, 'ui'), 'undo/redo 场景旋转落位');
 
   const beforeUndo = bus.activeLog().filter((e) => e.placementProvenance).map((e) => provList(e)[0]!.status);
   ok('undo 前：两条记录（superseded, live）', beforeUndo.join(',') === 'superseded,live', beforeUndo.join(','));
@@ -321,7 +347,7 @@ section('§7 导入（replaceProject）不清算意图：历史 provenance 全�
 {
   const project = mkProject([mkCab('cab_A', '主臂A', 2000, 60, 1500, 600), mkCab('cab_B', '副臂B', 4100, 60, 900, 600, 90)]);
   const bus = new CommandBus(project, rules);
-  bus.execute(CMD.placeCabinet(bus.getState().cabinets[1]!, atRight, 'ui', '落位副臂B', declAdj));
+  executeAndAssertOk(bus, CMD.placeCabinet(bus.getState().cabinets[1]!, atRight, 'ui', '落位副臂B', declAdj), '导入前落位');
   ok('导入前确有 provenance', bus.log().some((e) => e.placementProvenance), '');
 
   // 模拟从外部文件导入一个全新项目（来源由 cabinet.origin 回答，不伪造 intent）

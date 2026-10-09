@@ -28,6 +28,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.APP_PORT || 5273);
 const CDP_PORT = Number(process.env.CDP_PORT || 6273);
 const API_PORT = Number(process.env.API_PORT || 8791);
+const FILTER_ONLY = (process.env.ONLY || '').trim();
+const FILTER_STOP_AFTER_ONLY = process.env.STOP_AFTER_ONLY === '1';
+const PROBE_SOURCE = fs.readFileSync(path.join(ROOT, 'verify/browser-probe.cjs'), 'utf8');
+const UI_GROUPS = [...PROBE_SOURCE.matchAll(/^\s*section\('([^']+)'\);?\s*$/gm)].map((m) => m[1]);
+const FILTER_PLAN_GROUPS = FILTER_ONLY ? UI_GROUPS.filter((title) => title.includes(FILTER_ONLY)) : [];
+console.log(`ONLY=${FILTER_ONLY || '(unset)'} STOP_AFTER_ONLY=${FILTER_STOP_AFTER_ONLY ? '1' : '0'} PLAN_MATCH_GROUPS=${JSON.stringify(FILTER_ONLY ? FILTER_PLAN_GROUPS : `ALL ${UI_GROUPS.length} groups`)}`);
+if (FILTER_ONLY && FILTER_PLAN_GROUPS.length === 0) {
+  console.error(`[ui-runner] FILTER_CONFIG_ERROR: ONLY=${FILTER_ONLY} matches no browser-probe section`);
+  process.exit(2);
+}
 
 // vite 的 package.json 没有导出 ./bin/vite.js，只能按真实路径找（vite 8 / rolldown 同样是这个布局）
 const viteJs = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
@@ -132,11 +142,11 @@ function spawnProc(name, args, env) {
 const MOCK_PORT = Number(process.env.MOCK_PORT || 8792);
 const MOCK_URL = `http://127.0.0.1:${MOCK_PORT}/v1`;
 
-// mock 服务商抽成了 verify/mock-openai.mjs —— 与 B37 用的是同一份，
-// 否则"AI 到底回了什么"会在两处漂移。两条通道（规划 / 对话）都在里面。
+//  mock 服务商抽成了 verify/mock-openai.mjs —— 与 UI Agent 回归共用同一份，
+//  覆盖计划/对话与 Agent 工具调用；Agent 会走本地真实 MCP 写入与 validate。
 const mock = createMockServer();
 await new Promise((resolve) => mock.listen(MOCK_PORT, '127.0.0.1', resolve));
-console.log(`mock    : ${MOCK_URL} 就绪（两条通道：规划 / 对话；故意不实现 /models）`);
+console.log(`mock    : ${MOCK_URL} 就绪（规划 / 对话 / Agent 工具调用；故意不实现 /models）`);
 mock._name = 'mock';
 
 /**
@@ -285,16 +295,30 @@ const probe = spawn(process.execPath, ['verify/browser-probe.cjs'], {
     VERIFY_FAKE_KEY: FAKE_KEY,
     VERIFY_FAKE_KEY2: FAKE_KEY2,
     VERIFY_MOCK_URL: MOCK_URL,
+    UI_EXPECTED_ONLY: FILTER_ONLY,
+    UI_EXPECTED_STOP_AFTER_ONLY: FILTER_STOP_AFTER_ONLY ? '1' : '0',
   },
 });
 
-const code = await new Promise((resolve) => probe.on('exit', (c) => resolve(c ?? 1)));
+const probeResult = await new Promise((resolve) => {
+  let settled = false;
+  const settle = (result) => { if (!settled) { settled = true; resolve(result); } };
+  probe.once('error', (error) => {
+    console.error('[ui-runner] PROBE_SPAWN_ERROR:', error.stack || error.message || String(error));
+    settle({ code: 1, signal: null, spawnError: String(error) });
+  });
+  probe.once('close', (code, signal) => {
+    console.log(`[ui-runner] PROBE_CLOSE code=${code ?? 'null'} signal=${signal ?? 'none'}`);
+    settle({ code: code ?? 1, signal: signal ?? null });
+  });
+});
 stop();
 
-if (code !== 0) {
+if (probeResult.code !== 0) {
+  console.error(`[ui-runner] PROBE_FAILED ${JSON.stringify(probeResult)}`);
   console.log('\nvite 最近输出（排查用）：');
-  console.log(vite._log.split('\n').slice(-12).join('\n'));
+  console.log(vite._log.split('\n').slice(-12).map((line) => `[vite] ${line}`).join('\n'));
   console.log('\nserver 最近输出（排查用）：');
-  console.log(api._log.split('\n').slice(-12).join('\n'));
+  console.log(api._log.split('\n').slice(-12).map((line) => `[server] ${line}`).join('\n'));
 }
-process.exit(code);
+process.exit(probeResult.code);

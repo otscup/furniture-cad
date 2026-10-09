@@ -511,12 +511,9 @@ export async function api<T>(path: string, opts: { method?: string; body?: unkno
 }
 
 /**
- * token 存放位置：sessionStorage，不放 localStorage。
- *
- * 理由：sessionStorage 随标签页关闭而消失，且不跨标签页共享。
- * localStorage 里的 token 会一直留在这台机器上，任何人打开浏览器
- * （包括共用这台电脑的家人、以及任何注入到这个源上的脚本）都能直接拿到它。
- * 代价是"关掉标签页要重新登录"—— 这个代价换来的东西是值得的。
+ * 新会话 token 持久化到 localStorage；loadToken 仍兼容读取旧 sessionStorage token。
+ * 这是个人 NAS 部署下的产品取舍：多标签页/浏览器自动化不必反复登录；退出时
+ * saveToken(null) 会同时清理两个存储位置。
  */
 const TOKEN_KEY = 'furniture-cad.auth.token';
 

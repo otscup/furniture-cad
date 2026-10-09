@@ -14,15 +14,16 @@
  * 审计：只记元数据（文件名/大小），不记文件内容。
  */
 import { z } from 'zod';
-import { exportDxf, exportCutlist, exportRoombook } from './exportCore.mjs';
+import { exportDxf, exportCutlist, exportRoombook, exportPdf } from './exportCore.mjs';
 import { ROLES } from './auth.mjs';
 
 export const TOOL_EXPORT_DXF = 'cad.export_dxf';
 export const TOOL_EXPORT_BOM_CSV = 'cad.export_bom_csv';
 export const TOOL_EXPORT_ROOMBOOK = 'cad.export_roombook';
+export const TOOL_EXPORT_PDF = 'cad.export_pdf';
 
 /** S6 导出的全部工具（接 ALLOWED_TOOLS / WRITE_TOOLS 之后）。 */
-export const EXPORT_TOOLS = [TOOL_EXPORT_DXF, TOOL_EXPORT_BOM_CSV, TOOL_EXPORT_ROOMBOOK];
+export const EXPORT_TOOLS = [TOOL_EXPORT_DXF, TOOL_EXPORT_BOM_CSV, TOOL_EXPORT_ROOMBOOK, TOOL_EXPORT_PDF];
 
 /**
  * @param server  McpServer
@@ -42,6 +43,15 @@ export function registerExportTools(server, ctx) {
       isError: true,
     };
   }
+  function exportToolError(prefix, error) {
+    const blocked = error?.code === 'EXPORT_BLOCKED';
+    const identityConflict = error?.code === 'WORKSPACE_UNIT_ID_CONFLICT';
+    return toolError(
+      blocked ? 'EXPORT_BLOCKED' : identityConflict ? 'WORKSPACE_UNIT_ID_CONFLICT' : 'EXPORT_FAILED',
+      `${prefix}${error?.message ?? error}`,
+      blocked ? { blockingErrors: error.issues.length, issues: error.issues } : {}
+    );
+  }
   /** 权限判定（§11 权限矩阵，与 mcpWrite.mjs 一致：只读 ROLES 表）。 */
   function requirePerm(principal, need) {
     if (principal.mode === 'local-open') return null;
@@ -55,7 +65,7 @@ export function registerExportTools(server, ctx) {
   function workspaceOrError(workspaceState) {
     if (!workspaceState || workspaceState.ok !== true || !workspaceState.workspace) {
       const detail = workspaceState?.error ?? '未装载';
-      return { error: toolError('WORKSPACE_UNAVAILABLE', `服务端工作区不可用：${detail}`) };
+      return { error: toolError(workspaceState?.code ?? 'WORKSPACE_UNAVAILABLE', `服务端工作区不可用：${detail}`) };
     }
     return { workspace: workspaceState.workspace };
   }
@@ -80,6 +90,17 @@ export function registerExportTools(server, ctx) {
     size: buffer.length,
     base64: buffer.toString('base64'),
   });
+  const scopedProject = (project, roomId) => {
+    if (!roomId) return project;
+    const room = project.rooms.find((item) => item.id === roomId);
+    if (!room) return null;
+    const cabinets = project.cabinets.filter((cabinet) => cabinet.roomId === roomId);
+    const cabinetIds = new Set(cabinets.map((cabinet) => cabinet.id));
+    const sharedPanels = Array.isArray(project.sharedPanels)
+      ? project.sharedPanels.filter((panel) => !Array.isArray(panel?.memberCabinetIds) || panel.memberCabinetIds.every((id) => cabinetIds.has(id)))
+      : project.sharedPanels;
+    return { ...project, rooms: [room], cabinets, assemblies: (project.assemblies ?? []).filter((assembly) => assembly.roomId === roomId), sharedPanels };
+  };
 
   // ── cad.export_dxf ──────────────────────────────────────────────
   server.registerTool(
@@ -91,6 +112,8 @@ export function registerExportTools(server, ctx) {
         '返回 base64 文件内容，可直接存盘。只读，不碰 draft/live。',
       inputSchema: z.object({
         which: z.array(z.enum(['plan', 'sheet'])).optional().describe('plan=平面图, sheet=板件图；缺省都要'),
+        planRoomIds: z.array(z.string()).optional().describe('PLAN 只导出这些房间 ID；缺省导出全部房间'),
+        roomId: z.string().optional().describe('限定导出该房间的布局与柜体图纸'),
         version: z.enum(['R2007', 'R2000']).optional().describe('DXF 版本；缺省 R2007'),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -100,9 +123,12 @@ export function registerExportTools(server, ctx) {
       if (deny) return deny;
       const lp = await liveProject();
       if (lp.error) return lp.error;
+      const project = scopedProject(lp.project, args.roomId);
+      if (!project) return toolError('ROOM_NOT_FOUND', `找不到房间：${args.roomId}`);
       try {
-        const { buffer, filename, info } = await exportDxf(lp.project, {
+        const { buffer, filename, info } = await exportDxf(project, {
           which: args.which?.length ? args.which : ['plan', 'sheet'],
+          planRoomIds: args.roomId ? [args.roomId] : args.planRoomIds,
           version: args.version ?? 'R2007',
           modelVersion: lp.ws.getLiveModelVersion?.(),
         });
@@ -110,7 +136,7 @@ export function registerExportTools(server, ctx) {
         return toolText({ ...fileResult(filename, 'application/dxf', buffer), info });
       } catch (e) {
         auditToolCall(TOOL_EXPORT_DXF, 'fail', { error: e?.message ?? String(e) });
-        return toolError('EXPORT_FAILED', `DXF 导出失败：${e?.message ?? e}`);
+        return exportToolError('DXF 导出失败：', e);
       }
     }
   );
@@ -140,7 +166,7 @@ export function registerExportTools(server, ctx) {
         return toolText({ ...fileResult(filename, 'text/csv; charset=utf-8', buffer), stats });
       } catch (e) {
         auditToolCall(TOOL_EXPORT_BOM_CSV, 'fail', { error: e?.message ?? String(e) });
-        return toolError('EXPORT_FAILED', `开料单导出失败：${e?.message ?? e}`);
+        return exportToolError('开料单导出失败：', e);
       }
     }
   );
@@ -170,7 +196,38 @@ export function registerExportTools(server, ctx) {
         return toolText(fileResult(filename, 'text/html; charset=utf-8', buffer));
       } catch (e) {
         auditToolCall(TOOL_EXPORT_ROOMBOOK, 'fail', { error: e?.message ?? String(e) });
-        return toolError('EXPORT_FAILED', `图纸册导出失败：${e?.message ?? e}`);
+        return exportToolError('图纸册导出失败：', e);
+      }
+    }
+  );
+
+  // ── cad.export_pdf ───────────────────────────────────────────────
+  server.registerTool(
+    TOOL_EXPORT_PDF,
+    {
+      title: '导出房间 PDF 图纸册',
+      description: '只读：可选择房间导出 A3 横向 PDF，默认仅含逐柜尺寸/结构图页；layoutRoomIds 中的房间会在本房间首张柜体页前附加布局页。',
+      inputSchema: z.object({
+        roomId: z.string().optional().describe('限定房间；缺省导出全部房间'),
+        layoutRoomIds: z.array(z.string()).optional().describe('为这些房间附加布局页；缺省为空，不生成布局页'),
+      }),
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needRead();
+      if (deny) return deny;
+      const lp = await liveProject();
+      if (lp.error) return lp.error;
+      const project = scopedProject(lp.project, args.roomId);
+      if (!project) return toolError('ROOM_NOT_FOUND', `找不到房间：${args.roomId}`);
+      try {
+        const layoutRoomIds = args.layoutRoomIds ?? [];
+        const { pdf, pageCount, filename } = await exportPdf(project, { modelVersion: lp.ws.getLiveModelVersion?.(), layoutRoomIds });
+        auditToolCall(TOOL_EXPORT_PDF, 'ok', { filename, size: pdf.length, pages: pageCount, roomId: args.roomId ?? null, layoutRoomIds });
+        return toolText({ ...fileResult(filename, 'application/pdf', pdf), pageCount });
+      } catch (e) {
+        auditToolCall(TOOL_EXPORT_PDF, 'fail', { error: e?.message ?? String(e) });
+        return exportToolError('PDF 导出失败：', e);
       }
     }
   );

@@ -25,6 +25,7 @@ import { validateCornerInterference } from '../src/core/rules/corner.ts';
 import { CommandBus } from '../src/core/commandBus.ts';
 import { compileCorrections } from '../src/ai/memory.ts';
 import { loadCorrections } from '../src/ai/correctionStore.ts';
+import { findDuplicateUnitIds } from '../src/core/unitIdentity.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
@@ -54,6 +55,43 @@ const makeWine = (params?: Record<string, unknown>): Cabinet =>
   createCabinetFromTemplate({ templateId: 'wine_cabinet', name: '酒柜A', roomId: 'room1', x: 0, y: 0, rotation: 0, rules, params: params as never });
 
 const clone = (c: Cabinet): Cabinet => JSON.parse(JSON.stringify(c)) as Cabinet;
+
+function assignUniqueFixtureUnitIds(cabinets: Cabinet[]): void {
+  for (const cabinet of cabinets) {
+    let sequence = 0;
+    const assign = (units?: Array<{ id: string }>): void => {
+      for (const unit of units ?? []) {
+        sequence++;
+        unit.id = `${cabinet.id}_unit_${String(sequence).padStart(3, '0')}`;
+      }
+    };
+    if (cabinet.layout.rows?.length) {
+      for (const row of cabinet.layout.rows) assign(row.units);
+    } else {
+      assign(cabinet.layout.units);
+    }
+    assign(cabinet.layout.backUnits);
+  }
+}
+
+function assertUniqueFixtureUnitIds(project: Project): void {
+  const duplicates = findDuplicateUnitIds(project);
+  if (duplicates.length) {
+    throw new Error(`Special acceptance fixture has duplicate Unit/backUnit IDs: ${JSON.stringify(duplicates)}`);
+  }
+}
+
+function makeFixtureProject(cabinets: Cabinet[]): Project {
+  assignUniqueFixtureUnitIds(cabinets);
+  const project = { cabinets } as Project;
+  assertUniqueFixtureUnitIds(project);
+  return project;
+}
+
+function assertUniqueFixtureCabinet(project: Project, cabinet: Cabinet): void {
+  assignUniqueFixtureUnitIds([cabinet]);
+  assertUniqueFixtureUnitIds({ ...project, cabinets: [...project.cabinets, cabinet] });
+}
 
 // ════════════════════════════════════════════════════════════════
 section('1. 模板 wine_cabinet：tilt 语义落地、默认显式');
@@ -192,7 +230,7 @@ section('5. L 型转角干涉：正样本报 WARNING，负样本不误报（软�
   const A = createCabinetFromTemplate({ id: 'cA', templateId: 'shoe_cabinet', name: '转角柜A', roomId: 'r1', x: 0, y: 0, rotation: 0, rules });
   const B = createCabinetFromTemplate({ id: 'cB', templateId: 'shoe_cabinet', name: '转角柜B', roomId: 'r1', x: 900, y: 900, rotation: 270, rules });
   B.layout.units.forEach((u) => { u.doors = undefined; }); // B 无门：只验证 A 内端门扫进 B
-  const pos: Project = { cabinets: [A, B] } as Project;
+  const pos = makeFixtureProject([A, B]);
   const warn = validateCornerInterference(pos, rules).filter((i) => i.code === 'CORNER-DOOR-SWING');
   ok('正样本：产出 CORNER-DOOR-SWING WARNING', warn.length >= 1, `n=${warn.length} ${JSON.stringify(warn.map((i) => i.message))}`);
   ok('WARNING 不阻断生产（severity=WARNING，非 ERROR）', warn.every((i) => i.severity === 'WARNING'), JSON.stringify(warn.map((i) => i.severity)));
@@ -201,24 +239,24 @@ section('5. L 型转角干涉：正样本报 WARNING，负样本不误报（软�
   // 负样本 1：平行并排（不垂直）→ 不报
   const A1 = createCabinetFromTemplate({ id: 'n1a', templateId: 'shoe_cabinet', name: '平柜A', roomId: 'r2', x: 0, y: 0, rotation: 0, rules });
   const B1 = createCabinetFromTemplate({ id: 'n1b', templateId: 'shoe_cabinet', name: '平柜B', roomId: 'r2', x: 1200, y: 0, rotation: 0, rules });
-  ok('负样本1（平行并排，不垂直）：无 CORNER-DOOR-SWING', validateCornerInterference({ cabinets: [A1, B1] } as Project, rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
+  ok('负样本1（平行并排，不垂直）：无 CORNER-DOOR-SWING', validateCornerInterference(makeFixtureProject([A1, B1]), rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
 
   // 负样本 2：标准 L 相接（共角、垂直、不重叠）但两端都无门 → 不误报
   const A2 = createCabinetFromTemplate({ id: 'n2a', templateId: 'shoe_cabinet', name: '无门转角A', roomId: 'r3', x: 0, y: 0, rotation: 0, rules });
   const B2 = createCabinetFromTemplate({ id: 'n2b', templateId: 'shoe_cabinet', name: '无门转角B', roomId: 'r3', x: 900, y: 900, rotation: 270, rules });
   A2.layout.units.forEach((u) => { u.doors = undefined; });
   B2.layout.units.forEach((u) => { u.doors = undefined; });
-  ok('负样本2（L 相接但两端无门）：无 CORNER-DOOR-SWING（不误报）', validateCornerInterference({ cabinets: [A2, B2] } as Project, rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
+  ok('负样本2（L 相接但两端无门）：无 CORNER-DOOR-SWING（不误报）', validateCornerInterference(makeFixtureProject([A2, B2]), rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
 
   // 负样本 3：同房间但相距很远（无共角点）→ 不报
   const A3 = createCabinetFromTemplate({ id: 'n3a', templateId: 'shoe_cabinet', name: '远柜A', roomId: 'r4', x: 0, y: 0, rotation: 0, rules });
   const B3 = createCabinetFromTemplate({ id: 'n3b', templateId: 'shoe_cabinet', name: '远柜B', roomId: 'r4', x: 3000, y: 3000, rotation: 90, rules });
-  ok('负样本3（相距很远，无共角点）：无 CORNER-DOOR-SWING', validateCornerInterference({ cabinets: [A3, B3] } as Project, rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
+  ok('负样本3（相距很远，无共角点）：无 CORNER-DOOR-SWING', validateCornerInterference(makeFixtureProject([A3, B3]), rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
 
   // 跨房间不报：同位置但不同 roomId
   const A4 = createCabinetFromTemplate({ id: 'n4a', templateId: 'shoe_cabinet', name: '跨房A', roomId: 'rx', x: 0, y: 0, rotation: 0, rules });
   const B4 = createCabinetFromTemplate({ id: 'n4b', templateId: 'shoe_cabinet', name: '跨房B', roomId: 'ry', x: 900, y: 900, rotation: 270, rules });
-  ok('跨房间：即使几何相接也不报（按 roomId 分组）', validateCornerInterference({ cabinets: [A4, B4] } as Project, rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
+  ok('跨房间：即使几何相接也不报（按 roomId 分组）', validateCornerInterference(makeFixtureProject([A4, B4]), rules).filter((i) => i.code === 'CORNER-DOOR-SWING').length === 0);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -229,6 +267,8 @@ section('6. 命令总线白名单：finishedEnds 与 shelves.tilt 唯一写入�
   const proj = sampleProject(rules);
   const wine = createCabinetFromTemplate({ templateId: 'wine_cabinet', id: 'wine_E', name: '酒柜A', roomId: 'room1', x: 0, y: 0, rotation: 0, rules });
   proj.cabinets.push(wine);
+  assignUniqueFixtureUnitIds(proj.cabinets);
+  assertUniqueFixtureUnitIds(proj);
   const wb = new CommandBus(proj, rules);
   const cab = wb.getState().cabinets.find((c) => c.id === 'wine_E')!;
   const v0 = wb.getVersion();
@@ -265,10 +305,12 @@ section('7. cabinet.create 走真实记忆门（浏览器 B33 同款路径，防
   // 这条命令在 node 单测里被漏掉，因为单测总带 changes:[]。这里补上，
   // 并显式验证「不带 changes 也不许崩门」。
   const proj = sampleProject(rules);
+  assertUniqueFixtureUnitIds(proj);
   const wb = new CommandBus(proj, rules);
   wb.setGate(compileCorrections(loadCorrections()).gate); // 与浏览器一致：挂记忆门
 
   const wine = createCabinetFromTemplate({ templateId: 'wine_cabinet', id: 'wine_create', name: '酒柜A', roomId: 'room1', x: 2000, y: 2000, rotation: 0, rules, takenIds: proj.cabinets.map((c) => c.id) });
+  assertUniqueFixtureCabinet(proj, wine);
   const v0 = wb.getVersion();
   // 放点 (2000,2000) 远离墙、不重叠 → 不被记忆拦截，应干净落库
   const r = wb.execute({ id: 'c_create', op: 'cabinet.create', source: 'ui', target: { kind: 'project', id: 'project' }, changes: [], payload: { cabinet: wine } }, '建酒柜');
@@ -276,6 +318,7 @@ section('7. cabinet.create 走真实记忆门（浏览器 B33 同款路径，防
 
   // 防御：漏掉 changes 字段的命令，记忆门不得崩（pathForbidden 用 ?? [] 兜底）
   const wine2 = createCabinetFromTemplate({ templateId: 'wine_cabinet', id: 'wine_nochg', name: '酒柜B', roomId: 'room1', x: 2200, y: 2200, rotation: 0, rules, takenIds: wb.getState().cabinets.map((c) => c.id) });
+  assertUniqueFixtureCabinet(wb.getState(), wine2);
   let threw = false;
   try {
     wb.execute({ id: 'c_nochg', op: 'cabinet.create', source: 'ui', payload: { cabinet: wine2 } } as never, '建酒柜(漏changes)');
@@ -286,6 +329,7 @@ section('7. cabinet.create 走真实记忆门（浏览器 B33 同款路径，防
 
   // 记忆拦截仍生效：把酒柜扎进墙里（x,y 很小）应被 mem_002 拦下，且不崩
   const wine3 = createCabinetFromTemplate({ templateId: 'wine_cabinet', id: 'wine_wall', name: '酒柜C', roomId: 'room1', x: 40, y: 40, rotation: 0, rules, takenIds: wb.getState().cabinets.map((c) => c.id) });
+  assertUniqueFixtureCabinet(wb.getState(), wine3);
   const rWall = wb.execute({ id: 'c_wall', op: 'cabinet.create', source: 'ui', target: { kind: 'project', id: 'project' }, changes: [], payload: { cabinet: wine3 } }, '建酒柜(入墙)');
   ok('记忆门照常拦「扎进墙里」的 create（非崩溃、返回 error）', !rWall.ok && !!rWall.error && !!rWall.memoryHits?.length, `err=${rWall.error ?? '(none)'} hits=${rWall.memoryHits?.length ?? 0}`);
 }

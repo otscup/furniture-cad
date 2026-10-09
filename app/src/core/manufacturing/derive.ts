@@ -37,6 +37,7 @@ import type {
   MfgPartSource,
   MfgWarning,
 } from './model.ts';
+import { sharedPanelParts } from '../sharedPanels.ts';
 
 /** 几何角色 → 制造大类（回答「这是什么」而不只是一块矩形） */
 const ROLE_CATEGORY: Record<MfgPartRole, MfgPartCategory> = {
@@ -57,6 +58,7 @@ const ROLE_CATEGORY: Record<MfgPartRole, MfgPartCategory> = {
   DrawerBack: 'drawer',
   DrawerBottom: 'drawer',
   ApertureLintel: 'aperture',
+  SharedTopPanel: 'case-shell',
 };
 
 /** 箱体结构板（这些才可能要三合一/木榫连接孔） */
@@ -464,6 +466,8 @@ export function deriveManufacturing(
   const cabinets: Record<string, ManufacturingPart[]> = {};
   const parts: ManufacturingPart[] = [];
   const warnings: MfgWarning[] = [];
+  const sharedPanels = sharedPanelParts(project, rules);
+  const replacedPanelIds = new Set(sharedPanels.flatMap((panel) => panel.sharedPanelTrace?.replacesPanelIds ?? []));
 
   for (const cab of project.cabinets) {
     const g = geom.cabinets[cab.id];
@@ -471,9 +475,20 @@ export function deriveManufacturing(
       warnings.push({ code: 'MFG-CABINET-NO-GEOM', severity: 'warning', message: `柜体「${cab.name}」无派生几何，跳过制造派生` });
       continue;
     }
-    const list = g.panels.map((panel) => buildPart(panel, cab, g, rules, mfgRules, inAuthoredAssembly.has(cab.id)));
+    const list = g.panels.filter((panel) => !replacedPanelIds.has(panel.id)).map((panel) => buildPart(panel, cab, g, rules, mfgRules, inAuthoredAssembly.has(cab.id)));
     cabinets[cab.id] = list;
     parts.push(...list);
+  }
+
+  for (const panel of sharedPanels) {
+    const trace = panel.sharedPanelTrace!;
+    const sourceCabinet = project.cabinets.find((cabinet) => cabinet.id === trace.memberCabinetIds[0]);
+    const sourceGeometry = sourceCabinet ? geom.cabinets[sourceCabinet.id] : undefined;
+    if (!sourceCabinet || !sourceGeometry) continue;
+    const part = buildPart(panel, sourceCabinet, sourceGeometry, rules, mfgRules, false);
+    part.source = { cabinetId: sourceCabinet.id, geometryPanelId: panel.id, geometryRole: panel.role };
+    part.sharedPanelTrace = trace;
+    parts.push(part);
   }
 
   const byCategory = {} as Record<MfgPartCategory, number>;

@@ -50,6 +50,8 @@ export interface CabinetTemplate {
     depth: number;
     /** 缺省走 defaultCabinetParams 的 80。吊柜挂墙，不要踢脚，显式给 0 */
     bodyLift?: number;
+    cabinetType?: 'base' | 'wall' | 'tall' | 'island';
+    mountHeight?: number;
   };
   /** 分区骨架。空数组 = 走 defaultUnits（默认三分区），保持旧行为 */
   units: TemplateUnit[];
@@ -81,7 +83,7 @@ export const CABINET_TEMPLATES: CabinetTemplate[] = [
     id: 'wall_cabinet',
     name: '吊柜',
     hint: '矮柜 700 高 · 挂墙无踢脚 · 对开门',
-    params: { width: 1200, height: 700, depth: 350, bodyLift: 0 },
+    params: { width: 1200, height: 700, depth: 350, bodyLift: 0, cabinetType: 'wall', mountHeight: 1450 },
     units: [{ kind: 'shelves', width: { ratio: 1 }, count: 1, doors: { count: 2 }, nickname: '吊柜格' }],
   },
   {

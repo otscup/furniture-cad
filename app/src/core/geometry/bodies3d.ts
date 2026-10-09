@@ -55,7 +55,8 @@ export type BoxRole =
   | 'shelf'
   | 'door'
   | 'drawer'
-  | 'rod';
+  | 'rod'
+  | 'countertopCutout';
 
 /**
  * 单柜 3D 体块。板厚/层板位/门宽全部来自 computeCabinetLayout 与
@@ -77,7 +78,7 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
     const w = localToWorld({ x: lcx, y: lcy }, { x: ox, y: oy }, rot);
     out.push({
       id, cabId: cab.id, cabName: cab.name, role, nameZh,
-      cx: w.x, cy: w.y, cz: (z0 + z1) / 2,
+      cx: w.x, cy: w.y, cz: (z0 + z1) / 2 + (p.mountHeight ?? 0),
       sx: Math.round(x1 - x0), sy: Math.round(y1 - y0), sz: Math.round(z1 - z0),
       rot, material,
     });
@@ -232,6 +233,13 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
   if (DB) {
     // 后排：脸在 y=0 侧（朝 -Y），门贴 y ∈ [-t, 0]
     drawRow(cab.layout.backUnits!, DB.backNets, DB.backUnitX0, DB.midY0 - DB.backShelfDepth, DB.midY0, -t, 0, 'back', zBot + t, L.innerH);
+  }
+
+  for (const [i, cutout] of (p.counterCutouts ?? []).entries()) {
+    // 占位表示设计预留，不代表顶板已开孔；规则校验会提示生产图尚无 CNC 切孔轮廓。
+    push('countertopCutout', `${cab.id}_CTO${i + 1}`, `${cutout.name}（台面预留）`,
+      cutout.x, cutout.x + cutout.width, cutout.y, cutout.y + cutout.depth,
+      zTop + 1, zTop + 9, 'COUNTERTOP_CUTOUT_PLACEHOLDER');
   }
 
   return out;

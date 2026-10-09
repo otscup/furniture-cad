@@ -26,6 +26,20 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
     out.push(buildIssue(code, { target, targetKind, ctx: { cab, ...ctx } }));
   };
 
+  const mountHeight = p.mountHeight ?? 0;
+  const cabinetType = p.cabinetType ?? (mountHeight > 0 ? 'wall' : 'base');
+  if ((cabinetType === 'wall' && mountHeight <= 0) || (cabinetType !== 'wall' && mountHeight > 0)) {
+    emit('RULE-CABINET-TYPE-MOUNT', cab.id, 'cabinet', { cabName: cab.name, cabinetType, mountHeight });
+  }
+  for (const [i, cutout] of (p.counterCutouts ?? []).entries()) {
+    if (cutout.x < 18 || cutout.y < 0 || cutout.x + cutout.width > p.width - 18 || cutout.y + cutout.depth > p.depth) {
+      emit('RULE-COUNTERTOP-CUTOUT-OUT-OF-BOUNDS', `${cab.id}.counterCutouts[${i}]`, 'cabinet', { cabName: cab.name, cutoutName: cutout.name, width: cutout.width, depth: cutout.depth, cabWidth: p.width, cabDepth: p.depth });
+    }
+  }
+  if ((p.counterCutouts ?? []).length > 0) {
+    emit('RULE-COUNTERTOP-CUTOUT-PLACEHOLDER', cab.id, 'cabinet', { cabName: cab.name, count: p.counterCutouts!.length });
+  }
+
   // ───────── A. 恒等式断言 ─────────
   const assertEq = (label: string, a: number, b: number, detail: string): void => {
     if (Math.abs(a - b) > 1e-9) {
@@ -353,7 +367,15 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
   // ───────── B. 生产硬规则 ─────────
   for (const x of geom.panels) {
     const pctx = { nameZh: x.nameZh, len: x.length, wid: x.width };
-    if (x.length < rules.limits.minPanelSize || x.width < rules.limits.minPanelSize) {
+    const invalidDimensions = [
+      ['length', x.length], ['width', x.width], ['thickness', x.thickness],
+    ].filter(([, value]) => typeof value !== 'number' || !Number.isFinite(value) || value <= 0).map(([name]) => name);
+    if (invalidDimensions.length > 0) {
+      emit('RULE-PANEL-NONPOSITIVE-DIMENSION', x.id, 'panel', {
+        cabName: cab.name, panelName: x.nameZh, length: x.length, width: x.width, thickness: x.thickness,
+        invalidDimensions: invalidDimensions.join(', '),
+      });
+    } else if (x.length < rules.limits.minPanelSize || x.width < rules.limits.minPanelSize) {
       emit('RULE-MIN-PANEL', x.id, 'panel', { ...pctx, min: rules.limits.minPanelSize });
     }
     const fitsGrain = x.length <= sheetL && x.width <= sheetS;

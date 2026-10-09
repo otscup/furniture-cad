@@ -1,6 +1,6 @@
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  P10.0 · S0 镜像闭包验收的**变异验收**（MS1–MS10）
+ *  P10.0 · S0 镜像闭包验收的**变异验收**（MS1–MS13）
  *
  *  ── 它做什么 ──
  *    对每一项：**把 Dockerfile / .dockerignore / 源码改回"出事状态"** →
@@ -168,10 +168,10 @@ const MUTANTS: Mutant[] = [
   },
   {
     id: 'MS12',
-    what: 'MCP 工具层新增一条运行镜像没覆盖的运行期依赖（→ src/ai/compileProposal.ts）',
+    what: 'MCP 工具层新增一条运行镜像没覆盖的运行期依赖（→ src/ai/actionBudget.ts）',
     file: MCP,
     from: "import { z } from 'zod';",
-    to: "import { z } from 'zod';\nimport { compileProposal } from '../src/ai/compileProposal.ts';",
+    to: "import { z } from 'zod';\nimport { ACTION_BUDGET } from '../src/ai/actionBudget.ts';",
     expect: 'G2（服务端闭包覆盖判定）',
   },
   {
@@ -241,7 +241,7 @@ section('基线：未变异时验收必须全绿（否则"判红"无从谈起）
   ok('基线全绿（失败 0）', r.completed && r.failedCount === 0, `completed=${r.completed} failed=${r.failedCount}\n${r.out.slice(-300)}`);
 }
 
-section('MS1–MS10：每项改坏后都必须被抓住');
+section('MS1–MS13：每项改坏后都必须被抓住');
 for (const m of MUTANTS) await mutate(m);
 
 console.log(`\n══════════════════════════════════════════════`);

@@ -32,6 +32,7 @@ import { dirname, join } from 'node:path';
 import type { Cabinet, Prim, Project, RuleSet, Vec2 } from '../src/core/types.ts';
 import { CommandBus } from '../src/core/commandBus.ts';
 import { createCabinet, defaultCabinetParams, defaultUnits, rectRoom, sampleProject } from '../src/core/docFactory.ts';
+import { findDuplicateUnitIds } from '../src/core/unitIdentity.mjs';
 import {
   ATTACH_ALIGNMENTS,
   ATTACH_DEFAULT_ALIGNMENT,
@@ -78,6 +79,25 @@ function eq(a: unknown, b: unknown): boolean {
 }
 type Box = { min: Vec2; max: Vec2 };
 
+/** 测试夹具的柜体共享一个全局 Unit ID 命名空间；不触碰生产自动修复/放行逻辑。 */
+function assignFixtureUnitIds(project: Project): Project {
+  project.cabinets.forEach((cabinet, cabinetIndex) => {
+    const prefix = `unit_fixture_${cabinet.id || cabinetIndex + 1}`;
+    const assign = (units: Array<{ id: string }> | undefined, group: string): void => {
+      units?.forEach((unit, index) => { unit.id = `${prefix}_${group}_${index + 1}`; });
+    };
+    const rows = cabinet.layout.rows;
+    if (Array.isArray(rows) && rows.length > 0) {
+      rows.forEach((row, rowIndex) => assign(row.units, `row_${rowIndex + 1}`));
+      cabinet.layout.units = structuredClone(rows[0]!.units);
+    } else {
+      assign(cabinet.layout.units, 'main');
+    }
+    assign(cabinet.layout.backUnits, 'back');
+  });
+  return project;
+}
+
 // ───────────── 测试场景 ─────────────
 
 /** A(400,60) 2400×600 rot0；B(1000,1000) 800×550 rot0；C(2000,2000) 800×600 rot0 */
@@ -95,7 +115,7 @@ function mkProject(): Project {
       params: { ...defaultCabinetParams(rules), width: w, height: 2200, depth: d },
       units: defaultUnits(w, rules, d),
     });
-  return {
+  return assignFixtureUnitIds({
     schemaVersion: '0.3',
     id: 'proj_p82',
     name: 'P8.2 贴合验收',
@@ -106,7 +126,7 @@ function mkProject(): Project {
       mk('cab_B', '贴合柜B', 1000, 1000, 800, 550),
       mk('cab_C', '链柜C', 2000, 2000, 800, 600),
     ],
-  };
+  });
 }
 
 /** 验收侧独立重算：一个面在世界坐标下的两个端点（自然方向：左右面沿进深、前后端面沿宽） */
@@ -410,6 +430,8 @@ section('§4 错误路径：结构化错误，绝不 fallback 到 (0,0,0)');
 section('§5 架构：纯函数 / 单一真相源 / 不复制 Relations / preview==commit');
 {
   const project = mkProject();
+  const fixtureDuplicates = findDuplicateUnitIds(project);
+  ok('三柜架构 fixture 构造后 Unit ID 全局唯一（CommandBus 前置断言）', fixtureDuplicates.length === 0, JSON.stringify(fixtureDuplicates));
   const scene = sceneFromProject(project);
   const intent = attachIntent('cab_B', 'cab_A', 'left', 'right', { alignment: 'center' });
   const sceneBefore = JSON.stringify(scene);
@@ -439,19 +461,23 @@ section('§5 架构：纯函数 / 单一真相源 / 不复制 Relations / previe
     !src.includes('deriveContacts') && !src.includes('edgesFlush') && !src.includes('CONTACT_TOL'));
 
   // ── 唯一写入口仍然是 cabinet.place（不新增 cabinet.attach）──
-  const bus = new CommandBus(mkProject(), rules);
+  const bus = new CommandBus(project, rules);
   const v0 = bus.getVersion();
   const r = resolvePlacement(attachIntent('cab_B', 'cab_A', 'left', 'right'), sceneFromProject(bus.getState()));
+  ok('CommandBus 正向用例：attach 解析成功并给出 (2800, 60)', r.ok && r.placement.x === 2800 && r.placement.y === 60, JSON.stringify(r));
   const cabB = bus.getState().cabinets.find((c) => c.id === 'cab_B')!;
-  const cmd = CMD.placeCabinet(cabB, r.ok ? r.placement : { x: 0, y: 0, rotation: 0 }, 'ai');
-  ok('attach 的解析结果仍走 cabinet.place（没有第二套写入命令）', cmd.op === 'cabinet.place', cmd.op);
+  const cmd = r.ok ? CMD.placeCabinet(cabB, r.placement, 'ai') : null;
+  ok('attach 的解析结果仍走 cabinet.place（没有第二套写入命令）', cmd?.op === 'cabinet.place', cmd?.op ?? '解析失败，未执行命令');
   ok('  一条命令原子写三字段（白名单 placement.x/y/rotation）',
-    cmd.changes.length === 3 && cmd.changes.every((ch) => /^placement\.(x|y|rotation)$/.test(ch.path)));
-  const dry = bus.execute(cmd, { dryRun: true });
-  ok('干跑不动模型（版本不变）', dry.ok && bus.getVersion() === v0);
-  const exec = bus.execute(cmd);
+    !!cmd && cmd.changes.length === 3 && cmd.changes.every((ch) => /^placement\.(x|y|rotation)$/.test(ch.path)));
+  const dry = cmd ? bus.execute(cmd, { dryRun: true }) : null;
+  ok('干跑执行成功', dry?.ok === true, JSON.stringify(dry));
+  ok('干跑不动模型（版本不变）', dry?.ok === true && bus.getVersion() === v0);
+  const exec = cmd ? bus.execute(cmd) : null;
   const after = bus.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
-  ok('提交后 placement === 解析值（预览===提交）', exec.ok && after.x === 2800 && after.y === 60 && eq(dry.diff, exec.diff), JSON.stringify(after));
+  ok('提交执行成功', exec?.ok === true, JSON.stringify(exec));
+  ok('提交后 placement === 解析值（落位为 2800,60）', exec?.ok === true && after.x === 2800 && after.y === 60 && r.ok && after.x === r.placement.x && after.y === r.placement.y, JSON.stringify(after));
+  ok('预览 === 提交（diff 逐值相同）', dry?.ok === true && exec?.ok === true && eq(dry.diff, exec.diff), JSON.stringify({ dry: dry?.diff, commit: exec?.diff }));
 
   // ── 复用 P2 的 deriveContacts 独立验证"真的贴上了" ──
   const st = bus.getState();
@@ -466,13 +492,19 @@ section('§5 架构：纯函数 / 单一真相源 / 不复制 Relations / previe
 
   // offset > 0 = 留缝 → 不算接触（几何事实，不是"贴上了但记了个缝"）
   const bus2 = new CommandBus(mkProject(), rules);
+  const gapFixtureDuplicates = findDuplicateUnitIds(bus2.getState());
+  ok('offset=20 负向用例从有效唯一 ID fixture 开始', gapFixtureDuplicates.length === 0, JSON.stringify(gapFixtureDuplicates));
   const rGap = resolvePlacement(attachIntent('cab_B', 'cab_A', 'left', 'right', { offset: 20 }), sceneFromProject(bus2.getState()));
+  ok('offset=20 attach 解析成功并给出 (2820, 60)', rGap.ok && rGap.placement.x === 2820 && rGap.placement.y === 60, JSON.stringify(rGap));
   const cabB2 = bus2.getState().cabinets.find((c) => c.id === 'cab_B')!;
-  bus2.execute(CMD.placeCabinet(cabB2, rGap.ok ? rGap.placement : { x: 0, y: 0, rotation: 0 }, 'ai'));
+  const gapCmd = rGap.ok ? CMD.placeCabinet(cabB2, rGap.placement, 'ai') : null;
+  const gapExec = gapCmd ? bus2.execute(gapCmd) : null;
+  const gapPlacement = bus2.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
+  ok('offset=20 CommandBus 执行成功且实际落位为 (2820, 60)', gapExec?.ok === true && gapPlacement.x === 2820 && gapPlacement.y === 60, JSON.stringify({ result: gapExec, placement: gapPlacement }));
   const gapContacts = deriveContacts(bus2.getState()).filter(
     (c) => (c.a === 'cab_A' && c.b === 'cab_B') || (c.a === 'cab_B' && c.b === 'cab_A')
   );
-  ok('offset=20：两柜之间是 20mm 缝，deriveContacts 如实不算接触', gapContacts.length === 0, JSON.stringify(gapContacts));
+  ok('offset=20：有效执行后两柜之间是 20mm 缝，deriveContacts 如实不算接触', gapExec?.ok === true && gapPlacement.x === 2820 && gapPlacement.y === 60 && gapContacts.length === 0, JSON.stringify({ placement: gapPlacement, contacts: gapContacts }));
 
   // ── 2D / 3D 消费同一份 resolved placement ──
   const p3d = mkProject();
@@ -481,14 +513,18 @@ section('§5 架构：纯函数 / 单一真相源 / 不复制 Relations / previe
   const cxBefore = meanCx(g0.bodies3d.filter((b) => b.cabId === 'cab_B'));
   const bus3 = new CommandBus(p3d, rules);
   const r3d = resolvePlacement(attachIntent('cab_B', 'cab_A', 'left', 'right'), sceneFromProject(bus3.getState()));
+  ok('2D/3D 正向用例：attach 解析成功并给出 (2800, 60)', r3d.ok && r3d.placement.x === 2800 && r3d.placement.y === 60, JSON.stringify(r3d));
   const cabB3 = bus3.getState().cabinets.find((c) => c.id === 'cab_B')!;
-  bus3.execute(CMD.placeCabinet(cabB3, r3d.ok ? r3d.placement : { x: 0, y: 0, rotation: 0 }, 'ai'));
+  const cmd3 = r3d.ok ? CMD.placeCabinet(cabB3, r3d.placement, 'ai') : null;
+  const exec3 = cmd3 ? bus3.execute(cmd3) : null;
+  const placement3 = bus3.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
+  ok('2D/3D CommandBus 执行成功且实际落位为 (2800, 60)', exec3?.ok === true && placement3.x === 2800 && placement3.y === 60, JSON.stringify({ result: exec3, placement: placement3 }));
   const g1 = generateProject(bus3.getState(), rules);
   const planAfter = primBox(g1.cabinets['cab_B']!.plan);
   const cxAfter = meanCx(g1.bodies3d.filter((b) => b.cabId === 'cab_B'));
   const DX = 2800 - 1000;
-  ok('2D（plan 图元）位移 === 解析位移', Math.abs(planAfter.min.x - planBefore.min.x - DX) < 0.5, `${planAfter.min.x - planBefore.min.x}`);
-  ok('3D（bodies3d）位移 === 同一个解析位移', Math.abs(cxAfter - cxBefore - DX) < 0.5, `${cxAfter - cxBefore}`);
+  ok('2D（plan 图元）位移 === 解析位移', exec3?.ok === true && placement3.x === 2800 && placement3.y === 60 && Math.abs(planAfter.min.x - planBefore.min.x - DX) < 0.5, `${planAfter.min.x - planBefore.min.x}`);
+  ok('3D（bodies3d）位移 === 同一个解析位移', exec3?.ok === true && placement3.x === 2800 && placement3.y === 60 && Math.abs(cxAfter - cxBefore - DX) < 0.5, `${cxAfter - cxBefore}`);
 }
 
 function primBox(prims: Prim[]): Box {
@@ -617,6 +653,9 @@ section('§6 Proposal / AI：能说"哪两个面贴"，但不能给坐标');
       units: defaultUnits(800, rules, 550),
     })
   );
+  assignFixtureUnitIds(fresh);
+  const freshDuplicates = findDuplicateUnitIds(fresh);
+  ok('AI compile fixture（含 cab_ref）构造后 Unit ID 全局唯一', freshDuplicates.length === 0, JSON.stringify(freshDuplicates));
   const action: AiAction = {
     action: 'cabinet.place',
     target: { cabinetName: '主卧衣柜' },

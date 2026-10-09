@@ -11,6 +11,7 @@
  * 操作：新建项目 / 切换项目 / 删除项目 / 在当前项目下新建房间
  */
 import { useCallback, useEffect, useState } from 'react';
+import { findDuplicateUnitIds } from '../../core/unitIdentity.mjs';
 
 interface ProjectInfo {
   id: string;
@@ -32,12 +33,13 @@ interface Props {
   /** 当前项目的房间列表（从 workspace 来） */
   rooms: RoomInfo[];
   onToast?: (kind: 'info' | 'error' | 'ok' | 'warn', msg: string) => void;
-  /** 切换项目后回调（需刷新） */
+  /** 无 workspace 校验回调时切换后兜底刷新 */
   onProjectSwitched?: () => void;
-  /** 从服务端载入工作区后回调（父组件用 bus.replaceProject 装载） */
+  /** 用户确认切换/载入后回调；父组件必须先校验身份再应用项目 */
   onWorkspaceLoaded?: (project: any) => void;
   /** 新建房间：调用方提供实现（走命令总线） */
   onCreateRoom?: (name: string) => void;
+  readOnly?: boolean;
   /** 点击房间回调 */
   onFocusRoom?: (roomId: string) => void;
 }
@@ -69,7 +71,7 @@ export function ProjectsPanel(props: Props) {
 
   const [loadingWs, setLoadingWs] = useState(false);
   const loadFromServer = useCallback(async () => {
-    if (!confirm('从服务端载入当前账号的工作区？\n\n本地未保存的修改会被服务端版本覆盖。')) return;
+    if (!confirm('从服务端载入当前账号的工作区？\n\n本地未保存的修改会被服务端版本覆盖。载入后会校验重复 Unit ID；有冲突的项目仍保持只读。')) return;
     setLoadingWs(true);
     try {
       const r = await fetch('/api/workspace', {
@@ -113,22 +115,35 @@ export function ProjectsPanel(props: Props) {
   }, [newName, props]);
 
   const activateProject = useCallback(async (id: string, name: string) => {
-    if (!confirm(`切换到项目「${name}」？\n\n当前未保存的修改会丢失，切换后页面将刷新。`)) return;
+    if (loadingWs) return;
+    if (!confirm(`切换到项目「${name}」？\n\n当前未保存的修改会被放弃。系统会先读取并校验目标项目；若发现重复 Unit ID 或读取失败，当前项目与只读状态保持不变。`)) return;
+    setLoadingWs(true);
     try {
       const r = await fetch(`/api/projects/${encodeURIComponent(id)}/activate`, {
         method: 'POST',
         headers: props.token ? { Authorization: `Bearer ${props.token}` } : {},
       });
       const j = await r.json();
-      if (!j.ok) throw new Error(j.error);
-      props.onToast?.('ok', j.message || '已切换项目');
-      // 刷新页面加载新项目
-      setTimeout(() => window.location.reload(), 800);
-      props.onProjectSwitched?.();
+      if (j.code === 'WORKSPACE_UNIT_ID_CONFLICT') {
+        props.onToast?.('warn', `目标项目仍有历史重复 Unit ID；当前项目与只读告警保持不变。${j.error ?? ''}`);
+        return;
+      }
+      if (!r.ok || !j.ok || !j.project) throw new Error(j.error || '目标项目载入失败');
+      const duplicates = findDuplicateUnitIds(j.project);
+      if (duplicates.length > 0) {
+        props.onToast?.('warn', `目标项目身份复核仍发现 ${duplicates.length} 处重复 Unit ID；当前项目与只读告警保持不变。`);
+        return;
+      }
+      // 服务端只会在相同身份校验通过后提交 active project；父级再次验证后原子替换 CommandBus 并清除粘滞锁。
+      props.onWorkspaceLoaded?.(j.project);
+      props.onToast?.('ok', `已切换并验证健康项目「${name}」`);
+      await fetchProjects();
     } catch (e) {
       props.onToast?.('error', `切换失败：${e instanceof Error ? e.message : e}`);
+    } finally {
+      setLoadingWs(false);
     }
-  }, [props]);
+  }, [fetchProjects, loadingWs, props]);
 
   const deleteProject = useCallback(async (id: string, name: string) => {
     if (!confirm(`删除项目「${name}」？\n\n该操作不可恢复！`)) return;
@@ -235,7 +250,7 @@ export function ProjectsPanel(props: Props) {
                       value={newRoomName}
                       onChange={e => setNewRoomName(e.target.value)}
                       onKeyDown={e => {
-                        if (e.key === 'Enter' && newRoomName.trim()) {
+                        if (!props.readOnly && e.key === 'Enter' && newRoomName.trim()) {
                           props.onCreateRoom?.(newRoomName.trim());
                           setNewRoomName('');
                           setShowNewRoom(false);
@@ -247,7 +262,7 @@ export function ProjectsPanel(props: Props) {
                       <button
                         type="button"
                         className="tb-btn primary small"
-                        disabled={!newRoomName.trim()}
+                        disabled={props.readOnly || !newRoomName.trim()}
                         onClick={() => {
                           props.onCreateRoom?.(newRoomName.trim());
                           setNewRoomName('');
@@ -269,6 +284,7 @@ export function ProjectsPanel(props: Props) {
                   <button
                     type="button"
                     className="tb-btn small"
+                    disabled={props.readOnly}
                     onClick={() => setShowNewRoom(true)}
                     title="在当前项目下新建房间"
                   >

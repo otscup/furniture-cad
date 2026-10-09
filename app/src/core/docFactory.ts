@@ -207,12 +207,14 @@ export function createCabinetFromTemplate(opts: {
   rotation?: number;
   rules: RuleSet;
   takenIds?: Iterable<string>;
+  /** 同一项目已有的分区 id；避免新柜与既有柜共享板件来源 ID。 */
+  takenUnitIds?: Iterable<string>;
   id?: string;
   params?: Partial<CabinetParams>;
 }): Cabinet {
   const tpl = findCabinetTemplate(opts.templateId);
   const widths = resolveTemplateUnitWidths(tpl);
-  const units: UnitSpec[] =
+  const rawUnits: UnitSpec[] =
     tpl.units.length === 0
       ? defaultUnits(tpl.params.width, opts.rules, tpl.params.depth)
       : tpl.units.map((u, i) =>
@@ -230,14 +232,24 @@ export function createCabinetFromTemplate(opts: {
             appliance: u.appliance,
           })
         );
+  // 模板声明中的 unit_001 是柜内相对序号；落到项目文件时必须在所有柜体间全局唯一。
+  const takenUnitIds = new Set<string>(opts.takenUnitIds ?? []);
+  const units: UnitSpec[] = rawUnits.map((unit) => {
+    if (!takenUnitIds.has(unit.id)) {
+      takenUnitIds.add(unit.id);
+      return unit;
+    }
+    const id = nextId('unit', takenUnitIds);
+    takenUnitIds.add(id);
+    return { ...unit, id };
+  });
   // 双面模板：背面分区跟着构造，id 从前排之后接着排（takenIds 累积，撞 id 是清单事故）
   let backUnits: UnitSpec[] | undefined;
   if (tpl.backUnits && tpl.backUnits.length > 0) {
     const backWidths = resolveTemplateUnitWidthList(tpl.backUnits, tpl.params.width);
-    const taken = new Set(units.map((u) => u.id));
     backUnits = tpl.backUnits.map((u, i) => {
       const unit = makeUnit({
-        id: nextId('unit', taken),
+        id: nextId('unit', takenUnitIds),
         kind: u.kind,
         requestedWidth: backWidths[i]!,
         nickname: u.nickname,
@@ -250,7 +262,7 @@ export function createCabinetFromTemplate(opts: {
         doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
         appliance: u.appliance,
       });
-      taken.add(unit.id);
+      takenUnitIds.add(unit.id);
       return unit;
     });
   }
@@ -259,6 +271,8 @@ export function createCabinetFromTemplate(opts: {
     width: tpl.params.width,
     height: tpl.params.height,
     depth: tpl.params.depth,
+    ...(tpl.params.cabinetType ? { cabinetType: tpl.params.cabinetType } : {}),
+    ...(tpl.params.mountHeight !== undefined ? { mountHeight: tpl.params.mountHeight } : {}),
   };
   if (tpl.params.bodyLift != null) tplParams.bodyLift = tpl.params.bodyLift;
   return createCabinet({
@@ -459,10 +473,11 @@ export function createWall(opts: {
   };
 }
 
-export function createRoom(opts: { id?: string; name: string; walls?: Wall[]; takenIds?: Iterable<string> }): Room {
+export function createRoom(opts: { id?: string; name: string; note?: string; walls?: Wall[]; takenIds?: Iterable<string> }): Room {
   return {
     id: opts.id ?? nextId('room', opts.takenIds ?? []),
     name: opts.name,
+    ...(opts.note?.trim() ? { note: opts.note.trim() } : {}),
     walls: opts.walls ?? [],
   };
 }
@@ -470,6 +485,7 @@ export function createRoom(opts: { id?: string; name: string; walls?: Wall[]; ta
 /** 矩形房间：中心线沿给定矩形，四面墙逆时针 */
 export function rectRoom(opts: {
   name: string;
+  note?: string;
   x: number;
   y: number;
   w: number;
@@ -509,7 +525,7 @@ export function rectRoom(opts: {
     used.add(w.id);
     walls.push(w);
   }
-  return createRoom({ id: opts.id, name: opts.name, walls, takenIds: opts.takenIds });
+  return createRoom({ id: opts.id, name: opts.name, note: opts.note, walls, takenIds: opts.takenIds });
 }
 
 export function emptyProject(opts: { name?: string; ruleSetId: string; id?: string } = { ruleSetId: 'factory_default_v1' }): Project {

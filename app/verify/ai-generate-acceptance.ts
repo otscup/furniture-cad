@@ -88,6 +88,17 @@ function validate(actions: unknown[]): ReturnType<typeof validatePlan> {
   return validatePlan({ reply: '', actions }, ctx);
 }
 
+const roomRefProject = emptyProject({ ruleSetId: 'factory_default_v1' });
+roomRefProject.rooms.push(rectRoom({ name: '服务端唯一房间', x: 0, y: 0, w: 4000, h: 3000, id: 'room_server_only' }));
+const unknownRoomCompile = compileAction({
+  action: 'cabinet.create',
+  target: { roomId: 'room_browser_second' },
+  params: { name: '错位房间柜', width: 900 },
+} as AiAction, roomRefProject, rules);
+ok('单房间项目显式收到未知 roomId 时拒绝，不回退到唯一房间',
+  !unknownRoomCompile.ok && /找不到房间/.test(unknownRoomCompile.error),
+  unknownRoomCompile.ok ? 'unexpected compile success' : unknownRoomCompile.error);
+
 const goodUnits = [
   { kind: 'drawerBank', width: 500, count: 3, nickname: '左抽' },
   { kind: 'shelves', width: 800, count: 2, doorCount: 2, nickname: '中门格' },
@@ -152,10 +163,8 @@ ok('A9 门扇数超上限 → 拒', badDoor.ok === false, JSON.stringify(badDoor
 
 ok('A10 每一项字段都登记在册（不许出现没有校验的字段）',
   (() => {
-    // 电器格五字段加入后清单变长 —— 断言的意图不变：字段清单封闭，且每个都有类型声明。
-    // P9.6 §二十七：doorMaterial（玻璃门材质 id）入册 —— 契约有类型、编译期 checkDoorMaterial
-    // 校验存在性（未知材质拒收），real-furniture-request 验收 §2 钉住负样本。
-    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'doorMaterial', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
+    // 玻璃门材质、层板灯带和电器洞口均是正式分区字段，必须在契约中有类型且在编译时校验。
+    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'doorMaterial', 'ledStrip', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
     const keys = Object.keys(UNIT_INTENT_ITEM);
     return keys.every((k) => KNOWN.includes(k)) && keys.every((k) => UNIT_INTENT_ITEM[k] && typeof UNIT_INTENT_ITEM[k].type === 'string');
   })(),

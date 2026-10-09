@@ -37,6 +37,7 @@ const SOURCES: ImportSource[] = ['json', 'dxf', 'kujiale', 'imageVision'];
 export function ImportPanel(props: {
   bus: CommandBus;
   version: number;
+  unitIdentityReadOnly: boolean;
   onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void;
 }): ReactNode {
   const { bus } = props;
@@ -148,7 +149,7 @@ export function ImportPanel(props: {
   }, [nd, bus, props]);
 
   const doApply = useCallback(() => {
-    if (!run) return;
+    if (props.unitIdentityReadOnly || !run) return;
     const r = commitPlan(run, bus);
     if (!r.ok) {
       setLastApply(`✗ ${r.error}`);
@@ -340,6 +341,7 @@ export function ImportPanel(props: {
             lastApply={lastApply}
             applyLabel="应用导入"
             dismissLabel="丢弃"
+            readOnly={props.unitIdentityReadOnly}
           />
         </Section>
       ) : null}

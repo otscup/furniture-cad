@@ -1,16 +1,19 @@
-import type { Cabinet, Connection, DoorHinge, DoorSwingDirection, FurnitureAssembly, Issue, Opening, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
+import type { Cabinet, Connection, DrawingEntity, DoorHinge, DoorSwingDirection, FurnitureAssembly, Issue, Opening, Project, ProjectGeometry, Room, RuleSet, UnitSpec, Vec2, Wall } from './types.ts';
 import type { PlacementIntentDecl } from './placement.ts';
 import { generateProject } from './geometry/project.ts';
 import { buildProjectExplode, type ProjectExplodeSet } from './geometry/explode.ts';
 import { validateCabinet } from './rules/validate.ts';
 import { validateCornerInterference } from './rules/corner.ts';
 import { pairKey, validateAssemblies } from './relations.ts';
+import { validateSharedPanels } from './sharedPanels.ts';
 import { deriveSpatial } from './spatial/index.ts';
 import { createRoom, defaultCabinetParams, defaultUnits } from './docFactory.ts';
 import { nextId } from './ids.ts';
 import { allUnits, layoutRows, unitPathPrefix, unitsAtPath } from './layoutModel.ts';
 import type { Gate, GateHit } from '../ai/memory.ts';
 import { formatGateError } from '../ai/memory.ts';
+import { findDuplicateUnitIds, unitIdentityConflictError, unitIdentityConflictMessage } from './unitIdentity.mjs';
+import { assemblyRelationsEqual, confirmedAssemblySnapshot, isAssemblyRelationGeneration } from './assemblyConfirmation.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -99,6 +102,8 @@ export interface CommandPayload {
     hinge?: DoorHinge | null;
     swingDirection?: DoorSwingDirection | null;
   };
+  /** drawing.edits.replace：完整替换可撤销的手工二维覆盖列表。 */
+  drawingEdits?: DrawingEntity[];
 }
 
 export interface Command {
@@ -281,7 +286,8 @@ export type SideEffect =
    * 两个方向都要能走。（这条曾缺失：replaceProject 声称可撤销，实际 undo 后
    * 路径回退静默失败，模型仍是导入后的项目 —— 断言第一次抓到的就是它。）
    */
-  | { kind: 'replaceProject'; prev: Project; next: Project };
+  | { kind: 'replaceProject'; prev: Project; next: Project }
+  | { kind: 'replaceDrawingEdits'; prev: DrawingEntity[]; next: DrawingEntity[] };
 
 export interface LogEntry {
   seq: number;
@@ -313,6 +319,14 @@ export interface DerivedSummary {
   pieces: number;
   areaM2: number;
   weightKg: number;
+}
+
+/** replaceProject 的纯预演结果；关系账本只在持久化成功后的 commit 才发布。 */
+export interface PreparedProjectReplacement {
+  project: Project;
+  relationGenerations: ReadonlyMap<string, number>;
+  baseProject: Project;
+  baseModelVersion: number;
 }
 
 export interface ExecResult {
@@ -350,6 +364,7 @@ const STRUCTURAL_OPS = new Set([
   'opening.create',
   'opening.delete',
   'opening.update',
+  'drawing.edits.replace',
   'assembly.create',
   'assembly.delete',
   'assembly.addMember',
@@ -358,6 +373,7 @@ const STRUCTURAL_OPS = new Set([
   'assembly.disconnect',
   'assembly.move',
   'assembly.rename',
+  'assembly.confirm',
 ]);
 
 /** 写路径白名单：不在名单里的路径一律拒绝（AI 越权防线 #3） */
@@ -758,6 +774,10 @@ function applySideEffect(project: Project, se: SideEffect, forward: boolean): vo
       }
       return;
     }
+    case 'replaceDrawingEdits': {
+      project.drawingEdits = structuredClone(forward ? se.next : se.prev);
+      return;
+    }
   }
 }
 
@@ -814,6 +834,9 @@ export class CommandBus {
    * 不会残留已被撤销的命令的 live）。
    */
   private baselineProv = new Map<string, PlacementProvenance>();
+  private externalReadOnlyReason: string | null = null;
+  /** 同一 CommandBus 生命周期内的单调计数器；Assembly 上另有持久化镜像。 */
+  private assemblyRelationGenerations = new Map<string, number>();
 
   constructor(project: Project, rules: RuleSet) {
     /**
@@ -829,6 +852,9 @@ export class CommandBus {
     }
     this.project = structuredClone(project);
     this.rules = rules;
+    for (const assembly of this.project.assemblies ?? []) {
+      this.assemblyRelationGenerations.set(`${this.project.id}\u0000${assembly.id}`, isAssemblyRelationGeneration(assembly.relationGeneration) ? assembly.relationGeneration : 0);
+    }
     // P8.5-B：把文件里每柜的 placementProvenance 种子为本会话的 live 基线，
     // 使跨会话来源可见、user-confirmed 不退化、后续命令能正确 supersede。
     // 随后把该字段从内存模型剥掉——模型里永远干净（预览===提交的结构保证）。
@@ -836,9 +862,84 @@ export class CommandBus {
     this.stripProvenanceFields(this.project);
   }
 
+  /**
+   * 所有项目状态转换共用的装配关系失效边界。
+   * 只比较 memberIds/connections；任何关系差异（含组新增/删除、undo/redo 或载入）
+   * 都推进代次并清除 confirmed。失效代次保存在项目模型里，返回原集合也不能复活确认。
+   */
+  private reconcileAssemblyRelationChanges(
+    previous: Project,
+    next: Project,
+    relationGenerations: Map<string, number> = this.assemblyRelationGenerations,
+  ): void {
+    // 两个不同项目之间的切换不是同一装配组的关系编辑；保留目标项目已有的显式确认。
+    // 但同一项目内被删除后再恢复的组会命中其代次账本，仍按关系变化处理。
+    if (previous.id !== next.id) {
+      for (const assembly of next.assemblies ?? []) {
+        const key = `${next.id}\u0000${assembly.id}`;
+        const generation = isAssemblyRelationGeneration(assembly.relationGeneration) ? assembly.relationGeneration : 0;
+        relationGenerations.set(key, Math.max(relationGenerations.get(key) ?? 0, generation));
+      }
+      return;
+    }
+    const previousById = new Map((previous.assemblies ?? []).map((assembly) => [assembly.id, assembly]));
+    const nextById = new Map((next.assemblies ?? []).map((assembly) => [assembly.id, assembly]));
+    const ids = new Set([...previousById.keys(), ...nextById.keys()]);
+
+    for (const id of ids) {
+      const before = previousById.get(id);
+      const after = nextById.get(id);
+      const key = `${next.id}\u0000${id}`;
+      const known = relationGenerations.has(key);
+      const ledger = relationGenerations.get(key) ?? 0;
+      const beforeGeneration = isAssemblyRelationGeneration(before?.relationGeneration) ? before.relationGeneration : 0;
+      const afterGeneration = isAssemblyRelationGeneration(after?.relationGeneration) ? after.relationGeneration : 0;
+      const changed = before && after
+        ? !assemblyRelationsEqual(before, after)
+        : Boolean(before || (after && known));
+
+      if (!changed) {
+        const generation = Math.max(ledger, beforeGeneration, afterGeneration);
+        if (after && (after.relationGeneration !== undefined || before?.relationGeneration !== undefined || generation > 0)) {
+          after.relationGeneration = generation;
+        }
+        relationGenerations.set(key, generation);
+        continue;
+      }
+
+      const generation = Math.max(ledger, beforeGeneration, afterGeneration) + 1;
+      if (!Number.isSafeInteger(generation)) throw new Error(`组合 ${id} 的关系代次已超出安全整数范围`);
+      relationGenerations.set(key, generation);
+      if (!after) continue;
+
+      // 保留最近一次有效确认的证据，以便 UI 明确显示 stale；无效/旧格式确认仍 fail-closed。
+      const history = [before, after].find((assembly) =>
+        assembly && isAssemblyRelationGeneration(assembly.relationGeneration) &&
+        isAssemblyRelationGeneration(assembly.confirmedRelationGeneration) &&
+        Array.isArray(assembly.confirmedMemberIds) && Array.isArray(assembly.confirmedConnections),
+      );
+      after.relationGeneration = generation;
+      after.confirmed = false;
+      if (history) {
+        after.confirmedRelationGeneration = history.confirmedRelationGeneration;
+        after.confirmedMemberIds = [...history.confirmedMemberIds!];
+        after.confirmedConnections = structuredClone(history.confirmedConnections!);
+      } else {
+        delete after.confirmedRelationGeneration;
+        delete after.confirmedMemberIds;
+        delete after.confirmedConnections;
+      }
+    }
+  }
+
   /** 设置/清除记忆门。传 null 表示关闭（例如回放旧会话时不想被新规矩拦住） */
   setGate(gate: Gate | null): void {
     this.gate = gate;
+  }
+  /** 后端身份诊断建立粘滞锁；空值/健康轮询均不能清锁。仅健康项目显式切换 API 可解除。 */
+  setExternalReadOnly(reason: string | null): void {
+    const normalized = reason?.trim();
+    if (normalized) this.externalReadOnlyReason = normalized;
   }
   hasGate(): boolean {
     return this.gate !== null;
@@ -846,7 +947,13 @@ export class CommandBus {
 
   // ── 读 ──
   getState(): Project {
-    return this.project;
+    return this.getUnitIdentityConflict() ? structuredClone(this.project) : this.project;
+  }
+  /** 纯身份扫描；重复身份时允许读取/派生，但禁止所有模型写路径。 */
+  getUnitIdentityConflict(): string | null {
+    if (this.externalReadOnlyReason) return this.externalReadOnlyReason;
+    const duplicates = findDuplicateUnitIds(this.project);
+    return duplicates.length ? unitIdentityConflictMessage('project', duplicates) : null;
   }
   getRules(): RuleSet {
     return this.rules;
@@ -918,10 +1025,10 @@ export class CommandBus {
     return this.entries;
   }
   canUndo(): boolean {
-    return this.pointer >= 0;
+    return !this.getUnitIdentityConflict() && this.pointer >= 0;
   }
   canRedo(): boolean {
-    return this.pointer + 1 < this.entries.length;
+    return !this.getUnitIdentityConflict() && this.pointer + 1 < this.entries.length;
   }
   /** 已生效的日志条目（从旧到新），供历史面板展示 */
   activeLog(): LogEntry[] {
@@ -963,6 +1070,12 @@ export class CommandBus {
       // 组合：载荷缺什么就说什么（plan 那边也会 return null，但这里给得出人话）
       if (cmd.op === 'assembly.create' && !cmd.payload?.assembly) {
         return { ok: false, error: 'assembly.create 缺少 payload.assembly' };
+      }
+      if (cmd.op === 'assembly.confirm' && cmd.source !== 'ui') {
+        return { ok: false, error: '装配组只能由房间工作区的明确用户确认入口确认' };
+      }
+      if (cmd.op === 'assembly.confirm' && !cmd.payload?.assemblyId) {
+        return { ok: false, error: 'assembly.confirm 缺少 payload.assemblyId' };
       }
       if (cmd.op === 'assembly.connect' && !cmd.payload?.connection) {
         return { ok: false, error: 'assembly.connect 缺少 payload.connection' };
@@ -1059,7 +1172,13 @@ export class CommandBus {
    * 拖动/夹点编辑的实时预览走这里 —— 因此预览必然与提交结果逐位一致。
    */
   preview(cmd: Command): { ok: boolean; error?: string; project: Project } {
+    const identityConflict = this.getUnitIdentityConflict();
+    if (identityConflict) return { ok: false, error: identityConflict, project: this.getState() };
     const p = this.plan(cmd);
+    if (p.ok) {
+      const duplicates = findDuplicateUnitIds(p.draft);
+      if (duplicates.length) return { ok: false, error: unitIdentityConflictMessage('command result', duplicates), project: this.getState() };
+    }
     return p.ok ? { ok: true, project: p.draft } : { ok: false, error: p.error, project: this.project };
   }
 
@@ -1086,9 +1205,14 @@ export class CommandBus {
       memoryHits: [],
     });
 
+    const identityConflict = this.getUnitIdentityConflict();
+    if (identityConflict) return empty(identityConflict);
+
     const planned = this.plan(cmd);
     if (!planned.ok) return empty(planned.error);
     const { draft, diff, inverse, sideEffects, clamped } = planned;
+    const candidateDuplicates = findDuplicateUnitIds(draft);
+    if (candidateDuplicates.length) return empty(unitIdentityConflictMessage('command result', candidateDuplicates));
 
     // ④ 试算派生数据 + 规则（这就是干跑的价值：先看后果）
     const before = this.derive();
@@ -1160,6 +1284,7 @@ export class CommandBus {
       for (let i = this.pointer + 1; i < this.entries.length; i++) this.entries[i].discarded = true;
       this.entries = this.entries.slice(0, this.pointer + 1);
     }
+    this.reconcileAssemblyRelationChanges(this.project, draft);
     this.project = draft;
     this.modelVersion++;
     this.geomCache = null;
@@ -1218,6 +1343,31 @@ export class CommandBus {
     return { units: row.units, basePath: unitPathPrefix(cab.layout, ri) };
   };
 
+  if (cmd.op === 'drawing.edits.replace') {
+    if (cmd.source !== 'ui' || !Array.isArray(p.drawingEdits)) return null;
+    const ids = new Set<string>();
+    for (const e of p.drawingEdits as DrawingEntity[]) {
+      if (!e || typeof e.id !== 'string' || !e.id || ids.has(e.id)) return null;
+      ids.add(e.id);
+      if (!['plan', 'sheet'].includes(e.space) || !['line', 'polyline', 'text', 'dimension', 'leader'].includes(e.kind)) return null;
+      if (e.space === 'sheet' && (!['top', 'front', 'internal'].includes(e.view ?? '') || !e.cabinetId || !draft.cabinets.some(c => c.id === e.cabinetId))) return null;
+      if (!Array.isArray(e.points) || e.points.length > 500 || e.points.some(q => !Number.isFinite(q?.x) || !Number.isFinite(q?.y) || Math.abs(q.x) > 1_000_000 || Math.abs(q.y) > 1_000_000)) return null;
+      if (!Number.isFinite(e.textSize) || e.textSize < 1 || e.textSize > 10000 || !Number.isFinite(e.lineWidth) || e.lineWidth < 0.1 || e.lineWidth > 100) return null;
+      if (typeof e.layer !== 'string' || e.layer.length > 80) return null;
+      if (e.replacesSource !== undefined && (typeof e.replacesSource !== 'string' || e.replacesSource.length === 0 || e.replacesSource.length > 512)) return null;
+      if (e.rot !== undefined && (!Number.isFinite(e.rot) || Math.abs(e.rot) > 360000)) return null;
+      if (e.closed !== undefined && typeof e.closed !== 'boolean') return null;
+      if (e.dash !== undefined && (!Array.isArray(e.dash) || e.dash.length > 16 || e.dash.some(n => !Number.isFinite(n) || n <= 0 || n > 10000))) return null;
+    }
+    const prev = structuredClone(draft.drawingEdits ?? []);
+    const next = structuredClone(p.drawingEdits as DrawingEntity[]);
+    if (JSON.stringify(prev) === JSON.stringify(next)) return null;
+    return {
+      sideEffects: [{ kind: 'replaceDrawingEdits', prev, next }],
+      diff: [{ path: '(drawing.edits)', from: `${prev.length} 个图元`, to: `${next.length} 个图元` }],
+    };
+  }
+
   if (cmd.op === 'cabinet.create') {
     const cab = structuredClone(p.cabinet!);
     // 归一化：补齐可能缺失的默认值（AI 只给核心字段时也能落地）
@@ -1235,6 +1385,27 @@ export class CommandBus {
     if (!cab.layout || !hasAnyUnits) {
       cab.layout = { type: 'row', widthMode: 'fit_total', units: defaultUnits(cab.params.width, this.rules, cab.params.depth) };
     }
+    // Unit IDs participate in derived panel/source IDs and can be referenced outside the
+    // cabinet. Resolve project-wide collisions when the cabinet is created, not on restart.
+    const takenUnitIds = new Set<string>();
+    for (const existing of draft.cabinets) {
+      for (const unit of allUnits(existing.layout)) takenUnitIds.add(unit.id);
+      for (const unit of existing.layout.backUnits ?? []) takenUnitIds.add(unit.id);
+    }
+    const uniquifyUnits = (units: UnitSpec[]): void => {
+      for (const unit of units) {
+        if (takenUnitIds.has(unit.id)) unit.id = nextId('unit', takenUnitIds);
+        takenUnitIds.add(unit.id);
+      }
+    };
+    if (cab.layout.rows?.length) {
+      for (const row of cab.layout.rows) uniquifyUnits(row.units);
+      // Keep the legacy first-row mirror aligned with the canonical rows.
+      cab.layout.units = cab.layout.rows[0]!.units;
+    } else {
+      uniquifyUnits(cab.layout.units);
+    }
+    if (cab.layout.backUnits) uniquifyUnits(cab.layout.backUnits);
     if (!cab.id) cab.id = nextId('cab', draft.cabinets.map((c) => c.id));
     if (draft.cabinets.some((c) => c.id === cab.id)) return null;
     const room = draft.rooms.find((r) => r.id === cab.roomId) ?? draft.rooms[0];
@@ -1324,8 +1495,31 @@ export class CommandBus {
     //      而不是"取多数派"那种自作聪明。
     //   ③ **落位不由这里算**。整体移动只做平移（改 x/y），"移到哪不撞"仍由
     //      detectCollisions 在提交时判定 —— 关系层不写第二套坐标。
+    if (cmd.op === 'assembly.confirm') {
+      const id = p.assemblyId;
+      if (!id) return null;
+      const list = draft.assemblies ?? [];
+      const i = list.findIndex((a) => a.id === id);
+      if (i < 0) return null;
+      const prev = structuredClone(list[i]!);
+      if (prev.memberIds.length === 0) return null;
+      const memberCabinets = prev.memberIds.map((memberId) => draft.cabinets.find((cabinet) => cabinet.id === memberId));
+      if (memberCabinets.some((cabinet) => !cabinet || cabinet.roomId !== prev.roomId)) return null;
+      if (prev.connections.some((connection) => !prev.memberIds.includes(connection.a.cabinetId) || !prev.memberIds.includes(connection.b.cabinetId))) return null;
+      const next = { ...prev, ...confirmedAssemblySnapshot(prev) };
+      return {
+        sideEffects: [{ kind: 'patchAssembly', assemblyId: id, prev, next }],
+        diff: [{ path: `assemblies[${i}].confirmed`, from: prev.confirmed ?? false, to: true }],
+      };
+    }
     if (cmd.op === 'assembly.create') {
       const asm = structuredClone(p.assembly!);
+      // MCP/AI/import-style creation is never a user confirmation, even if payloads forge these fields.
+      delete asm.confirmed;
+      delete asm.relationGeneration;
+      delete asm.confirmedRelationGeneration;
+      delete asm.confirmedMemberIds;
+      delete asm.confirmedConnections;
       if (!asm.memberIds || asm.memberIds.length === 0) return null;
       const cabById = new Map(draft.cabinets.map((c) => [c.id, c]));
       for (const id of asm.memberIds) if (!cabById.has(id)) return null;
@@ -1666,9 +1860,12 @@ export class CommandBus {
   // ───────────────────────────── Undo / Redo ─────────────────────────────
 
   undo(): boolean {
+    if (this.getUnitIdentityConflict()) return false;
     if (!this.canUndo()) return false;
     const e = this.entries[this.pointer];
+    const previous = structuredClone(this.project);
     this.revert(e, false);
+    this.reconcileAssemblyRelationChanges(previous, this.project);
     e.applied = false;
     this.pointer--;
     this.modelVersion++;
@@ -1679,9 +1876,12 @@ export class CommandBus {
   }
 
   redo(): boolean {
+    if (this.getUnitIdentityConflict()) return false;
     if (!this.canRedo()) return false;
     const e = this.entries[this.pointer + 1];
+    const previous = structuredClone(this.project);
     this.revert(e, true);
+    this.reconcileAssemblyRelationChanges(previous, this.project);
     e.applied = true;
     this.pointer++;
     this.modelVersion++;
@@ -1858,11 +2058,62 @@ export class CommandBus {
     }
   }
 
-  /** 直接替换整个项目（导入 / 打开文件 / 恢复草稿）—— 也走日志，可撤销 */
+  /** 普通替换、自动 hydrate 与重挂载不能解除身份锁。 */
   replaceProject(next: Project, label: string): void {
+    this.commitProjectReplacement(next, label, false);
+  }
+
+  /** 纯预演项目替换：返回 reconcile 后项目和独立 ledger 副本，不修改 live 或账本。 */
+  prepareProjectReplacement(next: Project): PreparedProjectReplacement {
+    const currentConflict = this.getUnitIdentityConflict();
+    if (currentConflict) throw Object.assign(new Error(currentConflict), { code: 'WORKSPACE_UNIT_ID_CONFLICT' });
+    const nextDuplicates = findDuplicateUnitIds(next);
+    if (nextDuplicates.length) throw unitIdentityConflictError('replacement project', nextDuplicates);
+    const project = structuredClone(next);
+    const relationGenerations = new Map(this.assemblyRelationGenerations);
+    this.reconcileAssemblyRelationChanges(this.project, project, relationGenerations);
+    return { project, relationGenerations, baseProject: this.project, baseModelVersion: this.modelVersion };
+  }
+
+  /** 持久化成功后提交预演结果；基线检查避免将过期预演发布到不同 live 上。 */
+  replacePreparedProject(prepared: PreparedProjectReplacement, label: string): void {
+    if (prepared.baseProject !== this.project || prepared.baseModelVersion !== this.modelVersion) {
+      throw new Error('预演的项目替换已过期，未发布 live Project 或关系代次');
+    }
+    this.commitProjectReplacement(prepared.project, label, false, new Map(prepared.relationGenerations));
+  }
+
+  /** 仅供明确的用户项目切换流程调用：先验证目标无重复，再原子切换并清除旧项目锁。 */
+  switchToValidatedHealthyProject(next: Project, label: string, explicitUserSelection: true): void {
+    if (explicitUserSelection !== true) throw new Error('清除身份锁必须来自显式用户项目切换');
+    const nextDuplicates = findDuplicateUnitIds(next);
+    if (nextDuplicates.length) throw unitIdentityConflictError('selected healthy project', nextDuplicates);
+    const priorExternalLock = this.externalReadOnlyReason;
+    this.externalReadOnlyReason = null;
+    try {
+      this.commitProjectReplacement(next, label, true);
+    } catch (error) {
+      this.externalReadOnlyReason = priorExternalLock;
+      throw error;
+    }
+  }
+
+  private commitProjectReplacement(
+    next: Project,
+    label: string,
+    explicitHealthySwitch: boolean,
+    reconciledRelationGenerations?: Map<string, number>,
+  ): void {
+    const currentConflict = explicitHealthySwitch ? null : this.getUnitIdentityConflict();
+    if (currentConflict) throw Object.assign(new Error(currentConflict), { code: 'WORKSPACE_UNIT_ID_CONFLICT' });
+    const nextDuplicates = findDuplicateUnitIds(next);
+    if (nextDuplicates.length) throw unitIdentityConflictError('replacement project', nextDuplicates);
     // prev 侧快照带 provenance（物化当前 live）：撤销本次替换时才能原样恢复旧 provenance。
     const prev = this.toFileSnapshot();
     const nextInMemory = structuredClone(next);
+    const nextRelationGenerations = new Map(reconciledRelationGenerations ?? this.assemblyRelationGenerations);
+    if (!reconciledRelationGenerations) this.reconcileAssemblyRelationChanges(this.project, nextInMemory, nextRelationGenerations);
+    const nextSnapshot = structuredClone(nextInMemory);
     // P8.5-B：整批载入 = provenance 状态整体重置。旧映射先清（旧柜绝不残留），
     // 再按【载入内容】重新种子化——自家格式（项目文件 / 草稿）里带 provenance = 恢复，
     // 外来来源（P4/P5 适配器构造的柜）从不带该字段 = 天然 unknown。两种都诚实：
@@ -1872,6 +2123,7 @@ export class CommandBus {
     this.seedProvenanceFromProject(nextInMemory);
     this.stripProvenanceFields(nextInMemory);
     this.project = nextInMemory;
+    this.assemblyRelationGenerations = nextRelationGenerations;
     if (this.pointer + 1 < this.entries.length) this.entries = this.entries.slice(0, this.pointer + 1);
     this.modelVersion++;
     this.geomCache = null;
@@ -1885,7 +2137,7 @@ export class CommandBus {
       inverse: [],
       // 快照两侧都保留 provenance（next 原样、prev 已物化）：撤销/重做时按原样恢复，
       // provenance 与模型原子同步 —— 与 execute/undo/redo 的总纪律一致。
-      sideEffects: [{ kind: 'replaceProject', prev, next: structuredClone(next) }],
+      sideEffects: [{ kind: 'replaceProject', prev, next: nextSnapshot }],
       derived: this.sumDerived(this.derive().geom),
       issueDelta: { errors: 0, warnings: 0, added: [] },
       applied: true,
@@ -1894,6 +2146,24 @@ export class CommandBus {
     // 会话日志里指向旧模型的 provenance 一并清空（新会话从载入内容起步）。
     for (const e of this.entries) e.placementProvenance = undefined;
     this.pointer = this.entries.length - 1;
+    this.notify();
+  }
+
+  /** 只读地装载项目用于浏览/刷新 hydrate；不清身份锁、不进修改历史、不触发保存。 */
+  loadProjectReadOnly(next: Project): void {
+    const previous = structuredClone(this.project);
+    const nextInMemory = structuredClone(next);
+    this.reconcileAssemblyRelationChanges(previous, nextInMemory);
+    this.project = nextInMemory;
+    this.entries = [];
+    this.pointer = -1;
+    this.provById.clear();
+    this.baselineProv.clear();
+    this.seedProvenanceFromProject(this.project);
+    this.stripProvenanceFields(this.project);
+    this.modelVersion++;
+    this.geomCache = null;
+    this.explodeCache = null;
     this.notify();
   }
 
@@ -1909,6 +2179,8 @@ export class CommandBus {
     issues.push(...validateCornerInterference(p, this.rules));
     // 组合关系（v0.3，P2）：只校验**声明过**的关系；无组合时返回空数组（v0.2 逐位等价）
     issues.push(...validateAssemblies(p));
+    // 跨柜共享制造对象必须显式确认、可追溯且未 stale；统一阻断所有正式导出。
+    issues.push(...validateSharedPanels(p, this.rules));
     // 空间语义（v0.3，P8.7）：Room/Wall/Opening 的事实层校验。
     // 只报空间层独有问题（房间形状/洞口 span/柜在房间外/柜盖洞口）；
     // 穿墙硬错误仍归 geometry 层 RULE-CABINET-IN-WALL，不重复报。

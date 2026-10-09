@@ -172,8 +172,8 @@ export function boxSelectMode(a: Vec2, b: Vec2): 'window' | 'crossing' {
 /**
  * ── PickLine 命中测试（A2，设计文档《Local-Pick-Edit》§2.2）──
  *
- * 四视图图幅是只读视图，但"点一条线"要的从来不是改线 ——
- * 是解析出它背后的语义参数（哪个柜体的哪个部件、改哪条路径）。
+ * 四视图由同一模型投影派生；命中尺寸线会解析出其语义参数（柜体、部件与参数路径），
+ * 后续拖动修改的是模型参数，而不是直接改图元。
  * PickLine 的 pts 与图元同源生成（pickLines.ts），命中的就是屏幕上看得见的线。
  */
 import type { PickLine } from '../core/geometry/pickLines.ts';

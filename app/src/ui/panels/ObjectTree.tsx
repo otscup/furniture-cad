@@ -10,6 +10,7 @@ export function ObjectTree(props: {
   version: number;
   selection: string[];
   setSelection: (ids: string[]) => void;
+  readOnly?: boolean;
 }): ReactNode {
   const { bus, selection } = props;
   const project = bus.getState();
@@ -77,9 +78,9 @@ export function ObjectTree(props: {
             type="button"
             className="btn"
             title={selCabs.length >= 2 && sameRoom ? '把这组柜体声明成一个组合（不动任何尺寸）' : '只能把同一个房间里的柜体组成一组'}
-            disabled={!sameRoom}
+            disabled={props.readOnly || !sameRoom}
             onClick={() =>
-              bus.execute(
+              !props.readOnly && bus.execute(
                 CMD.createAssembly({
                   id: '',
                   name: `组合 ${(project.assemblies?.length ?? 0) + 1}`,
@@ -207,8 +208,10 @@ export function ObjectTree(props: {
                     <button
                       type="button"
                       className="btn"
+                      disabled={props.readOnly}
                       title={`补 ${missingOf(a).length} 条：${missingOf(a).map((c) => KIND_ZH[c.kind]).join('、')}`}
                       onClick={() => {
+                        if (props.readOnly) return;
                         for (const c of missingOf(a)) {
                           bus.execute(
                             CMD.connectInAssembly(a.id, a.name, {
@@ -228,8 +231,9 @@ export function ObjectTree(props: {
                   <button
                     type="button"
                     className="btn"
+                    disabled={props.readOnly}
                     title="只取消「这是一组」的语义，不会删掉里头的柜体"
-                    onClick={() => bus.execute(CMD.deleteAssembly(a.id, a.name))}
+                    onClick={() => { if (!props.readOnly) bus.execute(CMD.deleteAssembly(a.id, a.name)); }}
                   >
                     删除组合
                   </button>

@@ -72,51 +72,35 @@ const MUTANTS: Mutant[] = [
     what: '写模型绕过 CommandBus（直接假装成功，不经白名单校验）',
     file: WS,
     from:
-      '    // ── 唯一写入口：模型变更只允许经 CommandBus（其 plan() 内含 WRITABLE/DENY 白名单）──\n' +
-      '    const r = this.bus.execute(cmd);',
+      '      // ── 唯一写入口：模型变更只允许经 CommandBus（其 plan() 内含 WRITABLE/DENY 白名单）──\n' +
+      '      const r = this.bus.execute(cmd);',
     to:
-      '    // 变异：绕过 CommandBus 直接假装成功（破坏写路径白名单）\n' +
-      '    const r = { ok: true, diff: [], newIssues: [], resolvedIssues: [], derived: { panels: 0, pieces: 0 }, clamped: [], blockingErrors: 0, memoryHits: [] } as ExecResult;',
+      '      // 变异：绕过 CommandBus 直接假装成功（破坏写路径白名单）\n' +
+      '      const r = { ok: true, diff: [], newIssues: [], resolvedIssues: [], derived: { panels: 0, pieces: 0 }, clamped: [], blockingErrors: 0, memoryHits: [] } as ExecResult;',
     expect: 'B4/B5（非法 op、越权路径 panels.* 不再被拒）',
   },
   {
     id: 'M2',
     what: 'apply 的乐观锁（stale 检查）被整段删除',
     file: WS,
-    from:
-      '    if (this.liveModelVersion !== d.baseModelVersion) {\n' +
-      '      return {\n' +
-      '        ok: false,\n' +
-      '        code: DRAFT_STALE,\n' +
-      '        message: `live=${this.liveModelVersion} ≠ base=${d.baseModelVersion}：draft 已过期，拒绝应用（需 rebase 后重试）`,\n' +
-      '      };\n' +
-      '    }',
-    to: '    /* 变异：乐观锁已删除，stale 不再拒绝 */',
+    from: '    if (metadataMismatch || freshness.isStale) {',
+    to: '    if (false) { /* 变异：乐观锁已删除，stale 不再拒绝 */',
     expect: 'C9/C10（旧 draft apply 不再结构化拒绝、live 被覆盖）',
   },
   {
     id: 'M3',
     what: 'stale 时自动 merge / last-write-wins（不拒绝、直接应用）',
     file: WS,
-    from:
-      '      return {\n' +
-      '        ok: false,\n' +
-      '        code: DRAFT_STALE,\n' +
-      '        message: `live=${this.liveModelVersion} ≠ base=${d.baseModelVersion}：draft 已过期，拒绝应用（需 rebase 后重试）`,\n' +
-      '      };',
-    to: '      /* 变异：stale 但自动 merge（last-write-wins），不拒绝 */',
+    from: '    if (metadataMismatch || freshness.isStale) {',
+    to: '    if (metadataMismatch) { /* 变异：移除基线 stale 拒绝 */',
     expect: 'C9（stale 仍被拒绝）',
   },
   {
     id: 'M4',
     what: 'draft 命令直接作用于 live 总线（破坏 draft/live 隔离）',
     file: WS,
-    from:
-      '    // draft 命令只作用于 draft 自己的总线；绝不写 live\n' +
-      '    return d.execute(cmd);',
-    to:
-      '    // 变异：draft 命令直接作用于 live 总线（破坏隔离）\n' +
-      '    return this.bus.execute(cmd);',
+    from: '      const result = candidate.execute(cmd);',
+    to: '      const result = this.bus.execute(cmd); // 变异：draft 命令直接作用于 live 总线',
     expect: 'C4（draft 内修改后 live 仍保持原值）',
   },
   {

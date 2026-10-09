@@ -341,6 +341,8 @@ export const ACTIONS = {
       width: { type: 'number', min: 300, max: 6000, unit: 'mm' },
       height: { type: 'number', min: 300, max: 4000, unit: 'mm' },
       depth: { type: 'number', min: 200, max: 1200, unit: 'mm' },
+      cabinetType: { type: 'enum', values: ['base', 'wall', 'tall', 'island'], desc: '柜体类型；吊柜用 wall，岛台用 island' },
+      bodyLift: { type: 'number', min: 0, max: 300, unit: 'mm', desc: '踢脚高度；吊柜通常为 0' },
       atX: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 X（★ 强烈建议省略：你没有墙的坐标，猜出来的点多半扎在墙里；省略后系统按 rotation 贴到朝向对的墙上）' },
       atY: { type: 'number', min: -50000, max: 50000, unit: 'mm', desc: '落位 Y（同上，建议省略）' },
       /**
@@ -361,7 +363,7 @@ export const ACTIONS = {
       },
       units: UNIT_INTENT_DOC,
       backUnits: { ...UNIT_INTENT_DOC, desc: '背面分区（从左到右）。给了就建**双面柜（岛台）**：前后两排背靠背、共用中板、没有背板。岛台/吧台这类两面临走的柜子才用' },
-      mountHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', optional: true, desc: '壁挂安装高度：柜体底板离地高度。吊柜给（如 1400）；落地柜不给（=0）。' },
+      mountHeight: { type: 'number', min: 0, max: 3000, unit: 'mm', optional: true, desc: '柜体底板离地高度。cabinetType=wall 时必须给正数（mm）；地柜/高柜/岛台必须为 0。' },
       /**
        * 垂直行（v0.3 / P1 形状；P3 起设计方案也能表达）。
        * "上面挂衣服、下面放鞋"这种**上下分层**用 rows；units 是左右并排。

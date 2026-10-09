@@ -1,6 +1,6 @@
 /**
  * ══════════════════════════════════════════════════════════════════════
- *  P10.0 · S2 验收的**变异验收**（M1–M6）
+ *  P10.0 · S2 验收的**变异验收**（M1–M8）
  *
  *  ── 它做什么 ──
  *  对每一项：把 S2 的关键保护改回「出事状态」→ 跑 mcp-acceptance.ts →
@@ -67,6 +67,7 @@ interface Mutant {
   from: string;
   to: string;
   expect: string;
+  expectFailedLabels?: string[];
 }
 
 const MUTANTS: Mutant[] = [
@@ -113,10 +114,10 @@ const MUTANTS: Mutant[] = [
     id: 'M5',
     what: 'validate 直接替换现有 validator（返回自造的"没问题"）',
     file: MCP,
-    from: '      const v = ws.validate();',
+    from: '        v = ws.validate();',
     to:
-      "      // 变异：绕过既有 CommandBus.derive，自造一份校验结果\n" +
-      "      const v = { issues: [], derived: { panels: 0, pieces: 0, areaM2: 0, weightKg: 0 }, blockingErrors: 0 };",
+      "        // 变异：绕过既有 CommandBus.derive，自造一份实时校验结果\n" +
+      "        v = { issues: [], derived: { panels: 0, pieces: 0, areaM2: 0, weightKg: 0 }, blockingErrors: 0 };",
     expect: '②3/②3b/②3c（派生汇总与 issues 与既有 validator 不一致）',
   },
   {
@@ -141,35 +142,7 @@ const MUTANTS: Mutant[] = [
   // ── ⑧ 段（"记不下来"不得升级成"服务没了"）的反恒真变异 ──
   {
     id: 'M7',
-    what: '工作区装载失败的审计不再受保护（"记不下来"升级成未处理拒绝 ⇒ 服务被杀）',
-    file: SRV,
-    from:
-      '    try {\n' +
-      "      auth.audit({ actor: null, action: 'workspace.load', result: 'fail', error: workspaceState.error });\n" +
-      '    } catch {\n' +
-      '      /* 见上：审计落不下盘不是新故障，已有渠道如实报出 */\n' +
-      '    }',
-    to: "    auth.audit({ actor: null, action: 'workspace.load', result: 'fail', error: workspaceState.error });",
-    expect: '⑧A1/⑧A2（数据目录不可写时服务进程消失）',
-  },
-  {
-    id: 'M8',
-    what: '/mcp 的审计不再受保护（认证失败路径上的 audit 抛出即杀掉服务）',
-    file: MCP,
-    from:
-      '  const safeAudit = (entry) => {\n' +
-      '    try {\n' +
-      '      audit(entry);\n' +
-      '    } catch {\n' +
-      '      /* 见上 */\n' +
-      '    }\n' +
-      '  };',
-    to: '  const safeAudit = (entry) => audit(entry);',
-    expect: '⑧B2/⑧B2b（审计不可写时 /mcp 的 401 把服务带走）',
-  },
-  {
-    id: 'M9',
-    what: '装载事件通知不再受保护（旁路通知抛出 ⇒ 工作区被误判为装载失败）',
+    what: '工作区装载通知不再受保护（审计旁路异常 ⇒ 工作区被误判为装载失败）',
     file: HOST,
     from:
       '  const notify = (event) => {\n' +
@@ -181,6 +154,22 @@ const MUTANTS: Mutant[] = [
       '  };',
     to: '  const notify = (event) => onEvent(event);',
     expect: '⑧B3（审计不可写时工作区被误判装载失败）',
+  },
+  {
+    id: 'M8',
+    what: '/mcp 的审计不再受保护（认证失败路径上的 audit 抛出即杀掉服务）',
+    file: MCP,
+    from:
+      '  const safeAudit = (entry) => {\n' +
+      '    try {\n' +
+      '      audit(entry);\n' +
+      '    } catch {\n' +
+      '      /* 审计写入失败不改变 /mcp 响应；健康接口另报 dataWritable。 */\n' +
+      '    }\n' +
+      '  };',
+    to: '  const safeAudit = (entry) => audit(entry);',
+    expect: '⑧B2/⑧B2b（审计不可写时 /mcp 的 401 把服务带走）',
+    expectFailedLabels: ['⑧A5', '⑧B2', '⑧B3'],
   },
 ];
 
@@ -201,9 +190,10 @@ async function mutate(m: Mutant): Promise<void> {
   try {
     writeFileSync(m.file, mutated, 'utf8');
     const r = await runAcceptance();
-    const caught = r.completed && r.failedCount > 0;
+    const missingExpected = (m.expectFailedLabels ?? []).filter(label => !r.out.includes(`✗ ${label}`));
+    const caught = r.completed && r.failedCount > 0 && missingExpected.length === 0;
     const redLines = (r.out.match(/^\s+\u2717 .+$/gm) ?? []).slice(0, 4).join('\n      ');
-    ok(`变异【${m.id}】被验收抓到（${m.what}）`, caught, `completed=${r.completed} 失败数=${r.failedCount}\n      期望红的断言：${m.expect}\n${redLines}`);
+    ok(`变异【${m.id}】被验收抓到（${m.what}）`, caught, `completed=${r.completed} 失败数=${r.failedCount}\n      期望红的断言：${m.expect}${missingExpected.length ? `\n      缺少行为失败：${missingExpected.join(', ')}` : ''}\n${redLines}`);
   } finally {
     writeFileSync(m.file, raw, 'utf8');
   }

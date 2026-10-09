@@ -45,6 +45,7 @@ export const LAYERS: LayerDef[] = [
 
   { name: 'F-DIM', label: '尺寸标注', color: '#b91c1c', lw: 1, defaultVisible: true, plot: true, group: '标注' },
   { name: 'F-TEXT', label: '文字', color: '#475569', lw: 1, defaultVisible: true, plot: true, group: '标注' },
+  { name: 'F-CAD-EDIT', label: '手工图元 / 视图覆盖', color: '#0f766e', lw: 1.5, defaultVisible: true, plot: true, group: '手工编辑' },
 
   { name: 'PANEL_18', label: '18mm 板件', color: '#1d4ed8', lw: 1.2, defaultVisible: true, plot: true, group: '板件' },
   { name: 'PANEL_15', label: '15mm 板件', color: '#7c3aed', lw: 1.2, defaultVisible: true, plot: true, group: '板件' },

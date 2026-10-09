@@ -99,6 +99,31 @@ section('2. 构造：模板柜走同一条 makeUnit → createCabinet 管线');
   ok('同批构造的柜体 id 不冲突（takenIds 真的在工作）', taken.size === CABINET_TEMPLATES.length);
 }
 
+section('2b. 同项目重复新建柜型：分区 ID 全局唯一');
+{
+  const takenCabinetIds = new Set<string>();
+  const takenUnitIds = new Set<string>();
+  const allUnitIds: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const cabinet = createCabinetFromTemplate({
+      templateId: 'default',
+      name: `同项目第 ${index + 1} 个默认柜`,
+      roomId: 'room_check',
+      x: index * 1000,
+      y: 0,
+      rules,
+      takenIds: takenCabinetIds,
+      takenUnitIds,
+    });
+    takenCabinetIds.add(cabinet.id);
+    for (const unit of cabinet.layout.units) {
+      allUnitIds.push(unit.id);
+      takenUnitIds.add(unit.id);
+    }
+  }
+  ok('三个同模板柜体的全部分区 ID 互不重复', new Set(allUnitIds).size === allUnitIds.length, allUnitIds.join(', '));
+}
+
 section('3. 派生：模板柜的 layout / views / bodies3d 全部现算成立');
 for (const tpl of CABINET_TEMPLATES) {
   const cab = createCabinetFromTemplate({

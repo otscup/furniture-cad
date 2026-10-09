@@ -51,11 +51,13 @@ export function DraftPreview(props: {
   roomLabel?: string;
   /** 画布高度（CSS 像素） */
   height?: number;
+  /** 页面容器可指定初始观察方式；缺省仍为正面图。 */
+  initialView?: ViewKind;
 }): ReactNode {
   const height = props.height ?? 176;
   const ref = useRef<HTMLCanvasElement | null>(null);
   const [w, setW] = useState(300);
-  const [view, setView] = useState<ViewKind>('front');
+  const [view, setView] = useState<ViewKind>(props.initialView ?? 'front');
   /** 生成失败的柜体要说出来 —— 静默跳过会被读成"AI 没画" */
   const [buildErr, setBuildErr] = useState('');
 

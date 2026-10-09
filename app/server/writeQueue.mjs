@@ -17,8 +17,9 @@
  *   · 不换数据库、不引入第二存储系统（与 P10.0 架构审查 IR-5 一致）。
  * ══════════════════════════════════════════════════════════════════════
  */
-import { renameSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { renameSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
+const defaultFileSystem = { renameSync, writeFileSync, mkdirSync, existsSync, unlinkSync };
 
 /**
  * 每条路径一条 promise 链。链的当前末端 = 该路径「上一个已排队的写」的完成态。
@@ -46,17 +47,36 @@ export function enqueueWrite(path, task) {
  * 原子写字符串到文件（tmp + rename）。本函数本身不读旧文件、不做 read-modify-write；
  * 串行化由 enqueueWrite 保证。调用方应传入「当前内存真相」的完整内容。
  */
-export async function writeFileAtomic(path, content) {
+export async function writeFileAtomic(path, content, fileSystem = defaultFileSystem) {
   return enqueueWrite(path, () => {
     const dir = dirname(path);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    if (!fileSystem.existsSync(dir)) fileSystem.mkdirSync(dir, { recursive: true });
     const tmp = `${path}.${process.pid}.${Date.now().toString(36)}.tmp`;
-    writeFileSync(tmp, content, 'utf8');
-    renameSync(tmp, path);
+    try {
+      fileSystem.writeFileSync(tmp, content, 'utf8');
+      fileSystem.renameSync(tmp, path);
+    } catch (error) {
+      // rename/write 失败时不碰目标文件，并尽力清除可能已生成的临时文件。
+      try { fileSystem.unlinkSync(tmp); } catch (cleanupError) {
+        if (cleanupError?.code !== 'ENOENT') { /* preserve the original I/O error */ }
+      }
+      throw error;
+    }
   });
 }
 
-/** 便捷：把对象原子写成 JSON 文件。 */
+/** 在同一文件队列中幂等删除，保证之前的 save 完成后删除且之后不被旧写复活。 */
+export async function deleteFileAtomic(path, fileSystem = defaultFileSystem) {
+  return enqueueWrite(path, () => {
+    try {
+      fileSystem.unlinkSync(path);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  });
+}
+
+/** 便捷：把对象原子写成 JSON。 */
 export async function writeJsonAtomic(path, obj) {
   return writeFileAtomic(path, JSON.stringify(obj, null, 2));
 }

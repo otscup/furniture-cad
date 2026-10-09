@@ -33,6 +33,8 @@ export interface Project {
   ruleSetId: string;
   rooms: Room[];
   cabinets: Cabinet[];
+  /** 跨柜共享台面/顶板：仅显式创建的制造对象参与替代与生产导出。 */
+  sharedPanels?: SharedPanel[];
   /**
    * 家具组合（v0.3，可选）—— 一组柜体的**语义分组 + 关系声明**。
    *
@@ -73,11 +75,39 @@ export interface Project {
    * 缺省 = 不做人体工学校验（旧文件兼容）。
    */
   customerHeight?: number;
+  /** 二维图纸手工覆盖：与柜体语义参数分离，供视图与正式图纸共同消费。 */
+  drawingEdits?: DrawingEntity[];
+}
+
+export type DrawingSpace = 'plan' | 'sheet';
+export type DrawingEntityKind = 'line' | 'polyline' | 'text' | 'dimension' | 'leader';
+export type DrawingView = 'front' | 'internal' | 'top' | 'side' | 'plan';
+/** authored 二维图元；model-override 只覆盖对应视图，不修改柜体结构参数。 */
+export interface DrawingEntity {
+  id: string;
+  space: DrawingSpace;
+  roomId?: string;
+  cabinetId?: string;
+  view?: DrawingView;
+  kind: DrawingEntityKind;
+  points: Vec2[];
+  text?: string;
+  textSize: number;
+  rot?: number;
+  lineWidth: number;
+  closed?: boolean;
+  dash?: number[];
+  layer: string;
+  align?: 'l' | 'c' | 'r';
+  provenance: 'manual' | 'model-override';
+  replacesSource?: string;
 }
 
 export interface Room {
   id: string;
   name: string;
+  /** 用户可选备注；缺省时与旧项目完全兼容。 */
+  note?: string;
   walls: Wall[];
 }
 
@@ -229,10 +259,29 @@ export interface FurnitureAssembly {
   /** 成员柜体 id（指向 `project.cabinets`）；顺序有意义（界面与快照按此列） */
   memberIds: string[];
   connections: Connection[];
+  /** 只有显式 UI 确认才置 true；缺省/旧文件/MCP 创建均视为未确认。 */
+  confirmed?: boolean;
+  /** 成员/连接关系每发生一次变化就递增；用于阻止往返编辑恢复旧确认。 */
+  relationGeneration?: number;
+  /** 显式确认时的关系代次；缺省或不匹配时绝不视为已确认。 */
+  confirmedRelationGeneration?: number;
+  /** 确认当时的成员与连接快照；任一关系变更后 confirmed 状态即失效。 */
+  confirmedMemberIds?: string[];
+  confirmedConnections?: Connection[];
 }
 
 // ─────────────────────────── 柜体 ───────────────────────────
 
+export type CabinetType = 'base' | 'wall' | 'tall' | 'island';
+/** 台面上的水槽/灶具参考位，待拆单；坐标以柜体背左角为原点（mm），不是生产 CNC 开孔。 */
+export interface CountertopCutout {
+  kind: 'sink' | 'cooktop' | 'other';
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  depth: number;
+}
 export interface CabinetParams {
   width: number;
   height: number;
@@ -246,15 +295,18 @@ export interface CabinetParams {
     clearance: number;
   };
   bodyLift: number;
+  /** 语义柜型：base=地柜、wall=吊柜、tall=高柜、island=岛台。 */
+  cabinetType?: CabinetType;
   /**
    * 壁挂安装高度（mm）：柜体底板离地高度。
    *   · 落地柜恒为 0（bodyLift 管踢脚）；
    *   · 壁挂柜（吊柜）按需给，如 1400。
    * 不叫 `z` 是故意的：placement 明确没有 Z（见 ConnectionKind 注释），
-   * 这是参数层的语义字段，不是 3D 坐标。几何引擎不读它，
-   * 只进清单/图纸标注（安装高度）。
+   * 这是柜体安装语义；碰撞体和所有 3D 构件均以它作为世界 Z 起点。
    */
   mountHeight?: number;
+  /** 台面参考位/待拆单（2D/3D 参考标记；不代表顶板已开孔，当前不生成 CNC 加工孔）。 */
+  counterCutouts?: CountertopCutout[];
   shelfFrontClearance: number;
   /**
    * 见光板（圆弧见光，Phase E 表达异形）。
@@ -608,6 +660,90 @@ export interface Panel {
   edge: EdgeSpec;
   edgeLabel: string;
   layer: string;
+  /** 共享制造对象追溯信息；普通柜体几何板件不带此字段。 */
+  sharedPanelTrace?: SharedPanelTrace;
+}
+
+export interface SharedPanelMemberSnapshot {
+  cabinetId: string;
+  roomId: string;
+  x: number;
+  y: number;
+  rotation: number;
+  width: number;
+  height: number;
+  depth: number;
+  mountHeight: number;
+  bodyLift: number;
+  boardMaterial: string;
+}
+
+export interface SharedPanelSegment {
+  id: string;
+  /** 世界平面坐标下的矩形分段；必须由用户确认，不由系统排版。 */
+  x: number;
+  y: number;
+  length: number;
+  width: number;
+}
+
+export interface SharedPanelHole {
+  id: string;
+  kind: string;
+  /** 共享板局部坐标（mm）。 */
+  x: number;
+  y: number;
+  diameter: number;
+  depth: number;
+}
+
+export interface SharedPanel {
+  id: string;
+  name: string;
+  memberCabinetIds: string[];
+  /** 被该对象替代的柜体结构顶板 ID；必须与 members 一一对应。 */
+  replacesPanelIds: string[];
+  /** 成品板轴对齐矩形外轮廓（世界坐标）：minX=左、maxX=右、minY=后、maxY=前；已包含四边外挑。 */
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+  elevation: number;
+  length: number;
+  width: number;
+  thickness: number;
+  material: string;
+  finish: string;
+  edgeTreatment: EdgeSpec;
+  overhang: { front: number; back: number; left: number; right: number };
+  /** 纹理方向相对成品板长/宽轴；有纹理材料必须确认 length 或 width，无纹理材料必须明确 none。 */
+  grainDirection: Panel['grain'];
+  /** 制造适配字段，必须与 grainDirection 一致；新共享件追溯以 grainDirection 为明确语义。 */
+  grain: Panel['grain'];
+  segmentation: { confirmed: boolean; segments: SharedPanelSegment[] };
+  support: { confirmed: boolean; method: string; memberCabinetIds: string[] };
+  machining: { status: 'confirmed-none' | 'confirmed-holes' | 'reference-only' | 'unconfirmed'; holes: SharedPanelHole[] };
+  memberSnapshots: SharedPanelMemberSnapshot[];
+  confirmation: { status: 'draft' | 'confirmed'; fingerprint?: string };
+}
+
+export interface SharedPanelTrace {
+  id: string;
+  segmentId: string;
+  memberCabinetIds: string[];
+  replacesPanelIds: string[];
+  finish: string;
+  overhang: SharedPanel['overhang'];
+  edgeTreatment: EdgeSpec;
+  supportMethod: string;
+  supportCabinetIds: string[];
+  length: number;
+  width: number;
+  thickness: number;
+  material: string;
+  grainDirection: SharedPanel['grainDirection'];
+  grain: Panel['grain'];
+  segmentation: SharedPanel['segmentation'];
+  machining: SharedPanel['machining'];
+  bounds: SharedPanel['bounds'];
+  elevation: number;
 }
 
 export interface HardwareItem {
@@ -806,6 +942,11 @@ export interface CabinetDerived {
 export interface ProjectGeometry {
   cabinets: Record<string, CabinetGeometry>;
   plan: Prim[];
+  /** 与 plan 一一对应，供二维视图做单图元覆盖。 */
+  planSourceKeys: string[];
+  /** 按房间分组的平面图图元；柜体落位图与墙体和全局 plan 同次派生。 */
+  roomPlans: Record<string, Prim[]>;
+  roomPlanSourceKeys: Record<string, string[]>;
   issues: Issue[];
   bbox: BBox | null;
   /**

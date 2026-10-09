@@ -45,6 +45,7 @@ export interface BomRow {
   verification: MfgVerification;
   /** 该件未确认的制造方面（BOM 上也能看见，不藏） */
   unverified: string[];
+  sharedPanelTrace?: ManufacturingPart['sharedPanelTrace'];
 }
 
 /**
@@ -68,6 +69,7 @@ export function manufacturingToPanels(parts: ManufacturingPart[]): Panel[] {
     edge: p.edge,
     edgeLabel: p.edgeLabel,
     layer: p.layer,
+    ...(p.sharedPanelTrace ? { sharedPanelTrace: p.sharedPanelTrace } : {}),
   }));
 }
 
@@ -87,6 +89,7 @@ export function bomFromManufacturing(parts: ManufacturingPart[]): BomRow[] {
     grain: p.grain,
     verification: p.verification,
     unverified: p.unverified,
+    ...(p.sharedPanelTrace ? { sharedPanelTrace: p.sharedPanelTrace } : {}),
   }));
 }
 
@@ -100,10 +103,11 @@ export function manufacturingToNeutralExport(
   mfgRules: ManufacturingRuleSet,
   which: Array<'plan' | 'sheet'>,
   modelVersion: string,
+  selectedRoomIds?: string[],
 ): NeutralExport {
   const geom = generateProject(project, rules);
   const mfg = deriveManufacturing(project, geom, rules, mfgRules);
-  return toNeutralExport(project, rules, which, modelVersion, manufacturingToPanels(mfg.parts));
+  return toNeutralExport(project, rules, which, modelVersion, manufacturingToPanels(mfg.parts), selectedRoomIds);
 }
 
 /** 便捷：用默认制造规则 */
@@ -112,6 +116,7 @@ export function manufacturingToNeutralExportDefault(
   rules: RuleSet,
   which: Array<'plan' | 'sheet'>,
   modelVersion: string,
+  selectedRoomIds?: string[],
 ): NeutralExport {
-  return manufacturingToNeutralExport(project, rules, DEFAULT_MANUFACTURING_RULES, which, modelVersion);
+  return manufacturingToNeutralExport(project, rules, DEFAULT_MANUFACTURING_RULES, which, modelVersion, selectedRoomIds);
 }

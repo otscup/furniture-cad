@@ -42,6 +42,7 @@ export interface VariantPanelProps {
   onToast: (kind: ToastKind, text: string) => void;
   /** 采用成功后回调（用于把界面切到四视图 / 选中新柜体） */
   onAdopted?: (cabinetId: string) => void;
+  readOnly?: boolean;
 }
 
 /** 缩略图取景留白（mm）—— 图框外留一点，避免最外轮廓贴边被裁 */
@@ -147,6 +148,7 @@ export function VariantPanel(props: VariantPanelProps): ReactNode {
   const invalidate = (): void => setDrafts(null);
 
   const generate = (): void => {
+    if (props.readOnly) return;
     if (!roomId) {
       onToast('warn', '项目里还没有房间，先建一个房间再生成方案');
       return;
@@ -166,6 +168,7 @@ export function VariantPanel(props: VariantPanelProps): ReactNode {
    * 干跑会连记忆门一起过，所以"贴墙放会不会被你上次说的话拦住"在采用前就有答案。
    */
   const adopt = (d: VariantDraft): void => {
+    if (props.readOnly) return;
     const base = adoptVariant(d, bus.getState());
     const placed = placeVariant(base, bus.getState(), (trial) => {
       const r = bus.execute(CMD.createCabinet(trial), { dryRun: true });
@@ -230,7 +233,7 @@ export function VariantPanel(props: VariantPanelProps): ReactNode {
           </select>
         </Row>
         <div className="vgen">
-          <button type="button" className="tb-btn primary" disabled={presets.length === 0} onClick={generate}>
+          <button type="button" className="tb-btn primary" disabled={props.readOnly || presets.length === 0} onClick={generate}>
             生成方案对比
           </button>
           <span className="ts">{specText}</span>
@@ -279,7 +282,7 @@ export function VariantPanel(props: VariantPanelProps): ReactNode {
                   <div className="ts">校验通过：ERROR {countOf(d, 'ERROR')} · WARNING {countOf(d, 'WARNING')}</div>
                 )}
 
-                <button type="button" className="tb-btn" onClick={() => adopt(d)}>
+                <button type="button" className="tb-btn" disabled={props.readOnly} onClick={() => adopt(d)}>
                   采用这个方案
                 </button>
               </div>

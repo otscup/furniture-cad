@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CommandBus } from '../../core/commandBus.ts';
-import type { Issue } from '../../core/types.ts';
+import type { Issue, Project } from '../../core/types.ts';
 import { ACTION_NAMES, ACTIONS } from '../../../shared/aiContract.mjs';
 import { api, requestChat, type ChatTurn, type PlanRejection } from '../../ai/aiClient.ts';
 import type { QuotaView } from '../../ai/quotaTypes.ts';
@@ -88,6 +88,23 @@ const EXAMPLES = [
 /** 对话区的开场问题 —— 都是"看一眼就知道答案对不对"的常识题，用来确认链路通没通 */
 const CHAT_STARTERS = ['这个柜子的踢脚多高？', '背板 9mm 够吗？', '挂衣杆一般离地多高？'];
 
+interface RemoteDraftPreviewState {
+  draftId: string;
+  baseModelVersion: number;
+  liveModelVersion: number;
+  project: Project;
+  blockingErrors: number;
+}
+
+function stableProjectJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableProjectJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableProjectJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
+}
+
 /**
  * 会话存在 sessionStorage。
  *
@@ -125,6 +142,19 @@ interface Turn extends ChatTurn {
   agentSteps?: string;
   /** Agent 执行是否成功 */
   agentOk?: boolean;
+}
+
+function agentDraftIds(agentSteps: string | undefined): string[] {
+  if (!agentSteps) return [];
+  try {
+    const steps = JSON.parse(agentSteps);
+    if (!Array.isArray(steps)) return [];
+    return [...new Set(steps
+      .map((step: any) => step?.result?.draftId)
+      .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0))];
+  } catch {
+    return [];
+  }
 }
 
 /** 把 VisionResult 转成人类可读的摘要 */
@@ -300,7 +330,7 @@ function loadRoomId(): string {
   }
 }
 
-export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void }): ReactNode {
+export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void; /** 房间工作区与聊天共享当前房间上下文。 */ workspaceRoomId?: string; onWorkspaceRoomChange?: (roomId: string) => void; workspaceContext?: boolean; onOpenRemoteDrafts?: () => void; readOnly?: boolean }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
   // ── P10.1 识图：待发送的图片列表（data URL）与各自类型 ──
@@ -319,10 +349,21 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   const busy = busyKind !== '';
   /** 已等待秒数 —— 见文件头"为什么有一个计时器" */
   const [waited, setWaited] = useState(0);
+  const [remoteProjectMismatch, setRemoteProjectMismatch] = useState<boolean | null>(null);
+  const [remoteDraftPreview, setRemoteDraftPreview] = useState<RemoteDraftPreviewState | null>(null);
+  const [remotePreviewOpen, setRemotePreviewOpen] = useState(true);
+  const remotePreviewIdRef = useRef<string | null>(null);
 
   /** 全部会话（按房间 id 存放；'' 这一格是没有选房间时的"全项目"会话） */
   const [convos, setConvos] = useState<Record<string, Convo>>(loadConvos);
   const [roomId, setRoomId] = useState<string>(loadRoomId);
+  useEffect(() => {
+    if (props.workspaceRoomId !== undefined) setRoomId(props.workspaceRoomId);
+  }, [props.workspaceRoomId]);
+  const chooseRoom = useCallback((id: string) => {
+    setRoomId(id);
+    props.onWorkspaceRoomChange?.(id);
+  }, [props.onWorkspaceRoomChange]);
   /** 存不进去要**说一声** —— 默默不存等于骗人说记住了 */
   const [storeErr, setStoreErr] = useState('');
 
@@ -350,9 +391,70 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   }, [props.token]);
 
   const rooms = bus.getState().rooms;
-  /** 房间被删掉后 roomId 失效 —— 退回全项目会话，而不是对着空气聊天 */
-  const activeRoomId = rooms.some((r) => r.id === roomId) ? roomId : '';
+  const workspaceSelectedRoomId = props.workspaceContext && props.workspaceRoomId !== undefined ? props.workspaceRoomId : roomId;
+  const isUnassignedRoomContext = Boolean(
+    props.workspaceContext && workspaceSelectedRoomId && !rooms.some((r) => r.id === workspaceSelectedRoomId),
+  );
+  /** 保留“未分配”会话身份；真实房间失效时才退回全项目会话。 */
+  const activeRoomId = isUnassignedRoomContext
+    ? workspaceSelectedRoomId
+    : rooms.some((r) => r.id === workspaceSelectedRoomId) ? workspaceSelectedRoomId : '';
   const activeRoom = rooms.find((r) => r.id === activeRoomId) ?? null;
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    const refreshRemoteState = async (): Promise<void> => {
+      if (inFlight) return;
+      inFlight = true;
+      const headers: Record<string, string> = {};
+      if (props.token) headers.Authorization = `Bearer ${props.token}`;
+      try {
+        const [workspaceResponse, draftsResponse] = await Promise.all([
+          fetch('/api/workspace', { headers }),
+          fetch('/api/drafts', { headers }),
+        ]);
+        if (cancelled) return;
+        if (workspaceResponse.ok) {
+          const workspace = await workspaceResponse.json();
+          if (workspace?.ok && workspace.project) {
+            setRemoteProjectMismatch(stableProjectJson(workspace.project) !== stableProjectJson(bus.getState()));
+          }
+        }
+        if (!draftsResponse.ok) return;
+        const list = await draftsResponse.json();
+        if (!list?.ok || !Array.isArray(list.drafts)) return;
+        const latest = [...list.drafts].sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
+        if (!latest?.draftId) {
+          remotePreviewIdRef.current = null;
+          setRemoteDraftPreview(null);
+          return;
+        }
+        const detailResponse = await fetch(`/api/drafts/${encodeURIComponent(latest.draftId)}`, { headers });
+        if (!detailResponse.ok) return;
+        const detail = await detailResponse.json();
+        if (cancelled || !detail?.ok || !detail.project) return;
+        if (remotePreviewIdRef.current !== detail.draftId) {
+          remotePreviewIdRef.current = detail.draftId;
+          setRemotePreviewOpen(true);
+        }
+        const next: RemoteDraftPreviewState = {
+          draftId: detail.draftId,
+          baseModelVersion: detail.baseModelVersion,
+          liveModelVersion: detail.liveModelVersion,
+          project: detail.project,
+          blockingErrors: detail.validation?.blockingErrors ?? 0,
+        };
+        setRemoteDraftPreview((current) => current && current.draftId === next.draftId && stableProjectJson(current.project) === stableProjectJson(next.project) && current.blockingErrors === next.blockingErrors ? current : next);
+      } catch {
+        // 连接中断时保留最后一次预览；静默轮询不产生重复错误提示。
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refreshRemoteState();
+    const timer = window.setInterval(() => { void refreshRemoteState(); }, 2200);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [props.token, bus, version, activeRoomId]);
   const convo: Convo = convos[activeRoomId] ?? emptyConvo();
 
   const setConvo = useCallback(
@@ -524,8 +626,16 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
   /** 发送意图给 Agent，Agent 自主调 MCP 工具完成任务 */
   const sendAgent = useCallback(async () => {
+    if (props.readOnly) {
+      props.onToast?.('warn', '历史重复 Unit ID 项目处于只读浏览模式；Agent 写入已禁用。');
+      return;
+    }
     const q = text.trim();
     if (!q || busy) return;
+    if (isUnassignedRoomContext) {
+      props.onToast?.('warn', '未分配房间中的柜体不能执行 Agent 创建或修改操作。请先将柜体分配到真实房间，或选择一个真实房间后重试。');
+      return;
+    }
     // 如果有待处理的图片，一起传给 Agent（后端逐张做 vision）
     const imgs = [...pendingImages];
     const userTurn: Turn = { role: 'user', text: q };
@@ -553,6 +663,10 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         },
         body: JSON.stringify({
           intent: q,
+          // Agent 工具调用需要结构化房间上下文；普通聊天的提示文本不会传到这里。
+          roomId: isUnassignedRoomContext ? workspaceSelectedRoomId : activeRoom?.id,
+          roomName: isUnassignedRoomContext ? '未分配房间' : activeRoom?.name,
+          roomContext: isUnassignedRoomContext ? 'unassigned' : undefined,
           images: imgs.map(i => ({ dataUrl: i.dataUrl, mode: i.mode, name: i.name })),
           history,
         }),
@@ -565,6 +679,9 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         agentSteps: JSON.stringify(j.steps, null, 2),
         agentOk: j.ok,
       };
+      if (agentDraftIds(agentTurn.agentSteps).length > 0) {
+        window.dispatchEvent(new Event('furniture:server-drafts-updated'));
+      }
       setConvo({ chat: [...next, agentTurn] });
     } catch (e) {
       const errTurn: Turn = {
@@ -576,7 +693,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     } finally {
       setBusyKind('');
     }
-  }, [busy, chat, text, pendingImages, props.token, setConvo]);
+  }, [activeRoom, busy, chat, text, pendingImages, props.token, props.onToast, setConvo, isUnassignedRoomContext, workspaceSelectedRoomId]);
 
   // ── P10.1 识图 ──
 
@@ -702,7 +819,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
   /** 确认导入（commit 干跑结果） */
   const confirmVisionImport = useCallback(() => {
-    if (!pendingVisionRun) return;
+    if (!pendingVisionRun || props.readOnly) return;
     const r = commitPlan(pendingVisionRun, bus);
     setPendingVisionRun(null);
     if (!r.ok) {
@@ -719,6 +836,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
 
   const apply = useCallback(() => {
+    if (props.readOnly) return;
     const run = convo.plan.run;
     if (!run) return;
     const r = commitPlan(run, bus);
@@ -876,6 +994,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
 
   const applyDesign = useCallback(() => {
+    if (props.readOnly) return;
     const run = convo.design.run;
     if (!run) return;
     const r = commitPlan(run, bus);
@@ -903,6 +1022,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
 
   const finalize = useCallback(() => {
+    if (props.readOnly) return;
     if (!draft) return;
     const r = finalizeDraft(draft, bus);
     if (!r.ok) {
@@ -958,19 +1078,56 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
      * 这个缺陷是靠浏览器探针里那条"右侧面板必须有滚动容器"的结构断言抓出来的：
      * 当时 AI 面板与账号面板都漏了这一层，而所有只看文本内容的断言都读到了空字符串，
      * 一度被误判成"面板没渲染"。
-     */
-    <div className="panel-scroll">
+    */
+    <div className={`panel-scroll ${props.workspaceContext ? 'ai-workspace-panel' : ''}`}>
       {storeErr ? <div className="alert alert-warn">{storeErr}</div> : null}
+      {remoteProjectMismatch ? (
+        <div className="alert alert-warn" role="status" data-testid="remote-project-mismatch">
+          <b>网页与服务器模型不一致。</b> 网页导出使用当前网页项目，MCP 导出使用服务器 live；请先核对草稿，再决定是否同步。
+          {props.onOpenRemoteDrafts ? <button type="button" className="tb-btn" onClick={props.onOpenRemoteDrafts}>查看并确认同步</button> : null}
+        </div>
+      ) : null}
+      {remoteDraftPreview ? (
+        <div className="card remote-draft-live-preview" role="status" data-testid="remote-draft-live-preview" style={{ margin: '6px 0', padding: 8, borderColor: 'var(--accent)' }}>
+          <div className="row">
+            <Pill kind={remoteDraftPreview.blockingErrors === 0 ? 'INFO' : 'WARNING'}>
+              {busyKind === 'agent' ? 'Agent 正在绘制：网页实时预览' : '服务器 MCP 草稿：网页实时预览'}
+            </Pill>
+            <Text mono>{remoteDraftPreview.draftId}</Text>
+          </div>
+          <div className="hint">
+            服务器 live v{remoteDraftPreview.liveModelVersion} · 草稿基于 v{remoteDraftPreview.baseModelVersion} · {remoteDraftPreview.project.cabinets.length} 个柜体 · 约每 2.2 秒更新。
+            预览尚未应用到网页正式模型。
+          </div>
+          <details open={remotePreviewOpen} onToggle={(event) => setRemotePreviewOpen((event.currentTarget as HTMLDetailsElement).open)}>
+            <summary className="remote-draft-preview-toggle">{remotePreviewOpen ? '收起绘制预览' : '展开绘制预览'}</summary>
+            <DraftPreview
+              project={remoteDraftPreview.project}
+              rules={bus.getRules()}
+              roomId={activeRoom?.id}
+              roomLabel={activeRoom?.name}
+              height={170}
+              initialView="top"
+            />
+          </details>
+          {props.onOpenRemoteDrafts ? <button type="button" className="tb-btn" onClick={props.onOpenRemoteDrafts}>打开草稿确认应用 / 同步</button> : null}
+        </div>
+      ) : null}
+      {isUnassignedRoomContext ? (
+        <div className="alert alert-warn" role="status">
+          <b>未分配房间：</b>此处柜体没有归属到真实房间，Agent 创建或修改已禁用。请先将柜体分配到已有房间。
+        </div>
+      ) : null}
 
       {/* ═══════════════ 会话对象：一个房间一段 ═══════════════ */}
-      <Section title="会话对象（一个房间一段历史）" defaultOpen>
+      {!props.workspaceContext ? <Section title="会话对象（一个房间一段历史）" defaultOpen>
         <p className="note">
           每个房间有一段<b>各自独立</b>的会话和草案：聊"这个柜子再高一档"时，
           指代的是这个房间的柜子。切换页面、切换房间都不会丢 ——
           <b>连草案一起记住</b>（跑一次要几十秒，不该白等）。
         </p>
         <div className="chips room-chips">
-          <button type="button" className={`chip ${activeRoomId === '' ? 'chip-on' : ''}`} onClick={() => setRoomId('')}>
+          <button type="button" className={`chip ${activeRoomId === '' ? 'chip-on' : ''}`} onClick={() => chooseRoom('')}>
             全项目{convos['']?.chat?.length ? ` · ${convos[''].chat.length} 条` : ''}
           </button>
           {rooms.map((r, i) => {
@@ -982,7 +1139,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                 key={r.id}
                 type="button"
                 className={`chip ${activeRoomId === r.id ? 'chip-on' : ''}`}
-                onClick={() => setRoomId(r.id)}
+                onClick={() => chooseRoom(r.id)}
                 title={`房间 ${i + 1} · ${r.walls.length} 面墙`}
               >
                 {r.name}
@@ -992,8 +1149,8 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             );
           })}
           {rooms.length === 0 ? <span className="muted-sm">还没有房间 —— 先在「房间」页建一个，AI 才能把柜体放进去。</span> : null}
-        </div>
-      </Section>
+      </div>
+      </Section> : null}
 
       {/* ═══════════════ 草案：随每一句话更新，定稿才写入 ═══════════════ */}
       {draft ? (
@@ -1024,7 +1181,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             <button
               type="button"
               className="tb-btn primary ai-btn-finalize"
-              disabled={busy || draft.steps.length === 0}
+              disabled={props.readOnly || busy || draft.steps.length === 0}
               onClick={finalize}
             >
               定稿并生成可编辑稿件
@@ -1043,12 +1200,12 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       ) : null}
 
       {/* ═══════════════ 对话：问与改，历史都在 ═══════════════ */}
-      <Section title="AI 对话（不会改模型）" defaultOpen>
-        <p className="note">
+      <Section title={props.workspaceContext ? '对话时间线' : 'AI 对话（不会改模型）'} defaultOpen>
+        {!props.workspaceContext ? <p className="note">
           这里只是<b>问与答</b>：可以问尺寸、板材、五金、工艺，也可以问当前这个柜子。
-          想让 AI 改模型，请用下面的<b>「生成编辑计划」</b>或<b>「改草案」</b>——
-          两条路都会先给你预览，<b>你点确认了才会写进去</b>。
-        </p>
+          想让 AI 修改模型，请用下面的<b>「Agent 执行」</b>：Agent 会通过 MCP 生成并校验服务器草稿，
+          你确认应用并完成同步后才会写入本地模型。<b>「规划候选对比」</b>只做确定性枚举与评分，不调用 AI，也不修改模型。
+        </p> : null}
 
         {/*
           ── 剩余额度就摆在输入框上方 ──
@@ -1060,7 +1217,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         {quota ? <QuotaMeter quota={quota} compact /> : null}
 
         {chat.length > 0 ? (
-          <div className="chat-list">
+          <div className={`chat-list ${props.workspaceContext ? 'workspace-chat-timeline' : ''}`}>
             {chat.map((m, i) => (
               <div key={i} className={`chat-msg chat-${m.role}`}>
                 <div className="chat-role">{m.role === 'user' ? '你' : 'AI'}</div>
@@ -1105,47 +1262,62 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                   ) : null}
                   {/* Agent 执行步骤（折叠） */}
                   {m.agentSteps ? (
-                    <details className="chat-agent" open={!m.agentOk}>
-                      <summary>
-                        {m.agentOk ? '✅' : '❌'} Agent 执行步骤（{(() => {
-                          try {
-                            const s = JSON.parse(m.agentSteps!);
-                            return Array.isArray(s) ? s.length : 0;
-                          } catch { return 0; }
-                        })()} 步）
-                      </summary>
-                      <div className="agent-steps">
-                        {(() => {
-                          try {
-                            const steps = JSON.parse(m.agentSteps!);
-                            if (!Array.isArray(steps)) return <div>步骤数据异常</div>;
-                            return steps.map((s: any, i: number) => (
-                              <div key={i} className={`agent-step ${s.ok ? 'ok' : 'fail'}`}>
-                                <div className="agent-step-head">
-                                  <span className="agent-step-num">第 {s.round} 轮</span>
-                                  <code>{s.tool}</code>
-                                  <span className={s.ok ? 'ok-tag' : 'fail-tag'}>{s.ok ? '成功' : '失败'}</span>
-                                </div>
-                                <details>
-                                  <summary>参数</summary>
-                                  <pre className="code">{JSON.stringify(s.args, null, 2)}</pre>
-                                </details>
-                                {s.ok ? (
+                    <>
+                      {agentDraftIds(m.agentSteps).length > 0 ? (
+                        <div className="card agent-remote-draft" role="status" style={{ margin: '8px 0', borderColor: 'var(--accent)' }}>
+                          <div className="row"><Pill kind="INFO">服务器远端草稿已创建</Pill></div>
+                          <div className="hint">
+                            草稿 {agentDraftIds(m.agentSteps).join('、')} 保存在服务端工作区；浏览器本地房间卡片和模型版本尚未改变。请确认应用并完成同步。
+                          </div>
+                          {props.onOpenRemoteDrafts ? (
+                            <button type="button" className="tb-btn primary" onClick={props.onOpenRemoteDrafts}>
+                              查看远端草稿并确认同步
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      <details className="chat-agent" open={!m.agentOk}>
+                        <summary>
+                          {m.agentOk ? '✅' : '❌'} Agent 执行步骤（{(() => {
+                            try {
+                              const s = JSON.parse(m.agentSteps!);
+                              return Array.isArray(s) ? s.length : 0;
+                            } catch { return 0; }
+                          })()} 步）
+                        </summary>
+                        <div className="agent-steps">
+                          {(() => {
+                            try {
+                              const steps = JSON.parse(m.agentSteps!);
+                              if (!Array.isArray(steps)) return <div>步骤数据异常</div>;
+                              return steps.map((s: any, i: number) => (
+                                <div key={i} className={`agent-step ${s.ok ? 'ok' : 'fail'}`}>
+                                  <div className="agent-step-head">
+                                    <span className="agent-step-num">第 {s.round} 轮</span>
+                                    <code>{s.tool}</code>
+                                    <span className={s.ok ? 'ok-tag' : 'fail-tag'}>{s.ok ? '成功' : '失败'}</span>
+                                  </div>
                                   <details>
-                                    <summary>结果</summary>
-                                    <pre className="code">{JSON.stringify(s.result, null, 2).slice(0, 1000)}</pre>
+                                    <summary>参数</summary>
+                                    <pre className="code">{JSON.stringify(s.args, null, 2)}</pre>
                                   </details>
-                                ) : (
-                                  <div className="agent-error">错误：{s.error} {s.code ? `(${s.code})` : ''}</div>
-                                )}
-                              </div>
-                            ));
-                          } catch {
-                            return <div>步骤解析失败</div>;
-                          }
-                        })()}
-                      </div>
-                    </details>
+                                  {s.ok ? (
+                                    <details>
+                                      <summary>结果</summary>
+                                      <pre className="code">{JSON.stringify(s.result, null, 2).slice(0, 1000)}</pre>
+                                    </details>
+                                  ) : (
+                                    <div className="agent-error">错误：{s.error} {s.code ? `(${s.code})` : ''}</div>
+                                  )}
+                                </div>
+                              ));
+                            } catch {
+                              return <div>步骤解析失败</div>;
+                            }
+                          })()}
+                        </div>
+                      </details>
+                    </>
                   ) : null}
                   {/* 待确认的 vision 导入 */}
                   {pendingVisionRun && m.role === 'assistant' && m.text.includes('干跑完成') ? (
@@ -1153,7 +1325,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                       <button
                         type="button"
                         className="tb-btn primary"
-                        disabled={busy}
+                        disabled={props.readOnly || busy}
                         onClick={() => confirmVisionImport()}
                         title="把干跑的动作写进模型"
                       >
@@ -1228,6 +1400,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           等于用户打开 AI 页签时看不到主入口（而我第一版就是那么写的）。
           输入框必须在打开面板的第一眼就在视野里。
         */}
+        <div className={props.workspaceContext ? 'workspace-chat-composer' : ''}>
         {/* ── P10.1 识图工具条 ── */}
         <div className="btn-row ai-vision-bar">
           <input
@@ -1353,7 +1526,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           <button
             type="button"
             className="tb-btn primary ai-btn-agent"
-            disabled={busy || !text.trim() || !!quota?.blockedBy}
+            disabled={props.readOnly || busy || !text.trim() || !!quota?.blockedBy}
             onClick={() => void sendAgent()}
             title={
               quota?.blockedBy
@@ -1393,6 +1566,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             {snapshot.cabinets.length} 个柜体 · {snapshot.rooms.length} 个房间 · {(bytes / 1024).toFixed(1)} KB
           </Text>
         </Row>
+        </div>
         {plan.meta ? (
           <Row label="本次调用" derived hint="规划通道的用量。对话的用量显示在每条回答下面">
             <Text mono>
@@ -1435,7 +1609,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
 
       {plan.run ? (
         <Section title={`干跑预览（${plan.run.okCount} 条可应用 / ${plan.run.errorCount} 条失败）`} defaultOpen>
-          <PlanRunView run={plan.run} onApply={apply} onDismiss={dismissPlan} lastApply={plan.lastApply} />
+          <PlanRunView run={plan.run} onApply={apply} onDismiss={dismissPlan} lastApply={plan.lastApply} readOnly={props.readOnly} />
         </Section>
       ) : null}
 
@@ -1533,6 +1707,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
               lastApply={design.lastApply}
               applyLabel="应用设计方案"
               dismissLabel="丢弃方案"
+              readOnly={props.readOnly}
             />
           ) : null}
 

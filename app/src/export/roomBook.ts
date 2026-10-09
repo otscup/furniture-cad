@@ -1,42 +1,22 @@
-/**
- * ══════════════════════════════════════════════════════════════════════
- *  按房间排序的图纸册（Phase D）—— 销售图纸 HTML 打印版
- *
- *  ── 它是什么 ──
- *  把"多房间多柜体的项目"编排成一份可打印的图纸册：
- *    封面（项目 + 客户表 + 版本三件套）→ 每房间一页
- *    （家具生产图：地柜平面 + 吊柜平面 + 立面外观 + 立面结构 + 图框，
- *     与 DXF 导出同一套图元）→ 尾页汇总清单。
- *
- *  ── 它不是什么 ──
- *  **零新几何**。图纸图元全部来自 furnitureSheet.ts（与 DXF 导出同源），
- *  本文件只做"编排 + Prim→SVG + 打印 HTML"。
- *  排序也不发明规则：房间按 rooms 数组顺序（模型顺序即语义），
- *  房内柜体按 (y, x) 排序 —— 全部来自模型，导出器不做主。
- *
- *  ── 两层 API ──
- *  buildRoomBook()  → 结构化数据（验收可直接断言排序与分组）
- *  roomBookHtml()   → 打印 HTML（@page 分页，浏览器打印即 PDF）
- * ══════════════════════════════════════════════════════════════════════
- */
 import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
 import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
+import { cabinetWarningIssues, formatCabinetWarning } from './warningNotes.ts';
+import { confirmedSharedPanels } from '../core/sharedPanels.ts';
+import type { SharedPanel } from '../core/types.ts';
 
-// ─────────────────────────── SVG（Y 向上 CAD → Y 向下 SVG）───────────────────────────
-
-/** 图层 → 颜色。打印件：结构黑、隐藏浅灰、五金中灰、红标注红（虚线在 Prim 上自带） */
 function strokeOf(layer: string): string {
-  if (layer && layer.includes('ANNOT-RED')) return '#FF0000';
-  if (layer && layer.includes('HIDDEN')) return '#b0b7c3';
-  if (layer && layer.includes('HW')) return '#555b66';
-  if (layer && (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT') || layer.startsWith('F-BORDER'))) return '#333a45';
+  if (layer.includes('ANNOT-RED')) return '#c84435';
+  if (layer.includes('HIDDEN')) return '#9aa0a6';
+  if (layer.includes('HW')) return '#555b66';
+  if (layer.startsWith('F-DIM') || layer.startsWith('F-TEXT') || layer.startsWith('F-BORDER')) return '#30343b';
   return '#111318';
 }
-function fillOf(layer: string): string {
-  void layer;
+
+function fillOf(_layer: string): string {
   return '#eef0f4';
 }
 
@@ -45,90 +25,140 @@ function primPoints(prims: Prim[]): { minX: number; minY: number; maxX: number; 
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  const eat = (x: number, y: number): void => {
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-  };
-  for (const p of prims) {
-    if (p.k === 'text') eat(p.p.x, p.p.y);
-    else for (const q of p.pts) eat(q.x, q.y);
+  for (const prim of prims) {
+    if (prim.k === 'text') {
+      minX = Math.min(minX, prim.p.x);
+      minY = Math.min(minY, prim.p.y);
+      maxX = Math.max(maxX, prim.p.x);
+      maxY = Math.max(maxY, prim.p.y);
+    } else {
+      for (const point of prim.pts) {
+        minX = Math.min(minX, point.x);
+        minY = Math.min(minY, point.y);
+        maxX = Math.max(maxX, point.x);
+        maxY = Math.max(maxY, point.y);
+      }
+    }
   }
   return { minX, minY, maxX, maxY };
 }
 
-const esc = (s: string): string =>
-  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const esc = (value: string): string =>
+  value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+export interface RoomPlanCallout {
+  cabinetId: string;
+  tag: string;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+}
+
+/** 房间布局中的柜体编号、白底标记框和引线；其 bbox 可被验收直接检查碰撞。 */
+export function buildRoomPlanCallouts(cabinets: Cabinet[]): { prims: Prim[]; labels: RoomPlanCallout[] } {
+  const prims: Prim[] = [];
+  const labels: RoomPlanCallout[] = [];
+  const counters = { B: 0, W: 0, T: 0, I: 0 };
+  const bbox = (points: Array<{ x: number; y: number }>) => ({
+    minX: Math.min(...points.map((point) => point.x)), minY: Math.min(...points.map((point) => point.y)),
+    maxX: Math.max(...points.map((point) => point.x)), maxY: Math.max(...points.map((point) => point.y)),
+  });
+  const overlaps = (a: RoomPlanCallout['bounds'], b: RoomPlanCallout['bounds']) =>
+    a.minX < b.maxX && a.maxX > b.minX && a.minY < b.maxY && a.maxY > b.minY;
+  const footprints = cabinets.map((cabinet) => bbox(polyLocalToWorld(
+    [{ x: 0, y: 0 }, { x: cabinet.params.width, y: 0 }, { x: cabinet.params.width, y: cabinet.params.depth }, { x: 0, y: cabinet.params.depth }],
+    cabinet.placement,
+    cabinet.placement.rotation,
+  )));
+  for (const cabinet of cabinets) {
+    const kind = cabinet.params.cabinetType ?? ((cabinet.params.mountHeight ?? 0) > 0 ? 'wall' : 'base');
+    const prefix: keyof typeof counters = kind === 'wall' ? 'W' : kind === 'tall' ? 'T' : kind === 'island' ? 'I' : 'B';
+    const tag = `${prefix}${++counters[prefix]}`;
+    const W = cabinet.params.width;
+    const D = cabinet.params.depth;
+    const halfW = 70;
+    const halfH = 46;
+    let centerY = D + (prefix === 'W' ? 150 : prefix === 'T' ? 450 : 300);
+    let boxPoints: Array<{ x: number; y: number }> = [];
+    let labelBounds: RoomPlanCallout['bounds'] = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    for (let attempt = 0; attempt < 24; attempt++) {
+      boxPoints = polyLocalToWorld([
+        { x: W / 2 - halfW, y: centerY - halfH }, { x: W / 2 + halfW, y: centerY - halfH },
+        { x: W / 2 + halfW, y: centerY + halfH }, { x: W / 2 - halfW, y: centerY + halfH },
+      ], cabinet.placement, cabinet.placement.rotation);
+      labelBounds = bbox(boxPoints);
+      if (!footprints.some((footprint) => overlaps(labelBounds, footprint)) && !labels.some((label) => overlaps(labelBounds, label.bounds))) break;
+      centerY += 160;
+    }
+    const center = localToWorld({ x: W / 2, y: centerY }, cabinet.placement, cabinet.placement.rotation);
+    const leader = polyLocalToWorld([{ x: W / 2, y: D }, { x: W / 2, y: centerY - halfH }], cabinet.placement, cabinet.placement.rotation);
+    prims.push({ k: 'poly', pts: leader, closed: false, layer: 'A-CALLOUT', lw: 1.2 });
+    prims.push({ k: 'fill', pts: boxPoints, layer: 'A-CALLOUT', alpha: 1 });
+    prims.push({ k: 'poly', pts: boxPoints, closed: true, layer: 'A-CALLOUT', lw: 1.4 });
+    prims.push({ k: 'text', p: center, text: tag, size: 65, layer: 'A-CALLOUT', align: 'c' });
+    labels.push({ cabinetId: cabinet.id, tag, bounds: labelBounds });
+  }
+  return { prims, labels };
+}
 
 const PAD = 120;
 
-/** Prim 数组 → SVG 字符串（viewBox 取内容 bbox；scale(1,-1) 处理 Y 轴，文字再翻回） */
+/** Y-up CAD primitives to a self-contained SVG with readable, unmirrored text. */
 export function primsToSvg(prims: Prim[], cls: string): string {
-  if (prims.length === 0) return `<svg class="${cls}" role="img"></svg>`;
-  const b = primPoints(prims);
-  const minX = b.minX - PAD;
-  const minY = b.minY - PAD;
-  const w = b.maxX - b.minX + PAD * 2;
-  const h = b.maxY - b.minY + PAD * 2;
+  if (prims.length === 0) return `<svg class="${esc(cls)}" role="img" aria-label="空视图"></svg>`;
+  const box = primPoints(prims);
+  const minX = box.minX - PAD;
+  const minY = box.minY - PAD;
+  const width = Math.max(1, box.maxX - box.minX + PAD * 2);
+  const height = Math.max(1, box.maxY - box.minY + PAD * 2);
   const body: string[] = [];
-  for (const p of prims) {
-    if (p.k === 'poly') {
-      const pts = p.pts.map((q) => `${q.x},${q.y}`).join(' ');
-      const dash = p.dash ? ` stroke-dasharray="${p.dash.join(' ')}"` : '';
-      // 2026-10-04：closed 的 poly 用 polygon 渲染，确保框闭合（之前用 polyline 有缺口）
-      if ((p as any).closed) {
-        body.push(`<polygon points="${pts}" fill="none" stroke="${strokeOf(p.layer)}" stroke-width="${p.lw * 1.6}"${dash}/>`);
-      } else {
-        body.push(`<polyline points="${pts}" fill="none" stroke="${strokeOf(p.layer)}" stroke-width="${p.lw * 1.6}"${dash}/>`);
-      }
-    } else if (p.k === 'fill') {
-      const pts = p.pts.map((q) => `${q.x},${q.y}`).join(' ');
-      body.push(`<polygon points="${pts}" fill="${fillOf(p.layer)}" fill-opacity="${p.alpha}" stroke="none"/>`);
+  for (const prim of prims) {
+    if (prim.k === 'poly') {
+      const points = prim.pts.map((point) => `${point.x},${point.y}`).join(' ');
+      const dash = prim.dash ? ` stroke-dasharray="${prim.dash.join(' ')}"` : '';
+      const tag = prim.closed ? 'polygon' : 'polyline';
+      body.push(`<${tag} points="${points}" fill="none" stroke="${strokeOf(prim.layer)}" stroke-width="${Math.max(1, prim.lw * 1.6)}"${dash}/>`);
+    } else if (prim.k === 'fill') {
+      const points = prim.pts.map((point) => `${point.x},${point.y}`).join(' ');
+      body.push(`<polygon points="${points}" fill="${fillOf(prim.layer)}" fill-opacity="${prim.alpha}" stroke="none"/>`);
     } else {
-      const anchor = p.align === 'c' ? 'middle' : p.align === 'r' ? 'end' : 'start';
-      body.push(
-        `<text transform="translate(${p.p.x},${p.p.y}) scale(1,-1)" font-size="${p.size}" fill="${strokeOf(p.layer)}" text-anchor="${anchor}" font-family="sans-serif">${esc(p.text)}</text>`
-      );
+      const anchor = prim.align === 'c' ? 'middle' : prim.align === 'r' ? 'end' : 'start';
+      const rotation = prim.rot ? ` rotate(${-prim.rot})` : '';
+      body.push(`<text transform="translate(${prim.p.x},${prim.p.y}) scale(1,-1)${rotation}" font-size="${prim.size}" fill="${strokeOf(prim.layer)}" text-anchor="${anchor}" font-family="Noto Sans CJK SC, Microsoft YaHei, sans-serif">${esc(prim.text)}</text>`);
     }
   }
-  return `<svg class="${cls}" viewBox="${minX} ${-(minY + h)} ${w} ${h}" preserveAspectRatio="xMidYMid meet" role="img"><g transform="scale(1,-1)">${body.join('')}</g></svg>`;
+  return `<svg class="${esc(cls)}" viewBox="${minX} ${-(minY + height)} ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img"><g transform="scale(1,-1)">${body.join('')}</g></svg>`;
 }
-
-// ─────────────────────────── 结构化数据 ───────────────────────────
 
 export interface RoomBookCabinet {
   id: string;
   name: string;
   index: number;
+  mapTag: string;
+  cabinetType: 'base' | 'wall' | 'tall' | 'island';
   width: number;
   height: number;
   depth: number;
   boardMaterial: string;
   backMaterial: string;
   doorMaterial: string | null;
-  /** 壁挂安装高度（mm，0=落地柜） */
   mountHeight: number;
-  /** 见光板：none/left/right/both */
+  referenceNotes: string[];
+  safetyNote: string | null;
+  warningNotes: string[];
   finishedEnds: string;
-  /**
-   * 工艺标注（对标生产图纸）：
-   * 如 ["灯带居中", "黑框灰玻", "柜体色免拉手"]
-   * 从分区 ledStrip、门板材质、五金等派生
-   */
   craftNotes: string[];
   panelKinds: number;
   panelPieces: number;
   hardware: Array<{ nameZh: string; qty: number; spec: string }>;
   purchased: PurchasedItem[];
+  sheetSvg: string;
 }
 
 export interface RoomBookSection {
   roomId: string;
   roomName: string;
+  layoutSvg: string;
+  layoutSafetyNote: string | null;
   cabinets: RoomBookCabinet[];
-  /** 家具生产图 SVG（与 DXF 同源，一页一件家具） */
-  sheetSvg: string;
 }
 
 export interface RoomBook {
@@ -138,7 +168,7 @@ export interface RoomBook {
   ruleSetId: string;
   ruleSetName: string;
   sections: RoomBookSection[];
-  /** 尾页汇总：按柜归类的清单（模型顺序） */
+  sharedPanels: Array<Pick<SharedPanel, 'id' | 'name' | 'memberCabinetIds' | 'replacesPanelIds' | 'bounds' | 'elevation' | 'length' | 'width' | 'thickness' | 'material' | 'finish' | 'grainDirection' | 'edgeTreatment' | 'overhang' | 'segmentation' | 'support' | 'machining'> & { sheetSvg: string }>;
   summary: Array<{
     cabinet: string;
     room: string;
@@ -152,104 +182,106 @@ export interface RoomBook {
 }
 
 /**
- * 编排：房间按 rooms 数组顺序，房内柜体按 (y, x) 排序。
- * 没有归属房间的柜体进「未分配」节（放最后，明确标出 —— 不静默丢）。
- * 每房间一页家具生产图（与 DXF 导出同一套图元）。
+ * 房间顺序来自 Project.rooms，房间内按工作区坐标稳定排序；每个柜体独立生成一张图纸，
+ * 共享语义模型和几何生成器。悬空 roomId 会进入显式的“未分配房间”组。
  */
 export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: string): RoomBook {
-  const geom = generateProject(project, rules);
+  const geometry = generateProject(project, rules);
 
-  const buildCab = (cab: Cabinet, index: number): RoomBookCabinet => {
-    // 容错：若 generateCabinet 对该柜抛错（generateProject 已吞错记 issue），
-    // geom.cabinets[cab.id] 为 undefined。此时不崩，表格仍列出该柜（0 件），
-    // 而不是让整个导出挂掉或静默丢柜。
-    const g = geom.cabinets[cab.id];
-    const units = allUnits(cab.layout);
-    const doorUnit = units.find((u) => u.doors);
-    const doorMatName = doorUnit?.doors?.material ? (rules.materials[doorUnit.doors.material]?.name ?? doorUnit.doors.material) : null;
-    // ── 工艺标注（对标生产图纸）──
-    const craftNotes: string[] = [];
-    // 灯带：收集所有分区的 ledStrip，去重后转中文
-    const ledPositions = new Set<string>();
-    for (const u of units) {
-      const ls = u.shelves?.ledStrip;
-      if (ls && ls !== 'none') ledPositions.add(ls);
-    }
-    const LED_ZH: Record<string, string> = { center: '灯带居中', front: '灯带靠前', angled45: '45°斜光灯带' };
-    for (const pos of ledPositions) {
-      if (LED_ZH[pos]) craftNotes.push(LED_ZH[pos]);
-    }
-    // 门板材质：玻璃门特别标注
-    if (doorUnit?.doors?.material) {
-      const mat = rules.materials[doorUnit.doors.material];
-      if (mat?.kind === 'glass') craftNotes.push(mat.name ?? '玻璃门');
-    }
-    // 见光板
-    const fe = cab.params.finishedEnds;
-    if (fe === 'left' || fe === 'right') craftNotes.push(`${fe === 'left' ? '左' : '右'}见光板`);
-    else if (fe === 'both') craftNotes.push('双侧见光板');
-    return {
-      id: cab.id,
-      name: cab.name,
-      index,
-      width: cab.params.width,
-      height: cab.params.height,
-      depth: cab.params.depth,
-      boardMaterial: rules.materials[cab.params.boardMaterial]?.name ?? cab.params.boardMaterial,
-      backMaterial: rules.materials[cab.params.backPanel.material]?.name ?? cab.params.backPanel.material,
-      doorMaterial: doorMatName,
-      mountHeight: cab.params.mountHeight ?? 0,
-      finishedEnds: fe ?? 'none',
-      craftNotes,
-      panelKinds: g?.stats.panelKinds ?? 0,
-      panelPieces: g?.stats.totalPieces ?? 0,
-      hardware: (g?.hardware ?? []).map((h) => ({ nameZh: h.nameZh, qty: h.qty, spec: h.spec })),
-      purchased: g?.purchased ?? [],
-    };
-  };
-
-  const groups = groupByRoom(project);
-  // v9 修复：柜体明细表必须包含项目全部柜子。
-  // v8 的 ternary（project.cabinets.length > g.cabinets.length）在单房间时
-  // 取 g.cabinets，若 project.cabinets 本身不全仍会漏；且多房间时每个 section
-  // 都塞 10 个导致总数翻倍。这里恒用 project.cabinets，并在下面去重 section。
-  const allCabinets = project.cabinets;
-  let sections: RoomBookSection[] = groups.map((g) => {
-    // 家具生产图（与 DXF 同源）—— 按房间分组画图不变
-    const sheet = buildFurnitureSheet(g.room, g.cabinets, project, rules);
-    return {
-      roomId: g.room.id,
-      roomName: g.room.name,
-      cabinets: allCabinets.map((c, i) => buildCab(c, i + 1)),
-      sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
-    };
-  });
-  // 去重：若多个 section 的柜体 ID 集合完全相同（allCabinets 导致），只保留第一个，
-  // 避免表格重复、总数翻倍。
-  {
-    const seen = new Set<string>();
-    sections = sections.filter((s) => {
-      const key = s.cabinets.map((c) => c.id).sort().join(',');
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
+  const sections: RoomBookSection[] = groupByRoom(project).map((group) => {
+    const callouts = buildRoomPlanCallouts(group.cabinets);
+    const mapTags = new Map(callouts.labels.map((label) => [label.cabinetId, label.tag]));
+    const sourcePrims = geometry.roomPlans[group.room.id] ?? [];
+    const sourceKeys = geometry.roomPlanSourceKeys[group.room.id] ?? [];
+    const cabinetIds = new Set(group.cabinets.map((cabinet) => cabinet.id));
+    const cleanLayoutPrims = sourcePrims.filter((prim, index) => {
+      const match = /^plan:cabinet:([^:]+):/.exec(sourceKeys[index] ?? '');
+      if (!match || !cabinetIds.has(match[1]!)) return true;
+      return prim.k !== 'text' && !prim.layer.startsWith('F-DIM');
     });
-  }
+    const layoutSafetyNote = group.cabinets.some((cabinet) =>
+      (cabinet.params.counterCutouts?.length ?? 0) > 0 || allUnits(cabinet.layout).some((unit) => unit.kind === 'appliance' && unit.appliance)
+    ) ? '参考预留｜非 CNC 开孔｜待拆单确认。柜体编号通过引线对应下方清单；图中虚线/洞口为设计参考，须按实机与拆单复核，不代表已完成加工。' : null;
+    return {
+    roomId: group.room.id,
+    roomName: group.room.name,
+    layoutSvg: primsToSvg([...cleanLayoutPrims, ...callouts.prims], 'room-layout'),
+    layoutSafetyNote,
+    cabinets: group.cabinets.map((cabinet, index) => {
+      const generated = geometry.cabinets[cabinet.id];
+      const warningNotes = generated
+        ? cabinetWarningIssues(cabinet, generated, rules).map((issue) => formatCabinetWarning(cabinet, issue))
+        : [];
+      const units = allUnits(cabinet.layout);
+      const doorUnit = units.find((unit) => unit.doors);
+      const doorMaterial = doorUnit?.doors?.material;
+      const doorMaterialName = doorMaterial ? rules.materials[doorMaterial]?.name ?? doorMaterial : null;
+      const craftNotes: string[] = [];
+      const ledPositions = new Set<string>();
+      for (const unit of units) {
+        const position = unit.shelves?.ledStrip;
+        if (position && position !== 'none') ledPositions.add(position);
+      }
+      const ledNames: Record<string, string> = { center: '灯带居中', front: '灯带靠前', angled45: '45°斜光灯带' };
+      for (const position of ledPositions) if (ledNames[position]) craftNotes.push(ledNames[position]!);
+      if (doorMaterial) {
+        const material = rules.materials[doorMaterial];
+        if (material?.kind === 'glass') craftNotes.push(material.name ?? '玻璃门');
+      }
+      const finishedEnds = cabinet.params.finishedEnds ?? 'none';
+      if (finishedEnds === 'left' || finishedEnds === 'right') craftNotes.push(`${finishedEnds === 'left' ? '左' : '右'}见光板`);
+      else if (finishedEnds === 'both') craftNotes.push('双侧见光板');
 
-  const summary = sections.flatMap((s) =>
-    s.cabinets.map((c) => {
-      const g = geom.cabinets[c.id];
+      const cabinetType = cabinet.params.cabinetType ?? ((cabinet.params.mountHeight ?? 0) > 0 ? 'wall' : 'base');
+      const referenceNotes = (cabinet.params.counterCutouts ?? []).map((cutout) => `${cutout.name} ${cutout.width}×${cutout.depth}mm（X=${cutout.x}, Y=${cutout.y}mm）`);
+      for (const unit of units) if (unit.kind === 'appliance' && unit.appliance) {
+        referenceNotes.push(`${unit.appliance.name}安装净空 ${unit.appliance.openingWidth}×${unit.appliance.openingHeight}×${unit.appliance.openingDepth}mm`);
+      }
+      const safetyNote = referenceNotes.length > 0
+        ? `参考预留｜非 CNC 开孔｜待拆单确认（适用于台面虚线标记）。${referenceNotes.join('；')}。电器净空须按实机复核，不代表柜体加工完成。`
+        : null;
+
+      const sheet = buildFurnitureSheet(group.room, [cabinet], project, rules, { furnitureName: cabinet.name });
       return {
-        cabinet: c.name,
-        room: s.roomName,
-        panelKinds: c.panelKinds,
-        panelPieces: c.panelPieces,
-        hardwareKinds: g?.hardware.length ?? 0,
-        hardwarePieces: (g?.hardware ?? []).reduce((a, h) => a + h.qty, 0),
-        purchased: c.purchased.length,
+        id: cabinet.id,
+        name: cabinet.name,
+        index: index + 1,
+        mapTag: mapTags.get(cabinet.id) ?? `C${index + 1}`,
+        cabinetType,
+        width: cabinet.params.width,
+        height: cabinet.params.height,
+        depth: cabinet.params.depth,
+        boardMaterial: rules.materials[cabinet.params.boardMaterial]?.name ?? cabinet.params.boardMaterial,
+        backMaterial: rules.materials[cabinet.params.backPanel.material]?.name ?? cabinet.params.backPanel.material,
+        doorMaterial: doorMaterialName,
+        mountHeight: cabinet.params.mountHeight ?? 0,
+        referenceNotes,
+        safetyNote,
+        warningNotes,
+        finishedEnds,
+        craftNotes,
+        panelKinds: generated?.stats.panelKinds ?? 0,
+        panelPieces: generated?.stats.totalPieces ?? 0,
+        hardware: (generated?.hardware ?? []).map((item) => ({ nameZh: item.nameZh, qty: item.qty, spec: item.spec })),
+        purchased: generated?.purchased ?? [],
+        sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
       };
-    })
-  );
+    }),
+  };
+  });
+
+  const summary = sections.flatMap((section) => section.cabinets.map((cabinet) => {
+    const generated = geometry.cabinets[cabinet.id];
+    return {
+      cabinet: cabinet.name,
+      room: section.roomName,
+      panelKinds: cabinet.panelKinds,
+      panelPieces: cabinet.panelPieces,
+      hardwareKinds: generated?.hardware.length ?? 0,
+      hardwarePieces: (generated?.hardware ?? []).reduce((sum, item) => sum + item.qty, 0),
+      purchased: cabinet.purchased.length,
+    };
+  }));
 
   return {
     projectName: project.name,
@@ -258,114 +290,103 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     ruleSetId: rules.id,
     ruleSetName: rules.name,
     sections,
+    sharedPanels: confirmedSharedPanels(project, rules).map((panel) => {
+      const prims: Prim[] = [{ k: 'poly', pts: [{ x: 0, y: 0 }, { x: panel.length, y: 0 }, { x: panel.length, y: panel.width }, { x: 0, y: panel.width }], closed: true, layer: 'PANEL_SHARED', lw: 3 }];
+      for (const segment of panel.segmentation.segments) {
+        const x = segment.x - panel.bounds.minX;
+        const y = segment.y - panel.bounds.minY;
+        prims.push({ k: 'poly', pts: [{ x, y }, { x: x + segment.length, y }, { x: x + segment.length, y: y + segment.width }, { x, y: y + segment.width }], closed: true, layer: 'PANEL_SHARED', lw: 2 });
+        prims.push({ k: 'text', p: { x: x + segment.length / 2, y: y + segment.width / 2 }, text: `${panel.id}/${segment.id} ${segment.length}×${segment.width}mm`, size: 70, layer: 'F-TEXT', align: 'c' });
+      }
+      for (const hole of panel.machining.holes) {
+        const radius = hole.diameter / 2;
+        const points = Array.from({ length: 24 }, (_, index) => {
+          const angle = index * Math.PI * 2 / 24;
+          return { x: hole.x + Math.cos(angle) * radius, y: hole.y + Math.sin(angle) * radius };
+        });
+        prims.push({ k: 'poly', pts: points, closed: true, layer: 'PANEL_SHARED_HOLE', lw: 1.5 });
+      }
+      return { ...panel, sheetSvg: primsToSvg(prims, 'shared-panel-sheet') };
+    }),
     summary,
     totals: {
       cabinets: summary.length,
-      panelKinds: summary.reduce((a, s) => a + s.panelKinds, 0),
-      panelPieces: summary.reduce((a, s) => a + s.panelPieces, 0),
-      purchased: summary.reduce((a, s) => a + s.purchased, 0),
+      panelKinds: summary.reduce((sum, item) => sum + item.panelKinds, 0),
+      panelPieces: summary.reduce((sum, item) => sum + item.panelPieces, 0),
+      purchased: summary.reduce((sum, item) => sum + item.purchased, 0),
     },
   };
 }
 
-// ─────────────────────────── HTML 渲染 ───────────────────────────
-
 const CSS = `
   * { box-sizing: border-box; }
-  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; color: #111318; margin: 0; }
-  .page { page-break-after: always; padding: 10mm 12mm; }
-  .page:last-child { page-break-after: auto; }
-  h1 { font-size: 22pt; margin: 4mm 0; }
-  h2 { font-size: 14pt; margin: 3mm 0 2mm; border-bottom: 1.5pt solid #111318; padding-bottom: 1mm; }
-  table { border-collapse: collapse; width: 100%; font-size: 9pt; }
-  th, td { border: 0.5pt solid #444; padding: 1.2mm 2mm; text-align: left; }
-  th { background: #f0f1f4; }
-  .meta { font-size: 9pt; color: #444; margin: 2mm 0; }
-  .cover-table { width: 70%; margin: 8mm 0; font-size: 11pt; }
-  .cover-table td { height: 10mm; }
-  .cabinet-head { display: flex; justify-content: space-between; align-items: baseline; }
-  .cabinet-spec { font-size: 10pt; }
-  .sheet-wrap { margin: 2mm 0; border: 0.5pt solid #999; background: #fff; }
-  .sheet-wrap svg { width: 100%; height: 155mm; display: block; }
-  h3 { font-size: 11pt; margin: 3mm 0 1.5mm; }
-  .triptych { display: flex; gap: 3mm; margin: 2mm 0; }
-  .triptych figure { margin: 0; flex: 1; min-width: 0; }
-  .triptych svg { width: 100%; height: 62mm; border: 0.5pt solid #999; background: #fff; }
-  .triptych figcaption { font-size: 8.5pt; text-align: center; color: #444; padding: 0.8mm 0; }
-  .mat-line { font-size: 9pt; margin: 1.5mm 0; }
-  .cabinet-meta { margin: 2mm 0; font-size: 9pt; }
-  .cabinet-meta th { background: #f0f1f4; width: 14mm; }
-  .cabinet-meta td { min-width: 28mm; }
-  .cabinet-foot { font-size: 8pt; color: #666; margin: 2mm 0; border-top: 0.5pt solid #999; padding-top: 1mm; display: flex; justify-content: space-between; }
-  @page { size: A4 landscape; margin: 0; }
-  @media print { .no-print { display: none; } }
-  .print-hint { background: #fffbe6; border: 0.5pt solid #e0c96b; padding: 2mm 3mm; font-size: 9pt; margin-bottom: 3mm; }
+  html, body { margin: 0; padding: 0; color: #111318; font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+  body { background: #e8ebef; }
+  .page { width: 420mm; height: 297mm; margin: 10mm auto; overflow: hidden; background: #fff; box-shadow: 0 2mm 8mm #0002; break-after: page; page-break-after: always; }
+  .page:last-child { break-after: auto; page-break-after: auto; }
+  .sheet-wrap, .sheet-wrap svg { width: 100%; height: 100%; display: block; }
+  .layout-page { position: relative; }
+  .layout-page .layout-heading { position: absolute; z-index: 1; top: 6mm; left: 10mm; padding: 2mm 4mm; background: #fff; border: 0.3mm solid #555; font-size: 12pt; }
+  .layout-safety-note { position: absolute; z-index: 3; padding: 2mm 3mm; border: 0.6mm solid #a32218; background: #fff1ef; color: #701a12; font-size: 10pt; font-weight: 700; line-height: 1.25; top: 6mm; right: 8mm; max-width: 260mm; }
+  .layout-page .sheet-wrap { position: absolute; inset: 16mm 8mm 55mm; width: auto; height: auto; }
+  .layout-schedule { position: absolute; z-index: 2; left: 8mm; right: 8mm; bottom: 5mm; height: 45mm; padding: 2.5mm 3mm; border: 0.5mm solid #596579; background: #fff; display: grid; grid-template-rows: auto auto auto; gap: 1.5mm; font-size: 9pt; line-height: 1.25; }
+  .layout-schedule-row { white-space: normal; }
+  .layout-schedule-row strong { color: #26364c; }
+  .layout-schedule-tag { display: inline-block; min-width: 8mm; margin-right: 1mm; padding: 0.3mm 1mm; border: 0.3mm solid #46556a; border-radius: 1mm; font-weight: 700; text-align: center; }
+  .layout-schedule-special { color: #701a12; font-weight: 700; }
+  .cabinet-page { position: relative; }
+  .cabinet-note-stack { position: absolute; z-index: 3; top: 10mm; left: 10mm; width: 285mm; display: flex; flex-direction: column; gap: 1mm; }
+  .cabinet-safety-note, .cabinet-warning-note { position: static; padding: 2mm 3mm; border: 0.6mm solid #a32218; background: #fff1ef; color: #701a12; font-size: 10pt; font-weight: 700; line-height: 1.25; }
+  .cabinet-warning-note { border-color: #9a6a10; background: #fff7df; color: #563800; font-size: 9pt; }
+  .shared-panel-page { padding: 12mm; }
+  .shared-panel-page h1 { margin: 0 0 5mm; font-size: 18pt; }
+  .shared-panel-meta { border: 0.5mm solid #596579; padding: 4mm; font-size: 10pt; line-height: 1.5; }
+  .shared-panel-drawing { height: 185mm; margin-top: 5mm; }
+  .empty { padding: 24mm; font-size: 14pt; }
+  .print-hint { position: fixed; z-index: 2; left: 12px; top: 12px; padding: 8px 12px; border: 1px solid #d4b54a; background: #fff7cf; color: #564616; font-size: 12px; }
+  @page { size: A3 landscape; margin: 0; }
+  @media print { body { background: #fff; } .page { margin: 0; box-shadow: none; } .print-hint { display: none; } }
 `;
 
-export function roomBookHtml(book: RoomBook): string {
-  const parts: string[] = [];
-
-  // ── 封面 ──
-  parts.push(`<section class="page">`);
-  parts.push(`<div class="print-hint no-print">打印成 PDF：浏览器菜单 → 打印 → 目标选「另存为 PDF」→ 布局「横向」→ 勾选「背景图形」。</div>`);
-  parts.push(`<h1>${esc(book.projectName)} · 图纸册</h1>`);
-  parts.push(`<div class="meta">客户信息（签订时填写）</div>`);
-  parts.push(`<table class="cover-table"><tr><th>客户</th><td></td><th>电话</th><td></td></tr>`);
-  parts.push(`<tr><th>地址</th><td colspan="3"></td></tr>`);
-  parts.push(`<tr><th>出图日期</th><td>${new Date().toISOString().slice(0, 10)}</td><th>图纸册编号</th><td>${esc(book.modelVersion)}</td></tr></table>`);
-  parts.push(`<h2>版本三件套（生产数据可复现红线）</h2>`);
-  parts.push(`<table><tr><th>模型版本</th><td>${esc(book.modelVersion)}</td><th>生成器版本</th><td>${esc(book.generatorVersion)}</td><th>规则集</th><td>${esc(book.ruleSetId)}（${esc(book.ruleSetName)}）</td></tr></table>`);
-  parts.push(`<h2>项目概况</h2>`);
-  parts.push(`<table><tr><th>房间数</th><td>${book.sections.filter((s) => s.roomId !== '').length}</td><th>柜体数</th><td>${book.totals.cabinets}</td><th>板件种类</th><td>${book.totals.panelKinds}</td><th>板件总数</th><td>${book.totals.panelPieces}</td><th>甲购件</th><td>${book.totals.purchased}</td></tr></table>`);
-  parts.push(`</section>`);
-
-  // ── 每房间一页：家具生产图（与 DXF 同源）──
-  for (const sec of book.sections) {
-    parts.push(`<section class="page">`);
-    parts.push(`<h2>${esc(sec.roomName)} · 家具生产图</h2>`);
-    // 整张生产图（地柜平面 + 吊柜平面 + 立面外观 + 立面结构 + 图框）
-    parts.push(`<div class="sheet-wrap">${sec.sheetSvg}</div>`);
-    // 柜体明细表（材质/工艺/安装）
-    parts.push(`<h3>柜体明细</h3>`);
-    parts.push(`<table class="cabinet-meta"><tr><th>柜体</th><th>规格</th><th>板材</th><th>门板</th><th>背板</th><th>工艺</th><th>安装</th></tr>`);
-    for (const c of sec.cabinets) {
-      parts.push(`<tr>`);
-      parts.push(`<td>${esc(c.name)}</td>`);
-      parts.push(`<td>W${c.width}×H${c.height}×D${c.depth}</td>`);
-      parts.push(`<td>${esc(c.boardMaterial)}</td>`);
-      parts.push(`<td>${c.doorMaterial ? esc(c.doorMaterial) : '—'}</td>`);
-      parts.push(`<td>${esc(c.backMaterial)}</td>`);
-      parts.push(`<td>${c.craftNotes.length > 0 ? c.craftNotes.map(esc).join(' / ') : '标准'}</td>`);
-      parts.push(`<td>${c.mountHeight > 0 ? `壁挂，底离地 ${c.mountHeight}mm` : '落地'}</td>`);
-      parts.push(`</tr>`);
+/**
+ * 按需为选中的房间先出一页平面布局，再为房间内每个柜体单独出图（横向 A3）。
+ * HTML 打印版未指定时保留历史全房间布局；正式 PDF 调用方显式传空数组，默认只出逐柜页。
+ * 页面身份同时写入 data 属性和图框文字，便于自动化检查与后续追溯。
+ */
+export function roomBookHtml(book: RoomBook, options: { layoutRoomIds?: string[] } = {}): string {
+  const pages: string[] = [];
+  const layoutRoomIds = new Set(options.layoutRoomIds ?? book.sections.map((section) => section.roomId));
+  for (const section of book.sections) {
+    const scheduleItems = (cabinets: RoomBookCabinet[]) => cabinets.map((cabinet) =>
+      `<span class="layout-schedule-tag">${esc(cabinet.mapTag)}</span>${esc(cabinet.name)} ${cabinet.width}×${cabinet.height}×${cabinet.depth}mm${cabinet.cabinetType === 'wall' ? `（吊柜底 ${cabinet.mountHeight}mm）` : ''}`
+    ).join('　·　');
+    const base = section.cabinets.filter((cabinet) => cabinet.cabinetType === 'base' || cabinet.cabinetType === 'island' || cabinet.cabinetType === 'tall');
+    const wall = section.cabinets.filter((cabinet) => cabinet.cabinetType === 'wall');
+    const specialNotes = section.cabinets.flatMap((cabinet) => cabinet.referenceNotes.map((note) => `${cabinet.mapTag} ${cabinet.name}：${note}`));
+    const layoutNote = section.layoutSafetyNote ? `<aside class="layout-safety-note">${esc(section.layoutSafetyNote)}</aside>` : '';
+    const schedule = `<div class="layout-schedule" aria-label="柜体编号、名称和完整尺寸清单"><div class="layout-schedule-row"><strong>地柜/高柜：</strong>${scheduleItems(base) || '无'}</div><div class="layout-schedule-row"><strong>吊柜：</strong>${scheduleItems(wall) || '无'}</div><div class="layout-schedule-row layout-schedule-special"><strong>参考预留 / 设备净空：</strong>${esc(specialNotes.join('　·　') || '无')}</div></div>`;
+    if (layoutRoomIds.has(section.roomId)) {
+      pages.push(
+        `<section class="page layout-page" data-page-kind="layout" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间布局"><div class="layout-heading">${esc(section.roomName)} · 房间布局（单位：mm）</div>${layoutNote}<div class="sheet-wrap">${section.layoutSvg}</div>${schedule}</section>`,
+      );
     }
-    parts.push(`</table>`);
-    // 五金与甲购件汇总
-    const allHardware = sec.cabinets.flatMap((c) => c.hardware);
-    if (allHardware.length > 0) {
-      parts.push(`<table style="margin-top:2mm"><tr><th>五金</th><th>数量</th><th>规格</th></tr>`);
-      for (const h of allHardware) parts.push(`<tr><td>${esc(h.nameZh)}</td><td>${h.qty}</td><td>${esc(h.spec)}</td></tr>`);
-      parts.push(`</table>`);
+    for (const cabinet of section.cabinets) {
+      const noteBlocks = [
+        ...(cabinet.safetyNote ? [`<div class="cabinet-safety-note">${esc(cabinet.safetyNote)}</div>`] : []),
+        ...cabinet.warningNotes.map((note) => `<div class="cabinet-warning-note" role="note">${esc(note)}</div>`),
+      ].join('');
+      const noteStack = noteBlocks
+        ? `<aside class="cabinet-note-stack" aria-label="${esc(cabinet.name)}生产警告与加工说明">${noteBlocks}</aside>`
+        : '';
+      pages.push(
+        `<section class="page cabinet-page" data-page-kind="cabinet" data-room-id="${esc(section.roomId)}" data-cabinet-id="${esc(cabinet.id)}" aria-label="${esc(section.roomName)} / ${esc(cabinet.name)}"><div class="sheet-wrap">${cabinet.sheetSvg}</div>${noteStack}</section>`,
+      );
     }
-    const allPurchased = sec.cabinets.flatMap((c) => c.purchased);
-    if (allPurchased.length > 0) {
-      parts.push(`<table style="margin-top:1.5mm"><tr><th>甲购/外采件</th><th>材质</th><th>规格</th><th>数量</th></tr>`);
-      for (const p of allPurchased) parts.push(`<tr><td>${esc(p.nameZh)}</td><td>${esc(p.material)}</td><td>${esc(p.spec)}</td><td>${p.qty}</td></tr>`);
-      parts.push(`</table>`);
-    }
-    parts.push(`</section>`);
   }
-
-  // ── 尾页汇总 ──
-  parts.push(`<section class="page">`);
-  parts.push(`<h2>清单汇总（按柜归类）</h2>`);
-  parts.push(`<table><tr><th>房间</th><th>柜体</th><th>板件种类</th><th>板件总数</th><th>五金种类</th><th>五金总数</th><th>甲购件</th></tr>`);
-  for (const s of book.summary) {
-    parts.push(`<tr><td>${esc(s.room)}</td><td>${esc(s.cabinet)}</td><td>${s.panelKinds}</td><td>${s.panelPieces}</td><td>${s.hardwareKinds}</td><td>${s.hardwarePieces}</td><td>${s.purchased}</td></tr>`);
+  for (const panel of book.sharedPanels) {
+    const holeNotes = panel.machining.holes.map((hole) => `${hole.id} / ${hole.kind} / X=${hole.x} Y=${hole.y} / Ø${hole.diameter}mm / 深${hole.depth}mm`).join('；') || '已确认无孔';
+    pages.push(`<section class="page shared-panel-page" data-page-kind="shared-panel" data-shared-panel-id="${esc(panel.id)}" aria-label="共享制造板 ${esc(panel.id)}"><h1>跨柜共享制造件：${esc(panel.name)}（${esc(panel.id)}）</h1><div class="shared-panel-meta"><strong>成员柜：</strong>${esc(panel.memberCabinetIds.join('、'))}<br><strong>替代箱体顶板：</strong>${esc(panel.replacesPanelIds.join('、'))}<br><strong>成品尺寸/标高：</strong>${panel.length}×${panel.width}×${panel.thickness}mm / ${panel.elevation}mm<br><strong>材料/饰面：</strong>${esc(panel.material)} / ${esc(panel.finish)}<br><strong>纹理方向：</strong>${esc(panel.grainDirection)}（相对成品板长/宽轴）<br><strong>外挑：</strong>${esc(JSON.stringify(panel.overhang))}<br><strong>四边处理：</strong>${esc(JSON.stringify(panel.edgeTreatment))}<br><strong>接缝分段：</strong>${esc(JSON.stringify(panel.segmentation))}<br><strong>支撑：</strong>${esc(JSON.stringify(panel.support))}<br><strong>孔位：</strong>${esc(panel.machining.status)}；${esc(holeNotes)}<br><strong>成品边界：</strong>${esc(JSON.stringify(panel.bounds))}<br>共享件追踪页；不提供专业开料优化、板材旋转优化或机床专用 CNC 后处理。</div><div class="shared-panel-drawing">${panel.sheetSvg}</div></section>`);
   }
-  parts.push(`</table>`);
-  parts.push(`<p class="meta">生成：${esc(book.generatorVersion)} · 模型 ${esc(book.modelVersion)} · 规则集 ${esc(book.ruleSetId)} —— 首批生产必须人工全检。</p>`);
-  parts.push(`</section>`);
-
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>${esc(book.projectName)} · 图纸册</title><style>${CSS}</style></head><body>${parts.join('')}</body></html>`;
+  if (pages.length === 0) pages.push(`<section class="page"><div class="empty">当前项目没有可导出的柜体。</div></section>`);
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="furniture-model-version" content="${esc(book.modelVersion)}"><meta name="furniture-generator-version" content="${esc(book.generatorVersion)}"><meta name="furniture-ruleset" content="${esc(book.ruleSetId)}"><title>${esc(book.projectName)} · 柜体图纸</title><style>${CSS}</style></head><body><div class="print-hint">${esc(book.projectName)} · ${book.totals.cabinets} 个柜体图纸 · ${esc(book.modelVersion)} / ${esc(book.generatorVersion)} / ${esc(book.ruleSetId)} · 打印设置为 A3 横向 / 边距无 / 背景图形开启</div>${pages.join('')}</body></html>`;
 }

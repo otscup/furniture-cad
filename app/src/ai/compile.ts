@@ -765,6 +765,24 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       const width = p.width === undefined ? base.width : mm(Number(p.width));
       const height = p.height === undefined ? base.height : mm(Number(p.height));
       const depth = p.depth === undefined ? base.depth : mm(Number(p.depth));
+      const cabinetType = String(p.cabinetType ?? (Number(p.mountHeight ?? 0) > 0 ? 'wall' : 'base'));
+      if (!['base', 'wall', 'tall', 'island'].includes(cabinetType)) return { ok: false, error: 'cabinetType 必须是 base / wall / tall / island' };
+      const mountHeight = p.mountHeight === undefined ? 0 : Number(p.mountHeight);
+      if (!Number.isInteger(mountHeight) || mountHeight < 0 || mountHeight > 3000) return { ok: false, error: 'mountHeight 必须是 0~3000mm 整数' };
+      if ((cabinetType === 'wall' && mountHeight <= 0) || (cabinetType !== 'wall' && mountHeight > 0)) return { ok: false, error: '吊柜必须给正数 mountHeight；地柜/高柜/岛台的 mountHeight 必须为 0' };
+      const bodyLift = p.bodyLift === undefined ? (cabinetType === 'wall' ? 0 : base.bodyLift) : Number(p.bodyLift);
+      if (!Number.isInteger(bodyLift) || bodyLift < 0 || bodyLift > 300) return { ok: false, error: 'bodyLift 必须是 0~300mm 整数' };
+      let counterCutouts: Cabinet['params']['counterCutouts'];
+      if (p.counterCutouts !== undefined) {
+        if (!Array.isArray(p.counterCutouts)) return { ok: false, error: 'counterCutouts 必须是数组' };
+        counterCutouts = [];
+        for (const [i, raw] of p.counterCutouts.entries()) {
+          const c = (raw ?? {}) as Record<string, unknown>;
+          const cutout = { kind: String(c.kind ?? 'other'), name: String(c.name ?? ''), x: Number(c.x), y: Number(c.y), width: Number(c.width), depth: Number(c.depth) };
+          if (!['sink', 'cooktop', 'other'].includes(cutout.kind) || !cutout.name || ![cutout.x, cutout.y, cutout.width, cutout.depth].every(Number.isInteger) || cutout.x < 18 || cutout.y < 0 || cutout.width < 50 || cutout.depth < 50 || cutout.x + cutout.width > width - 18 || cutout.y + cutout.depth > depth) return { ok: false, error: `counterCutouts 第 ${i + 1} 项无效或超出台面范围` };
+          counterCutouts.push(cutout as NonNullable<Cabinet['params']['counterCutouts']>[number]);
+        }
+      }
 
       // ── 分区意图：AI 说"左边三个抽屉、右边两组对开门"时就落在这里 ──
       // 省略 units 才走默认三分区；给了就必须**完全按它说的建**，不许偷偷补默认分区。
@@ -824,7 +842,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         rotation,
         rules,
         ...(action.origin ? { origin: action.origin } : {}),
-        params: { width, height, depth, ...(p.mountHeight !== undefined ? { mountHeight: Number(p.mountHeight) } : {}) },
+        params: { width, height, depth, bodyLift, cabinetType: cabinetType as Cabinet['params']['cabinetType'], mountHeight, ...(counterCutouts ? { counterCutouts } : {}) },
         units,
         backUnits,
         rows,
@@ -1008,9 +1026,11 @@ function checkMaterial(rules: RuleSet, id: string, use: 'body' | 'back'): string
 
 function resolveRoom(project: Project, target: AiAction['target']): { id: string } | string {
   if (project.rooms.length === 0) return '项目里还没有房间';
-  if (project.rooms.length === 1) return { id: project.rooms[0].id };
   const ref = target.roomName ?? target.roomId;
-  if (ref === undefined) return `项目里有 ${project.rooms.length} 个房间，需要指明 target.roomName`;
+  if (ref === undefined) {
+    if (project.rooms.length === 1) return { id: project.rooms[0].id };
+    return `项目里有 ${project.rooms.length} 个房间，需要指明 target.roomName`;
+  }
   if (typeof ref === 'number') {
     const r = project.rooms[Math.round(ref) - 1];
     return r ? { id: r.id } : `房间序号 ${ref} 超范围（共 ${project.rooms.length} 个）`;

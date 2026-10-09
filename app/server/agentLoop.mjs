@@ -119,13 +119,14 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * @param opts.images 图片数组 [{dataUrl, mode, name}]（可选，Agent 直接看图）
  * @param opts.visionResult vision 识别结果（可选，已识别好的结构化数据）
  * @param opts.draftId 继续的 draft（可选）
+ * @param opts.roomId / opts.roomName 当前工作区房间（可选；新建柜体未明确指定房间时使用）
  * @param opts.token 用户 Bearer token（调 MCP 用）
  * @param opts.mcpBaseUrl MCP 地址（如 http://127.0.0.1:8787）
  * @param opts.aiConfig { baseUrl, apiKey, model, timeoutMs }
  * @param opts.onStep 步骤回调（流式推送给前端，可选）
  */
 export async function runAgentLoop(opts) {
-  const { intent, images, visionResult, draftId, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
+  const { intent, images, visionResult, draftId, roomId, roomName, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
   const steps = [];
   let currentDraftId = draftId || null;
   let round = 0;
@@ -137,7 +138,7 @@ export async function runAgentLoop(opts) {
     ['cad.create_cabinet', 'cad.place_cabinet', 'cad.update_object',
      'cad.delete_object', 'cad.validate', 'cad.get_state',
      'cad.create_room', 'cad.draw_wall', 'cad.submit_proposal',
-     'cad.duplicate_object', 'cad.list_drafts'].includes(t.name)
+     'cad.duplicate_object', 'cad.create_assembly', 'cad.list_drafts'].includes(t.name)
   );
 
   // 2. 构建系统提示
@@ -146,9 +147,12 @@ export async function runAgentLoop(opts) {
 规则：
 - 所有写操作只进 draft，不碰 live。${currentDraftId ? `继续使用 draft ${currentDraftId}。` : '没有 draft 时工具会自动创建。'}
 - 先理解意图，拆成工具调用。每步只调一个工具，看结果再决定下一步。
+- 一排连续的厨房地柜、吊柜，先分别创建独立柜体模块，再按地柜排、吊柜排分别调用 cad.create_assembly 组成柜组；连接只描述相邻模块关系。
+- 组合只用于整体展示/操作，不代表把多个柜箱合成一只柜，也不自动生成连续台面、共享顶板或 CNC 开孔；不要合并柜体模块尺寸或板件。
 - 工具报错时读错误信息，调整参数重试。同一问题最多重试 3 轮，修不好就停下说明原因。
 - 完成后调用 cad.validate 确认 0 错误。
 - 不要编造数据：尺寸不确定就问用户，不要猜。
+${roomId ? `- 当前工作区房间为「${roomName || roomId}」（roomId=${roomId}）；新建柜体默认放在此房间，除非用户明确指定其他房间。\n` : ''}
 
 ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}\n` : ''}${images && images.length > 0 ? `用户附了 ${images.length} 张图（${images.map(i => `${i.name || '图片'}:${i.mode === 'dimension' ? '尺寸图' : '效果图'}`).join('、')}），请结合图片理解意图。尺寸图上的标注数字优先采用。\n` : ''}
 当前 draft：${currentDraftId ?? '无（工具会自动创建）'}`;
@@ -203,10 +207,16 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
     } catch {
       toolArgs = {};
     }
+    // Agent 模型有时会省略房间字段；没有明确房间目标时，将前端当前房间设为工具参数，
+    // 避免 cad.create_cabinet 的通用 MCP 默认值把柜体放到项目第一个房间。
+    if (toolName === 'cad.create_cabinet' && roomId && !toolArgs.roomId && !toolArgs.roomName) {
+      toolArgs.roomId = roomId;
+      if (roomName) toolArgs.roomName = roomName;
+    }
     // 透传 draftId
     if (currentDraftId && !toolArgs.draftId &&
         ['cad.create_cabinet', 'cad.place_cabinet', 'cad.update_object',
-         'cad.delete_object', 'cad.validate'].includes(toolName)) {
+         'cad.delete_object', 'cad.create_assembly', 'cad.validate'].includes(toolName)) {
       toolArgs.draftId = currentDraftId;
     }
 

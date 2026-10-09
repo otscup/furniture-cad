@@ -229,6 +229,19 @@ export function renameAssembly(assemblyId: string, name: string, source: Command
   };
 }
 
+/** 用户在房间工作区完成二次确认后，才将组合标记为可连续浏览的装配组。 */
+export function confirmAssembly(assemblyId: string, name: string, source: CommandSource = 'ui'): Command {
+  return {
+    id: newCommandId('assembly.confirm'),
+    op: 'assembly.confirm',
+    source,
+    target: { kind: 'project', id: assemblyId },
+    changes: [],
+    payload: { assemblyId },
+    label: `明确确认装配组「${name}」`,
+  };
+}
+
 /**
  * 镜像柜体：分区左右反序（语义镜像，不是几何镜像）。
  * `rowIndex` 同 addUnit：多行柜必须指明翻哪一行（缺省会被 CommandBus 拒绝）。

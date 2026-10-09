@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import type { Project, RuleSet, Command } from '../src/core/types.ts';
 import { WorkspaceStore, DRAFT_STALE, type ApplyResult } from '../src/workspace/workspace.ts';
 import { emptyProject, createCabinet, rectRoom } from '../src/core/docFactory.ts';
+import { hashProjectSnapshot } from '../server/projectHash.mjs';
 import { enqueueWrite, writeFileAtomic } from '../server/writeQueue.mjs';
 
 const APP = join(import.meta.dirname, '..');
@@ -67,6 +68,7 @@ function makeStore(project?: Project): WorkspaceStore {
     filePath: WS_PATH,
     rules,
     persist: (c: string) => writeFileAtomic(WS_PATH, c),
+    projectHash: hashProjectSnapshot,
     owner: 'test-owner',
     account: 'test-owner',
     project,
@@ -97,7 +99,7 @@ section('A. Workspace 持久实体');
   ok('A3b. 一次提交后 liveModelVersion 单调 +1（=1）', r.ok && store.getLiveModelVersion() === 1, store.getLiveModelVersion());
 
   // 从磁盘重新加载
-  const loaded = WorkspaceStore.load({ filePath: WS_PATH, rules, persist: (c) => writeFileAtomic(WS_PATH, c), readRaw: () => readFileSync(WS_PATH, 'utf8') });
+  const loaded = WorkspaceStore.load({ filePath: WS_PATH, rules, persist: (c) => writeFileAtomic(WS_PATH, c), readRaw: () => readFileSync(WS_PATH, 'utf8'), projectHash: hashProjectSnapshot });
   ok('A4. 保存→重新加载后模型逐值一致（width=900）', loaded.getState().cabinets.find((c) => c.id === 'cab_1')!.params.width === 900);
   ok('A4b. 重新加载后 liveModelVersion 也还原（=1）', loaded.getLiveModelVersion() === 1, loaded.getLiveModelVersion());
   ok('A4c. 重新加载后 workspaceId 稳定', loaded.workspaceId === store.workspaceId);
@@ -145,31 +147,42 @@ section('C. Draft 隔离 + 乐观锁');
   await store.execute(setWidthCmd('cab_1', 900)); // live = 1
   const N = store.getLiveModelVersion();
 
-  const d1 = store.createDraft('author');
+  const d1 = await store.createDraft('author');
   ok('C1. live 建立 version=N', N === 1);
   ok('C2. draft 从 base=N 开始', d1.baseModelVersion === N, d1.baseModelVersion);
 
-  const dr1 = store.draftExecute(d1.draftId, setWidthCmd('cab_1', 1500));
+  const dr1 = await store.draftExecute(d1.draftId, setWidthCmd('cab_1', 1500));
   ok('C3. draft 内修改模型成功', dr1.ok);
   ok('C4. live 仍保持原值（=900，draft 不碰 live）', widthOf(store.getState()) === 900, widthOf(store.getState()));
   ok('C5. draft 看到修改后的值（=1500）', widthOf(store.draftState(d1.draftId)!) === 1500);
 
-  const a1: ApplyResult = await store.applyDraft(d1.draftId);
+  const f1 = store.getDraftFreshness(d1.draftId)!;
+  const a1: ApplyResult = await store.applyDraft(d1.draftId, {
+    draftId: d1.draftId, runId: f1.runId, revision: f1.revision, draftHash: f1.draftHash,
+    localVersion: 0, remoteVersion: f1.liveModelVersion,
+  });
   ok('C6. apply 且 live=N → 成功，version=N+1', a1.ok === true && (a1 as { newVersion: number }).newVersion === N + 1, JSON.stringify(a1));
   ok('C6b. apply 后 live 反映 draft 终态（=1500）', widthOf(store.getState()) === 1500);
 
-  const d2 = store.createDraft('author');
+  const d2 = await store.createDraft('author');
   ok('C7. 重新创建 draft base=N+1', d2.baseModelVersion === N + 1, d2.baseModelVersion);
 
   await store.execute(setWidthCmd('cab_1', 700)); // live 再前进 → N+2
   ok('C8. live 先发生修改 → version=N+2', store.getLiveModelVersion() === N + 2, store.getLiveModelVersion());
 
-  const a2: ApplyResult = await store.applyDraft(d2.draftId);
+  const f2 = store.getDraftFreshness(d2.draftId)!;
+  const a2: ApplyResult = await store.applyDraft(d2.draftId, {
+    draftId: d2.draftId, runId: f2.runId, revision: f2.revision, draftHash: f2.draftHash,
+    localVersion: 0, remoteVersion: f2.liveModelVersion,
+  });
   ok('C9. 旧 draft（base=N+1）apply → 结构化 DRAFT_STALE 拒绝', a2.ok === false && a2.code === DRAFT_STALE, JSON.stringify(a2));
   ok('C10. 拒绝后 live 不变（仍=N+2，width=700）', store.getLiveModelVersion() === N + 2 && widthOf(store.getState()) === 700);
   ok('C10b. 拒绝后 draft 不被静默覆盖（仍可取）', store.getDraft(d2.draftId) !== null);
 
-  const a3: ApplyResult = await store.applyDraft('nonexistent');
+  const a3: ApplyResult = await store.applyDraft('nonexistent', {
+    draftId: 'nonexistent', runId: 'run_nonexistent', revision: 0, draftHash: '0'.repeat(64),
+    localVersion: 0, remoteVersion: store.getLiveModelVersion(),
+  });
   ok('C11. 不存在的 draft apply → 结构化拒绝（非崩溃）', a3.ok === false && a3.code === DRAFT_STALE);
 }
 

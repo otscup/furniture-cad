@@ -4,6 +4,9 @@ import type {
   CabinetGeometry,
   DoorHinge,
   DoorSwingDirection,
+  DrawingEntity,
+  DrawingSpace,
+  DrawingView,
   Opening,
   Project,
   ProjectGeometry,
@@ -11,6 +14,7 @@ import type {
   RuleSet,
   UnitSpec,
   Wall,
+  Prim,
 } from '../../core/types.ts';
 import type { Command, CommandBus } from '../../core/commandBus.ts';
 import * as CMD from '../../core/commands.ts';
@@ -35,6 +39,8 @@ import {
 import { buildAlignIntent, buildAttachIntent, commitPlacementIntent } from '../placementIntent.ts';
 import { designViewFor, validateDesign, type CabinetDesignView, type WallContactFact } from '../../core/designValidation/index.ts';
 import type { ToastKind } from '../types.ts';
+import { editIdFromSelection, editSelectionId, replaceDrawingEdits, sourceKeyFromSelection, sourceOverride } from '../../core/drawingEdits.ts';
+import { newCommandId } from '../../core/ids.ts';
 
 /**
  * 属性面板（主方案 §L6）
@@ -50,6 +56,7 @@ export interface PropertiesPanelProps {
   selection: string[];
   setSelection: (ids: string[]) => void;
   onToast: (kind: ToastKind, text: string) => void;
+  readOnly?: boolean;
 }
 
 type Run = (c: Command) => void;
@@ -61,6 +68,10 @@ export function PropertiesPanel(props: PropertiesPanelProps): ReactNode {
   const derived = bus.derive();
 
   const run: Run = (cmd) => {
+    if (props.readOnly) {
+      props.onToast('warn', '历史重复 Unit ID 项目只读；属性修改/保存已拦截，需显式修复/迁移后恢复。');
+      return;
+    }
     const r = bus.execute(cmd, { commitLabel: cmd.label });
     if (!r.ok) props.onToast('error', r.error ?? '操作被拒绝');
   };
@@ -74,6 +85,25 @@ export function PropertiesPanel(props: PropertiesPanelProps): ReactNode {
   }
 
   const id = selection[0];
+  const editId = editIdFromSelection(id!);
+  const editedEntity = editId ? project.drawingEdits?.find(e => e.id === editId) : undefined;
+  if (editedEntity) return <DrawingEntityProps project={project} entity={editedEntity} onRun={run} setSelection={props.setSelection} />;
+  const sourceKey = sourceKeyFromSelection(id!);
+  if (sourceKey) {
+    const geom = derived.geom;
+    const pi = geom.planSourceKeys.indexOf(sourceKey), si = geom.views.sourceKeys.indexOf(sourceKey);
+    const prim = pi >= 0 ? geom.plan[pi] : si >= 0 ? geom.views.prims[si] : undefined;
+    if (prim) {
+      const parts = sourceKey.split(':');
+      const space = parts[0] === 'sheet' ? 'sheet' : 'plan';
+      const meta = parts[0] === 'sheet'
+        ? { cabinetId: parts[1], view: parts[2] as DrawingView }
+        : parts[1] === 'wall'
+          ? { roomId: project.rooms.find(r => r.walls.some(w => w.id === parts[2]))?.id }
+          : { cabinetId: parts[2], roomId: project.cabinets.find(c => c.id === parts[2])?.roomId };
+      return <GeneratedLineProps sourceKey={sourceKey} prim={prim} space={space} meta={meta} project={project} bus={bus} setSelection={props.setSelection} onToast={props.onToast} readOnly={props.readOnly} />;
+    }
+  }
   const cab = project.cabinets.find((c) => c.id === id);
   if (cab) return <CabinetProps bus={bus} cab={cab} project={project} rules={rules} geom={derived.geom.cabinets[cab.id]} onRun={run} onToast={props.onToast} />;
 
@@ -81,6 +111,78 @@ export function PropertiesPanel(props: PropertiesPanelProps): ReactNode {
   if (wall) return <WallProps project={project} wall={wall} onRun={run} />;
 
   return <div className="panel-scroll empty-hint">对象已不存在（可能被撤销删除）。</div>;
+}
+
+function GeneratedLineProps(props: {
+  sourceKey: string; prim: Prim; space: DrawingSpace; meta: Partial<DrawingEntity>;
+  project: Project; bus: CommandBus; setSelection: (ids: string[]) => void; onToast: (kind: ToastKind, text: string) => void;
+  readOnly?: boolean;
+}): ReactNode {
+  const convert = (): void => {
+    if (props.readOnly) {
+      props.onToast('warn', '历史重复 Unit ID 项目只读；CAD 图元保存已拦截。');
+      return;
+    }
+    const entity = sourceOverride(props.sourceKey, props.prim, props.space, newCommandId('edit'), props.meta);
+    if (!entity) { props.onToast('info', '填充区域目前只读，避免透明度/填充语义在编辑或导出时丢失'); return; }
+    const next = [...(props.project.drawingEdits ?? []), entity];
+    const result = props.bus.execute(replaceDrawingEdits(props.project, next, '覆盖模型生成线'), { commitLabel: '覆盖模型生成线' });
+    if (!result.ok) { props.onToast('error', result.error ?? '无法创建视图覆盖'); return; }
+    props.setSelection([editSelectionId(entity.id)]);
+  };
+  return <div className="panel-scroll"><Section title="模型生成图元（只读来源）">
+    <Row label="来源"><Text mono>{props.sourceKey}</Text></Row>
+    <Row label="编辑策略"><Text>创建当前视图覆盖，不修改柜体语义参数</Text></Row>
+    {props.prim.k === 'fill'
+      ? <div className="hint-line">填充图元保持只读；当前 DXF 规范仅把它表示为闭合线框，编辑会丢失 alpha。</div>
+      : <div className="btn-row"><button type="button" className="btn" onClick={convert} disabled={props.readOnly}>转为可编辑覆盖</button></div>}
+    <div className="hint-line">也可直接拖动该线移动；结构性尺寸请在柜体参数中修改后重生成。</div>
+  </Section></div>;
+}
+
+function DrawingEntityProps(props: { project: Project; entity: DrawingEntity; onRun: Run; setSelection: (ids: string[]) => void }): ReactNode {
+  const { project, entity } = props;
+  const update = (patch: Partial<DrawingEntity>): void => {
+    const next = (project.drawingEdits ?? []).map(e => e.id === entity.id ? { ...e, ...patch } : e);
+    props.onRun(replaceDrawingEdits(project, next, '编辑二维图元属性'));
+  };
+  const pointUpdate = (index: number, axis: 'x' | 'y', value: number): void => {
+    const points = entity.points.map((p, i) => i === index ? { ...p, [axis]: value } : p);
+    update({ points });
+  };
+  return <div className="panel-scroll">
+    <Section title={`二维图元 · ${entity.kind}`}>
+      <Row label="图元 ID" derived><Text mono>{entity.id}</Text></Row>
+      <Row label="空间 / 视图" derived><Text>{entity.space}{entity.view ? ` · ${entity.view}` : ''}</Text></Row>
+      <Row label="来源" derived><Text>{entity.provenance === 'model-override' ? '模型生成 · 手工覆盖' : '手工绘制'}</Text></Row>
+      {entity.text !== undefined ? <Row label="文字"><TextField value={entity.text} onCommit={v => update({ text: v })} /></Row> : null}
+      <Row label="图层"><TextField value={entity.layer} onCommit={v => update({ layer: v })} /></Row>
+      <Row label="线宽"><NumField value={entity.lineWidth} min={1} max={12} onCommit={v => update({ lineWidth: v })} /></Row>
+      {entity.kind === 'polyline' ? <>
+        <Row label="闭合"><input type="checkbox" checked={Boolean(entity.closed)} onChange={e => update({ closed: e.target.checked })} /></Row>
+        <Row label="线型"><select className="input" value={entity.dash?.join(',') ?? 'solid'} onChange={e => update({ dash: e.target.value === 'solid' ? undefined : e.target.value.split(',').map(Number) })}>
+          <option value="solid">实线</option><option value="6,4">虚线 6,4</option>
+          {entity.dash && entity.dash.join(',') !== '6,4' ? <option value={entity.dash.join(',')}>当前样式 {entity.dash.join(',')}</option> : null}
+        </select></Row>
+      </> : null}
+      {entity.kind === 'text' || entity.kind === 'dimension' || entity.kind === 'leader' ? <Row label="文字高"><NumField value={entity.textSize} min={20} max={2000} onCommit={v => update({ textSize: v })} /></Row> : null}
+      {entity.kind === 'text' ? <Row label="旋转角"><NumField value={entity.rot ?? 0} min={-36000} max={36000} onCommit={v => update({ rot: v })} /></Row> : null}
+    </Section>
+    <Section title={`坐标点 (${entity.points.length})`}>
+      {entity.points.map((p, i) => <div className="row" key={`${entity.id}-${i}`}>
+        <label className="row-label">P{i + 1}</label>
+        <div className="row-value" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+          <NumField value={p.x} min={-1000000} max={1000000} onCommit={v => pointUpdate(i, 'x', v)} />
+          <NumField value={p.y} min={-1000000} max={1000000} onCommit={v => pointUpdate(i, 'y', v)} />
+        </div>
+      </div>)}
+      <div className="hint-line">更改坐标只作用于当前图纸覆盖；不会写回柜体结构参数。</div>
+      <div className="btn-row"><button type="button" className="btn danger" onClick={() => {
+        props.onRun(replaceDrawingEdits(project, (project.drawingEdits ?? []).filter(e => e.id !== entity.id), '删除二维图元属性'));
+        props.setSelection([]);
+      }}>删除此图元</button></div>
+    </Section>
+  </div>;
 }
 
 function findWall(project: Project, id: string): Wall | null {
@@ -264,6 +366,20 @@ function CabinetProps(props: {
           </select>
         </Row>
       </Section>
+
+      {(p.counterCutouts?.length ?? 0) > 0 ? (
+        <Section title="台面参考预留（未加工）">
+          <Row label="加工状态" derived>
+            <Text>参考预留｜非 CNC 开孔｜待拆单确认</Text>
+          </Row>
+          {(p.counterCutouts ?? []).map((cutout, index) => (
+            <Row key={`${cutout.name}-${index}`} label={cutout.name} derived>
+              <Text>{cutout.width} × {cutout.depth} mm · X={cutout.x}, Y={cutout.y} mm</Text>
+            </Row>
+          ))}
+          <div className="hint-line">虚线仅为布局参考，不代表台面已开孔；下单前由台面供应商复核模板并完成拆单。</div>
+        </Section>
+      ) : null}
 
       <Section title="位置（背左角 + 旋转）">
         <Row label="X">

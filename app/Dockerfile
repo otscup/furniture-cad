@@ -20,12 +20,16 @@ RUN npm run build
 
 # ── 阶段二：运行时 ──
 FROM node:22-slim
-# ezdxf 装进系统 Python（bookworm 需要 --break-system-packages）；
-# ezdxf 有预编译 wheel，无需编译器工具链，slim 底座即可。
+# ezdxf + WeasyPrint 装进系统 Python（bookworm 需要 --break-system-packages）。
+# WeasyPrint 用系统 Pango/Cairo 和 Noto CJK 字体渲染固定版式 PDF；无需捆绑整套 Chromium。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip \
+        libcairo2 libfontconfig1 libgdk-pixbuf-2.0-0 \
+        libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
+        shared-mime-info fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --break-system-packages --no-cache-dir "ezdxf==1.4.4"
+    && pip3 install --break-system-packages --no-cache-dir "ezdxf==1.4.4" "weasyprint==70.0"
 
 ENV APP_PYTHON=/usr/bin/python3 \
     APP_HOST=0.0.0.0 \

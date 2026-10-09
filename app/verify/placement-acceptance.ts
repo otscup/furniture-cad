@@ -47,6 +47,7 @@ import { compileProposal } from '../src/ai/compileProposal.ts';
 import { commitPlan, dryRunPlan } from '../src/ai/planRunner.ts';
 import { ACTIONS, proposalShapeError } from '../shared/aiContract.mjs';
 import * as CMD from '../src/core/commands.ts';
+import { findDuplicateUnitIds } from '../src/core/unitIdentity.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const APP = join(here, '..');
@@ -79,7 +80,7 @@ type Box = { min: Vec2; max: Vec2 };
 function mkProject(): Project {
   const room = rectRoom({ name: '测试房', x: 0, y: 0, w: 6000, h: 4000, thickness: 100, height: 2700 });
   const mk = (id: string, name: string, x: number, y: number, w: number, d: number, rotation = 0): Cabinet =>
-    createCabinet({
+    withUniqueUnitIds(createCabinet({
       id,
       name,
       roomId: room.id,
@@ -89,7 +90,7 @@ function mkProject(): Project {
       rules,
       params: { ...defaultCabinetParams(rules), width: w, height: 2200, depth: d },
       units: defaultUnits(w, rules, d),
-    });
+    }));
   const project: Project = {
     schemaVersion: '0.3',
     id: 'proj_p81',
@@ -98,7 +99,31 @@ function mkProject(): Project {
     rooms: [room],
     cabinets: [mk('cab_A', '基准柜A', 400, 60, 2400, 600), mk('cab_B', '相邻柜B', 1000, 1000, 800, 550)],
   };
+  assertUniqueFixtureUnitIds(project);
   return project;
+}
+
+function withUniqueUnitIds(cabinet: Cabinet): Cabinet {
+  let sequence = 0;
+  const assign = (units?: Array<{ id: string }>): void => {
+    for (const unit of units ?? []) {
+      sequence++;
+      unit.id = `${cabinet.id}_unit_${String(sequence).padStart(3, '0')}`;
+    }
+  };
+  if (cabinet.layout.rows?.length) {
+    for (const row of cabinet.layout.rows) assign(row.units);
+  } else {
+    assign(cabinet.layout.units);
+  }
+  assign(cabinet.layout.backUnits);
+  return cabinet;
+}
+
+function assertUniqueFixtureUnitIds(project: Project): void {
+  if (findDuplicateUnitIds(project).length === 0) return;
+  const duplicates = findDuplicateUnitIds(project);
+  throw new Error(`Placement fixture has duplicate Unit/backUnit IDs: ${JSON.stringify(duplicates)}`);
 }
 
 function primBox(prims: Prim[]): Box {
@@ -188,7 +213,7 @@ section('§2 多柜连续：后面的柜贴前面"刚解析出来"的位置');
 {
   const project = mkProject();
   project.cabinets.push(
-    createCabinet({
+    withUniqueUnitIds(createCabinet({
       id: 'cab_C',
       name: '第三柜C',
       roomId: project.rooms[0]!.id,
@@ -198,8 +223,9 @@ section('§2 多柜连续：后面的柜贴前面"刚解析出来"的位置');
       rules,
       params: { ...defaultCabinetParams(rules), width: 800, height: 2200, depth: 600 },
       units: defaultUnits(800, rules, 600),
-    })
+    }))
   );
+  assertUniqueFixtureUnitIds(project);
   const scene = sceneFromProject(project);
   const intents: PlacementIntent[] = [
     { relation: 'adjacent', targetId: 'cab_C', referenceId: 'cab_B', side: 'right' }, // 故意乱序：C 排在 B 前面
@@ -295,12 +321,12 @@ section('§5 CommandBus：解析结果经 cabinet.place 原子写入（不绕过
 
   const dry = bus.execute(cmd, { dryRun: true });
   const untouched = bus.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
-  ok('干跑成功、模型未动（版本不变、placement 不变）', dry.ok && bus.getVersion() === v0 && untouched.x === 1000 && untouched.y === 1000);
+  ok('干跑成功、模型未动（版本不变、placement 不变）', dry.ok && bus.getVersion() === v0 && untouched.x === 1000 && untouched.y === 1000, dry.ok ? '' : JSON.stringify(dry));
   ok('一条命令带齐 x/y/rotation（原子，不是三条）', cmd.changes.length === 3 && cmd.changes.every((ch) => /^placement\.(x|y|rotation)$/.test(ch.path)));
 
   const exec = bus.execute(cmd);
   const after = bus.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
-  ok('提交成功：版本 +1，落位 = 解析值（2800, 60, 0）', exec.ok && bus.getVersion() === v0 + 1 && after.x === 2800 && after.y === 60 && after.rotation === 0, JSON.stringify(after));
+  ok('提交成功：版本 +1，落位 = 解析值（2800, 60, 0）', exec.ok && bus.getVersion() === v0 + 1 && after.x === 2800 && after.y === 60 && after.rotation === 0, exec.ok ? JSON.stringify(after) : `${JSON.stringify(exec)}; after=${JSON.stringify(after)}`);
   ok('预览（dryRun diff）与提交结果一致', eq(dry.diff, exec.diff));
 
   ok('撤销一步回到原位（placement 逐值还原）', (() => {

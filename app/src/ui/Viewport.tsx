@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, PointerEvent as RPointerEvent, SetStateAction, MouseEvent as ReactMouseEvent } from 'react';
-import type { Cabinet, Project, Vec2, Wall } from '../core/types.ts';
+import type { Cabinet, DrawingEntity, DrawingSpace, DrawingView, Prim, Project, Vec2, Wall } from '../core/types.ts';
 import type { Command, CommandBus } from '../core/commandBus.ts';
 import { generateProject } from '../core/geometry/project.ts';
 import { doorSwingPrimsOf } from '../viewport/doorSwingPrims.ts';
@@ -18,6 +18,9 @@ import type { SheetDragSpec } from '../viewport/sheetDrag.ts';
 import { dragPlanOf, dragValueOf, dragClamped } from '../viewport/sheetDrag.ts';
 import type { Scene } from '../viewport/renderer.ts';
 import { renderScene } from '../viewport/renderer.ts';
+import { conflictsWithProductionDimension, drawingEntityPrims, editIdFromSelection, editSelectionId, replaceDrawingEdits, sourceKeysInRect, sourceOverride, sourceSelectionId, translateDrawingEntity } from '../core/drawingEdits.ts';
+import { newCommandId } from '../core/ids.ts';
+import { buildCabinetViews } from '../core/geometry/views.ts';
 import * as CMD from '../core/commands.ts';
 import type { Tool, ToastKind } from './types.ts';
 
@@ -53,7 +56,8 @@ type Drag =
       cab: Cabinet;
       startWorld: Vec2;
       value: number;
-    };
+    }
+  | { kind: 'drawing'; startWorld: Vec2; edits: DrawingEntity[]; selectedIds: string[]; source?: { key: string; prim: Prim; id: string; meta: Partial<DrawingEntity> } };
 
 export interface ViewportProps {
   bus: CommandBus;
@@ -64,7 +68,7 @@ export interface ViewportProps {
   cancelSignal: number;
   /** 聚焦房间：sig 变化时把视口缩放到该房间包围盒（id 为空表示不聚焦） */
   focusRoom: { id: string; sig: number };
-  /** 'plan' 平面图（可编辑） | 'sheet' 四视图图幅（只读看图） */
+  /** 'plan' 平面图 | 'sheet' 四视图图幅（派生投影；尺寸线可编辑、空白处可平移） */
   mode: 'plan' | 'sheet';
   /**
    * 分解图（爆炸图）开关。**默认关闭**。
@@ -96,6 +100,7 @@ export interface ViewportProps {
   onPickPart?: (pl: PickLine) => void;
   onToast: (kind: ToastKind, text: string) => void;
   cursorStyle: string;
+  readOnly?: boolean;
 }
 
 function findWall(project: Project, id: string): Wall | null {
@@ -104,6 +109,66 @@ function findWall(project: Project, id: string): Wall | null {
     if (w) return w;
   }
   return null;
+}
+
+function pointSegmentDistance(p: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+function primHit(p: Prim, at: Vec2, tol: number): boolean {
+  if (p.k === 'text') return Math.hypot(p.p.x - at.x, p.p.y - at.y) <= Math.max(tol, (p.size ?? 100) * 0.6);
+  if (p.k !== 'poly' || p.pts.length < 2) return false;
+  const segments = p.closed ? p.pts.length : p.pts.length - 1;
+  for (let i = 0; i < segments; i++) if (pointSegmentDistance(at, p.pts[i]!, p.pts[(i + 1) % p.pts.length]!) <= tol) return true;
+  return false;
+}
+function hitDrawingEntity(entities: DrawingEntity[], space: DrawingSpace, at: Vec2, tol: number): DrawingEntity | null {
+  for (let i = entities.length - 1; i >= 0; i--) {
+    const e = entities[i]!;
+    if (e.space === space && drawingEntityPrims(e).some(p => primHit(p, at, tol))) return e;
+  }
+  return null;
+}
+function hitGeneratedPrim(prims: Prim[], keys: string[], suppressed: Set<string>, at: Vec2, tol: number): { prim: Prim; key: string } | null {
+  for (let i = prims.length - 1; i >= 0; i--) {
+    const prim = prims[i]!;
+    const key = keys[i];
+    if (!key || suppressed.has(key) || !primHit(prim, at, tol)) continue;
+    return { prim, key };
+  }
+  return null;
+}
+function nearestRoomId(project: Project, p: Vec2): string | undefined {
+  let best: { id: string; d: number } | undefined;
+  for (const room of project.rooms) {
+    if (!room.walls.length) continue;
+    const pts = room.walls.flatMap(w => [w.start, w.end]);
+    const c = { x: pts.reduce((s, q) => s + q.x, 0) / pts.length, y: pts.reduce((s, q) => s + q.y, 0) / pts.length };
+    const d = Math.hypot(c.x - p.x, c.y - p.y);
+    if (!best || d < best.d) best = { id: room.id, d };
+  }
+  return best?.id;
+}
+function sheetTarget(project: Project, geom: ReturnType<CommandBus['derive']>['geom'], rules: ReturnType<CommandBus['getRules']>, p: Vec2): { cabinetId?: string; view?: DrawingView } {
+  let best: { cabinetId: string; view: DrawingView; d: number } | undefined;
+  for (const cab of project.cabinets) {
+    const placement = geom.views.placements[cab.id];
+    if (!placement) continue;
+    let views;
+    try { views = buildCabinetViews(cab, rules); } catch { continue; }
+    const dx = placement.x - views.meta.front.origin.x;
+    for (const view of ['top', 'front', 'internal'] as const) {
+      const pts = views.prims[view].flatMap(q => q.k === 'text' ? [q.p] : q.pts).map(q => ({ x: q.x + dx, y: q.y }));
+      if (!pts.length) continue;
+      const minX = Math.min(...pts.map(q => q.x)), maxX = Math.max(...pts.map(q => q.x));
+      const minY = Math.min(...pts.map(q => q.y)), maxY = Math.max(...pts.map(q => q.y));
+      const ox = Math.max(minX - p.x, 0, p.x - maxX), oy = Math.max(minY - p.y, 0, p.y - maxY);
+      const d = Math.hypot(ox, oy);
+      if (!best || d < best.d) best = { cabinetId: cab.id, view, d };
+    }
+  }
+  return best ? { cabinetId: best.cabinetId, view: best.view } : {};
 }
 
 export function Viewport(props: ViewportProps) {
@@ -122,13 +187,32 @@ export function Viewport(props: ViewportProps) {
   const [hover, setHover] = useState<string | null>(null);
   const [hoverGrip, setHoverGrip] = useState<Grip | null>(null);
   const [activeGrip, setActiveGrip] = useState<Grip | null>(null);
-  /** 图纸模式悬停到的那条线 —— 决定能不能拖、拖了改什么（悬停即告知，不等用户试错） */
+  /** 图纸模式悬停到的那条线 —— 仅用于高亮；具体读数只在明确拖动操作中显示。 */
   const [sheetHoverPl, setSheetHoverPl] = useState<PickLine | null>(null);
   const [preview, setPreview] = useState<Scene | null>(null);
   const [readout, setReadout] = useState('');
+  const [drawPoints, setDrawPoints] = useState<Vec2[]>([]);
+  const [drawDraft, setDrawDraft] = useState<DrawingEntity | null>(null);
+  const [editPreview, setEditPreview] = useState<DrawingEntity[] | null>(null);
 
   const snapNodes = useMemo(() => collectSnapNodes(bus.getState()), [bus, version]);
   const sheet = props.mode === 'sheet';
+
+  useEffect(() => {
+    setHover(null);
+    setHoverGrip(null);
+    setSheetHoverPl(null);
+    setActiveGrip(null);
+    setSnap(null);
+    setCursor(null);
+    setReadout('');
+    setDrag(null);
+    setDraft(null);
+    setDrawPoints([]);
+    setDrawDraft(null);
+    setEditPreview(null);
+    setPreview(null);
+  }, [props.mode, tool]);
 
   /**
    * 分解图（按需派生视图）。只在图幅模式下、且开关打开时才真的去算。
@@ -291,7 +375,12 @@ export function Viewport(props: ViewportProps) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const derived = bus.derive();
-    const scene: Scene = preview ?? { project: bus.getState(), geom: derived.geom };
+    const baseScene: Scene = preview ?? { project: bus.getState(), geom: derived.geom };
+    const previewEdits = editPreview ?? baseScene.project.drawingEdits ?? [];
+    const shownEdits = drawDraft ? [...previewEdits, drawDraft] : previewEdits;
+    const scene: Scene = editPreview || drawDraft
+      ? { project: { ...baseScene.project, drawingEdits: shownEdits }, geom: baseScene.geom }
+      : baseScene;
 
     renderScene({
       ctx,
@@ -313,7 +402,7 @@ export function Viewport(props: ViewportProps) {
       doorSwingPrims: props.mode === 'plan' ? doorSwingPrimsOf(scene.project) : [],
       sheetHover: sheetHoverPl ? { pts: sheetHoverPl.pts, draggable: dragPlanOf(sheetHoverPl).ok } : null,
     });
-  }, [size, cam, version, preview, selection, hover, hoverGrip, activeGrip, hiddenLayers, showGrid, snap, drag, draft, bus, props.mode, explodeSet, sheetHoverPl]);
+  }, [size, cam, version, preview, editPreview, drawDraft, selection, hover, hoverGrip, activeGrip, hiddenLayers, showGrid, snap, drag, draft, bus, props.mode, explodeSet, sheetHoverPl]);
 
   // ── 坐标换算 ──
   const toCanvas = useCallback((e: { clientX: number; clientY: number }): Vec2 => {
@@ -335,6 +424,10 @@ export function Viewport(props: ViewportProps) {
 
   const runCommand = useCallback(
     (cmd: Command): void => {
+      if (props.readOnly) {
+        props.onToast('warn', '历史重复 Unit ID 项目只读；CAD 图元与模型写入已禁用，需显式修复/迁移后恢复。');
+        return;
+      }
       const r = bus.execute(cmd, { commitLabel: cmd.label });
       if (!r.ok) {
         props.onToast('error', r.error ?? '操作被拒绝');
@@ -361,15 +454,117 @@ export function Viewport(props: ViewportProps) {
     [bus]
   );
 
+  const persistDrawing = (edits: DrawingEntity[], label: string): void => {
+    const project = bus.getState();
+    const previousById = new Map((project.drawingEdits ?? []).map((entity) => [entity.id, entity]));
+    const changedDimensions = edits.filter((entity) => entity.kind === 'dimension' && JSON.stringify(previousById.get(entity.id)) !== JSON.stringify(entity));
+    runCommand(replaceDrawingEdits(project, edits, label));
+    if (changedDimensions.length > 0) {
+      const geom = bus.derive().geom;
+      const conflict = changedDimensions.some((entity) => {
+        const generated = entity.space === 'plan'
+          ? geom.roomPlans[entity.roomId ?? ''] ?? []
+          : geom.views.prims.filter((_, i) => geom.views.sourceKeys[i]?.startsWith(`sheet:${entity.cabinetId ?? ''}:${entity.view ?? ''}:`));
+        return conflictsWithProductionDimension(entity, generated);
+      });
+      if (conflict) props.onToast('warn', '注意：此手工尺寸与同视图模型生产尺寸端点重合。手工标注不会替代生产尺寸，请检查是否重复或数值矛盾。');
+    }
+  };
+  const drawingMetaAt = (p: Vec2, space: DrawingSpace): Partial<DrawingEntity> => {
+    const project = bus.getState();
+    if (space === 'plan') return { roomId: nearestRoomId(project, p) };
+    return sheetTarget(project, bus.derive().geom, bus.getRules(), p);
+  };
+  const makeDrawing = (kind: DrawingEntity['kind'], points: Vec2[], text = ''): DrawingEntity => {
+    const space = props.mode as DrawingSpace;
+    const meta = drawingMetaAt(points[0] ?? { x: 0, y: 0 }, space);
+    return {
+      id: newCommandId('edit'), space, kind, points: points.map(p => ({ x: Math.round(p.x), y: Math.round(p.y) })),
+      text: text || undefined, textSize: 180, lineWidth: 1.4,
+      layer: kind === 'text' || kind === 'leader' ? 'F-TEXT' : kind === 'dimension' ? 'F-DIM' : 'F-CAD-EDIT',
+      provenance: 'manual', ...meta,
+    };
+  };
+
   // ───────────────────────── 指针事件 ─────────────────────────
 
   const onPointerDown = (e: RPointerEvent<HTMLDivElement>): void => {
     const el = wrapRef.current;
     if (!el) return;
+    if (props.readOnly && e.button === 0 && !spaceRef.current) {
+      if (tool !== 'select' || pendingMove || drawPoints.length > 0) {
+        props.onToast('warn', '历史重复 Unit ID 项目只读；画布图元与模型写入已拦截，需显式修复/迁移后恢复。');
+      }
+      const raw = toWorld(toCanvas(e));
+      const project = bus.getState();
+      const tolerance = snapToleranceWorld(8, cam.scale);
+      if (sheet) {
+        const manual = hitDrawingEntity(project.drawingEdits ?? [], 'sheet', raw, tolerance);
+        if (manual) { setSelection([editSelectionId(manual.id)]); return; }
+        const semantic = hitPart(bus.derive().geom.views.pickLines, raw, tolerance);
+        if (semantic) { props.onPickPart?.(semantic); return; }
+        const hidden = new Set((project.drawingEdits ?? []).filter((entity) => entity.space === 'sheet' && entity.replacesSource).map((entity) => entity.replacesSource!));
+        const source = hitGeneratedPrim(bus.derive().geom.views.prims, bus.derive().geom.views.sourceKeys, hidden, raw, tolerance);
+        if (source) { setSelection([sourceSelectionId(source.key)]); return; }
+      } else {
+        const hit = hitTest(project, raw, tolerance, selection);
+        if ('id' in hit && typeof hit.id === 'string') {
+          if (selection.includes(hit.id)) props.onToast('warn', '历史重复 Unit ID 项目只读；画布拖拽/编辑已拦截。');
+          setSelection([hit.id]);
+        }
+        else setSelection([]);
+      }
+      return;
+    }
     el.setPointerCapture(e.pointerId);
     const sp = toCanvas(e);
     const raw = toWorld(sp);
     setCursor(sp);
+
+    if (e.button === 0 && !spaceRef.current && ['line', 'polyline', 'text', 'dimension', 'leader'].includes(tool)) {
+      const snapped = resolveAt(raw, drawPoints.at(-1) ?? null).p;
+      if (tool === 'text') {
+        const text = window.prompt('输入文字内容');
+        if (text?.trim()) {
+          const entity = makeDrawing('text', [snapped], text.trim());
+          persistDrawing([...(bus.getState().drawingEdits ?? []), entity], '添加文字');
+          setSelection([editSelectionId(entity.id)]);
+        }
+        setDrawPoints([]); setDrawDraft(null); return;
+      }
+      if (tool === 'polyline') {
+        if (e.detail > 1 && drawPoints.length >= 2) {
+          const pts = [...drawPoints];
+          if (Math.hypot(snapped.x - pts.at(-1)!.x, snapped.y - pts.at(-1)!.y) > 2) pts.push(snapped);
+          const entity = makeDrawing('polyline', pts);
+          persistDrawing([...(bus.getState().drawingEdits ?? []), entity], '绘制多段线');
+          setSelection([editSelectionId(entity.id)]); setDrawPoints([]); setDrawDraft(null); return;
+        }
+        const pts = [...drawPoints, snapped];
+        setDrawPoints(pts);
+        setDrawDraft(makeDrawing('polyline', [...pts, pts.at(-1)!]));
+        return;
+      }
+      if (drawPoints.length === 0) {
+        setDrawPoints([snapped]);
+        const kind = tool === 'line' ? 'line' : tool === 'dimension' ? 'dimension' : 'leader';
+        setDrawDraft(makeDrawing(kind, [snapped, snapped, snapped]));
+        return;
+      }
+      const a = drawPoints[0]!;
+      let entity: DrawingEntity;
+      if (tool === 'dimension') {
+        const dx = snapped.x - a.x, dy = snapped.y - a.y, len = Math.hypot(dx, dy) || 1;
+        const off = { x: (a.x + snapped.x) / 2 - (dy / len) * 220, y: (a.y + snapped.y) / 2 + (dx / len) * 220 };
+        entity = makeDrawing('dimension', [a, snapped, off], `${Math.round(len)} mm`);
+      } else if (tool === 'leader') {
+        const text = window.prompt('输入引线注释', '注释');
+        if (!text?.trim()) { setDrawPoints([]); setDrawDraft(null); return; }
+        entity = makeDrawing('leader', [a, snapped], text.trim());
+      } else entity = makeDrawing('line', [a, snapped]);
+      persistDrawing([...(bus.getState().drawingEdits ?? []), entity], tool === 'line' ? '绘制直线' : tool === 'dimension' ? '添加尺寸' : '添加引线');
+      setSelection([editSelectionId(entity.id)]); setDrawPoints([]); setDrawDraft(null); return;
+    }
 
     // 图幅曾经是只读视图；现在允许"拖一条线 = 改一个语义参数"，走的仍是
     // 与平面图拖夹点完全相同的一条链路（preview → 确认 → 提交），
@@ -377,28 +572,55 @@ export function Viewport(props: ViewportProps) {
     // 注意顺序：点选判断必须在平移分支**之前**，否则左键永远先进平移。
     if (sheet) {
       if (e.button === 0 && !spaceRef.current) {
+        const project = bus.getState();
+        const edits = project.drawingEdits ?? [];
         const tol = snapToleranceWorld(8, cam.scale);
-        const hit = hitPart(bus.derive().geom.views.pickLines, raw, tol);
-        if (hit) {
-          // 交给 AI 助攻（把语义部件喂给 AI 面板），任何时候都保留
-          props.onPickPart?.(hit);
-          const plan = dragPlanOf(hit);
-          if (plan.ok) {
-            const cab = bus.getState().cabinets.find((c) => c.id === hit.cabinetId);
-            if (cab) {
-              setDrag({ kind: 'sheetDim', pl: hit, spec: plan.spec, cab, startWorld: raw, value: plan.spec.read(cab) });
-              setReadout(`${plan.spec.labelZh} ${Math.round(plan.spec.read(cab))}mm · ${plan.spec.hintZh}`);
+        const manualHit = hitDrawingEntity(edits, 'sheet', raw, tol);
+        if (manualHit) {
+          const sid = editSelectionId(manualHit.id);
+          const ids = e.shiftKey
+            ? selection.includes(sid) ? selection.filter(x => x !== sid) : [...selection, sid]
+            : selection.includes(sid) ? selection : [sid];
+          setSelection(ids);
+          if (ids.includes(sid)) setDrag({ kind: 'drawing', startWorld: raw, edits: structuredClone(edits), selectedIds: ids.filter(x => editIdFromSelection(x)) });
+          return;
+        }
+        const derived = bus.derive();
+        if (!e.altKey) {
+          const semantic = hitPart(derived.geom.views.pickLines, raw, tol);
+          if (semantic) {
+            props.onPickPart?.(semantic);
+            const plan = dragPlanOf(semantic);
+            if (!plan.ok) {
+              // 语义识别成功但该边不可拖（例如尺寸基准端）时，必须遵守
+              // sheetDrag 的 NoDrag 契约；不能把它当普通生成图元继续建覆盖。
+              props.onToast('info', `${plan.labelZh}：${plan.reason}`);
               return;
             }
-          } else {
-            // 能点但拖不动 —— 必须当场说清为什么，静默无反应是最伤信任的交互
-            props.onToast('info', `${plan.labelZh}：${plan.reason}`);
+            const cab = project.cabinets.find(c => c.id === semantic.cabinetId);
+            if (!cab) {
+              props.onToast('error', `无法拖动${plan.spec.labelZh}：柜体不存在`);
+              return;
+            }
+            setDrag({ kind: 'sheetDim', pl: semantic, spec: plan.spec, cab, startWorld: raw, value: plan.spec.read(cab) });
+            setReadout(`${plan.spec.labelZh} ${Math.round(plan.spec.read(cab))}mm · ${plan.spec.hintZh}`);
             return;
           }
         }
+        const suppressed = new Set(edits.filter(x => x.space === 'sheet' && x.replacesSource).map(x => x.replacesSource!));
+        const source = hitGeneratedPrim(derived.geom.views.prims, derived.geom.views.sourceKeys, suppressed, raw, tol);
+        if (source) {
+          const sid = sourceSelectionId(source.key);
+          setSelection([sid]);
+          const parts = source.key.split(':');
+          const meta: Partial<DrawingEntity> = parts[0] === 'sheet' ? { cabinetId: parts[1], view: parts[2] as DrawingView } : {};
+          setDrag({ kind: 'drawing', startWorld: raw, edits: structuredClone(edits), selectedIds: [], source: { key: source.key, prim: source.prim, id: newCommandId('edit'), meta } });
+          return;
+        }
+        setSelection([]);
       }
-      // 空白处照旧平移 —— 图幅的左键平移不能因为有点选就消失
-      setDrag({ kind: 'pan', last: sp });
+      if (e.altKey && e.button === 0) setDrag({ kind: 'marquee', a: raw, b: raw });
+      else setDrag({ kind: 'pan', last: sp });
       setPreview(null);
       return;
     }
@@ -438,6 +660,33 @@ export function Viewport(props: ViewportProps) {
 
     // ③ 选择工具
     const tol = snapToleranceWorld(8, cam.scale);
+    const edits = project.drawingEdits ?? [];
+    if (!e.altKey) {
+      const manualHit = hitDrawingEntity(edits, 'plan', raw, tol);
+      if (manualHit) {
+        const sid = editSelectionId(manualHit.id);
+        const ids = e.shiftKey
+          ? selection.includes(sid) ? selection.filter(x => x !== sid) : [...selection, sid]
+          : selection.includes(sid) ? selection : [sid];
+        setSelection(ids);
+        if (ids.includes(sid)) setDrag({ kind: 'drawing', startWorld: raw, edits: structuredClone(edits), selectedIds: ids.filter(x => editIdFromSelection(x)) });
+        return;
+      }
+    } else {
+      const derived = bus.derive();
+      const suppressed = new Set(edits.filter(x => x.space === 'plan' && x.replacesSource).map(x => x.replacesSource!));
+      const source = hitGeneratedPrim(derived.geom.plan, derived.geom.planSourceKeys, suppressed, raw, tol);
+      if (source) {
+        const parts = source.key.split(':');
+        const meta: Partial<DrawingEntity> = parts[1] === 'wall'
+          ? { roomId: project.rooms.find(r => r.walls.some(w => w.id === parts[2]))?.id }
+          : { cabinetId: parts[2], roomId: project.cabinets.find(c => c.id === parts[2])?.roomId };
+        const sid = sourceSelectionId(source.key);
+        setSelection([sid]);
+        setDrag({ kind: 'drawing', startWorld: raw, edits: structuredClone(edits), selectedIds: [], source: { key: source.key, prim: source.prim, id: newCommandId('edit'), meta } });
+        return;
+      }
+    }
     const hit = hitTest(project, raw, tol, selection);
 
     if (hit.kind === 'grip' && hit.grip) {
@@ -478,23 +727,26 @@ export function Viewport(props: ViewportProps) {
     setCursor(sp);
 
     if (!drag) {
+      if (drawPoints.length > 0 && ['line', 'polyline', 'dimension', 'leader'].includes(tool)) {
+        const snapped = resolveAt(raw, drawPoints.at(-1) ?? null).p;
+        let points = [...drawPoints, snapped];
+        const kind = tool === 'line' ? 'line' : tool === 'polyline' ? 'polyline' : tool === 'dimension' ? 'dimension' : 'leader';
+        if (kind === 'dimension' && drawPoints.length > 0) {
+          const a = drawPoints[0]!, dx = snapped.x - a.x, dy = snapped.y - a.y, len = Math.hypot(dx, dy) || 1;
+          points = [a, snapped, { x: (a.x + snapped.x) / 2 - dy / len * 220, y: (a.y + snapped.y) / 2 + dx / len * 220 }];
+        }
+        setDrawDraft(makeDrawing(kind, points));
+      }
       if (sheet) {
-        // 图幅模式下悬停到一条线：高亮它，并预告"拖它会改什么"或"为什么不能拖"。
-        // 让用户在动手**之前**就知道结果 —— 这比拖了没反应再去看文档强得多。
+        // 图幅模式下悬停只高亮线条，不显示会被误认为编辑结果的尺寸或位移读数。
         const tol = snapToleranceWorld(8, cam.scale);
         const hit = hitPart(bus.derive().geom.views.pickLines, raw, tol);
         setHover(null);
         setHoverGrip(null);
         setSnap(null);
         setSheetHoverPl(hit);
-        if (hit) {
-          const plan = dragPlanOf(hit);
-          const cab = bus.getState().cabinets.find((c) => c.id === hit.cabinetId);
-          if (plan.ok && cab) setReadout(`${plan.spec.labelZh} ${Math.round(plan.spec.read(cab))}mm · ${plan.spec.hintZh}`);
-          else setReadout(plan.ok ? plan.spec.hintZh : `${plan.labelZh}：${plan.reason}`);
-        } else {
-          setReadout('');
-        }
+        // 悬停只负责高亮可交互线条；尺寸/位移读数仅在实际进入拖动等操作后显示。
+        setReadout('');
         return;
       }
       const base = draft ? draft.a : (pendingMove?.base ?? null);
@@ -550,6 +802,25 @@ export function Viewport(props: ViewportProps) {
         previewCommand(drag.spec.build(drag.cab, drag.pl.unitIndex, value));
         return;
       }
+      case 'drawing': {
+        const dx = Math.round(raw.x - drag.startWorld.x), dy = Math.round(raw.y - drag.startWorld.y);
+        if (Math.abs(dx) + Math.abs(dy) < 2) { setEditPreview(null); return; }
+        const next = drag.edits.filter(e => !drag.selectedIds.includes(e.id));
+        if (drag.source) {
+          const entity = sourceOverride(drag.source.key, drag.source.prim, sheet ? 'sheet' : 'plan', drag.source.id, drag.source.meta);
+          if (!entity) { setEditPreview(null); return; }
+          next.push(translateDrawingEntity(entity, dx, dy));
+          setReadout(`视图覆盖 Δ(${dx}, ${dy}) mm`);
+        } else {
+          for (const id of drag.selectedIds) {
+            const original = drag.edits.find(e => e.id === id);
+            if (original) next.push(translateDrawingEntity(original, dx, dy));
+          }
+          setReadout(`图元移动 Δ(${dx}, ${dy}) mm`);
+        }
+        setEditPreview(next);
+        return;
+      }
       case 'body': {
         const s = resolveAt(raw, drag.startPointer);
         setSnap(s);
@@ -576,14 +847,31 @@ export function Viewport(props: ViewportProps) {
     const raw = toWorld(sp);
 
     if (drag.kind === 'marquee') {
-      const ids = boxSelect(bus.getState(), drag.a, drag.b);
-      if (ids.length > 0) setSelection(ids);
+      const project = bus.getState();
+      const ids = sheet ? [] : boxSelect(project, drag.a, drag.b);
+      const minX = Math.min(drag.a.x, drag.b.x), maxX = Math.max(drag.a.x, drag.b.x);
+      const minY = Math.min(drag.a.y, drag.b.y), maxY = Math.max(drag.a.y, drag.b.y);
+      for (const entity of project.drawingEdits ?? []) {
+        if (entity.space !== (sheet ? 'sheet' : 'plan') || !entity.points.length) continue;
+        if (entity.points.every(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY)) ids.push(editSelectionId(entity.id));
+      }
+      const derived = bus.derive().geom;
+      const space: DrawingSpace = sheet ? 'sheet' : 'plan';
+      const prims = sheet ? derived.views.prims : derived.plan;
+      const keys = sheet ? derived.views.sourceKeys : derived.planSourceKeys;
+      const hidden = new Set((project.drawingEdits ?? []).filter(x => x.space === space && x.replacesSource).map(x => x.replacesSource!));
+      ids.push(...sourceKeysInRect(prims, keys, { minX, minY, maxX, maxY }, hidden).map(sourceSelectionId));
+      setSelection(ids);
     } else if (drag.kind === 'sheetDim') {
       // 松手时的最终值：与刚才预览用的是同一个算法、同一个模型，
       // 所以"预览 === 提交"是结构性保证，不是巧合。
       const value = dragValueOf(drag.spec, drag.cab, drag.startWorld, raw);
       const before = drag.spec.read(drag.cab);
       if (value !== before) {
+        if (props.readOnly) {
+          props.onToast('warn', '历史重复 Unit ID 项目只读；图纸尺寸编辑已禁用。');
+          return;
+        }
         const r = bus.execute(drag.spec.build(drag.cab, drag.pl.unitIndex, value), { commitLabel: `${drag.spec.labelZh} 拖动` });
         if (!r.ok) props.onToast('error', `改${drag.spec.labelZh}失败：${r.error ?? '被规则拒绝'}`);
         else if (dragClamped(drag.spec, value)) props.onToast('info', `${drag.spec.labelZh}已到上下限（${drag.spec.min}~${drag.spec.max}mm）：这是规则允许的边界`);
@@ -603,10 +891,31 @@ export function Viewport(props: ViewportProps) {
       if (dx !== 0 || dy !== 0) {
         runCommand(CMD.moveCabinetBatch(drag.cabs, bus.getState().cabinets, dx, dy));
       }
+      } else if (drag.kind === 'drawing') {
+        const dx = Math.round(raw.x - drag.startWorld.x), dy = Math.round(raw.y - drag.startWorld.y);
+        if (Math.abs(dx) + Math.abs(dy) >= 2) {
+          const next = drag.edits.filter(e => !drag.selectedIds.includes(e.id));
+          if (drag.source) {
+            const entity = sourceOverride(drag.source.key, drag.source.prim, sheet ? 'sheet' : 'plan', drag.source.id, drag.source.meta);
+            if (!entity) { setEditPreview(null); return; }
+            next.push(translateDrawingEntity(entity, dx, dy));
+          setSelection([editSelectionId(entity.id)]);
+          props.onToast('info', '已创建当前视图覆盖；柜体生产参数未更改');
+        } else {
+          const moved: string[] = [];
+          for (const id of drag.selectedIds) {
+            const original = drag.edits.find(e => e.id === id);
+            if (original) { next.push(translateDrawingEntity(original, dx, dy)); moved.push(editSelectionId(id)); }
+          }
+          setSelection(moved);
+        }
+        persistDrawing(next, drag.source ? '覆盖并移动生成线' : '移动二维图元');
+      }
     }
 
     setDrag(null);
     setPreview(null);
+    setEditPreview(null);
     setActiveGrip(null);
     setReadout('');
     // 必须一起清掉捕捉结果：拖动过程中它带着极轴/正交的「追踪线」，
@@ -620,6 +929,8 @@ export function Viewport(props: ViewportProps) {
     setHover(null);
     setHoverGrip(null);
     setSnap(null);
+    setSheetHoverPl(null);
+    setReadout('');
   };
 
   // ── 右键上下文菜单：先"右键即选中"，再把屏幕坐标交回 App ──
@@ -673,7 +984,7 @@ export function Viewport(props: ViewportProps) {
         {sheet ? (
           <>
             <span className="vp-hud-item vp-hud-sheet">
-              四视图图幅{props.explode ? ' + 分解图（下方）' : ''} · 可编辑：蓝线可拖改尺寸 · 拖动平移 / 滚轮缩放
+              图纸视图（俯视 / 正视 / 内部）{props.explode ? ' + 分解图（下方）' : ''} · 可编辑：图元覆盖 / 蓝线拖尺寸 · 拖动平移 / 滚轮缩放
             </span>
             {/*
               读数在图纸模式下**必须**出现：拖动时它会显示"柜宽 → 2400mm"，

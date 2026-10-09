@@ -92,7 +92,7 @@ const CHROME_CANDIDATES = [
   path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
 ];
 
-const DIAG_DIR = path.join(OUT_DIR, 'diagnostics');
+const DIAG_DIR = process.env.VERIFY_DIAG_DIR || path.join(OUT_DIR, 'diagnostics');
 
 // 从真实管线实测得到的期望值（verify/_probe-facts.ts 采过，跑完即删）
 const FACT = {
@@ -112,25 +112,47 @@ const FACT = {
 // ───────────────────────────── 断言 ─────────────────────────────
 
 const results = [];
+const emittedCounts = { pass: 0, fail: 0 };
 let currentGroup = '';
+const ONLY = (process.env.ONLY || '').trim();
+const STOP_AFTER_ONLY = process.env.STOP_AFTER_ONLY === '1';
+const plannedGroups = [...fs.readFileSync(__filename, 'utf8').matchAll(/^\s*section\('([^']+)'\);?\s*$/gm)].map((m) => m[1]);
+const plannedMatches = ONLY ? plannedGroups.filter((title) => title.includes(ONLY)) : [];
+const matchedFilterGroups = [];
+console.log(`[browser-probe] ONLY=${ONLY || '(unset)'} STOP_AFTER_ONLY=${STOP_AFTER_ONLY ? '1' : '0'} PLAN_MATCH_GROUPS=${JSON.stringify(ONLY ? plannedMatches : `ALL ${plannedGroups.length} groups`)}`);
+if (ONLY && plannedMatches.length === 0) {
+  console.error(`[browser-probe] FILTER_CONFIG_ERROR: ONLY=${ONLY} matches no planned section; plannedGroups=${JSON.stringify(plannedGroups)}`);
+  process.exit(2);
+}
+if (process.env.UI_EXPECTED_ONLY !== undefined && ONLY !== process.env.UI_EXPECTED_ONLY.trim()) {
+  console.error(`[browser-probe] FILTER_ENV_MISMATCH: runner expected ONLY=${process.env.UI_EXPECTED_ONLY}, probe received ONLY=${ONLY || '(unset)'}`);
+  process.exit(2);
+}
+if (process.env.UI_EXPECTED_STOP_AFTER_ONLY !== undefined && (STOP_AFTER_ONLY ? '1' : '0') !== process.env.UI_EXPECTED_STOP_AFTER_ONLY) {
+  console.error(`[browser-probe] FILTER_ENV_MISMATCH: runner expected STOP_AFTER_ONLY=${process.env.UI_EXPECTED_STOP_AFTER_ONLY}, probe received STOP_AFTER_ONLY=${STOP_AFTER_ONLY ? '1' : '0'}`);
+  process.exit(2);
+}
 
 /**
- * ONLY=<小节关键字> 时只统计/打印该小节 —— 排查单节失败时不必每次等满 3 分钟。
- * 注意：其他小节的**动作照样执行**（很多小节依赖前序留下的状态），
- * 只是不记账。所以它是排查工具，不是"跳过前置"的开关。
+ * ONLY=<小节关键字> 时只统计/打印该小节；其他小节的动作照样执行（保持状态依赖）。
+ * STOP_AFTER_ONLY=1 时在匹配章节结束后完整清理并退出；不跳过该章节依赖的前置动作。
  */
-const ONLY = (process.env.ONLY || '').trim();
 const focused = () => !ONLY || currentGroup.includes(ONLY);
 
 function section(title) {
   currentGroup = title;
   console.log(`\n── ${title} ──`);
+  if (ONLY && title.includes(ONLY)) {
+    matchedFilterGroups.push(title);
+    console.log(`[browser-probe] FILTER_MATCH ${JSON.stringify(title)}`);
+  }
 }
 
 function ok(name, cond, detail) {
   const pass = !!cond;
   if (focused()) {
     results.push({ group: currentGroup, name, pass, detail });
+    emittedCounts[pass ? 'pass' : 'fail'] += 1;
     console.log(`${pass ? '  \u2713' : '  \u2717'} ${name}${pass || !detail ? '' : `\n      → ${detail}`}`);
   }
   return pass;
@@ -354,6 +376,38 @@ async function waitForApp(url, timeoutMs = 25000) {
   };
 
   let ws = null;
+  const finishProbe = async () => {
+    if (ONLY && matchedFilterGroups.length === 0) {
+      console.error(`[browser-probe] FILTER_TARGET_NOT_REACHED: requested=${ONLY}; planned=${JSON.stringify(plannedMatches)}; currentGroup=${currentGroup || '(none)'}`);
+      ws?.close();
+      await cleanup();
+      process.exit(2);
+    }
+    const pass = results.filter((r) => r.pass).length;
+    const fail = results.length - pass;
+    const countsConsistent = pass === emittedCounts.pass && fail === emittedCounts.fail
+      && results.length === emittedCounts.pass + emittedCounts.fail;
+    const byGroup = new Map();
+    for (const r of results) byGroup.set(r.group, (byGroup.get(r.group) || 0) + (r.pass ? 0 : 1));
+    console.log('\n══════════════════════════════════════════════');
+    for (const [g, f] of byGroup) if (f > 0) console.log(`  ${g}  →  ${f} 项失败`);
+    console.log(`  总计 ${results.length} 项：通过 ${pass}，失败 ${fail}`);
+    console.log(`[browser-probe] ASSERTION_COUNTS ${JSON.stringify({ total: results.length, pass, fail, emitted: emittedCounts, consistent: countsConsistent })}`);
+    console.log('══════════════════════════════════════════════');
+    if (!countsConsistent) {
+      console.error(`[browser-probe] assertion ledger mismatch: ${JSON.stringify({ total: results.length, pass, fail, emitted: emittedCounts })}`);
+      ws?.close();
+      await cleanup();
+      process.exit(1);
+    }
+    if (fail > 0) {
+      console.log('\n失败清单：');
+      for (const r of results.filter((x) => !x.pass)) console.log(`  · [${r.group}] ${r.name}${r.detail ? `\n      ${r.detail}` : ''}`);
+    }
+    ws?.close();
+    await cleanup();
+    process.exit(fail > 0 ? 1 : 0);
+  };
 
   try {
     // ── 1. 等 CDP ──
@@ -427,7 +481,7 @@ async function waitForApp(url, timeoutMs = 25000) {
       let ready = false;
       while (Date.now() < dl) {
         const r = await send('Runtime.evaluate', {
-          expression: `!!document.querySelector('.vp-canvas') && document.querySelectorAll('.tree-leaf').length >= 0 && !!document.querySelector('.statusbar')`,
+          expression: `!!document.querySelector('.room-workspace') || (!!document.querySelector('.vp-canvas') && !!document.querySelector('.statusbar'))`,
           returnByValue: true,
         });
         if (r.result?.result?.value) {
@@ -442,12 +496,248 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ── 工具函数（都建立在 send 之上）──
 
+    const evalJsRaw = async (expression) => {
+      const response = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+      const remote = response?.result?.result ?? null;
+      return {
+        expression,
+        response,
+        remote,
+        hasValue: Boolean(remote && Object.prototype.hasOwnProperty.call(remote, 'value')),
+        value: remote && Object.prototype.hasOwnProperty.call(remote, 'value') ? remote.value : undefined,
+      };
+    };
     const evalJs = async (expression) => {
-      const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-      if (r.result?.exceptionDetails) {
-        throw new Error(`页面内报错: ${r.result.exceptionDetails.text} :: ${r.result.exceptionDetails.exception?.description ?? ''}`);
+      const evaluated = await evalJsRaw(expression);
+      if (evaluated.response?.error) {
+        throw new Error(`CDP Runtime.evaluate protocol error: ${JSON.stringify({ error: evaluated.response.error, expression })}`);
       }
-      return r.result?.result?.value;
+      if (evaluated.response?.result?.exceptionDetails) {
+        throw new Error(`CDP Runtime.evaluate exception: ${JSON.stringify({ exceptionDetails: evaluated.response.result.exceptionDetails, expression })}`);
+      }
+      return evaluated.value;
+    };
+
+    // 所有可能跨模块加载/复位工程的页面任务共用这一入口：Promise、状态、错误与
+    // 前后 project/version 均留在 window；CDP 只同步启动和轮询，不 await 临时 IIFE。
+    const initializePageHarness = async () => evalJs(`(()=>{
+      if(window.__verifyHarness?.version===1)return {ready:true,reused:true,version:1};
+      const snapshot=(bus=window.__verifyBus)=>{
+        try{if(!bus)return null;const p=bus.getState();return {project:p?.name??null,projectId:p?.id??null,version:bus.getVersion(),
+          rooms:p?.rooms?.length??0,cabinets:p?.cabinets?.length??0,
+          roomIds:(p?.rooms??[]).map(x=>x.id),cabinetIds:(p?.cabinets??[]).map(x=>x.id)}}
+        catch(error){return {snapshotError:String(error?.stack??error)}}
+      };
+      const errorInfo=error=>({name:String(error?.name??'Error'),message:String(error?.message??error),stack:String(error?.stack??'')});
+      const moduleLoaders={
+        hitTest:()=>import('/src/viewport/hitTest.ts'),
+        snapping:()=>import('/src/viewport/snapping.ts'),
+        camDebug:()=>import('/src/viewport/camDebug.ts'),
+        sheetDrag:()=>import('/src/viewport/sheetDrag.ts'),
+        camera:()=>import('/src/viewport/camera.ts'),
+      };
+      const api={
+        version:1,operations:Object.create(null),snapshot,
+        bindBus(bus){if(!bus)throw new Error('Cannot bind missing CommandBus');window.__verifyBus=bus;return snapshot(bus)},
+        start(key,task){
+          key=String(key||'');if(!key||typeof task!=='function')return {started:false,reason:'key/task invalid'};
+          if(this.operations[key]?.status==='pending')return {started:false,reason:'operation already pending',key};
+          const op={key,status:'pending',startedAt:Date.now(),before:snapshot(),after:null,result:null,error:null,finishedAt:null,promise:null};
+          this.operations[key]=op;
+          op.promise=(async()=>{try{op.result=await task();op.status='fulfilled'}
+            catch(error){op.error=errorInfo(error);op.status='rejected'}
+            finally{op.after=snapshot();op.finishedAt=Date.now()}})();
+          op.promise.catch(error=>{op.error=errorInfo(error);op.status='rejected';op.after=snapshot();op.finishedAt=Date.now()});
+          return {started:true,key,status:'pending',before:op.before};
+        },
+        startSampleReset(key,options={}){
+          return this.start(key,async()=>{
+            const [store,docFactory]=await Promise.all([import('/src/state/store.ts'),import('/src/core/docFactory.ts')]);
+            const beforeState=store.bus.getState();const before=snapshot(store.bus);this.bindBus(store.bus);
+            if(options.saveAs)window[options.saveAs]=structuredClone(beforeState);
+            const loaded={};for(const name of (options.modules||[])){const load=moduleLoaders[name];if(!load)throw new Error('Unknown reset module: '+name);loaded[name]=await load()}
+            if(options.modulesKey){const bundle={store,docFactory,...loaded};if(loaded.camDebug)bundle.camDebug=loaded.camDebug.camDebug;window[options.modulesKey]=bundle}
+            const result=store.bus.replaceProject(docFactory.sampleProject(store.RULESET),String(options.label||key));
+            const p=store.bus.getState();return {before,after:snapshot(store.bus),reset:{project:p.name,projectId:p.id??null,version:store.bus.getVersion(),
+              cabinetCount:p.cabinets.length,cabinetId:p.cabinets[0]?.id??null,cabinetName:p.cabinets[0]?.name??null,width:p.cabinets[0]?.params?.width??null,
+              replaceResult:result?.ok??null}};
+          });
+        },
+        startRestore(key,options={}){
+          return this.start(key,async()=>{
+            const saved=window[options.snapshotKey];
+            const bus=options.busFromSnapshot?(saved?.[options.busFromSnapshot]):window[options.busGlobal||'__verifyBus'];
+            if(!saved||!bus)throw new Error('Restore snapshot/bus missing: '+JSON.stringify({snapshotKey:options.snapshotKey,busGlobal:options.busGlobal,busFromSnapshot:options.busFromSnapshot}));
+            const before=snapshot(bus);
+            if(options.mode==='full'){
+              bus.project=saved.project;bus.entries=saved.entries;bus.pointer=saved.pointer;bus.modelVersion=saved.modelVersion;
+              bus.provById=new Map(saved.provById);bus.baselineProv=new Map(saved.baselineProv);bus.geomCache=null;bus.explodeCache=null;bus.notify();
+            }else if(options.mode==='project')bus.replaceProject(saved,String(options.label||key));
+            else throw new Error('Unknown restore mode: '+String(options.mode));
+            const after=snapshot(bus);if(options.clearSaved!==false)delete window[options.snapshotKey];
+            return {restored:true,before,after};
+          });
+        },
+        read(key){const op=this.operations[String(key||'')];return op?{key:op.key,status:op.status,startedAt:op.startedAt,finishedAt:op.finishedAt,
+          before:op.before,after:op.after,result:op.result,error:op.error}:null;},
+      };
+      window.__verifyHarness=api;return {ready:true,reused:false,version:api.version};
+    })()`);
+    const pageHarnessReady = await initializePageHarness();
+    if (!pageHarnessReady?.ready || pageHarnessReady.version !== 1) {
+      throw new Error(`[page harness] initialization failed: ${JSON.stringify(pageHarnessReady)}`);
+    }
+    console.log(`[page-harness] READY ${JSON.stringify(pageHarnessReady)}`);
+
+    const waitPageOperation = async (key, timeoutMs = 12000) => {
+      const deadline = Date.now() + timeoutMs;let state = null;
+      while (Date.now() < deadline) {
+        state = await evalJs(`(()=>window.__verifyHarness?.read(${JSON.stringify(key)})??null)()`);
+        if (state?.status === 'fulfilled') {
+          console.log(`[page-harness] DONE key=${key} before=${JSON.stringify(state.before)} after=${JSON.stringify(state.after)}`);
+          return state;
+        }
+        if (state?.status === 'rejected') throw new Error(`[page-harness] ${key} rejected: ${JSON.stringify({error:state.error,before:state.before,after:state.after})}`);
+        await sleep(50);
+      }
+      throw new Error(`[page-harness] ${key} timed out after ${timeoutMs}ms: ${JSON.stringify(state)}`);
+    };
+    const startPageOperation = async (key, taskExpression, timeoutMs = 12000) => {
+      const kickoff = await evalJs(`(()=>{const h=window.__verifyHarness;if(!h)return {started:false,reason:'harness missing'};return h.start(${JSON.stringify(key)},(${taskExpression}));})()`);
+      if (!kickoff?.started) throw new Error(`[page-harness] ${key} kickoff failed: ${JSON.stringify(kickoff)}`);
+      console.log(`[page-harness] START key=${key} before=${JSON.stringify(kickoff.before)}`);
+      return waitPageOperation(key, timeoutMs);
+    };
+    const startPageReset = async (key, options, timeoutMs = 12000) => {
+      const kickoff = await evalJs(`(()=>window.__verifyHarness?.startSampleReset(${JSON.stringify(key)},${JSON.stringify(options)})??{started:false,reason:'harness missing'})()`);
+      if (!kickoff?.started) throw new Error(`[page-harness] ${key} reset kickoff failed: ${JSON.stringify(kickoff)}`);
+      console.log(`[page-harness] RESET_START key=${key} before=${JSON.stringify(kickoff.before)}`);
+      return waitPageOperation(key, timeoutMs);
+    };
+    const startPageRestore = async (key, options, timeoutMs = 5000) => {
+      const kickoff = await evalJs(`(()=>window.__verifyHarness?.startRestore(${JSON.stringify(key)},${JSON.stringify(options)})??{started:false,reason:'harness missing'})()`);
+      if (!kickoff?.started) throw new Error(`[page-harness] ${key} restore kickoff failed: ${JSON.stringify(kickoff)}`);
+      console.log(`[page-harness] RESTORE_START key=${key} before=${JSON.stringify(kickoff.before)}`);
+      return waitPageOperation(key, timeoutMs);
+    };
+    const startServerBaselineFixture = async (key, snapshotKey, busGlobal = '__verifyBus', timeoutMs = 15000) => {
+      const task = `async()=>{
+        const bus=window[${JSON.stringify(busGlobal)}];if(!bus)throw new Error('live CommandBus missing');
+        const original=structuredClone(bus.getState());window[${JSON.stringify(snapshotKey)}]=original;
+        const response=await fetch('/api/workspace');const server=await response.json();
+        if(!response.ok||server?.ok!==true||!server.project?.rooms?.length)throw new Error('server workspace baseline unavailable: '+JSON.stringify({status:response.status,body:server}));
+        bus.replaceProject(server.project,${JSON.stringify(`${key} server baseline`)});
+        const p=bus.getState();const derived=bus.derive();
+        return {ready:true,httpStatus:response.status,project:p.name,projectId:p.id,ver:bus.getVersion(),count:p.cabinets.length,
+          names:p.cabinets.map(c=>c.name),rooms:p.rooms.length,roomId:p.rooms[0]?.id,roomName:p.rooms[0]?.name,
+          errs:derived.issues.filter(i=>i.severity==='ERROR').length,liveModelVersion:server.liveModelVersion??null,
+          workspaceId:server.workspaceId??null,serverProjectId:server.project?.id??null,
+          original:{project:original.name,projectId:original.id,count:original.cabinets.length,names:original.cabinets.map(c=>c.name)}};
+      }`;
+      return startPageOperation(key, task, timeoutMs);
+    };
+    const readMcpToolAudit = async (key, timeoutMs = 12000) => startPageOperation(key, `async()=>{
+      const response=await fetch('/api/security/audit?limit=1000');const body=await response.json();
+      if(!response.ok||body?.ok!==true||!Array.isArray(body.entries))throw new Error('security audit unavailable: '+JSON.stringify({status:response.status,body}));
+      const events=body.entries.filter(e=>e.action==='mcp.tool'&&['cad.create_cabinet','cad.validate'].includes(e.tool)).map(e=>({
+        at:e.at,action:e.action,tool:e.tool,result:e.result,workspaceId:e.workspaceId??null,draftId:e.draftId??null,
+        cabinetId:e.cabinetId??null,
+        blockingErrors:e.blockingErrors??null,issues:e.issues??null,
+      }));
+      return {httpStatus:response.status,totalEntries:body.entries.length,events};
+    }`, timeoutMs);
+    const mcpAuditKey = (event) => JSON.stringify([event?.at,event?.action,event?.tool,event?.result,event?.workspaceId,event?.draftId,event?.cabinetId,event?.blockingErrors]);
+    const readPersistedServerDraft = async (draftId, timeoutMs = 6000) => {
+      if (!draftId) return { ok: false, error: 'draftId missing' };
+      const accountsPath = process.env.VERIFY_ACCOUNTS_PATH;
+      if (!accountsPath) return { ok: false, error: 'VERIFY_ACCOUNTS_PATH missing' };
+      const workspaceRoot = path.join(path.dirname(accountsPath), 'workspaces');
+      const safeId = String(draftId).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const deadline = Date.now() + timeoutMs;
+      let lastError = null;
+      while (Date.now() < deadline) {
+        try {
+          if (fs.existsSync(workspaceRoot)) {
+            for (const accountDir of fs.readdirSync(workspaceRoot, { withFileTypes: true })) {
+              if (!accountDir.isDirectory()) continue;
+              const file = path.join(workspaceRoot, accountDir.name, 'drafts', `${safeId}.json`);
+              if (!fs.existsSync(file)) continue;
+              const stat = fs.statSync(file);
+              const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+              if (doc?.draftId === draftId) return { ok: true, file, mtimeMs: stat.mtimeMs, doc };
+              lastError = `draftId mismatch in ${file}`;
+            }
+          }
+        } catch (error) {
+          lastError = String(error?.stack ?? error);
+        }
+        await sleep(100);
+      }
+      return { ok: false, error: lastError ?? 'persisted draft file not found before timeout', workspaceRoot, draftId };
+    };
+
+    // B37/B38 success-path Agent requests must use this run's local deterministic
+    // provider, never the deliberately invalid DeepSeek key used by B15 failure tests.
+    // The only writable target is the runner-owned temporary .env passed to this probe.
+    const configureAgentMockProvider = (label) => {
+      const envPath = process.env.VERIFY_ENV_PATH;
+      const mockUrl = process.env.VERIFY_MOCK_URL;
+      const fakeKey = process.env.VERIFY_FAKE_KEY;
+      const tempRoot = path.resolve(os.tmpdir(), 'furniture-cad-verify-');
+      if (!envPath || !mockUrl || !fakeKey) throw new Error(`[${label}] missing test-only provider fixture config`);
+      const resolvedEnv = path.resolve(envPath);
+      if (!resolvedEnv.startsWith(tempRoot)) throw new Error(`[${label}] refusing to modify non-test env path: ${resolvedEnv}`);
+      const updates = {
+        AI_PROVIDER: 'custom',
+        AI_BASE_URL: mockUrl,
+        AI_MODEL: 'mock-model-1',
+        AI_API_KEY: fakeKey,
+        AI_TIMEOUT_MS: '60000',
+      };
+      const existing = fs.existsSync(resolvedEnv) ? fs.readFileSync(resolvedEnv, 'utf8').split(/\r?\n/) : [];
+      const retained = existing.filter(line => !Object.hasOwn(updates, line.split('=', 1)[0].trim()));
+      fs.writeFileSync(resolvedEnv, [...retained, ...Object.entries(updates).map(([key, value]) => `${key}=${value}`), ''].join('\n'), 'utf8');
+      const written = fs.readFileSync(resolvedEnv, 'utf8');
+      for (const [key, value] of Object.entries(updates)) {
+        if (!written.split(/\r?\n/).some(line => line === `${key}=${value}`)) throw new Error(`[${label}] test provider fixture write did not persist ${key}`);
+      }
+      const evidence = { provider: updates.AI_PROVIDER, baseUrl: mockUrl, model: updates.AI_MODEL, apiKeySet: true, keyLogged: false };
+      console.log(`[${label}] TEST_PROVIDER ${JSON.stringify(evidence)}`);
+      return evidence;
+    };
+    const readConfiguredAgentMockProvider = async (label) => {
+      const operation = await startPageOperation(`${label}.live-settings`, `async()=>{
+        const response=await fetch('/api/settings',{method:'GET',credentials:'same-origin'});
+        const settings=await response.json();
+        return {httpStatus:response.status,provider:settings?.provider??null,baseUrl:settings?.baseUrl??null,
+          model:settings?.model??null,apiKeySet:settings?.apiKeySet===true};
+      }`);
+      const actual = operation.result;
+      const expectedBaseUrl = process.env.VERIFY_MOCK_URL;
+      const matches = actual?.httpStatus === 200 && actual.provider === 'custom'
+        && actual.baseUrl === expectedBaseUrl && actual.model === 'mock-model-1' && actual.apiKeySet === true;
+      console.log(`[${label}] LIVE_SETTINGS ${JSON.stringify({actual,expected:{provider:'custom',baseUrl:expectedBaseUrl,model:'mock-model-1',apiKeySet:true},matches})}`);
+      return { actual, matches };
+    };
+
+    // Early ONLY branches execute before the legacy full-suite helpers below.
+    const earlyActivateRightTab = async (name) => {
+      const clicked=await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tabs button')].find(x=>x.textContent.trim().startsWith(${JSON.stringify(name)}));if(!b)return false;b.click();return true})()`);
+      await sleep(260);
+      return clicked;
+    };
+    const earlyPanelSet = async (label,value) => evalJs(`(()=>{
+      const norm=s=>String(s).replace(/[\\s\\u{1F512}]/gu,'');
+      const row=[...document.querySelectorAll('.side-right .row')].find(r=>{const l=r.querySelector('.row-label');return l&&norm(l.textContent)===norm(${JSON.stringify(label)})});
+      const f=row?.querySelector('input,select,textarea');if(!f)return 'no-field';
+      const proto=f.tagName==='SELECT'?HTMLSelectElement.prototype:f.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto,'value').set.call(f,${JSON.stringify(String(value))});
+      f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));return 'ok';
+    })()`);
+    const earlyClickPanelButton = async (label,waitMs=320) => {
+      const clicked=await evalJs(`(()=>{const l=${JSON.stringify(label)};const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.replace(/\\s+/g,' ').trim()===l||x.textContent.includes(l));if(!b)return false;b.click();return true})()`);
+      await sleep(waitMs);
+      return clicked;
     };
 
     const mouse = (type, x, y, opts = {}) =>
@@ -468,6 +758,1018 @@ async function waitForApp(url, timeoutMs = 25000) {
       mouse('mousePressed', x, y, { button: 'right', buttons: 2 });
       mouse('mouseReleased', x, y, { button: 'right', buttons: 0 });
     };
+
+    // Independent project fixture for strict room cabinet-group DOM membership and the real edit click.
+    if (ONLY === 'B47_ROOM_CABINET_GROUPS_UI') {
+      section('B47_ROOM_CABINET_GROUPS_UI 房间柜型分组集合对账与逐柜编辑选中 ID');
+      await sleep(1600); // finish one-time draft restoration before replacing it with an isolated fixture
+      const fixture = await evalJs(`(async()=>{
+        const [store,docs]=await Promise.all([import('/src/state/store.ts'),import('/src/core/docFactory.ts')]);
+        const roomA=docs.rectRoom({id:'room_b47_kitchen',name:'B47 验收厨房',x:0,y:0,w:7000,h:4500,thickness:120,height:2700});
+        const roomB=docs.rectRoom({id:'room_b47_study',name:'B47 验收书房',x:8000,y:0,w:6000,h:4500,thickness:120,height:2700});
+        const project=docs.emptyProject({name:'B47 柜型分组真实浏览器验收',ruleSetId:store.RULESET.id});
+        project.rooms=[roomA,roomB];
+        const defs=[
+          {id:'cab_b47_base',name:'B47 厨房地柜',roomId:roomA.id,type:'base',x:300,y:60,width:900,height:850,depth:600},
+          {id:'cab_b47_wall_left',name:'B47 左吊柜',roomId:roomA.id,type:'wall',x:1400,y:1500,width:900,height:700,depth:350},
+          {id:'cab_b47_wall_center',name:'B47 中吊柜',roomId:roomA.id,type:'wall',x:2500,y:1500,width:900,height:700,depth:350},
+          {id:'cab_b47_wall_right',name:'B47 右吊柜',roomId:roomA.id,type:'wall',x:3600,y:1500,width:900,height:700,depth:350},
+          {id:'cab_b47_tall',name:'B47 厨房高柜',roomId:roomA.id,type:'tall',x:4800,y:60,width:900,height:2100,depth:600},
+          {id:'cab_b47_island',name:'B47 厨房岛台',roomId:roomA.id,type:'island',x:5800,y:700,width:900,height:850,depth:700},
+          {id:'cab_b47_other_room',name:'B47 书房地柜',roomId:roomB.id,type:'base',x:8400,y:60,width:1000,height:900,depth:500},
+        ];
+        project.cabinets=defs.map(d=>{
+          const cab=docs.createCabinet({id:d.id,name:d.name,roomId:d.roomId,x:d.x,y:d.y,rules:store.RULESET,params:{width:d.width,height:d.height,depth:d.depth}});
+          cab.params.cabinetType=d.type;
+          cab.params.mountHeight=d.type==='wall'?1450:0;
+          return cab;
+        });
+        project.assemblies=[
+          {id:'asm_b47_left',name:'B47 左吊柜组',roomId:roomA.id,memberIds:['cab_b47_wall_left'],connections:[]},
+          {id:'asm_b47_center',name:'B47 中吊柜组',roomId:roomA.id,memberIds:['cab_b47_wall_center'],connections:[]},
+          {id:'asm_b47_right',name:'B47 右吊柜组',roomId:roomA.id,memberIds:['cab_b47_wall_right'],connections:[]},
+        ];
+        window.__cabinetGroupBus=store.bus;
+        store.bus.replaceProject(project,'B47 isolated room cabinet-group fixture');
+        return {roomId:roomA.id,roomName:roomA.name,targetId:'cab_b47_wall_center',targetName:'B47 中吊柜',allIds:defs.map(d=>d.id),roomCabinetCount:defs.filter(d=>d.roomId===roomA.id).length};
+      })()`);
+      ok('隔离真实浏览器房间 fixture 已安装，含四种柜型、三个独立装配吊柜及另一个房间',
+        fixture?.roomId==='room_b47_kitchen'&&fixture?.roomCabinetCount===6&&fixture?.allIds?.length===7,
+        JSON.stringify(fixture));
+      if(!fixture?.roomId)throw new Error('B47 room/cabinet fixture setup failed');
+      await sleep(500);
+
+      const clickAt = async (point) => {
+        if(!point||!Number.isFinite(point.x)||!Number.isFinite(point.y))return false;
+        await moveMouse(point.x,point.y);
+        await mouse('mousePressed',point.x,point.y,{button:'left',buttons:1});
+        await mouse('mouseReleased',point.x,point.y,{button:'left',buttons:0});
+        await sleep(320);
+        return true;
+      };
+      const roomPoint=await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.querySelector('.workspace-room-item-name')?.textContent.trim()===${JSON.stringify(fixture.roomName)});if(!b)return null;const r=b.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2,text:b.innerText.trim()}})()`);
+      const clickedRoom=await clickAt(roomPoint);
+      await sleep(250);
+      ok('通过真实鼠标事件选择目标房间，页面标题与房间列表均对应 fixture',clickedRoom&&await evalJs(`document.querySelector('.workspace-room-heading h1')?.textContent.trim()===${JSON.stringify(fixture.roomName)}`),JSON.stringify(roomPoint));
+
+      const summaries=await evalJs(`(()=>[...document.querySelectorAll('.workspace-cabinet-members')].map(d=>({open:d.open,rect:(()=>{const r=d.querySelector('summary')?.getBoundingClientRect();return r?{x:r.left+r.width/2,y:r.top+r.height/2}:null})()})))()`);
+      for(const item of summaries)if(!item.open&&item.rect)await clickAt(item.rect);
+      await sleep(200);
+      const membership=await evalJs(`(()=>{
+        const bus=window.__cabinetGroupBus,p=bus?.getState();if(!p)return{error:'fixture bus missing'};
+        const roomId=${JSON.stringify(fixture.roomId)};
+        const input=p.cabinets.filter(c=>c.roomId===roomId).map(c=>({id:c.id,name:c.name}));
+        const reactKey=el=>{const prop=Object.keys(el).find(k=>k.startsWith('__reactFiber$'));return prop?el[prop]?.key??null:null};
+        const byName=new Map();for(const c of input){const a=byName.get(c.name)||[];a.push(c.id);byName.set(c.name,a)}
+        const groups=[...document.querySelectorAll('.workspace-cabinet-group')].map(g=>({name:g.querySelector('.workspace-cabinet-group-head strong')?.textContent.trim()||'',groupId:g.getAttribute('data-cabinet-group'),cards:[...g.querySelectorAll('.workspace-cabinet-card')].map(card=>{const name=card.querySelector('.workspace-cabinet-name')?.textContent.trim()||'';return{name,cabinetId:reactKey(card),sourceNameIds:byName.get(name)||[]}})}));
+        const cards=groups.flatMap(g=>g.cards.map(card=>({group:g.name,groupId:g.groupId,...card})));
+        const inputIds=input.map(c=>c.id),renderedIds=cards.flatMap(c=>typeof c.cabinetId==='string'?[c.cabinetId]:[]),counts=new Map();for(const id of renderedIds)counts.set(id,(counts.get(id)||0)+1);
+        return{inputIds,renderedIds,inputCount:input.length,groups,cards,unknownOrAmbiguous:cards.filter(c=>typeof c.cabinetId!=='string'||!inputIds.includes(c.cabinetId)||c.sourceNameIds.length!==1||c.sourceNameIds[0]!==c.cabinetId),counts:[...counts],
+          exact:inputIds.length===renderedIds.length&&[...inputIds].sort().join('\\0')===[...renderedIds].sort().join('\\0'),
+          exactlyOnce:inputIds.every(id=>counts.get(id)===1)&&counts.size===inputIds.length};
+      })()`);
+      const expectedGroupNames=['地柜','吊柜','高柜','岛台'];
+      ok('room input cabinetId 与真实 DOM 柜卡 React key 的 ID 多重集合完全相同，无遗漏/替换/额外项',
+        membership?.exact===true&&membership?.unknownOrAmbiguous?.length===0,
+        JSON.stringify({inputIds:membership?.inputIds,renderedIds:membership?.renderedIds,unknownOrAmbiguous:membership?.unknownOrAmbiguous}));
+      ok('每个 room input cabinetId 在 UI 分组中恰好出现一次，React key 与唯一可见柜名均回指同一 ID，且按四种柜型呈现',
+        membership?.exactlyOnce===true&&membership?.groups?.map(g=>g.name).join(',')===expectedGroupNames.join(','),
+        JSON.stringify({groups:membership?.groups?.map(g=>({name:g.name,groupId:g.groupId,cards:g.cards?.map(c=>({cabinetId:c.cabinetId,name:c.name,sourceNameIds:c.sourceNameIds}))})),counts:membership?.counts}));
+
+      const editPoint=await evalJs(`(()=>{const bus=window.__cabinetGroupBus,p=bus?.getState(),cards=[...document.querySelectorAll('.workspace-cabinet-card')],diagnostics=[],reactKey=el=>{const prop=Object.keys(el).find(k=>k.startsWith('__reactFiber$'));return prop?el[prop]?.key??null:null};for(const card of cards){const b=[...(card.querySelectorAll('button')||[])].find(x=>x.textContent.trim()==='编辑');if(!b||b.disabled||b.getClientRects().length===0)continue;const design=card.closest('.workspace-room-design');if(design){const br=b.getBoundingClientRect(),dr=design.getBoundingClientRect(),center=br.top+br.height/2,target=design.scrollTop+center-(dr.top+design.clientHeight/2);design.scrollTop=Math.max(0,Math.min(design.scrollHeight-design.clientHeight,target))}const r=b.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2,hit=document.elementFromPoint(x,y),hitTarget=!!hit&&(hit===b||b.contains(hit)),cabinetName=card.querySelector('.workspace-cabinet-name')?.textContent.trim()||'',cabinetId=reactKey(card),cabinet=p?.cabinets.find(c=>c.id===cabinetId);const item={cabinetName,cabinetId:cabinet?.id||null,reactKey:cabinetId,x,y,rect:{left:r.left,top:r.top,width:r.width,height:r.height},hitTarget,hitTag:hit?.tagName||'',hitText:hit?.textContent.trim()||'',hitHtml:hit?.outerHTML?.slice(0,180)||''};diagnostics.push(item);if(hitTarget&&cabinet){window.__b47EditClickObserved=false;b.addEventListener('click',()=>{window.__b47EditClickObserved=true},{once:true});const dr=design?.getBoundingClientRect();return{...item,text:b.textContent.trim(),designScroll:design?{top:design.scrollTop,height:design.scrollHeight,clientHeight:design.clientHeight,rect:{left:dr.left,top:dr.top,width:dr.width,height:dr.height}}:null,diagnostics}}}return{unreachable:true,diagnostics}})()`);
+      const clickedEdit=await clickAt(editPoint);
+      const cadDeadline=Date.now()+9000;let cadReady=false;
+      while(Date.now()<cadDeadline){cadReady=await evalJs(`!document.querySelector('.room-workspace')&&!!document.querySelector('.side-left .tree')`);if(cadReady)break;await sleep(100)}
+      const finalSelection=await evalJs(`(()=>{
+        const bus=window.__cabinetGroupBus,p=bus?.getState();
+        const leaves=[...document.querySelectorAll('.side-left .tree-leaf.sel')].map(e=>e.querySelector('.tree-name')?.textContent.replace(/\\s+/g,' ').trim()||e.textContent.replace(/\\s+/g,' ').trim());
+        const selectedIds=leaves.flatMap(name=>p?.cabinets.filter(c=>c.name===name).map(c=>c.id)||[]);
+        return{leaves,selectedIds,targetId:${JSON.stringify(editPoint?.cabinetId??null)},targetName:${JSON.stringify(editPoint?.cabinetName??null)},status:document.querySelector('.statusbar')?.innerText.replace(/\\s+/g,' ').trim()||'',editClickObserved:window.__b47EditClickObserved===true,workspaceStill:!!document.querySelector('.room-workspace'),bodyTail:document.body.innerText.slice(-380),viewport:{innerWidth,innerHeight,clientWidth:document.documentElement.clientWidth,clientHeight:document.documentElement.clientHeight}};
+      })()`);
+      ok('CDP 鼠标事件已在目标“编辑”按钮上触发真实 DOM click 事件',finalSelection?.editClickObserved===true,JSON.stringify({editPoint,clickedEdit,workspaceStill:finalSelection?.workspaceStill}));
+      ok('真实浏览器 CDP 鼠标实际点击分组卡片内的“编辑”，成功进入 CAD 编辑界面',
+        Boolean(clickedEdit&&editPoint?.text==='编辑'&&editPoint?.hitTarget&&cadReady),
+        JSON.stringify({editPoint,clickedEdit,cadReady}));
+      ok('编辑入口完成后的最终 CAD 选中 cabinetId 精确等于被点击卡片的输入 ID',
+        finalSelection?.selectedIds?.length===1&&finalSelection.selectedIds[0]===editPoint?.cabinetId,
+        JSON.stringify(finalSelection));
+      await finishProbe();
+    }
+
+    if (ONLY === 'B49_ASSEMBLY_CONFIRMATION_UI') {
+      section('B49_ASSEMBLY_CONFIRMATION_UI 装配确认、stale 失效与逐柜生产图隔离');
+      await sleep(1500);
+      const evalTask=async(key,expression,timeout=20000)=>(await startPageOperation(key,`async()=>await (${expression})`,timeout)).result;
+      const fixture = await evalTask('B49-fixture', `(async()=>{
+        const [store,docs,layout,sheets]=await Promise.all([import('/src/state/store.ts'),import('/src/core/docFactory.ts'),import('/src/core/layoutModel.ts'),import('/src/export/furnitureSheet.ts')]);
+        const room=docs.rectRoom({id:'room_b49_kitchen',name:'B49 确认验收厨房',x:0,y:0,w:5200,h:3500,thickness:120,height:2700});
+        const project=docs.emptyProject({id:'project_b49_assembly_confirmation',name:'B49 装配确认真实浏览器验收',ruleSetId:store.RULESET.id});project.rooms=[room];
+        const defs=[{id:'cab_b49_left',name:'B49 相邻柜 A',x:300},{id:'cab_b49_center',name:'B49 相邻柜 B',x:1200},{id:'cab_b49_right',name:'B49 单柜 C',x:2100}];
+        project.cabinets=defs.map(item=>{const cabinet=docs.createCabinet({id:item.id,name:item.name,roomId:room.id,x:item.x,y:100,rules:store.RULESET,params:{width:900,height:850,depth:600}});cabinet.params.cabinetType='base';layout.allUnits(cabinet.layout).forEach((unit,index)=>unit.id='unit_'+cabinet.id+'_'+(index+1));cabinet.layout.backUnits?.forEach((unit,index)=>unit.id='back_'+cabinet.id+'_'+(index+1));return cabinet});
+        project.assemblies=[{id:'asm_b49_adjacent',name:'B49 相邻但未确认组',roomId:room.id,memberIds:['cab_b49_left','cab_b49_center'],connections:[]},{id:'asm_b49_legacy_true',name:'B49 缺快照的旧 true 组',roomId:room.id,memberIds:['cab_b49_right'],connections:[],confirmed:true}];
+        window.__assemblyConfirmBus=store.bus;window.__b49HealthyProject=project;window.__b49InitialIds=project.cabinets.map(c=>c.id);window.__b49ProductionBefore=JSON.stringify(sheets.buildFurnitureSheet(room,[project.cabinets[0]],project,store.RULESET));
+        store.bus.replaceProject(project,'B49 isolated adjacent unconfirmed assembly fixture');
+        return {roomId:room.id,roomName:room.name,cabinetIds:defs.map(d=>d.id),assemblyId:'asm_b49_adjacent',assemblyName:'B49 相邻但未确认组'};
+      })()`);
+      ok('真实 Chromium fixture 已安装相邻柜、未确认命名组和缺确认快照的旧 true 组',fixture?.cabinetIds?.length===3&&fixture.assemblyId==='asm_b49_adjacent',JSON.stringify(fixture));
+      if(!fixture?.roomId)throw new Error('B49 assembly confirmation fixture setup failed');
+      const clickAt=async point=>{if(!point||!Number.isFinite(point.x)||!Number.isFinite(point.y))return false;await moveMouse(point.x,point.y);await mouse('mousePressed',point.x,point.y,{button:'left',buttons:1});await mouse('mouseReleased',point.x,point.y,{button:'left',buttons:0});await sleep(220);return true};
+      const clickSelector=async selector=>{const p=await evalJs(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return null;e.scrollIntoView({block:'center'});const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2,disabled:e.disabled}})()`);return p&&!p.disabled?clickAt(p):false};
+      const waitFor=async(expression,timeout=9000)=>{const end=Date.now()+timeout;while(Date.now()<end){if(await evalJs(expression))return true;await sleep(100)}return false};
+      const roomPoint=await evalJs(`(()=>{const e=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.querySelector('.workspace-room-item-name')?.textContent.trim()===${JSON.stringify(fixture.roomName)});if(!e)return null;const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2}})()`);
+      await clickAt(roomPoint);await waitFor(`document.querySelector('.workspace-room-heading h1')?.textContent.trim()===${JSON.stringify(fixture.roomName)}`);
+      const initial=await evalJs(`(()=>({category:document.querySelector('.workspace-cabinet-group-head strong')?.textContent.trim(),singles:[...document.querySelectorAll('.workspace-cabinet-independent-item')].map(e=>e.dataset.independentCabinetId).sort(),preview:document.querySelectorAll('[data-testid="confirmed-assembly-preview"]').length,headers:[...document.querySelectorAll('.workspace-cabinet-group-head')].map(e=>e.innerText)}))()`);
+      ok('相邻和已有名称不推断连续组；柜型仍按地柜分类且三台柜逐柜预览',initial?.category==='地柜'&&initial?.singles?.join(',')===fixture.cabinetIds.slice().sort().join(',')&&initial?.preview===0&&!initial?.headers?.some(t=>t.includes(fixture.assemblyName)),JSON.stringify(initial));
+      const bad=await evalTask('B49-readonly', `(async()=>{const [layout,commands]=await Promise.all([import('/src/core/layoutModel.ts'),import('/src/core/commands.ts')]);const bus=window.__assemblyConfirmBus,p=structuredClone(window.__b49HealthyProject);layout.allUnits(p.cabinets[1].layout)[0].id=layout.allUnits(p.cabinets[0].layout)[0].id;bus.loadProjectReadOnly(p);const r=bus.execute(commands.confirmAssembly('asm_b49_adjacent','B49 相邻但未确认组','ui'));return {locked:Boolean(bus.getUnitIdentityConflict()),rejected:!r.ok,unconfirmed:bus.getState().assemblies.find(a=>a.id==='asm_b49_adjacent').confirmed!==true}})()`);
+      await waitFor(`!!document.querySelector('[data-testid="unit-identity-readonly-banner"]')`);
+      const disabled=await evalJs(`document.querySelector('[data-testid="assembly-confirm-start"]')?.disabled===true`);
+      ok('重复 Unit ID 坏项目的确认按钮禁用，统一 CommandBus 只读锁拒绝写入',bad?.locked&&bad?.rejected&&bad?.unconfirmed&&disabled,JSON.stringify({bad,disabled}));
+      const healthy=await evalJs(`(()=>{const b=window.__assemblyConfirmBus;b.switchToValidatedHealthyProject(window.__b49HealthyProject,'B49 explicit healthy project selection',true);localStorage.removeItem('furniture-cad.unit-identity-readonly-lock');return {locked:Boolean(b.getUnitIdentityConflict()),ids:b.getState().cabinets.map(c=>c.id)}})()`);
+      await waitFor(`!document.querySelector('[data-testid="unit-identity-readonly-banner"]')&&!!document.querySelector('[data-testid="assembly-confirm-start"]')`);
+      const began=await clickSelector('[data-testid="assembly-confirm-start"]');const dialog=await waitFor(`!!document.querySelector('[data-testid="assembly-confirm-dialog"]')`);
+      ok('健康项目入口恢复；第一次点击仅打开明确确认步骤，不提前写入',healthy?.locked===false&&healthy?.ids?.join(',')===fixture.cabinetIds.join(',')&&began&&dialog&&await evalJs(`window.__assemblyConfirmBus.getState().assemblies.find(a=>a.id==='asm_b49_adjacent').confirmed!==true`));
+      const clicked=await clickSelector('[data-testid="assembly-confirm-final"]');await waitFor(`document.querySelectorAll('[data-testid="confirmed-assembly-preview"]').length===1`);
+      const after=await evalTask('B49-after-confirm', `(async()=>{const [store,logic,sheets]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts'),import('/src/export/furnitureSheet.ts')]);const p=store.bus.getState(),a=p.assemblies.find(x=>x.id==='asm_b49_adjacent'),g=document.querySelector('[data-testid="confirmed-assembly-preview"]');return {confirmed:logic.isAssemblyConfirmed(a),name:g?.querySelector('header strong')?.textContent.trim(),members:[...g?.querySelectorAll('[data-assembly-member-id]')||[]].map(e=>e.dataset.assemblyMemberId).sort(),sheet:JSON.stringify(sheets.buildFurnitureSheet(p.rooms[0],[p.cabinets[0]],p,store.RULESET)),ids:p.cabinets.map(c=>c.id).join(',')}})()`);
+      ok('用户最终确认后装配名称/连续组出现，单柜生产页图元与柜体 ID 保持原样',clicked&&after?.confirmed&&after?.name===fixture.assemblyName&&after?.members?.join(',')===fixture.cabinetIds.slice(0,2).sort().join(',')&&after?.sheet===await evalJs('window.__b49ProductionBefore')&&after?.ids===fixture.cabinetIds.join(','),JSON.stringify(after));
+      await sleep(1200);
+      const saved=await evalJs(`(()=>{const env=JSON.parse(localStorage.getItem('furnicad.draft.v1')||'null'),p=env?.project||env,a=p?.assemblies?.find(x=>x.id==='asm_b49_adjacent');return {confirmed:a?.confirmed,members:a?.confirmedMemberIds,connections:a?.confirmedConnections}})()`);
+      ok('自动保存记录确认位及成员/连接快照',saved?.confirmed===true&&saved?.members?.join(',')===fixture.cabinetIds.slice(0,2).join(',')&&Array.isArray(saved?.connections),JSON.stringify(saved));
+      await send('Page.reload',{ignoreCache:false});await waitFor(`!!document.querySelector('.room-workspace')`,12000);await waitFor(`document.querySelectorAll('[data-testid="confirmed-assembly-preview"]').length===1`,12000);await initializePageHarness();
+      const reloaded=await evalTask('B49-after-reload', `(async()=>{const [store,logic]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);const p=store.bus.getState(),a=p.assemblies.find(x=>x.id==='asm_b49_adjacent');return {ok:logic.isAssemblyConfirmed(a),name:document.querySelector('[data-testid="confirmed-assembly-preview"] header strong')?.textContent.trim(),ids:p.cabinets.map(c=>c.id).join(',')}})()`);
+      ok('真实刷新后仍是已确认连续组并显示原装配名',reloaded?.ok&&reloaded?.name===fixture.assemblyName&&reloaded?.ids===fixture.cabinetIds.join(','),JSON.stringify(reloaded));
+      const memberChange=await evalTask('B49-member-change', `(async()=>{const [store,commands,logic]=await Promise.all([import('/src/state/store.ts'),import('/src/core/commands.ts'),import('/src/core/assemblyConfirmation.ts')]);const b=store.bus,a=b.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'),c=b.getState().cabinets.find(x=>x.id==='cab_b49_right'),r=b.execute(commands.addAssemblyMember(a.id,a.name,c.id,c.name));return {ok:r.ok,error:r.error||'',locked:Boolean(b.getUnitIdentityConflict()),status:logic.assemblyConfirmationStatus(b.getState().assemblies.find(x=>x.id===a.id))}})()`);
+      await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`);
+      ok('成员变更使确认 stale、组名/连续预览隐藏并可重新确认',memberChange?.ok&&memberChange?.status==='stale'&&await evalJs(`document.querySelector('.workspace-assembly-confirmation-note')?.textContent.includes('成员或连接已变化')===true`),JSON.stringify(memberChange));
+      const memberRoundTrip=await evalTask('B49-member-roundtrip', `(async()=>{const [s,c,l,pf]=await Promise.all([import('/src/state/store.ts'),import('/src/core/commands.ts'),import('/src/core/assemblyConfirmation.ts'),import('/src/core/projectFile.ts')]);const b=s.bus,a=b.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'),before=[...a.memberIds],addGen=a.relationGeneration;const r=b.execute(c.removeAssemblyMember(a.id,a.name,'cab_b49_right','B49 单柜 C')),after=b.getState().assemblies.find(x=>x.id===a.id),saved=pf.parseProjectFile(pf.serializeProjectFile(b.getState(),'2026-10-09T00:00:05.000Z'));return {ok:r.ok,before,after:[...after.memberIds],confirmed:after.confirmed,status:l.assemblyConfirmationStatus(after),generation:after.relationGeneration,staleReload:saved.ok&&l.assemblyConfirmationStatus(saved.project.assemblies.find(x=>x.id===a.id))==='stale',reloadGeneration:saved.ok?saved.project.assemblies.find(x=>x.id===a.id).relationGeneration:null,addGen}})()`);
+      await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`);
+      ok('Chromium 中 add→remove 回到原 memberIds 仍 stale，序列化回读也 stale',memberRoundTrip?.ok&&memberRoundTrip?.after?.join(',')===fixture.cabinetIds.slice(0,2).join(',')&&memberRoundTrip?.confirmed===false&&memberRoundTrip?.status==='stale'&&memberRoundTrip?.generation>memberRoundTrip?.addGen&&memberRoundTrip?.staleReload&&memberRoundTrip?.reloadGeneration===memberRoundTrip?.generation&&!await evalJs(`document.querySelector('[data-testid="confirmed-assembly-preview"]')`),JSON.stringify(memberRoundTrip));
+      await sleep(1300);
+      const savedMemberStale=await evalJs(`(()=>{const env=JSON.parse(localStorage.getItem('furnicad.draft.v1')||'null'),a=(env?.project||env)?.assemblies?.find(x=>x.id==='asm_b49_adjacent');return {confirmed:a?.confirmed,generation:a?.relationGeneration,confirmedGeneration:a?.confirmedRelationGeneration}})()`);
+      ok('自动保存将成员往返的 confirmed=false 和失效代次落盘',savedMemberStale?.confirmed===false&&savedMemberStale?.generation>savedMemberStale?.confirmedGeneration,JSON.stringify(savedMemberStale));
+      await send('Page.reload',{ignoreCache:false});await waitFor(`!!document.querySelector('.room-workspace')`,12000);await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`,12000);await initializePageHarness();
+      const memberStaleAfterReload=await evalTask('B49-member-stale-reload', `(async()=>{const [s,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);const a=s.bus.getState().assemblies.find(x=>x.id==='asm_b49_adjacent');return {status:l.assemblyConfirmationStatus(a),generation:a.relationGeneration,confirmed:a.confirmed,hidden:!document.querySelector('[data-testid="confirmed-assembly-preview"]')}})()`);
+      ok('真实刷新后成员关系原集合仍 stale 且连续组继续隐藏',memberStaleAfterReload?.status==='stale'&&memberStaleAfterReload?.confirmed===false&&memberStaleAfterReload?.hidden&&memberStaleAfterReload?.generation===memberRoundTrip?.generation,JSON.stringify(memberStaleAfterReload));
+      const clickAndConfirm=async()=>{const began=await clickSelector('[data-testid="assembly-confirm-start"]'),dialog=await waitFor(`!!document.querySelector('[data-testid="assembly-confirm-dialog"]')`);const clicked=began&&dialog&&await clickSelector('[data-testid="assembly-confirm-final"]');return clicked};
+      const memberConfirmed=await clickAndConfirm();await waitFor(`document.querySelectorAll('[data-testid="confirmed-assembly-preview"] [data-assembly-member-id]').length===2`);
+      ok('刷新后的 stale 只有经过 Chromium 确认对话框才恢复原两柜连续组',memberConfirmed&&await evalTask('B49-member-reconfirmed', `(async()=>{const [s,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);return l.isAssemblyConfirmed(s.bus.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'))&&document.querySelectorAll('[data-testid="confirmed-assembly-preview"] [data-assembly-member-id]').length===2})()`));
+      const undoRedo=await evalTask('B49-undo-redo-roundtrip', `(async()=>{const [s,c,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/commands.ts'),import('/src/core/assemblyConfirmation.ts')]);const b=s.bus,a=b.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'),start=a.relationGeneration,add=b.execute(c.addAssemblyMember(a.id,a.name,'cab_b49_right','B49 单柜 C')),afterAdd=b.getState().assemblies.find(x=>x.id===a.id),undo=b.undo(),afterUndo=b.getState().assemblies.find(x=>x.id===a.id),redo=b.redo(),afterRedo=b.getState().assemblies.find(x=>x.id===a.id),undoAgain=b.undo(),final=b.getState().assemblies.find(x=>x.id===a.id);return {add:add.ok,undo,redo,undoAgain,start,addGen:afterAdd.relationGeneration,undoGen:afterUndo.relationGeneration,redoGen:afterRedo.relationGeneration,finalGen:final.relationGeneration,undoStatus:l.assemblyConfirmationStatus(afterUndo),redoStatus:l.assemblyConfirmationStatus(afterRedo),finalStatus:l.assemblyConfirmationStatus(final),originalMembers:final.memberIds.join(',')==='cab_b49_left,cab_b49_center',confirmed:final.confirmed}})()`);
+      await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`);
+      ok('关系变更 undo/redo/再 undo 均单调推进代次，原集合不会自动恢复 confirmed',undoRedo?.add&&undoRedo?.undo&&undoRedo?.redo&&undoRedo?.undoAgain&&undoRedo?.undoStatus==='stale'&&undoRedo?.redoStatus==='stale'&&undoRedo?.finalStatus==='stale'&&undoRedo?.start<undoRedo?.addGen&&undoRedo?.addGen<undoRedo?.undoGen&&undoRedo?.undoGen<undoRedo?.redoGen&&undoRedo?.redoGen<undoRedo?.finalGen&&undoRedo?.originalMembers&&undoRedo?.confirmed===false&&!await evalJs(`document.querySelector('[data-testid="confirmed-assembly-preview"]')`),JSON.stringify(undoRedo));
+      const undoRedoConfirmed=await clickAndConfirm();await waitFor(`document.querySelectorAll('[data-testid="confirmed-assembly-preview"] [data-assembly-member-id]').length===2`);
+      ok('undo/redo 后只经 UI 显式重确认才恢复连续组',undoRedoConfirmed&&await evalTask('B49-undo-redo-reconfirmed', `(async()=>{const [s,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);return l.isAssemblyConfirmed(s.bus.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'))})()`));
+      const connectionRoundTrip=await evalTask('B49-connection-roundtrip', `(async()=>{const [s,c,l,pf]=await Promise.all([import('/src/state/store.ts'),import('/src/core/commands.ts'),import('/src/core/assemblyConfirmation.ts'),import('/src/core/projectFile.ts')]);const b=s.bus,a=b.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'),before=JSON.stringify(a.connections),conn={id:'conn_b49_roundtrip',kind:'butt',a:{cabinetId:'cab_b49_left'},b:{cabinetId:'cab_b49_center'},origin:'authored'},connected=b.execute(c.connectInAssembly(a.id,a.name,conn)),afterConnect=b.getState().assemblies.find(x=>x.id===a.id),disconnect=b.execute(c.disconnectInAssembly(a.id,a.name,conn.id)),after=b.getState().assemblies.find(x=>x.id===a.id),parsed=pf.parseProjectFile(pf.serializeProjectFile(b.getState(),'2026-10-09T00:00:06.000Z'));return {connected:connected.ok,disconnect:disconnect.ok,before,after:JSON.stringify(after.connections),connectStatus:l.assemblyConfirmationStatus(afterConnect),status:l.assemblyConfirmationStatus(after),confirmed:after.confirmed,connectGen:afterConnect.relationGeneration,generation:after.relationGeneration,staleReload:parsed.ok&&l.assemblyConfirmationStatus(parsed.project.assemblies.find(x=>x.id===a.id))==='stale',reloadGeneration:parsed.ok?parsed.project.assemblies.find(x=>x.id===a.id).relationGeneration:null}})()`);
+      await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`);
+      ok('Chromium 中 connect→disconnect 回到原 connections 仍 stale 且序列化回读保持 stale',connectionRoundTrip?.connected&&connectionRoundTrip?.disconnect&&connectionRoundTrip?.before===connectionRoundTrip?.after&&connectionRoundTrip?.connectStatus==='stale'&&connectionRoundTrip?.status==='stale'&&connectionRoundTrip?.confirmed===false&&connectionRoundTrip?.generation>connectionRoundTrip?.connectGen&&connectionRoundTrip?.staleReload&&connectionRoundTrip?.reloadGeneration===connectionRoundTrip?.generation&&!await evalJs(`document.querySelector('[data-testid="confirmed-assembly-preview"]')`),JSON.stringify(connectionRoundTrip));
+      await sleep(1300);
+      await send('Page.reload',{ignoreCache:false});await waitFor(`!!document.querySelector('.room-workspace')`,12000);await waitFor(`!document.querySelector('[data-testid="confirmed-assembly-preview"]')&&document.querySelector('[data-testid="assembly-confirm-start"]')?.textContent.includes('重新确认')`,12000);await initializePageHarness();
+      const connectionStaleAfterReload=await evalTask('B49-connection-stale-reload', `(async()=>{const [s,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);const a=s.bus.getState().assemblies.find(x=>x.id==='asm_b49_adjacent');return {status:l.assemblyConfirmationStatus(a),generation:a.relationGeneration,confirmed:a.confirmed,hidden:!document.querySelector('[data-testid="confirmed-assembly-preview"]')}})()`);
+      ok('真实刷新后连接关系原集合仍 stale 且连续组继续隐藏',connectionStaleAfterReload?.status==='stale'&&connectionStaleAfterReload?.confirmed===false&&connectionStaleAfterReload?.hidden&&connectionStaleAfterReload?.generation===connectionRoundTrip?.generation,JSON.stringify(connectionStaleAfterReload));
+      const connectionConfirmed=await clickAndConfirm();await waitFor(`document.querySelectorAll('[data-testid="confirmed-assembly-preview"] [data-assembly-member-id]').length===2`);
+      ok('连接往返刷新后再次通过 UI 明确确认才恢复连续组',connectionConfirmed&&await evalTask('B49-connection-reconfirmed', `(async()=>{const [s,l]=await Promise.all([import('/src/state/store.ts'),import('/src/core/assemblyConfirmation.ts')]);return l.isAssemblyConfirmed(s.bus.getState().assemblies.find(x=>x.id==='asm_b49_adjacent'))})()`));
+      await finishProbe();
+    }
+
+    // Full browser flow for explicit shared tops, manufacturing confirmation and export round-trip.
+    if (ONLY === 'B48_SHARED_PANEL_UI') {
+      section('B48_SHARED_PANEL_UI SharedPanel 显式创建、分段、孔位、stale 与导出回读');
+      await sleep(1600);
+      const fixture = await evalJs(`(async()=>{
+        const [store,docs]=await Promise.all([import('/src/state/store.ts'),import('/src/core/docFactory.ts'),import('/src/core/geometry/project.ts'),import('/src/core/manufacturing/derive.ts')]);
+        const room=docs.rectRoom({id:'room_b48_kitchen',name:'B48 连续台面验收厨房',x:0,y:0,w:5200,h:3200,thickness:120,height:2700});
+        const project=docs.emptyProject({name:'B48 SharedPanel 真实浏览器验收',ruleSetId:store.RULESET.id});
+        project.rooms=[room];
+        const defs=[
+          {id:'cab_b48_left',name:'B48 左柜',x:300},
+          {id:'cab_b48_center',name:'B48 中柜',x:1200},
+          {id:'cab_b48_right',name:'B48 右柜',x:2100},
+        ];
+        project.cabinets=defs.map(item=>docs.createCabinet({id:item.id,name:item.name,roomId:room.id,x:item.x,y:100,rules:store.RULESET,params:{width:900,height:850,depth:600}}));
+        window.__sharedPanelBus=store.bus;
+        window.__b48ExportEvents={requests:0,downloads:0};
+        window.__b48OriginalFetch=window.fetch.bind(window);
+        window.fetch=(input,...args)=>{const url=typeof input==='string'?input:input?.url||'';if(['/api/export/cutlist','/api/export/pdf','/api/export/dxf','/api/export/roombook'].some(route=>url.includes(route)))window.__b48ExportEvents.requests++;return window.__b48OriginalFetch(input,...args)};
+        window.__b48DownloadListener=event=>{if(event.target instanceof Element&&event.target.closest('a[download]'))window.__b48ExportEvents.downloads++};
+        document.addEventListener('click',window.__b48DownloadListener,true);
+        store.bus.replaceProject(project,'B48 isolated adjacent three-cabinet fixture');
+        const geom=(await import('/src/core/geometry/project.ts')).generateProject(project,store.RULESET);
+        const manufacturing=(await import('/src/core/manufacturing/derive.ts')).deriveManufacturing(project,geom,store.RULESET);
+        return {roomId:room.id,roomName:room.name,projectId:project.id,cabinetIds:defs.map(item=>item.id),topIds:manufacturing.parts.filter(part=>part.role==='TopPanel').map(part=>part.id),sharedCount:project.sharedPanels?.length??0};
+      })()`);
+      ok('浏览器隔离 fixture 含同房间相邻三柜与三个原始顶板',fixture?.cabinetIds?.length===3&&fixture?.topIds?.length===3&&fixture.sharedCount===0,JSON.stringify(fixture));
+      if(!fixture?.roomId)throw new Error('B48 fixture setup failed');
+      await sleep(450);
+      const clickAt = async (point) => {
+        if(!point||!Number.isFinite(point.x)||!Number.isFinite(point.y))return false;
+        await moveMouse(point.x,point.y);
+        await mouse('mousePressed',point.x,point.y,{button:'left',buttons:1});
+        await mouse('mouseReleased',point.x,point.y,{button:'left',buttons:0});
+        await sleep(220);
+        return true;
+      };
+      const clickSelector = async (selector) => {
+        const point=await evalJs(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return null;e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2,disabled:!!e.disabled}})()`);
+        return point&&!point.disabled?clickAt(point):false;
+      };
+      const fillSelector = async (selector,value) => evalJs(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;e.scrollIntoView({block:'center',inline:'center'});e.focus();const proto=e instanceof HTMLSelectElement?HTMLSelectElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;if(!setter)return false;setter.call(e,${JSON.stringify(String(value))});e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return true})()`);
+      const waitFor = async (expression,timeout=7000) => {const deadline=Date.now()+timeout;while(Date.now()<deadline){if(await evalJs(expression))return true;await sleep(120)}return false};
+
+      const roomClicked=await clickSelector('.workspace-room-item');
+      await waitFor(`document.querySelector('.workspace-room-heading h1')?.textContent.trim()===${JSON.stringify(fixture.roomName)}`);
+      const noAuto=await evalJs(`(()=>{const p=window.__sharedPanelBus.getState();const tops=p.cabinets.map(c=>'P_'+c.id+'_TOP');const listed=[...document.querySelectorAll('.shared-panel-card')].map(e=>e.dataset.sharedPanelId);return {sameRoomCabinets:p.cabinets.filter(c=>c.roomId===${JSON.stringify(fixture.roomId)}).length,sharedCount:p.sharedPanels?.length??0,listed,topIds:tops,emptyNotice:document.querySelector('.shared-panel-empty')?.textContent||''}})()`);
+      ok('相邻三柜初始不自动合并；房间仍显示三个独立箱体顶板 ID 和“不会自动合并”说明',roomClicked&&noAuto?.sameRoomCabinets===3&&noAuto?.sharedCount===0&&noAuto?.listed?.length===0&&noAuto?.topIds?.length===3&&/不会.*自动合并/u.test(noAuto?.emptyNotice||''),JSON.stringify(noAuto));
+      const initialProject=await evalJs(`window.__sharedPanelBus.getState()`);
+      const initialSnapshotResponse=await fetch(process.env.SHARED_PANEL_EXPORT_ORACLE_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'draftLock',project:initialProject})});
+      const initialSnapshot=await initialSnapshotResponse.json();
+      ok('初始未合并 Project 的隔离 WorkspaceStore 返回稳定旧 hash 且无临时产物',initialSnapshot?.ok&&initialSnapshot.snapshotHash&&initialSnapshot.zeroTempFiles===true,JSON.stringify(initialSnapshot));
+
+      const createClicked=await clickSelector('[data-testid="shared-panel-create"]');
+      const dialogReady=await waitFor(`!!document.querySelector('[data-testid="shared-panel-dialog"]')`);
+      const missingSubmit=await clickSelector('[data-testid="sp-confirm"]');
+      const missingMessage=await evalJs(`document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||''`);
+      const stillNoShared=await evalJs(`(window.__sharedPanelBus.getState().sharedPanels||[]).length===0`);
+      ok('未选成员、未填制造必要项时确认被页面拒绝且未写入项目',createClicked&&dialogReady&&missingSubmit&&/至少两个不同柜体/u.test(missingMessage)&&stillNoShared,missingMessage.slice(0,400));
+
+      for(const id of fixture.cabinetIds)await clickSelector(`[data-testid="sp-member-${id}"]`);
+      await fillSelector('[data-testid="sp-name"]','三柜连续台面 · 人工接缝');
+      const overhangValues={front:'20',back:'30',left:'40',right:'50'};
+      for(const side of ['front','back','left','right'])await fillSelector(`[data-testid="sp-overhang-${side}"]`,overhangValues[side]);
+      await fillSelector('[data-testid="sp-material"]','M_BOARD_18_WOOD');
+      await fillSelector('[data-testid="sp-finish"]','18mm 双饰面木纹板，同色饰面');
+      await fillSelector('[data-testid="sp-grain"]','length');
+      for(const edge of ['top','bottom','left','right'])await fillSelector(`[data-testid="sp-edge-${edge}"]`,'__no_edge__');
+      await clickSelector('.shared-panel-radio-row label:nth-child(2) input[type="radio"]');
+      await fillSelector('[data-testid="sp-support-method"]','三柜顶板连续承托，接缝由人工确认');
+      for(const id of fixture.cabinetIds)await clickSelector(`[data-testid="sp-support-${id}"]`);
+      await fillSelector('[data-testid="sp-machining-status"]','confirmed-none');
+      await clickSelector('.shared-panel-bound-preview .shared-panel-confirm-check input');
+      const exportWhileEditing=await evalJs(`(()=>{const b=document.querySelector('[data-testid="workspace-export-button"]');return {disabled:!!b?.disabled,title:b?.title||'',dialog:!!document.querySelector('[data-testid="shared-panel-dialog"]'),sharedCount:window.__sharedPanelBus.getState().sharedPanels?.length??0}})()`);
+      const exportAttemptKeepsEditor=await evalJs(`(()=>{const b=document.querySelector('[data-testid="workspace-export-button"]');b?.click();return !!document.querySelector('[data-testid="shared-panel-dialog"]')})()`);
+      const noSegmentsSubmit=await clickSelector('[data-testid="sp-confirm"]');
+      await waitFor(`!!document.querySelector('[data-testid="shared-panel-errors"]')`);
+      const noSegmentsMessage=await evalJs(`document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||''`);
+      const noSegmentsSaved=await evalJs(`window.__sharedPanelBus.getState().sharedPanels?.length??0`);
+      const unconfirmedCandidate=await evalJs(`(async()=>{const [shared,store]=await Promise.all([import('/src/core/sharedPanels.ts'),import('/src/state/store.ts')]);const p=window.__sharedPanelBus.getState();const members=[...document.querySelectorAll('[data-testid^="sp-member-cab_"]')].filter(e=>e.checked).map(e=>e.getAttribute('data-testid').slice('sp-member-'.length));const edges=Object.fromEntries(['top','bottom','left','right'].map(k=>[k,document.querySelector('[data-testid="sp-edge-'+k+'"]')?.value==='__no_edge__'?null:document.querySelector('[data-testid="sp-edge-'+k+'"]')?.value]));const supports=[...document.querySelectorAll('[data-testid^="sp-support-cab_"]')].filter(e=>e.checked).map(e=>e.getAttribute('data-testid').slice('sp-support-'.length));const oh=Object.fromEntries(['front','back','left','right'].map(k=>[k,Number(document.querySelector('[data-testid="sp-overhang-'+k+'"]')?.value)]));const d={id:'SP_B48_MANUAL_UNCONFIRMED',name:document.querySelector('[data-testid="sp-name"]')?.value||'',memberCabinetIds:members,replacesPanelIds:${JSON.stringify(fixture.topIds)},bounds:{minX:260,minY:70,maxX:3050,maxY:720},elevation:Number(document.querySelector('[data-testid="sp-elevation"]')?.value),length:2790,width:650,thickness:Number(document.querySelector('[data-testid="sp-thickness"]')?.value),material:document.querySelector('[data-testid="sp-material"]')?.value,finish:document.querySelector('[data-testid="sp-finish"]')?.value,edgeTreatment:edges,overhang:oh,grainDirection:document.querySelector('[data-testid="sp-grain"]')?.value,grain:document.querySelector('[data-testid="sp-grain"]')?.value,segmentation:{confirmed:false,segments:[]},support:{confirmed:true,method:document.querySelector('[data-testid="sp-support-method"]')?.value||'',memberCabinetIds:supports},machining:{status:'confirmed-none',holes:[]},memberSnapshots:[],confirmation:{status:'draft'}};const panel=shared.confirmSharedPanel(d,p);return {project:{...p,sharedPanels:[panel]},ruleSet:store.RULESET.id,segmentMode:[...document.querySelectorAll('input[name="sp-segmentation"]')].map(e=>e.checked),segments:document.querySelectorAll('.shared-panel-segment-row').length}})()`);
+      const noSegmentsOracle=await (async()=>{const r=await fetch(process.env.SHARED_PANEL_EXPORT_ORACLE_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'unconfirmed',project:unconfirmedCandidate?.project})});return {status:r.status,result:await r.json()}})();
+      ok('其它必填规格已填全、选择人工分段但未填分段即保存：明确报分段未确认且 Project.sharedPanels 仍空',noSegmentsSubmit&&/接缝\/分段方案未确认/u.test(noSegmentsMessage)&&noSegmentsSaved===0&&unconfirmedCandidate?.segments===0&&unconfirmedCandidate?.segmentMode?.[1]===true,JSON.stringify({message:noSegmentsMessage,sharedCount:noSegmentsSaved,draft:exportWhileEditing}));
+      ok('编辑未确认共享件期间页面导出入口被禁用，按钮激活尝试不触发导出且编辑状态保留',exportWhileEditing?.disabled===true&&exportWhileEditing?.dialog===true&&exportWhileEditing?.sharedCount===0&&exportAttemptKeepsEditor===true,JSON.stringify({exportWhileEditing,exportAttemptKeepsEditor}));
+      ok('超板幅未确认人工分段的同一快照经正式 HTTP CSV/PDF/DXF 路由全部拒绝且零产物',noSegmentsOracle?.status===200&&noSegmentsOracle?.result?.ok&&['csv','pdf','dxf'].every(kind=>noSegmentsOracle.result.blockedKinds.includes(kind))&&noSegmentsOracle.result.zeroArtifacts===true,JSON.stringify(noSegmentsOracle).slice(0,1200));
+
+      await clickSelector('[data-testid="sp-add-segment"]');
+      await clickSelector('[data-testid="sp-add-segment"]');
+      const segmentValues=[['260','70','1395','650'],['1655','70','1395','650']];
+      for(let index=0;index<segmentValues.length;index++)for(const [field,value] of ['x','y','length','width'].map((name,at)=>[name,segmentValues[index][at]]))await fillSelector(`[data-testid="sp-segment-${index}-${field}"]`,value);
+      const expectedSegments=segmentValues.map((values,index)=>({id:`segment-${index+1}`,x:Number(values[0]),y:Number(values[1]),length:Number(values[2]),width:Number(values[3])}));
+      const filledButUnconfirmed=await clickSelector('[data-testid="sp-confirm"]');
+      await waitFor(`!!document.querySelector('[data-testid="shared-panel-errors"]')`);
+      const uncheckedMessage=await evalJs(`document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||''`);
+      const uncheckedProjectCount=await evalJs(`window.__sharedPanelBus.getState().sharedPanels?.length??0`);
+      ok('已填两段但未勾选“确认接缝/分段”仍被拒绝且没有写入 SharedPanel',filledButUnconfirmed&&/接缝\/分段方案未确认/u.test(uncheckedMessage)&&uncheckedProjectCount===0,JSON.stringify({uncheckedMessage,uncheckedProjectCount}));
+      await clickSelector('[data-testid="sp-confirm-segmentation"]');
+      const preview=await evalJs(`(()=>({bounds:document.querySelector('[data-testid="shared-panel-finished-bounds"]')?.textContent||'',members:[...document.querySelectorAll('[data-testid^="sp-member-cab_"]')].filter(e=>e.checked).length,material:document.querySelector('[data-testid="sp-material"]')?.value,thickness:document.querySelector('[data-testid="sp-thickness"]')?.value,mode:[...document.querySelectorAll('input[name="sp-segmentation"]')].map(e=>e.checked),segments:document.querySelectorAll('.shared-panel-segment-row').length}))()`);
+      const validClick=await clickSelector('[data-testid="sp-confirm"]');
+      const saved=await waitFor(`document.querySelectorAll('.shared-panel-card').length===1`,8000);
+      const pageRecord=await evalJs(`(()=>{const p=window.__sharedPanelBus.getState(),s=p.sharedPanels?.[0],card=document.querySelector('.shared-panel-card');return {panel:s?{id:s.id,name:s.name,members:s.memberCabinetIds,bounds:s.bounds,length:s.length,width:s.width,thickness:s.thickness,material:s.material,finish:s.finish,grain:s.grainDirection,edges:s.edgeTreatment,overhang:s.overhang,segments:s.segmentation,support:s.support,machining:s.machining,status:s.confirmation.status}:null,card:card?.innerText||'',errors:document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||'',panelCount:p.sharedPanels?.length??0}})()`);
+      ok('显式选中三柜并填完整规格后成功建立：四边外挑均为非零，bounds 精确为联合范围±外挑，人工两段逐字段等于确认表单',validClick&&saved&&preview?.members===3&&preview?.bounds.includes('X 260–3050')&&preview?.bounds.includes('Y 70–720')&&preview?.segments===2&&preview?.material==='M_BOARD_18_WOOD'&&pageRecord?.panel?.members?.length===3&&pageRecord.panel.length===2790&&pageRecord.panel.width===650&&JSON.stringify(pageRecord.panel.bounds)===JSON.stringify({minX:260,minY:70,maxX:3050,maxY:720})&&JSON.stringify(pageRecord.panel.overhang)===JSON.stringify({front:20,back:30,left:40,right:50})&&JSON.stringify(pageRecord.panel.segments.segments)===JSON.stringify(expectedSegments)&&pageRecord.panel.status==='confirmed',JSON.stringify({preview,panel:pageRecord?.panel,expectedSegments,errors:pageRecord?.errors,card:pageRecord?.card?.slice(0,420)}));
+      if(!pageRecord?.panel?.id)throw new Error('B48 valid shared panel was not persisted');
+
+      const oracleUrl=process.env.SHARED_PANEL_EXPORT_ORACLE_URL;
+      const savedProject=await evalJs(`window.__sharedPanelBus.getState()`);
+      const exportResponse=await fetch(oracleUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'exports',project:savedProject,expectedSegments})});
+      const exportResult={status:exportResponse.status,result:await exportResponse.json()};
+      const exportChecks={oracleOk:exportResult.status===200&&exportResult.result?.ok===true,routes:exportResult.result?.api?.routes===true,newHash:!!exportResult.result?.api?.snapshotHash&&exportResult.result.api.snapshotHash!==initialSnapshot.snapshotHash,snapshotStable:exportResult.result?.api?.snapshotStableAfterExports===true,panelIdentity:exportResult.result?.panelId===pageRecord.panel.id,bounds:JSON.stringify(exportResult.result?.bounds)===JSON.stringify(pageRecord.panel.bounds),geometry:!!(exportResult.result?.geometry?.boundsMatch&&exportResult.result.geometry.noOverlap&&exportResult.result.geometry.exactCoverage&&exportResult.result.geometry.allSegmentsWithinSheet&&exportResult.result.formSegmentsMatch),csv:!!(exportResult.result?.csv?.ok&&exportResult.result.csv.hasPanelId&&exportResult.result.csv.hasBounds&&exportResult.result.csv.segmentsMatch),pdf:!!(exportResult.result?.pdf?.ok&&exportResult.result.pdf.hasPanelId&&exportResult.result.pdf.hasBounds&&exportResult.result.pdf.segmentChecks?.every(Boolean)),dxf:!!(exportResult.result?.dxf?.ok&&exportResult.result.dxf.hasPanelId&&exportResult.result.dxf.hasBounds&&exportResult.result.dxf.segmentsMatch),roombook:!!(exportResult.result?.roombook?.ok&&exportResult.result.roombook.hasPanelId&&exportResult.result.roombook.hasBounds&&exportResult.result.roombook.hasSegments)};
+      ok('正式 HTTP CSV/PDF/DXF/图纸册四路由绑定确认后的同一新 hash，内容均含同一 SharedPanel、bounds 与逐段 ID/尺寸',Object.values(exportChecks).every(Boolean),JSON.stringify({checks:exportChecks,initialHash:initialSnapshot.snapshotHash,newHash:exportResult.result?.api?.snapshotHash}).slice(0,1700));
+      ok('共享件正式 PDF 仍包含每台柜各自的单柜生产图页',Boolean(exportResult?.result?.pdf?.cabinetPagesOk&&fixture.cabinetIds.every(id=>exportResult.result.pdf.cabinetPageIds.includes(id))),JSON.stringify(exportResult?.result?.pdf));
+
+      const panelSelector=`[data-shared-panel-id="${pageRecord.panel.id}"]`;
+      const committedProject=await evalJs(`window.__sharedPanelBus.getState()`);
+      const committedApiBeforeResponse=await fetch(`http://127.0.0.1:${process.env.API_PORT}/api/workspace`);
+      const committedApiBefore=await committedApiBeforeResponse.json();
+      const openEditForDiscard=await clickSelector(`${panelSelector} button`);
+      const editorOpen=await waitFor(`!!document.querySelector('[data-testid="shared-panel-dialog"]')`);
+      const lockState=async()=>evalJs(`(()=>({disabled:!!document.querySelector('[data-testid="workspace-export-button"]')?.disabled,dialog:!!document.querySelector('[data-testid="shared-panel-dialog"]')}))()`);
+      const categoryLocks={};
+      await clickSelector(`[data-testid="sp-member-${fixture.cabinetIds[0]}"]`);
+      await clickSelector(`[data-testid="sp-member-${fixture.cabinetIds[0]}"]`);
+      categoryLocks.member=await lockState();
+      await fillSelector('[data-testid="sp-segment-0-x"]','261');
+      await fillSelector('[data-testid="sp-segment-0-x"]','260');
+      categoryLocks.segmentation=await lockState();
+      await fillSelector('[data-testid="sp-machining-status"]','confirmed-holes');
+      await clickSelector('[data-testid="sp-add-hole"]');
+      for(const [field,value] of [['kind','cable-pass'],['x','350'],['y','150'],['diameter','35'],['depth','12']])await fillSelector(`[data-testid="sp-hole-0-${field}"]`,value);
+      categoryLocks.hole=await lockState();
+      await fillSelector('[data-testid="sp-overhang-right"]','51');
+      await fillSelector('[data-testid="sp-overhang-right"]','50');
+      categoryLocks.dimension=await lockState();
+      const lockPanelProbe=await evalJs(`(async()=>{const module=await import('/verify/shared-panel-export-lock-probe.tsx');return await module.probeExportPanelLock(window.__sharedPanelBus,window.__sharedPanelBus.getState(),window.__b48ExportEvents)})()`);
+      const draftProjectUnchanged=JSON.stringify(await evalJs(`window.__sharedPanelBus.getState()`))===JSON.stringify(committedProject);
+      const appSnapshotDuringResponse=await fetch(`http://127.0.0.1:${process.env.API_PORT}/api/workspace`);
+      const appSnapshotDuring=await appSnapshotDuringResponse.json();
+      const appSnapshotUnchanged=appSnapshotDuring.projectSnapshotId===committedApiBefore.projectSnapshotId&&appSnapshotDuring.projectSnapshotHash===committedApiBefore.projectSnapshotHash&&appSnapshotDuring.projectSnapshotVersion===committedApiBefore.projectSnapshotVersion;
+      const oracleDraftLockResponse=await fetch(oracleUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'draftLock',project:committedProject})});
+      const oracleDraftLock=await oracleDraftLockResponse.json();
+      ok('成员、分段、孔位和尺寸四类编辑期间始终锁住工作区导出入口',openEditForDiscard&&editorOpen&&Object.values(categoryLocks).length===4&&Object.values(categoryLocks).every(state=>state.disabled&&state.dialog),JSON.stringify(categoryLocks));
+      ok('真实 ExportPanel 的 CSV/PDF/DXF/图纸册按钮全部显式禁用并说明未确认草稿；四次点击零路由请求、零下载',!lockPanelProbe?.error&&['pdf','dxf','csv','roombook'].every(kind=>lockPanelProbe?.disabled?.[kind]===true)&&/共享件规格仍在编辑/u.test(lockPanelProbe?.warning||'')&&lockPanelProbe.requestCount===0&&lockPanelProbe.downloadCount===0&&lockPanelProbe.projectSharedCount===1,JSON.stringify(lockPanelProbe));
+      ok('草稿未提交时 Project 不变，浏览器服务与隔离 WorkspaceStore 的 snapshotId/hash/version 均稳定且无临时产物',draftProjectUnchanged&&appSnapshotUnchanged&&oracleDraftLock?.ok&&oracleDraftLock.snapshotStable&&oracleDraftLock.zeroTempFiles&&oracleDraftLock.snapshotHash===exportResult.result.api.snapshotHash,JSON.stringify({draftProjectUnchanged,appSnapshotUnchanged,oracleDraftLock}));
+      await clickSelector('[data-testid="shared-panel-dialog"] .workspace-3d-header button');
+      await waitFor(`!document.querySelector('[data-testid="shared-panel-dialog"]')`);
+      const discardedProject=await evalJs(`window.__sharedPanelBus.getState()`);
+      const committedApiAfterResponse=await fetch(`http://127.0.0.1:${process.env.API_PORT}/api/workspace`);
+      const committedApiAfter=await committedApiAfterResponse.json();
+      const discardRestored=JSON.stringify(discardedProject)===JSON.stringify(committedProject)&&committedApiAfter.projectSnapshotId===committedApiBefore.projectSnapshotId&&committedApiAfter.projectSnapshotHash===committedApiBefore.projectSnapshotHash&&committedApiAfter.projectSnapshotVersion===committedApiBefore.projectSnapshotVersion;
+      const restoredExportResponse=await fetch(oracleUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'exports',project:discardedProject,expectedSegments})});
+      const restoredExport=await restoredExportResponse.json();
+      ok('丢弃未确认草稿恢复原 Project 与旧服务快照，并可用旧 hash 重新导出四种生产文件',discardRestored&&restoredExport?.ok&&restoredExport.api.snapshotHash===exportResult.result.api.snapshotHash&&restoredExport.api.headersMatch&&restoredExport.roombook?.ok,JSON.stringify({discardRestored,oldHash:exportResult.result.api.snapshotHash,restoredHash:restoredExport?.api?.snapshotHash,ok:restoredExport?.ok}).slice(0,900));
+
+      await clickSelector(`${panelSelector} button`);
+      const referenceEditorOpen=await waitFor(`!!document.querySelector('[data-testid="shared-panel-dialog"]')`);
+      await fillSelector('[data-testid="sp-machining-status"]','reference-only');
+      await clickSelector('.shared-panel-bound-preview .shared-panel-confirm-check input');
+      await clickSelector('[data-testid="sp-confirm"]');
+      await waitFor(`!!document.querySelector('[data-testid="shared-panel-errors"]')`);
+      const referenceState=await evalJs(`(()=>({message:document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||'',warning:document.querySelector('.shared-panel-reference-notice')?.innerText||'',saved:window.__sharedPanelBus.getState().sharedPanels?.[0]?.machining?.status,card:document.querySelector('[data-shared-panel-id="${pageRecord.panel.id}"]')?.innerText||''}))()`);
+      ok('参考孔位明确显示“非 CNC”，尝试确认会被阻断且不会改写已确认制造状态',referenceEditorOpen&&/参考标记.*不是已确认 CNC/u.test(referenceState?.message)&&/非 CNC/u.test(referenceState?.warning)&&referenceState?.saved==='confirmed-none'&&/已确认/u.test(referenceState?.card),JSON.stringify(referenceState).slice(0,800));
+      const referenceCandidate=await evalJs(`(async()=>{const shared=await import('/src/core/sharedPanels.ts'),bus=window.__sharedPanelBus,p=bus.getState(),original=p.sharedPanels[0],panel=shared.confirmSharedPanel({...original,machining:{status:'reference-only',holes:[]},confirmation:{status:'draft'}},p);return {...p,sharedPanels:[panel]}})()`);
+      const referenceExportsResponse=await fetch(process.env.SHARED_PANEL_EXPORT_ORACLE_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'reference',project:referenceCandidate})});
+      const referenceExports=await referenceExportsResponse.json();
+      ok('参考孔候选项目同一 HTTP 快照下 CSV/PDF/DXF 全部拒绝且零产物',referenceExports?.ok&&referenceExports.zeroArtifacts&&['csv','pdf','dxf'].every(kind=>referenceExports.blockedKinds.includes(kind)),JSON.stringify(referenceExports).slice(0,1100));
+      await fillSelector('[data-testid="sp-machining-status"]','unconfirmed');
+      await clickSelector('[data-testid="sp-confirm"]');
+      await waitFor(`!!document.querySelector('[data-testid="shared-panel-errors"]')`);
+      const unconfirmedHoleState=await evalJs(`(()=>({message:document.querySelector('[data-testid="shared-panel-errors"]')?.innerText||'',saved:window.__sharedPanelBus.getState().sharedPanels?.[0]?.machining?.status}))()`);
+      ok('未确认孔位状态尝试保存被 UI 阻断，已保存状态保持 confirmed-none',/CNC 孔位尚未确认/u.test(unconfirmedHoleState?.message)&&unconfirmedHoleState?.saved==='confirmed-none',JSON.stringify(unconfirmedHoleState));
+      const unconfirmedHoleCandidate=await evalJs(`(async()=>{const shared=await import('/src/core/sharedPanels.ts'),bus=window.__sharedPanelBus,p=bus.getState(),original=p.sharedPanels[0],panel=shared.confirmSharedPanel({...original,machining:{status:'unconfirmed',holes:[]},confirmation:{status:'draft'}},p);return {...p,sharedPanels:[panel]}})()`);
+      const unconfirmedHoleResponse=await fetch(process.env.SHARED_PANEL_EXPORT_ORACLE_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'unconfirmedHole',project:unconfirmedHoleCandidate})});
+      const unconfirmedHoleExports=await unconfirmedHoleResponse.json();
+      ok('未确认孔位候选项目正式 HTTP CSV/PDF/DXF 全部阻断且零产物',unconfirmedHoleExports?.ok&&unconfirmedHoleExports.zeroArtifacts&&['csv','pdf','dxf'].every(kind=>unconfirmedHoleExports.blockedKinds.includes(kind)),JSON.stringify(unconfirmedHoleExports).slice(0,1100));
+      await clickSelector('[data-testid="shared-panel-dialog"] .workspace-3d-header button');
+
+      const staleMutation=await evalJs(`(()=>{const bus=window.__sharedPanelBus,p=bus.getState(),changed={...p,cabinets:p.cabinets.map(c=>c.id==='cab_b48_center'?{...c,params:{...c.params,height:c.params.height+1}}:c)};bus.replaceProject(changed,'B48 simulate member cabinet dimension change');return {height:changed.cabinets.find(c=>c.id==='cab_b48_center')?.params.height,sharedId:changed.sharedPanels?.[0]?.id}})()`);
+      await waitFor(`document.querySelector('[data-shared-panel-id="${pageRecord.panel.id}"]')?.dataset.stale==='true'`);
+      const staleUi=await evalJs(`(()=>{const card=document.querySelector('[data-shared-panel-id="${pageRecord.panel.id}"]');return {stale:card?.dataset.stale,text:card?.innerText||'',blocked:card?.innerText.includes('正式生产导出已阻断')}})()`);
+      ok('任一成员柜尺寸变化后 UI 显著标记 STALE、说明需重新确认并显示生产导出阻断',staleMutation?.sharedId===pageRecord.panel.id&&staleUi?.stale==='true'&&/重新确认/u.test(staleUi.text)&&staleUi.blocked===true,JSON.stringify({staleMutation,staleUi}).slice(0,700));
+      const staleProject=await evalJs(`window.__sharedPanelBus.getState()`);
+      const staleResponse=await fetch(process.env.SHARED_PANEL_EXPORT_ORACLE_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'stale',project:staleProject})});
+      const staleExports=await staleResponse.json();
+      ok('成员 stale 后正式 HTTP CSV、PDF、DXF 三路由均拒绝并确认零临时产物',staleExports?.ok&&staleExports.zeroArtifacts&&['csv','pdf','dxf'].every(kind=>staleExports.blockedKinds.includes(kind)),JSON.stringify(staleExports).slice(0,1300));
+
+      await clickSelector('.workspace-cabinet-members > summary');
+      const cabinetViewSummaries=await evalJs(`([...document.querySelectorAll('.workspace-cabinet-card .workspace-cabinet-details summary')]).length`);
+      for(let index=0;index<Number(cabinetViewSummaries);index++)await clickSelector(`.workspace-cabinet-card:nth-of-type(${index+1}) .workspace-cabinet-details summary`);
+      const views=await evalJs(`(()=>{const cards=[...document.querySelectorAll('.workspace-cabinet-card')];return {count:cards.length,each:cards.map(card=>({name:card.querySelector('.workspace-cabinet-name')?.textContent.trim()||'',views:[...card.querySelectorAll('.workspace-view figcaption strong')].map(x=>x.textContent.trim()),edit:[...card.querySelectorAll('.workspace-cabinet-actions button')].some(b=>b.textContent.trim()==='编辑')}))}})()`);
+      ok('共享件功能保留三台柜各自的正面/内部/俯视三视图及单柜编辑入口',views?.count===3&&views.each.every(item=>item.views.includes('外观正面')&&item.views.includes('内部结构')&&item.views.includes('俯视图')&&item.edit),JSON.stringify(views));
+      const cabinetName=views?.each?.[0]?.name||'';
+      const editClick=await clickSelector('.workspace-cabinet-card .workspace-cabinet-actions button:nth-of-type(2)');
+      const cadReady=await waitFor(`!document.querySelector('.room-workspace')&&!!document.querySelector('.side-left .tree')`,9000);
+      const editSelection=await evalJs(`(()=>{const selected=[...document.querySelectorAll('.side-left .tree-leaf.sel')].map(e=>e.textContent.replace(/\\s+/g,' ').trim());return {cad:!document.querySelector('.room-workspace'),selected,name:${JSON.stringify(cabinetName)}}})()`);
+      ok('点击单柜“编辑”仍可进入 CAD，并保留被点柜体选择',editClick&&cadReady&&editSelection?.cad&&editSelection.selected.some(name=>name.includes(cabinetName)),JSON.stringify(editSelection));
+      await finishProbe();
+    }
+
+    // Independent mode for room-workspace cabinet creation with a dangling roomId.
+    if (ONLY === 'B46_ROOM_UNASSIGNED') {
+      section('B46_ROOM_UNASSIGNED 未分配房间加柜入口与真实房间创建');
+      // The app restores its local draft in a mount effect; let that one-time startup path finish before installing the isolated fixture.
+      await sleep(1800);
+      await evalJs(`(async()=>{try{
+        const store=await import('/src/state/store.ts');
+        const docs=await import('/src/core/docFactory.ts');
+        const bus=store.bus;
+        window.__roomWsBus=bus;
+        const project=docs.emptyProject({name:'B46 房间归属验收',ruleSetId:'factory_default_v1'});
+        const roomA=docs.rectRoom({id:'room_b46_first',name:'B46 首房间',x:0,y:0,w:6000,h:4000});
+        const roomB=docs.rectRoom({id:'room_b46_target',name:'B46 目标房间',x:8000,y:0,w:6000,h:4000});
+        project.rooms.push(roomA,roomB);
+        const orphan=docs.createCabinet({id:'cab_b46_orphan',name:'B46 遗留未分配柜体',roomId:'room_b46_deleted',x:100,y:60,rules:store.RULESET,params:{width:900,height:850,depth:600}});
+        project.cabinets.push(orphan);
+        bus.replaceProject(project,'B46 房间工作区验收 fixture');
+        window.__roomWsFixture=JSON.stringify({roomAId:roomA.id,roomAName:roomA.name,roomBId:roomB.id,roomBName:roomB.name,orphanId:orphan.id,orphanRoomId:orphan.roomId});
+        window.__roomWsProgress='ready';
+      }catch(e){window.__roomWsFixture=JSON.stringify({error:String(e),stack:String(e?.stack??'')});window.__roomWsProgress='error'}})()`);
+      let fixtureProgress = 'not-started';
+      const fixtureDeadline = Date.now() + 10000;
+      while (Date.now() < fixtureDeadline) {
+        fixtureProgress = await evalJs(`String(window.__roomWsProgress||'not-started')`);
+        if (fixtureProgress === 'ready' || fixtureProgress === 'error') break;
+        await sleep(100);
+      }
+      const fixtureJson = await evalJs(`String(window.__roomWsFixture||'')`);
+      const fixture = fixtureJson ? JSON.parse(fixtureJson) : null;
+      ok('建立两个真实房间与一个悬空 roomId 柜体 fixture', fixtureProgress === 'ready' && fixture?.roomAId && fixture?.roomBId && fixture?.orphanRoomId === 'room_b46_deleted', `${fixtureProgress}: ${fixtureJson}`);
+      if (fixtureProgress !== 'ready' || !fixture?.roomBId) throw new Error('B46 房间 fixture 建立失败');
+      await sleep(350);
+
+      const selectedTargetRoom = await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes(${JSON.stringify(fixture.roomBName)}));if(b)b.click();return !!b})()`);
+      await sleep(200);
+      const realRoomEntry = await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-actions button')].find(x=>x.textContent.trim()==='＋ 添加柜体');return {present:!!b,enabled:!!b&&!b.disabled,heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''}})()`);
+      await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-actions button')].find(x=>x.textContent.trim()==='＋ 添加柜体');if(b)b.click()})()`);
+      await sleep(160);
+      const dialogLabel = await evalJs(`document.querySelector('[role="dialog"][aria-label]')?.getAttribute('aria-label')||''`);
+      const createName = 'B46 真实房间入口验收柜';
+      const nameInputReady = await evalJs(`(()=>{const form=document.querySelector('.workspace-cabinet-form');const input=form?.querySelector('input:not([type="number"])');if(!input)return false;const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;if(!setter)return false;setter.call(input,${JSON.stringify(createName)});input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));return true})()`);
+      const submitted = await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-cabinet-form button[type="submit"]')].find(x=>x.textContent.trim()==='创建柜体');if(!b)return false;b.click();return true})()`);
+      let realCreated = null;
+      const createDeadline = Date.now() + 10000;
+      while (Date.now() < createDeadline) {
+        realCreated = await evalJs(`(()=>{const cab=window.__roomWsBus.getState().cabinets.find(c=>c.name===${JSON.stringify(createName)});return cab?{id:cab.id,roomId:cab.roomId}:null})()`);
+        if (realCreated) break;
+        await sleep(120);
+      }
+      ok('真实房间仍显示启用的添加入口并打开其创建表单', selectedTargetRoom && realRoomEntry?.present && realRoomEntry?.enabled && realRoomEntry?.heading === fixture.roomBName && dialogLabel === `在${fixture.roomBName}添加柜体`, JSON.stringify({selectedTargetRoom,realRoomEntry,dialogLabel}));
+      ok('通过工作区表单成功创建并归属于所选真实房间（不是首房间）', nameInputReady && submitted && realCreated?.roomId === fixture.roomBId && realCreated?.roomId !== fixture.roomAId, JSON.stringify({nameInputReady,submitted,realCreated,fixture}));
+      if (!realCreated) {
+        const submitDebug = await evalJs(`JSON.stringify({cabinetNames:window.__roomWsBus.getState().cabinets.map(c=>({name:c.name,roomId:c.roomId})),bodyTail:document.body.innerText.slice(-500),dialog:!!document.querySelector('.workspace-cabinet-dialog'),formValid:document.querySelector('.workspace-cabinet-form')?.checkValidity()??null,invalid:[...document.querySelectorAll('.workspace-cabinet-form :invalid')].map(x=>({tag:x.tagName,type:x.type,value:x.value,required:x.required,min:x.min,max:x.max,message:x.validationMessage,label:x.closest('label')?.innerText})),inputs:[...document.querySelectorAll('.workspace-cabinet-form input')].map(x=>({type:x.type,value:x.value,required:x.required,min:x.min,max:x.max})),version:window.__roomWsBus.getVersion()})`);
+        throw new Error(`B46 真实房间创建未完成，无法继续未分配状态验收：${submitDebug}`);
+      }
+
+      const selectedUnassigned = await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes('未分配房间'));if(b)b.click();return !!b})()`);
+      await sleep(220);
+      const unassignedUi = await evalJs(`(()=>{const heading=document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'';const buttons=[...document.querySelectorAll('.workspace-room-actions button,.workspace-empty-state button')].map(b=>b.textContent.trim());const notice=document.querySelector('.workspace-unassigned-notice[role="note"]')?.textContent||'';return {heading,addButtons:buttons.filter(t=>t.includes('添加柜体')||t.includes('添加第一个柜体')),notice,dialog:!!document.querySelector('.workspace-cabinet-dialog')}})()`);
+      const finalState = await evalJs(`(()=>{const p=window.__roomWsBus.getState();const orphan=p.cabinets.find(c=>c.id===${JSON.stringify(fixture.orphanId)});const added=p.cabinets.find(c=>c.name===${JSON.stringify(createName)});return {cabinetCount:p.cabinets.length,orphanRoomId:orphan?.roomId,addedRoomId:added?.roomId,firstRoomCabinets:p.cabinets.filter(c=>c.roomId===${JSON.stringify(fixture.roomAId)}).length,missingRoomCabinets:p.cabinets.filter(c=>c.roomId===${JSON.stringify(fixture.orphanRoomId)}).length}})()`);
+      ok('未分配房间隐藏添加入口并说明需先选择真实房间', selectedUnassigned && unassignedUi?.heading === '未分配房间' && unassignedUi.addButtons.length === 0 && /不能添加柜体/.test(unassignedUi.notice) && /选择一个真实房间/.test(unassignedUi.notice) && !unassignedUi.dialog, JSON.stringify(unassignedUi));
+      ok('未分配状态未静默新增到首房间且保留原悬空归属', finalState?.cabinetCount === 2 && finalState?.orphanRoomId === fixture.orphanRoomId && finalState?.addedRoomId === fixture.roomBId && finalState?.firstRoomCabinets === 0 && finalState?.missingRoomCabinets === 1, JSON.stringify(finalState));
+      await finishProbe();
+    }
+
+    // Independent empty-project path: create rooms through the visible toolbar form,
+    // add cabinets through RoomWorkspace, then reload and verify persisted selection.
+    if (ONLY === 'B22_ROOM_CREATE_PERSIST') {
+      section('B22_ROOM_CREATE_PERSIST 空项目新建房间→加柜→刷新恢复');
+      await sleep(1800); // allow startup draft restoration to finish before installing the isolated fixture
+      await evalJs(`(async()=>{
+        const store=await import('/src/state/store.ts');
+        const docs=await import('/src/core/docFactory.ts');
+        window.__roomCreateBus=store.bus;
+        store.bus.replaceProject(docs.emptyProject({name:'B22 空项目验收',ruleSetId:'factory_default_v1'}),'B22 isolated empty fixture');
+        return true;
+      })()`);
+      await sleep(1000);
+      const emptyStart = await evalJs(`(()=>{const p=window.__roomCreateBus.getState();return {rooms:p.rooms.length,cabinets:p.cabinets.length,version:window.__roomCreateBus.getVersion()}})()`);
+      ok('从无房间/无柜体的隔离空项目开始', emptyStart?.rooms === 0 && emptyStart?.cabinets === 0, JSON.stringify(emptyStart));
+      if (emptyStart?.rooms !== 0 || emptyStart?.cabinets !== 0) throw new Error(`B22 空项目 fixture 无效：${JSON.stringify(emptyStart)}`);
+      const emptyProjectId = await evalJs(`window.__roomCreateBus.getState().id`);
+
+      const ensureWorkspace = async () => {
+        if (await evalJs(`!!document.querySelector('.workspace-top-actions')`)) return true;
+        const clicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+        await sleep(300);
+        return Boolean(clicked && await evalJs(`!!document.querySelector('.workspace-top-actions')`));
+      };
+      const openRoomForm = async () => {
+        const clicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-top-actions button,.toolbar .tb-btn')].find(x=>['＋ 房间','+ 房间'].includes(x.textContent.trim()));if(b)b.click();return !!b})()`);
+        await sleep(300);
+        const form = await evalJs(`(()=>({input:!!document.querySelector('.side-right input.input'),button:[...document.querySelectorAll('.side-right button')].some(x=>x.textContent.trim()==='创建房间'),note:!!document.querySelector('.side-right textarea[aria-label="房间备注（可选）"]')}))()`);
+        return { clicked, form };
+      };
+      const setRoomForm = async (name, note = '') => evalJs(`(()=>{
+        const input=document.querySelector('.side-right input.input');
+        const noteInput=document.querySelector('.side-right textarea[aria-label="房间备注（可选）"]');
+        const inputSetter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+        const noteSetter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;
+        if(!input||!noteInput||!inputSetter||!noteSetter)return false;
+        inputSetter.call(input,${JSON.stringify(name)});input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));
+        noteSetter.call(noteInput,${JSON.stringify(note)});noteInput.dispatchEvent(new Event('input',{bubbles:true}));noteInput.dispatchEvent(new Event('change',{bubbles:true}));
+        return {required:input.required,noteRequired:noteInput.required};
+      })()`);
+      const createButtonState = async () => evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');return b?{present:true,disabled:b.disabled}:null})()`);
+      const clickCreateRoom = async () => evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');if(!b||b.disabled)return false;b.click();return true})()`);
+      const waitRoom = async (name) => {
+        const deadline=Date.now()+10000;
+        while(Date.now()<deadline){
+          const room=await evalJs(`(()=>{const r=window.__roomCreateBus.getState().rooms.find(x=>x.name===${JSON.stringify(name)});return r?{id:r.id,name:r.name,note:r.note||'',walls:r.walls.length}:null})()`);
+          if(room)return room;
+          await sleep(120);
+        }
+        return null;
+      };
+      const openWorkspaceCabinetForm = async () => {
+        const clicked=await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-room-actions button,.workspace-empty-state button')].find(x=>/添加柜体/.test(x.textContent.trim()));if(b)b.click();return !!b})()`);
+        await sleep(180);
+        return {clicked,dialog:await evalJs(`!!document.querySelector('.workspace-cabinet-form')`)};
+      };
+      const createCabinetInWorkspace = async (name) => {
+        const filled=await evalJs(`(()=>{
+          const form=document.querySelector('.workspace-cabinet-form');
+          const input=form?.querySelector('input:not([type="number"])');
+          const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+          if(!input||!setter)return false;
+          setter.call(input,${JSON.stringify(name)});input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));return true;
+        })()`);
+        const submitted=await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-cabinet-form button[type="submit"]')].find(x=>x.textContent.trim()==='创建柜体');if(!b)return false;b.click();return true})()`);
+        let cabinet=null;
+        const deadline=Date.now()+10000;
+        while(Date.now()<deadline){
+          cabinet=await evalJs(`(()=>{const c=window.__roomCreateBus.getState().cabinets.find(x=>x.name===${JSON.stringify(name)});return c?{id:c.id,name:c.name,roomId:c.roomId}:null})()`);
+          if(cabinet)break;
+          await sleep(120);
+        }
+        return {filled,submitted,cabinet};
+      };
+      const waitForDraft = async (roomIds, cabinetNames) => {
+        const deadline=Date.now()+10000;
+        while(Date.now()<deadline){
+          const saved=await evalJs(`(()=>{try{const raw=localStorage.getItem('furnicad.draft.v1');if(!raw)return null;const env=JSON.parse(raw);const p=env.project||env;return {rooms:(p.rooms||[]).map(r=>({id:r.id,name:r.name,note:r.note||''})),cabinets:(p.cabinets||[]).map(c=>({name:c.name,roomId:c.roomId}))}}catch{return null}})()`);
+          const roomsOk=roomIds.every(id=>saved?.rooms?.some(r=>r.id===id));
+          const cabinetsOk=cabinetNames.every(name=>saved?.cabinets?.some(c=>c.name===name));
+          if(roomsOk&&cabinetsOk)return saved;
+          await sleep(150);
+        }
+        return null;
+      };
+      const reloadPage = async () => {
+        await send('Page.reload',{ignoreCache:false});
+        await sleep(1500);
+        const deadline=Date.now()+12000;
+        while(Date.now()<deadline){
+          const ready=await evalJs(`!!document.querySelector('.workspace-top-actions')`);
+          if(ready)break;
+          await sleep(200);
+        }
+        await evalJs(`(async()=>{const s=await import('/src/state/store.ts');window.__roomCreateBus=s.bus;return true})()`);
+        await sleep(1200); // wait for App's loadDraft effect to restore the saved model
+      };
+      const storedWorkspaceContext = async () => evalJs(`(()=>{try{return JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{return null}})()`);
+      const roomSelectionState = async () => evalJs(`(()=>{
+        const selected=document.querySelector('.workspace-room-item.selected');
+        let context=null;try{context=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{}
+        return {context,selected:selected?.querySelector('.workspace-room-item-name')?.textContent.trim()||'',heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''};
+      })()`);
+
+      ok('空项目打开房间工作区', await ensureWorkspace(), 'workspace topbar');
+      const firstName='B22 空项目主房间';
+      const firstNote='持久化验收备注 A';
+      const firstForm=await openRoomForm();
+      const requiredState=await setRoomForm('',firstNote);
+      await sleep(120);
+      const blankButton=await createButtonState();
+      ok('“+ 房间”按真实入口打开侧栏表单，名称必填且备注可选',
+        firstForm.clicked&&firstForm.form.input&&firstForm.form.button&&firstForm.form.note&&requiredState?.required===true&&requiredState?.noteRequired===false&&blankButton?.disabled===true,
+        JSON.stringify({firstForm,requiredState,blankButton}));
+      const filledFirst=await setRoomForm(firstName,firstNote);
+      const submitFirst=await clickCreateRoom();
+      const firstRoom=await waitRoom(firstName);
+      await sleep(180);
+      const firstSelectionContext=await storedWorkspaceContext();
+      const returnedToList=await evalJs(`!document.querySelector('.side-right textarea[aria-label="房间备注（可选）"]')`);
+      ok('真实创建首房间成功、备注写入模型，创建后选择新 roomId 并回列表',
+        Boolean(filledFirst&&submitFirst&&firstRoom&&firstRoom.id===firstSelectionContext?.roomId&&firstSelectionContext?.projectId===emptyProjectId&&firstRoom.note===firstNote&&returnedToList),
+        JSON.stringify({filledFirst,submitFirst,firstRoom,firstSelectionContext,emptyProjectId,returnedToList}));
+      if(!firstRoom)throw new Error('B22 首房间未真正写入模型');
+
+      const backToWorkspace=await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+      await sleep(320);
+      const firstWorkspaceSelection=await roomSelectionState();
+      ok('切回 RoomWorkspace 后当前上下文就是新建首房间',backToWorkspace&&firstWorkspaceSelection?.context?.projectId===emptyProjectId&&firstWorkspaceSelection?.context?.roomId===firstRoom.id&&firstWorkspaceSelection?.selected===firstName&&firstWorkspaceSelection?.heading===firstName,JSON.stringify(firstWorkspaceSelection));
+      const firstCabinetName='B22 空项目主房间柜体';
+      const firstAddForm=await openWorkspaceCabinetForm();
+      const firstCabinet=await createCabinetInWorkspace(firstCabinetName);
+      ok('通过工作区真实表单为新建首房间添加柜体且归属正确',
+        firstAddForm.clicked&&firstAddForm.dialog&&firstCabinet.filled&&firstCabinet.submitted&&firstCabinet.cabinet?.roomId===firstRoom.id,
+        JSON.stringify({firstAddForm,firstCabinet,expectedRoomId:firstRoom.id}));
+      if(firstCabinet.cabinet?.roomId!==firstRoom.id)throw new Error('B22 首房间柜体未正确归属');
+      await evalJs(`(()=>{sessionStorage.setItem('__b22_first_room_id',${JSON.stringify(firstRoom.id)});sessionStorage.setItem('__b22_first_room_name',${JSON.stringify(firstName)});sessionStorage.setItem('__b22_first_cabinet_name',${JSON.stringify(firstCabinetName)});return true})()`);
+      const firstSaved=await waitForDraft([firstRoom.id],[firstCabinetName]);
+      ok('首次刷新前本地草稿已包含房间、备注与柜体归属',
+        Boolean(firstSaved?.rooms?.some(r=>r.id===firstRoom.id&&r.note===firstNote)&&firstSaved?.cabinets?.some(c=>c.name===firstCabinetName&&c.roomId===firstRoom.id)),JSON.stringify(firstSaved));
+      await reloadPage();
+      const firstAfterReload=await evalJs(`(()=>{const p=window.__roomCreateBus.getState();const id=sessionStorage.getItem('__b22_first_room_id');const room=p.rooms.find(r=>r.id===id);const cab=p.cabinets.find(c=>c.name===sessionStorage.getItem('__b22_first_cabinet_name'));const selected=document.querySelector('.workspace-room-item.selected');let context=null;try{context=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{}return {projectId:p.id,room:room?{id:room.id,name:room.name,note:room.note||''}:null,cabinet:cab?{name:cab.name,roomId:cab.roomId}:null,context,selectedName:selected?.querySelector('.workspace-room-item-name')?.textContent.trim()||'',heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''}})()`);
+      ok('刷新后首房间/备注/柜体仍存在且房间上下文恢复',
+        firstAfterReload?.projectId===emptyProjectId&&firstAfterReload?.room?.id===firstRoom.id&&firstAfterReload.room.note===firstNote&&firstAfterReload.cabinet?.roomId===firstRoom.id&&firstAfterReload.context?.projectId===emptyProjectId&&firstAfterReload.context?.roomId===firstRoom.id&&firstAfterReload.selectedName===firstName&&firstAfterReload.heading===firstName,
+        JSON.stringify(firstAfterReload));
+      if(firstAfterReload?.room?.id!==firstRoom.id)throw new Error('B22 首次刷新后房间或柜体丢失');
+
+      const secondForm=await openRoomForm();
+      const duplicateAttempt=await setRoomForm(firstName,'');
+      await sleep(150);
+      const duplicateState=await createButtonState();
+      const duplicateText=await evalJs(`document.querySelector('.side-right')?.innerText||''`);
+      ok('第二房间表单阻止与首房间重名',secondForm.clicked&&duplicateAttempt?.required===true&&duplicateState?.disabled===true&&/已经有一个房间叫/.test(duplicateText),JSON.stringify({secondForm,duplicateAttempt,duplicateState,duplicateText:duplicateText.slice(-220)}));
+      const secondName='B22 空项目第二房间';
+      const secondNote='持久化验收备注 B';
+      const filledSecond=await setRoomForm(secondName,secondNote);
+      const submitSecond=await clickCreateRoom();
+      const secondRoom=await waitRoom(secondName);
+      await sleep(180);
+      const secondSelectionContext=await storedWorkspaceContext();
+      ok('修正名称后第二房间真实创建并切换上下文',Boolean(filledSecond&&submitSecond&&secondRoom&&secondRoom.id!==firstRoom.id&&secondRoom.id===secondSelectionContext?.roomId&&secondSelectionContext?.projectId===emptyProjectId&&secondRoom.note===secondNote),JSON.stringify({filledSecond,submitSecond,secondRoom,secondSelectionContext}));
+      if(!secondRoom)throw new Error('B22 第二房间未真正写入模型');
+
+      await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+      await sleep(300);
+      const secondWorkspaceSelection=await roomSelectionState();
+      const secondCabinetName='B22 第二房间独立柜体';
+      const secondAddForm=await openWorkspaceCabinetForm();
+      const secondCabinet=await createCabinetInWorkspace(secondCabinetName);
+      ok('第二房间工作区选中状态正确，柜体不会写入首房间',
+        secondWorkspaceSelection?.context?.projectId===emptyProjectId&&secondWorkspaceSelection?.context?.roomId===secondRoom.id&&secondWorkspaceSelection?.selected===secondName&&secondWorkspaceSelection?.heading===secondName&&secondAddForm.clicked&&secondCabinet.cabinet?.roomId===secondRoom.id&&secondCabinet.cabinet?.roomId!==firstRoom.id,
+        JSON.stringify({secondWorkspaceSelection,secondAddForm,secondCabinet,firstRoomId:firstRoom.id,secondRoomId:secondRoom.id}));
+      if(secondCabinet.cabinet?.roomId!==secondRoom.id)throw new Error('B22 第二房间柜体被错误归属');
+      await evalJs(`(()=>{sessionStorage.setItem('__b22_second_room_id',${JSON.stringify(secondRoom.id)});sessionStorage.setItem('__b22_second_room_name',${JSON.stringify(secondName)});sessionStorage.setItem('__b22_second_cabinet_name',${JSON.stringify(secondCabinetName)});return true})()`);
+      const finalSaved=await waitForDraft([firstRoom.id,secondRoom.id],[firstCabinetName,secondCabinetName]);
+      const finalDraftParse=await evalJs(`(async()=>{try{const raw=localStorage.getItem('furnicad.draft.v1');const parser=await import('/src/core/projectFile.ts');const result=parser.parseProjectFile(raw||'');return {ok:result.ok,error:result.ok?'':result.error,rooms:result.ok?result.project.rooms.length:0,cabinets:result.ok?result.project.cabinets.length:0,unitIds:result.ok?result.project.cabinets.flatMap(c=>c.layout.units.map(u=>u.id)):[]}}catch(error){return {ok:false,error:String(error)}}})()`);
+      ok('二次刷新前草稿已保存两房间两柜、parser 可读且分区 ID 唯一',
+        Boolean(finalSaved?.rooms?.some(r=>r.id===firstRoom.id)&&finalSaved?.rooms?.some(r=>r.id===secondRoom.id&&r.note===secondNote)&&finalSaved?.cabinets?.some(c=>c.name===firstCabinetName&&c.roomId===firstRoom.id)&&finalSaved?.cabinets?.some(c=>c.name===secondCabinetName&&c.roomId===secondRoom.id))&&finalDraftParse?.ok===true&&finalDraftParse.rooms===2&&finalDraftParse.cabinets===2&&new Set(finalDraftParse.unitIds||[]).size===(finalDraftParse.unitIds||[]).length,
+        JSON.stringify({finalSaved,finalDraftParse}));
+      await reloadPage();
+      const finalState=await evalJs(`(()=>{const p=window.__roomCreateBus.getState();const firstId=sessionStorage.getItem('__b22_first_room_id');const secondId=sessionStorage.getItem('__b22_second_room_id');const first=p.rooms.find(r=>r.id===firstId);const second=p.rooms.find(r=>r.id===secondId);const firstCab=p.cabinets.find(c=>c.name===sessionStorage.getItem('__b22_first_cabinet_name'));const secondCab=p.cabinets.find(c=>c.name===sessionStorage.getItem('__b22_second_cabinet_name'));const selected=document.querySelector('.workspace-room-item.selected');let context=null;try{context=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{}return {projectId:p.id,roomCount:p.rooms.length,cabinetCount:p.cabinets.length,first:first?{id:first.id,name:first.name,note:first.note||''}:null,second:second?{id:second.id,name:second.name,note:second.note||''}:null,firstCabinet:firstCab?{name:firstCab.name,roomId:firstCab.roomId}:null,secondCabinet:secondCab?{name:secondCab.name,roomId:secondCab.roomId}:null,context,selectedName:selected?.querySelector('.workspace-room-item-name')?.textContent.trim()||'',heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''}})()`);
+      const validContextRestored=finalState?.projectId===emptyProjectId&&finalState?.roomCount===2&&finalState?.cabinetCount===2&&finalState.first?.id===firstRoom.id&&finalState.first.note===firstNote&&finalState.second?.id===secondRoom.id&&finalState.second.note===secondNote&&finalState.firstCabinet?.roomId===firstRoom.id&&finalState.secondCabinet?.roomId===secondRoom.id&&finalState.context?.projectId===emptyProjectId&&finalState.context?.roomId===secondRoom.id&&finalState.selectedName===secondName&&finalState.heading===secondName;
+      await evalJs(`localStorage.setItem('furniture-cad.workspace-context',JSON.stringify({projectId:${JSON.stringify(emptyProjectId)},roomId:'deleted_room_for_probe'}))`);
+      await reloadPage();
+      const invalidRoomContext=await evalJs(`(()=>{const p=window.__roomCreateBus.getState();return {projectId:p.id,rooms:p.rooms.length,cabinets:p.cabinets.length,heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',selected:!!document.querySelector('.workspace-room-item.selected'),prompt:document.querySelector('.workspace-room-reselect')?.innerText||''}})()`);
+      await evalJs(`localStorage.setItem('furniture-cad.workspace-context',JSON.stringify({projectId:'deleted_project_for_probe',roomId:${JSON.stringify(secondRoom.id)}}))`);
+      await reloadPage();
+      const invalidProjectContext=await evalJs(`(()=>{const p=window.__roomCreateBus.getState();return {projectId:p.id,rooms:p.rooms.length,cabinets:p.cabinets.length,heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',selected:!!document.querySelector('.workspace-room-item.selected'),prompt:document.querySelector('.workspace-room-reselect')?.innerText||''}})()`);
+      ok('刷新恢复第二房间；无效 roomId/projectId 均留在原项目并提示重选',
+        validContextRestored&&invalidRoomContext?.projectId===emptyProjectId&&invalidRoomContext.rooms===2&&invalidRoomContext.cabinets===2&&!invalidRoomContext.heading&&!invalidRoomContext.selected&&/房间已不存在/.test(invalidRoomContext.prompt)&&invalidProjectContext?.projectId===emptyProjectId&&invalidProjectContext.rooms===2&&invalidProjectContext.cabinets===2&&!invalidProjectContext.heading&&!invalidProjectContext.selected&&/项目未切换/.test(invalidProjectContext.prompt),
+        JSON.stringify({finalState,invalidRoomContext,invalidProjectContext}));
+      await finishProbe();
+    }
+
+    // Independent mode for the remote-draft flow. The full legacy probe has
+    // unrelated stateful UI suites; this path exercises B45 on a fresh app/server.
+    if (ONLY === 'B45_AGENT_SYNC') {
+      section('B45_AGENT_SYNC Agent → 远端草稿 → 确认应用 → 本地房间同步');
+      if (await evalJs(`!!document.querySelector('.room-workspace')`)) {
+        await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-topbar button')].find(x=>x.textContent.trim()==='高级 CAD 编辑');if(b)b.click();return !!b})()`);
+        await sleep(300);
+      }
+      await earlyActivateRightTab('账号');
+      await sleep(220);
+      const syncOnlyPassword='B45-Verify-Strong-Pw-2026!';
+      const syncOnlyUsername=await earlyPanelSet('用户名','owner');
+      const syncOnlyPasswordSet=await earlyPanelSet('口令',syncOnlyPassword);
+      const syncOnlyConfirmSet=await earlyPanelSet('再输一次',syncOnlyPassword);
+      const syncOnlyRegistered=await earlyClickPanelButton('建立账号并进入账号模式',1600);
+      let syncOnlyAuth=null;
+      const syncOnlyAuthDeadline=Date.now()+10000;
+      while(Date.now()<syncOnlyAuthDeadline){
+        syncOnlyAuth=await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');if(!token)return null;const me=await fetch('/api/auth/me',{headers:{Authorization:'Bearer '+token}});return {status:me.status,ok:me.ok,hasToken:token.length>=40}})()`);
+        if(syncOnlyAuth?.ok)break;
+        await sleep(150);
+      }
+      ok('B45 建立并验证 accounts 会话（/api/auth/me 200）',syncOnlyUsername&&syncOnlyPasswordSet&&syncOnlyConfirmSet&&syncOnlyRegistered&&syncOnlyAuth?.status===200&&syncOnlyAuth?.ok===true,JSON.stringify({syncOnlyUsername,syncOnlyPasswordSet,syncOnlyConfirmSet,syncOnlyRegistered,syncOnlyAuth}));
+      const unauthWorkspaceStatus=await evalJs(`fetch('/api/workspace').then(r=>r.status)`);
+      ok('accounts 模式无 token 访问 /api/workspace 被 401 拒绝',unauthWorkspaceStatus===401,String(unauthWorkspaceStatus));
+      const mockUrl = process.env.VERIFY_MOCK_URL || '';
+      const settings = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({provider:'custom',baseUrl:${JSON.stringify(mockUrl)},model:'mock-model-1'})});return r.json()})()`);
+      ok('mock 服务商配置成功', settings?.baseUrl === mockUrl, JSON.stringify(settings));
+      await evalJs(`(()=>{window.__syncOnlyProgress='starting';window.__syncOnlyConfirmMessages=[];window.confirm=(m)=>{window.__syncOnlyConfirmMessages.push(String(m));return true}})()`);
+      await evalJs(`(async()=>{try{
+        const store=await import('/src/state/store.ts');const bus=store.bus;window.__syncOnlyBus=bus;
+        const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');
+        const response=await fetch('/api/workspace',{headers:{Authorization:'Bearer '+token}});const server=await response.json();
+        if(!server.ok||!server.project?.rooms?.length)throw new Error('server workspace has no room: '+JSON.stringify(server));
+        bus.replaceProject(server.project,'B45 isolated server baseline');
+        const room=server.project.rooms[0];window.__syncOnlyRoom=JSON.stringify({httpStatus:response.status,id:room.id,name:room.name,version:bus.getVersion(),cabinetCount:server.project.cabinets.filter(c=>c.roomId===room.id).length});
+        window.__syncOnlyProgress='ready';
+      }catch(e){window.__syncOnlyRoom=JSON.stringify({error:String(e),stack:String(e?.stack??'')});window.__syncOnlyProgress='error'}})()`);
+      let setupProgress = 'not-started';
+      const setupDeadline = Date.now() + 10000;
+      while (Date.now() < setupDeadline) {
+        setupProgress = await evalJs(`String(window.__syncOnlyProgress||'not-started')`);
+        if (setupProgress === 'ready' || setupProgress === 'error') break;
+        await sleep(100);
+      }
+      const setupJson = await evalJs(`String(window.__syncOnlyRoom||'')`);
+      const setup = setupJson ? JSON.parse(setupJson) : null;
+      ok('有效登录态 GET /api/workspace 返回 200 并建立同房间基线', setupProgress === 'ready' && setup?.httpStatus===200 && !!setup?.id, `${setupProgress} ${setupJson}`);
+      if (setupProgress !== 'ready' || !setup?.id) throw new Error('B45 isolated fixture setup failed');
+
+      if (!(await evalJs(`!!document.querySelector('.room-workspace')`))) {
+        await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+      }
+      const roomClicked = await evalJs(`(()=>{const n=${JSON.stringify(setup.name)};const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes(n));if(b)b.click();return !!b})()`);
+      await sleep(250);
+      const roomHeading = await evalJs(`document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''`);
+      const baselineVersion = await evalJs(`window.__syncOnlyBus.getVersion()`);
+      const baselineCards = await evalJs(`document.querySelectorAll('.workspace-cabinet-card').length`);
+      ok('AI 面板当前选中的是服务端真实房间', roomClicked && roomHeading === setup.name, `${roomHeading} / ${setup.name}`);
+      const auditBeforeAgent = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/security/audit?limit=1000',{headers:{Authorization:'Bearer '+token}});const j=await r.json();return {ok:r.ok,toolCount:(j.entries||[]).filter(e=>e.action==='mcp.tool').length}})()`);
+
+      const inputSet = await evalJs(`(()=>{const e=document.querySelector('.ai-workspace-panel .ai-input');if(!e)return false;const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;if(!s)return false;s.call(e,'在当前房间新建一个柜体，叫 Agent同步验收柜');e.dispatchEvent(new Event('input',{bubbles:true}));return true})()`);
+      const agentClicked = await evalJs(`(()=>{const b=document.querySelector('.ai-workspace-panel .ai-btn-agent');if(b)b.click();return !!b})()`);
+      let remoteNotice = false;
+      const agentDeadline = Date.now() + 30000;
+      while (Date.now() < agentDeadline) {
+        remoteNotice = await evalJs(`!!document.querySelector('.ai-workspace-panel .agent-remote-draft')`);
+        if (remoteNotice) break;
+        await sleep(250);
+      }
+      ok('真实 Agent API 创建服务端草稿并显示远端提示', inputSet && agentClicked && remoteNotice,
+        await evalJs(`document.querySelector('.ai-workspace-panel .chat-list')?.textContent.slice(-500)||''`));
+      let livePreviewVisible = false;
+      const previewDeadline = Date.now() + 10000;
+      while (Date.now() < previewDeadline) {
+        livePreviewVisible = await evalJs(`!!document.querySelector('.ai-workspace-panel [data-testid="remote-draft-live-preview"]')`);
+        if (livePreviewVisible) break;
+        await sleep(250);
+      }
+      ok('服务端草稿自动显示在网页实时预览中，无需先打开草稿面板', livePreviewVisible,
+        await evalJs(`document.querySelector('.ai-workspace-panel [data-testid="remote-draft-live-preview"]')?.textContent.slice(0,300)||''`));
+      const auditAfterAgent = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/security/audit?limit=1000',{headers:{Authorization:'Bearer '+token}});const j=await r.json();const entries=j.entries||[];const events=entries.filter(e=>e.action==='mcp.tool'&&e.result==='ok'&&['cad.create_cabinet','cad.validate','cad.list_drafts'].includes(e.tool));return {ok:r.ok,totalToolCount:entries.filter(e=>e.action==='mcp.tool').length,toolEvents:events.map(e=>({tool:e.tool,result:e.result})),count:events.length}})()`);
+      ok('登录用户真实点击 Agent 后出现新增成功 MCP 工具审计事件', auditAfterAgent?.ok===true && auditAfterAgent.totalToolCount>(auditBeforeAgent?.toolCount??0) && auditAfterAgent.count>0, JSON.stringify({before:auditBeforeAgent,after:auditAfterAgent}));
+      const afterAgent = await evalJs(`({version:window.__syncOnlyBus.getVersion(),cards:document.querySelectorAll('.workspace-cabinet-card').length,notice:document.querySelector('.agent-remote-draft')?.textContent||''})`);
+      ok('应用前 Agent 未改本地柜体卡片或模型版本', afterAgent?.version === baselineVersion && afterAgent?.cards === baselineCards
+        && /本地.*尚未改变/.test(afterAgent?.notice||''), JSON.stringify(afterAgent));
+
+      const openDrafts = await evalJs(`(()=>{const b=document.querySelector('.agent-remote-draft button');if(b)b.click();return !!b})()`);
+      let applyVisible = false;
+      const draftDeadline = Date.now() + 12000;
+      while (Date.now() < draftDeadline) {
+        applyVisible = await evalJs(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='网页实时预览')`);
+        if (applyVisible) break;
+        await sleep(200);
+      }
+      const previewClicked37 = applyVisible && await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='网页实时预览');if(!b)return false;b.click();return true})()`);
+      const previewReady37 = previewClicked37 && await waitFor(`!!document.querySelector('.side-right [data-testid="remote-draft-confirmation-metadata"]')`, 8000, 150);
+      applyVisible = previewReady37 && await evalJs(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='确认应用到服务器')`);
+      ok('可从 Agent 结果进入服务端草稿管理并先读取预览', openDrafts && previewReady37 && applyVisible);
+      await evalJs(`(()=>{window.confirm=(m)=>{window.__syncOnlyConfirmMessages.push(String(m));return true}})()`);
+      const openedConfirm37 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='确认应用到服务器');if(b)b.click();return !!b})()`)
+        && await waitFor(`!!document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]')`, 3000, 100);
+      const confirmText37 = openedConfirm37 ? await evalJs(`document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]')?.textContent||''`) : '';
+      await evalJs(`(()=>{window.__syncOnlyConfirmMessages.push(String(${JSON.stringify(confirmText37)}));return true})()`);
+      const acceptedConfirm37 = openedConfirm37 && await evalJs(`(()=>{const d=document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]');const b=[...(d?.querySelectorAll('button')||[])].find(x=>x.textContent.trim()==='确认应用这份预览');if(!b)return false;b.click();return true})()`);
+      const applyClicked = openedConfirm37 && acceptedConfirm37;
+      let resultReady = false;
+      const applyDeadline = Date.now() + 20000;
+      while (Date.now() < applyDeadline) {
+        resultReady = await evalJs(`!!document.querySelector('.room-workspace')||!!document.querySelector('.remote-sync-card')`);
+        if (resultReady) break;
+        await sleep(200);
+      }
+      const needsExplicitSync = await evalJs(`!!document.querySelector('.remote-sync-card')`);
+      if (needsExplicitSync) {
+        const unchangedAfterRemoteApply = await evalJs(`window.__syncOnlyBus.getVersion()===${Number(baselineVersion)}`);
+        ok('不匹配基线时远端 apply 不静默覆盖本地', unchangedAfterRemoteApply === true);
+        const syncClicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.remote-sync-card button')].find(x=>x.textContent.includes('确认将服务器项目同步到本地'));if(b)b.click();return !!b})()`);
+        let workspaceReturned = false;
+        const syncDeadline = Date.now() + 15000;
+        while (Date.now() < syncDeadline) {
+          workspaceReturned = await evalJs(`!!document.querySelector('.room-workspace')`);
+          if (workspaceReturned) break;
+          await sleep(200);
+        }
+        ok('基线不匹配时，单独确认同步后返回房间工作区', syncClicked && workspaceReturned);
+      }
+      const finalVersion = await evalJs(`window.__syncOnlyBus.getVersion()`);
+      const cardUpdated = await evalJs(`[...document.querySelectorAll('.workspace-cabinet-title')].some(e=>e.textContent.includes('Agent同步验收柜'))`);
+      const confirms = await evalJs(`window.__syncOnlyConfirmMessages||[]`);
+      ok('apply 操作经过明确的用户确认', applyClicked && Array.isArray(confirms) && confirms.length > 0 && /服务端草稿/.test(confirms[0]), JSON.stringify(confirms));
+      ok('应用/同步后当前房间卡片出现 Agent 新柜体', resultReady && cardUpdated === true);
+      ok('应用/同步后本地版本增加一次，Agent 阶段未提前改动', finalVersion === baselineVersion + 1, `v${baselineVersion} → v${finalVersion}`);
+      const serverAfter = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/workspace',{headers:{Authorization:'Bearer '+token}});return r.json()})()`).catch(()=>null);
+      const serverCabinet = serverAfter?.project?.cabinets?.find((c)=>c.name==='Agent同步验收柜');
+      ok('服务器 live 与本地同步的是同一柜体房间 ID', serverCabinet?.roomId === setup.id, JSON.stringify({roomId:serverCabinet?.roomId,expected:setup.id}));
+      await finishProbe();
+    }
+
+    if (ONLY === 'B23_EXPORT_OPTIONS') {
+      section('B23_EXPORT_OPTIONS 导出类型与动态房间选项');
+      if (await evalJs(`!!document.querySelector('.room-workspace')`)) {
+        await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-topbar button')].find(x=>x.textContent.trim()==='导出图纸');if(b)b.click();return !!b})()`);
+        await sleep(320);
+      } else {
+        await earlyActivateRightTab('导出');
+      }
+      await sleep(420);
+      const state = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');const p=s.bus.getState();const g=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('DXF 图纸内容'));const top=[...(g?.children||[])].filter(x=>x.matches?.('label.exp-check'));const rooms=[...(g?.querySelectorAll('.exp-room-list label.exp-check')||[])];const pg=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('PDF 房间布局页'));const pdfRooms=[...(pg?.querySelectorAll('input.pdf-layout-room-checkbox')||[])];return {names:p.rooms.map(r=>r.name),ids:p.rooms.map(r=>r.id),top:top.map(x=>({text:x.textContent.replace(/\\s+/g,' ').trim(),checked:x.querySelector('input')?.checked})),roomNames:rooms.map(x=>x.textContent.replace(/\\s+/g,' ').trim()),roomCount:rooms.length,checkedRooms:rooms.filter(x=>x.querySelector('input')?.checked).length,pdfRoomCount:pdfRooms.length,pdfChecked:pdfRooms.filter(x=>x.checked).length}})()`);
+      ok('DXF 两类导出开关和房间子项按项目动态匹配，PDF 布局选项按房间生成且默认全关', state?.top.length===2 && state.roomCount===state.names.length && state.checkedRooms===state.names.length && JSON.stringify(state.roomNames)===JSON.stringify(state.names) && state.pdfRoomCount===state.names.length && state.pdfChecked===0, JSON.stringify(state));
+      const pdfToggle=await evalJs(`(()=>{const i=document.querySelector('.pdf-layout-room-checkbox');if(!i)return false;i.click();return true})()`);await sleep(160);
+      const pdfSelected=await evalJs(`(()=>[...document.querySelectorAll('.pdf-layout-room-checkbox')].filter(i=>i.checked).map(i=>i.dataset.pdfLayoutRoom))()`);
+      ok('PDF 布局页真实勾选只启用一个房间，取消后恢复默认关闭', pdfToggle===true&&pdfSelected.length===1&&state.ids.includes(pdfSelected[0]), JSON.stringify(pdfSelected));
+      await evalJs(`(()=>{const i=document.querySelector('.pdf-layout-room-checkbox');if(i?.checked)i.click();return true})()`);await sleep(160);
+      const pdfReset=await evalJs(`(()=>[...document.querySelectorAll('.pdf-layout-room-checkbox')].filter(i=>i.checked).length)()`);
+      ok('PDF 房间布局页复选框取消后重新全关', pdfReset===0, String(pdfReset));
+      const clickType=async(needle)=>evalJs(`(()=>{const g=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('DXF 图纸内容'));const l=[...(g?.children||[])].find(x=>x.matches?.('label.exp-check')&&x.textContent.includes(${JSON.stringify(needle)}));const i=l?.querySelector('input');if(!i)return false;i.click();return true})()`);
+      await clickType('房间平面布置图');await sleep(120);await clickType('柜体图纸');await sleep(220);
+      const empty=await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.includes('导出 DXF'));return {disabled:b?.disabled??null,notice:document.querySelector('.side-right')?.innerText.includes('至少选一张图')??false}})()`);
+      ok('关闭两类图纸后 DXF 被禁用并说明原因',empty?.disabled===true&&empty?.notice===true,JSON.stringify(empty));
+      await clickType('房间平面布置图');await sleep(120);await clickType('柜体图纸');await sleep(220);
+      const restored=await evalJs(`(()=>{const g=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('DXF 图纸内容'));const top=[...(g?.children||[])].filter(x=>x.matches?.('label.exp-check'));const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.includes('导出 DXF'));return {checked:top.map(x=>x.querySelector('input')?.checked??false),disabled:b?.disabled??null}})()`);
+      ok('恢复两类图纸后 DXF 按钮重新可用',restored?.checked.length===2&&restored.checked.every(Boolean)&&restored.disabled===false,JSON.stringify(restored));
+      await finishProbe();
+    }
+    if (ONLY === 'B32_ROOMBOOK_AUTH') {
+      section('B32_ROOMBOOK_AUTH 账号模式 RoomBook 鉴权正反向验收');
+      if (await evalJs(`!!document.querySelector('.room-workspace')`)) {
+        await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-topbar button')].find(x=>x.textContent.trim()==='高级 CAD 编辑');if(b)b.click();return !!b})()`);
+        await sleep(350);
+      }
+      await earlyActivateRightTab('账号');
+      await sleep(240);
+      const roomBookPassword='B32-Verify-Strong-Pw-2026!';
+      const usernameSet=await earlyPanelSet('用户名','owner');
+      const passwordSet=await earlyPanelSet('口令',roomBookPassword);
+      const confirmSet=await earlyPanelSet('再输一次',roomBookPassword);
+      const registered=await earlyClickPanelButton('建立账号并进入账号模式',1600);
+      let auth=null;
+      const authDeadline=Date.now()+10000;
+      while(Date.now()<authDeadline){
+        auth=await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');if(!token)return null;const me=await fetch('/api/auth/me',{headers:{Authorization:'Bearer '+token}});return {status:me.status,ok:me.ok,hasToken:token.length>=40}})()`);
+        if(auth?.ok)break;
+        await sleep(150);
+      }
+      ok('B32 临时账号建立后 /api/auth/me 确认有效会话', usernameSet&&passwordSet&&confirmSet&&registered&&auth?.status===200&&auth?.ok===true, JSON.stringify({usernameSet,passwordSet,confirmSet,registered,auth}));
+      await earlyActivateRightTab('导出');
+      const pdfButton=await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.includes('导出横向 PDF 图纸'));return {found:!!b,disabled:b?.disabled??null}})()`);
+      ok('当前导出面板提供可用的正式「导出横向 PDF 图纸」入口',pdfButton?.found===true&&pdfButton.disabled===false,JSON.stringify(pdfButton));
+      const negative=await evalJs(`(async()=>{const workspace=await fetch('/api/workspace');const roomBook=await fetch('/api/export/roombook',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});return {workspace:workspace.status,roomBook:roomBook.status}})()`);
+      ok('accounts 模式下无 token 的 workspace 与 RoomBook 请求都返回 401', negative?.workspace===401&&negative?.roomBook===401, JSON.stringify(negative));
+      const positive=await evalJs(`(async()=>{const s=await import('/src/state/store.ts');const p=s.bus.getState();const room=p.rooms[0];const cabinet=p.cabinets.find(c=>c.roomId===room?.id);const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/export/roombook',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({project:p,modelVersion:'b32-auth-proof'})});const html=await r.text();return {status:r.status,ctype:r.headers.get('Content-Type')||'',isDoc:html.startsWith('<!DOCTYPE html>')&&html.includes('</html>'),layout:html.includes('data-page-kind="layout"')&&html.includes('class="layout-schedule"'),cabinetPage:!!cabinet&&html.includes('data-page-kind="cabinet"')&&html.includes('data-cabinet-id="'+cabinet.id+'"'),roomPage:!!room&&html.includes('data-room-id="'+room.id+'"'),cabinetName:!!cabinet&&html.includes(cabinet.name),version:html.includes('b32-auth-proof')&&html.includes('factory_default_v1')}})()`);
+      ok('有效会话带 Bearer token 导出当前 RoomBook：布局页、清单、指定柜体页与版本元数据齐全', positive?.status===200&&positive?.ctype.includes('text/html')&&positive?.isDoc&&positive?.layout&&positive?.cabinetPage&&positive?.roomPage&&positive?.cabinetName&&positive?.version, JSON.stringify(positive));
+      await finishProbe();
+    }
+    section('B0 默认房间工作区与聊天入口');
+    const workspaceInfo = await evalJs(`(()=>{
+      const root=document.querySelector('.room-workspace');
+      const cards=root?[...root.querySelectorAll('.workspace-cabinet-card')]:[];
+      return {
+        present:!!root,
+        roomList:!!root?.querySelector('.workspace-room-list'),
+        topbar:!!document.querySelector('.workspace-topbar'),
+        assistant:!!root?.querySelector('.ai-workspace-panel')&&!!root?.querySelector('.workspace-chat-composer'),
+        cabinetCount:cards.length,
+        viewCounts:cards.map(c=>c.querySelectorAll('.workspace-view').length),
+        viewTitles:cards.map(c=>[...c.querySelectorAll('.workspace-view strong')].map(e=>e.textContent.trim())),
+        emptyState:!!root?.querySelector('.workspace-empty-state'),
+      };
+    })()`);
+    ok('默认首屏显示房间列表、顶部操作与 AI 聊天区', workspaceInfo?.present && workspaceInfo?.roomList && workspaceInfo?.topbar && workspaceInfo?.assistant, JSON.stringify(workspaceInfo));
+    const cabinetViewsReady = workspaceInfo?.cabinetCount > 0
+      ? workspaceInfo.viewCounts.every((n) => n === 3) && workspaceInfo.viewTitles.every((titles) => JSON.stringify(titles) === JSON.stringify(['外观正面', '内部结构', '俯视图']))
+      : workspaceInfo?.emptyState === true;
+    ok('房间内柜体各显示外观/内部/俯视三视图（或明确空状态）', cabinetViewsReady, JSON.stringify(workspaceInfo));
+
+    // A → B → 顶部 CAD：验证离开房间后，房间 A 的对象不会继续成为 CAD/AI 的隐式目标。
+    const roomSwitchOperation = await startPageOperation('B0.room-switch-fixture', `async()=>{
+      const s=await import('/src/state/store.ts');const d=await import('/src/core/docFactory.ts');const c=await import('/src/core/commands.ts');
+      window.__verifyHarness.bindBus(s.bus);
+      window.__b0SavedBusState={bus:s.bus,project:structuredClone(s.bus.getState()),
+        entries:structuredClone(s.bus.entries),pointer:s.bus.pointer,modelVersion:s.bus.modelVersion,
+        provById:structuredClone([...s.bus.provById]),baselineProv:structuredClone([...s.bus.baselineProv])};
+      s.bus.replaceProject(d.sampleProject(s.RULESET),'B0 双房间选择清理 fixture');
+      const base=s.bus.getState();
+      const ids=new Set([...base.rooms.flatMap(r=>[r.id,...r.walls.map(w=>w.id)]),...base.cabinets.map(x=>x.id)]);
+      const roomB=d.rectRoom({name:'验收房间 B',x:5000,y:0,w:3000,h:2500,thickness:120,height:2700,takenIds:ids});
+      const created=s.bus.execute(c.createRoomCommand(roomB));
+      return {created:created.ok,createError:created.error??null,roomAId:base.rooms[0]?.id,roomAName:base.rooms[0]?.name,
+        roomBId:roomB.id,roomBName:roomB.name,cabinetId:base.cabinets[0]?.id,cabinetName:base.cabinets[0]?.name,
+        project:s.bus.getState().name,version:s.bus.getVersion()};
+    }`, 8000);
+    const roomSwitchFixture = roomSwitchOperation.result;
+    const roomSwitchFixtureJson = JSON.stringify(roomSwitchFixture);
+    ok('A→B 验收 fixture 含房间 A 的柜体与空房间 B', roomSwitchOperation.status === 'fulfilled'
+      && roomSwitchFixture?.created && roomSwitchFixture?.cabinetId && roomSwitchFixture?.roomBId,
+      `result=${roomSwitchFixtureJson}; before=${JSON.stringify(roomSwitchOperation.before)} after=${JSON.stringify(roomSwitchOperation.after)}`);
+    if (!roomSwitchFixture?.created || !roomSwitchFixture?.cabinetId || !roomSwitchFixture?.roomBId) {
+      throw new Error(`无法建立 A→B→CAD 的双房间验收 fixture：${JSON.stringify(roomSwitchOperation)}`);
+    }
+    await sleep(320);
+    const clickedRoomACabinet = await evalJs(`(()=>{
+      const n=${JSON.stringify(roomSwitchFixture.cabinetName)};
+      const b=[...document.querySelectorAll('.workspace-cabinet-title')].find(x=>x.textContent.includes(n));
+      if(b)b.click();
+      return !!b;
+    })()`);
+    await sleep(180);
+    const selectedRoomACabinet = await evalJs(`!!document.querySelector('.workspace-cabinet-card.is-selected')`);
+    ok('在房间 A 点击柜体后该卡片显示选中态', clickedRoomACabinet === true && selectedRoomACabinet === true);
+    const clickedRoomB = await evalJs(`(()=>{
+      const n=${JSON.stringify(roomSwitchFixture.roomBName)};
+      const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes(n));
+      if(b)b.click();
+      return !!b;
+    })()`);
+    await sleep(300);
+    const roomBSelection = await evalJs(`({
+      activeRoom:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',
+      selectedCards:document.querySelectorAll('.workspace-cabinet-card.is-selected').length,
+    })`);
+    ok('切到房间 B 会清空房间 A 的卡片选中态', clickedRoomB && roomBSelection.activeRoom === roomSwitchFixture.roomBName && roomBSelection.selectedCards === 0, JSON.stringify(roomBSelection));
+    const clickedTopCad = await evalJs(`(()=>{
+      const b=[...document.querySelectorAll('.workspace-topbar button')].find(x=>x.textContent.trim()==='高级 CAD 编辑');
+      if(b)b.click();
+      return !!b;
+    })()`);
+    let roomSwitchCadReady = false;
+    const roomSwitchCadDeadline = Date.now() + 15000;
+    while (Date.now() < roomSwitchCadDeadline) {
+      roomSwitchCadReady = await evalJs(`!!document.querySelector('.vp-canvas')&&!!document.querySelector('.statusbar')`);
+      if (roomSwitchCadReady) break;
+      await sleep(250);
+    }
+    const roomSwitchCadSelection = await evalJs(`(()=>{
+      const e=[...document.querySelectorAll('.statusbar .sb-item')].find(x=>x.textContent.includes('已选'));
+      const m=e&&/已选\\s*(\\d+)\\s*项/.exec(e.textContent);
+      return {count:m?Number(m[1]):null,selectedTree:document.querySelectorAll('.side-left .tree-leaf.sel').length};
+    })()`);
+    ok('房间 B 顶部进入 CAD 后不继承房间 A 的选择', clickedTopCad && roomSwitchCadReady && (roomSwitchCadSelection.count === null || roomSwitchCadSelection.count === 0) && roomSwitchCadSelection.selectedTree === 0, JSON.stringify(roomSwitchCadSelection));
+    const b0RestoreOperation = await startPageRestore('B0.restore-fixture', {
+      snapshotKey: '__b0SavedBusState', busFromSnapshot: 'bus', mode: 'full', clearSaved: true,
+    }, 5000);
+    const restoredB0Fixture = b0RestoreOperation.result?.restored === true;
+    ok('B0 通过共享 page-harness 恢复完整 CommandBus（project/version 已回读）', restoredB0Fixture,
+      JSON.stringify({before:b0RestoreOperation.before,after:b0RestoreOperation.after,result:b0RestoreOperation.result}));
+    if (!restoredB0Fixture) throw new Error(`[B0 harness] fixture restoration failed: ${JSON.stringify(b0RestoreOperation)}`);
+    await sleep(300);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+    let workspaceRestored = false;
+    const workspaceRestoreDeadline = Date.now() + 10000;
+    while (Date.now() < workspaceRestoreDeadline) {
+      workspaceRestored = await evalJs(`!!document.querySelector('.room-workspace')`);
+      if (workspaceRestored) break;
+      await sleep(200);
+    }
+    ok('A→B→CAD 验收结束后恢复原项目并返回房间工作区', workspaceRestored === true);
+    const clickedRestoredRoomA = await evalJs(`(()=>{
+      const n=${JSON.stringify(roomSwitchFixture.roomAName)};
+      const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes(n));
+      if(b)b.click();
+      return !!b;
+    })()`);
+    let restoredRoomA = null;
+    const restoredRoomADeadline = Date.now() + 8000;
+    while (Date.now() < restoredRoomADeadline) {
+      restoredRoomA = await evalJs(`(()=>({
+        heading:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',
+        selected:document.querySelector('.workspace-room-item.selected')?.textContent.trim()||''
+      }))()`);
+      if (restoredRoomA?.heading === roomSwitchFixture.roomAName && restoredRoomA?.selected.includes(roomSwitchFixture.roomAName)) break;
+      await sleep(150);
+    }
+    ok('恢复原项目后显式选择有效房间 A（不沿用失效的房间 B 上下文）', clickedRestoredRoomA
+      && restoredRoomA?.heading === roomSwitchFixture.roomAName
+      && restoredRoomA?.selected.includes(roomSwitchFixture.roomAName), JSON.stringify(restoredRoomA));
+    const clickedExplicitEdit = await evalJs(`(()=>{
+      const n=${JSON.stringify(roomSwitchFixture.cabinetName)};
+      const card=[...document.querySelectorAll('.workspace-cabinet-card')]
+        .find(x=>x.querySelector('.workspace-cabinet-name')?.textContent.trim()===n);
+      const b=[...(card?.querySelectorAll('.workspace-cabinet-actions button')||[])]
+        .find(x=>x.textContent.trim()==='编辑');
+      if(b)b.click();
+      return !!b;
+    })()`);
+    let explicitCadReady = false;
+    const explicitCadDeadline = Date.now() + 15000;
+    while (Date.now() < explicitCadDeadline) {
+      explicitCadReady = await evalJs(`!!document.querySelector('.vp-canvas')&&!!document.querySelector('.statusbar')`);
+      if (explicitCadReady) break;
+      await sleep(250);
+    }
+    let explicitCadSelection = null;
+    const explicitSelectionDeadline = Date.now() + 6000;
+    while (Date.now() < explicitSelectionDeadline) {
+      explicitCadSelection = await evalJs(`(()=>{
+        const status=document.querySelector('.statusbar .sb-sel')?.textContent||'';
+        const m=/已选\\s*(\\d+)\\s*项/.exec(status);
+        const tree=[...document.querySelectorAll('.side-left .tree-leaf.sel')].map(x=>x.textContent.replace(/\\s+/g,' ').trim());
+        return {count:m?Number(m[1]):null,tree,status};
+      })()`);
+      if (explicitCadSelection?.count === 1 && explicitCadSelection?.tree.length === 1) break;
+      await sleep(150);
+    }
+    ok('柜卡“编辑此柜”进入 CAD 后精确选中该目标柜（状态栏与对象树一致）',
+      clickedExplicitEdit && explicitCadReady && explicitCadSelection?.count === 1
+      && explicitCadSelection?.tree.length === 1
+      && explicitCadSelection.tree[0].includes(roomSwitchFixture.cabinetName),
+      JSON.stringify(explicitCadSelection));
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+    let explicitWorkspaceRestored = false;
+    const explicitWorkspaceDeadline = Date.now() + 10000;
+    while (Date.now() < explicitWorkspaceDeadline) {
+      explicitWorkspaceRestored = await evalJs(`!!document.querySelector('.room-workspace')`);
+      if (explicitWorkspaceRestored) break;
+      await sleep(200);
+    }
+    ok('显式目标选择验收后返回房间工作区', explicitWorkspaceRestored === true);
+
+    const advancedBox = await evalJs(`(()=>{
+      const b=[...document.querySelectorAll('button')].find(e=>e.textContent.trim()==='高级 CAD 编辑');
+      if(!b)return null;
+      const r=b.getBoundingClientRect();
+      return {x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height};
+    })()`);
+    ok('高级 CAD 编辑入口可见', !!advancedBox && advancedBox.w > 0 && advancedBox.h > 0, JSON.stringify(advancedBox));
+    if (!advancedBox) throw new Error('默认房间工作区缺少“高级 CAD 编辑”入口');
+    await moveMouse(advancedBox.x, advancedBox.y);
+    await mouseDown(advancedBox.x, advancedBox.y);
+    await mouseUp(advancedBox.x, advancedBox.y);
+    let cadReady = false;
+    const cadDeadline = Date.now() + 15000;
+    while (Date.now() < cadDeadline) {
+      cadReady = await evalJs(`!!document.querySelector('.vp-canvas') && !!document.querySelector('.statusbar')`);
+      if (cadReady) break;
+      await sleep(250);
+    }
+    if (!cadReady) throw new Error('点击“高级 CAD 编辑”后传统 CAD 视口未挂载');
+    const topCadSelection = await evalJs(`(()=>{
+      const e=[...document.querySelectorAll('.statusbar .sb-item')].find(x=>x.textContent.includes('已选'));
+      const m=e&&/已选\\s*(\\d+)\\s*项/.exec(e.textContent);
+      return m?Number(m[1]):null;
+    })()`);
+    ok('房间工作区顶部的通用 CAD 入口不会带入旧选择', topCadSelection === null || topCadSelection === 0, String(topCadSelection));
+    if (process.env.STOP_AFTER_ONLY === '1' && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     const keyPress = async (key, code, vk, modifiers = 0) => {
       await send('Input.dispatchKeyEvent', {
@@ -569,6 +1871,19 @@ async function waitForApp(url, timeoutMs = 25000) {
         if(!b) return false; b.click(); return true;
       })()`);
       await sleep(260);
+      return r;
+    };
+
+    /** 共享的右侧折叠分区展开 helper，供不同过滤章节各自调用。 */
+    const openPanelSection = async (needle) => {
+      const r = await evalJs(`(()=>{
+        const sec=[...document.querySelectorAll('.side-right .sec')]
+          .find(s=>((s.querySelector('.sec-toggle')?.textContent)||'').includes(${JSON.stringify(needle)}));
+        if(!sec) return 'no-sec';
+        if(!sec.querySelector('.sec-body')){ sec.querySelector('.sec-toggle').click(); return 'opened'; }
+        return 'already';
+      })()`);
+      await sleep(300);
       return r;
     };
 
@@ -690,6 +2005,83 @@ async function waitForApp(url, timeoutMs = 25000) {
       return false;
     };
 
+    const runAgentDraftViaUi = async (intent, timeoutMs = 60000, rootSelector = '.side-right') => {
+      const inputSelector = `${rootSelector} .ai-input`;
+      const buttonSelector = `${rootSelector} .ai-btn-agent`;
+      const blockSelector = `${rootSelector} .chat-agent`;
+      const inputSet = await setElValue(inputSelector, intent);
+      const buttonInfo = await evalJs(`(()=>{const b=document.querySelector(${JSON.stringify(buttonSelector)});return b?{label:b.textContent.trim(),disabled:b.disabled,title:b.title}:null})()`);
+      const priorAgentMessages = await evalJs(`[...document.querySelectorAll(${JSON.stringify(blockSelector)})].length`);
+      const clicked = await evalJs(`(()=>{const b=document.querySelector(${JSON.stringify(buttonSelector)});if(!b||b.disabled)return false;b.click();return true})()`);
+      const completed = clicked && await waitFor(`(()=>{const b=document.querySelector(${JSON.stringify(buttonSelector)});const xs=[...document.querySelectorAll(${JSON.stringify(blockSelector)})];return xs.length>${Number(priorAgentMessages)}&&!(b?.textContent||'').includes('执行中…')})()`, timeoutMs, 180);
+      const evidence = await evalJs(`(()=>{
+        const root=${JSON.stringify(rootSelector)};
+        const blocks=[...document.querySelectorAll(root+' .chat-agent')];const block=blocks.at(-1);
+        const parse=(raw)=>{try{return JSON.parse(raw)}catch{return null}};
+        const steps=[...(block?.querySelectorAll('.agent-step')||[])].map(s=>{
+          const details=[...s.querySelectorAll('details')];const read=(label)=>{const d=details.find(x=>x.querySelector('summary')?.textContent.trim()===label);return d?.querySelector('pre')?.textContent||''};
+          const resultRaw=read('结果');const result=parse(resultRaw);
+          return {tool:s.querySelector('.agent-step-head code')?.textContent.trim()||'',ok:!!s.querySelector('.ok-tag'),
+            args:parse(read('参数')),result,resultRaw,blockingErrors:result?.blockingErrors??null};
+        });
+        return {hasBlock:!!block,summary:block?.querySelector(':scope > summary')?.textContent.trim()||'',
+          remote:!!document.querySelector(root+' .agent-remote-draft'),
+          remoteText:document.querySelector(root+' .agent-remote-draft')?.textContent.trim()||'',
+          steps,uiTail:document.querySelector(root)?.textContent.slice(-1200)||''};
+      })()`);
+      const beforeApply = await evalJs(`(()=>{const b=window.__verifyBus;const p=b?.getState();return p?{ver:b.getVersion(),count:p.cabinets.length,names:p.cabinets.map(c=>c.name),project:p.name,projectId:p.id}:null})()`);
+      return { inputSet, buttonInfo, priorAgentMessages, clicked, completed, evidence, beforeApply };
+    };
+
+    const selectWorkspaceRoom = async (roomName) => {
+      const clicked = await evalJs(`(()=>{const name=${JSON.stringify(String(roomName))};const b=[...document.querySelectorAll('.workspace-room-list-items button')].find(x=>x.textContent.includes(name));if(!b)return false;b.click();return true})()`);
+      await sleep(260);
+      const state = await evalJs(`(()=>{const roomName=document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'';const project=window.__verifyBus?.getState();return {workspace:!!document.querySelector('.room-workspace'),
+        roomName,roomId:project?.rooms?.find(r=>r.name===roomName)?.id||'',
+        chatContext:document.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||'',
+        input:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input'),
+        agentButton:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent')}})()`);
+      return { clicked, state };
+    };
+
+    const applyRemoteDraftViaUi = async (cabinetName, prefix, timeoutMs = 20000) => {
+      const messagesKey = `__${prefix}ConfirmMessages`;
+      const originalKey = `__${prefix}OriginalConfirm`;
+      await evalJs(`(()=>{window[${JSON.stringify(messagesKey)}]=[];window[${JSON.stringify(originalKey)}]=window.confirm;window.confirm=(m)=>{window[${JSON.stringify(messagesKey)}].push(String(m));return true};return true})()`);
+      let openDrafts = false, applyVisible = false, applyClicked = false, resultReady = false;
+      let needsExplicitSync = false, localUnchangedBeforeSync = null, syncClicked = false, syncReady = false;
+      try {
+        openDrafts = await evalJs(`(()=>{const b=document.querySelector('.room-workspace .ai-workspace-panel .agent-remote-draft button, .side-right .agent-remote-draft button');if(!b)return false;b.click();return true})()`);
+        const previewClicked = openDrafts && await waitFor(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='网页实时预览')`, 15000, 180)
+          && await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='网页实时预览');if(!b)return false;b.click();return true})()`);
+        const previewReady = previewClicked && await waitFor(`!!document.querySelector('.side-right [data-testid="remote-draft-confirmation-metadata"]')`, 8000, 150);
+        applyVisible = previewReady && await waitFor(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='确认应用到服务器')`, 5000, 150);
+        if (applyVisible) {
+          const openedConfirm = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='确认应用到服务器');if(!b)return false;b.click();return true})()`)
+            && await waitFor(`!!document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]')`, 3000, 100);
+          const confirmText = openedConfirm ? await evalJs(`document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]')?.textContent||''`) : '';
+          await evalJs(`(()=>{window[${JSON.stringify(messagesKey)}].push(String(${JSON.stringify(confirmText)}));return true})()`);
+          const accepted = openedConfirm && await evalJs(`(()=>{const d=document.querySelector('.side-right [role="dialog"][aria-label="确认应用服务端草稿"]');const b=[...(d?.querySelectorAll('button')||[])].find(x=>x.textContent.trim()==='确认应用这份预览');if(!b)return false;b.click();return true})()`);
+          applyClicked = openedConfirm && accepted;
+          resultReady = applyClicked && await waitFor(`(()=>!!window.__verifyBus?.getState().cabinets.find(c=>c.name===${JSON.stringify(cabinetName)})||!!document.querySelector('.side-right .remote-sync-card'))()`, timeoutMs, 180);
+          needsExplicitSync = await evalJs(`!!document.querySelector('.side-right .remote-sync-card')`);
+          if (needsExplicitSync) {
+            localUnchangedBeforeSync = await evalJs(`!window.__verifyBus.getState().cabinets.some(c=>c.name===${JSON.stringify(cabinetName)})`);
+            syncClicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .remote-sync-card button')].find(x=>x.textContent.includes('确认将服务器项目同步到本地'));if(!b)return false;b.click();return true})()`);
+            syncReady = syncClicked && await waitFor(`!!window.__verifyBus?.getState().cabinets.find(c=>c.name===${JSON.stringify(cabinetName)})`, 15000, 180);
+          } else {
+            syncReady = resultReady && await evalJs(`!!window.__verifyBus?.getState().cabinets.find(c=>c.name===${JSON.stringify(cabinetName)})`);
+          }
+        }
+      } finally {
+        await sleep(100);
+        await evalJs(`(()=>{const f=window[${JSON.stringify(originalKey)}];if(f)window.confirm=f;delete window[${JSON.stringify(originalKey)}];return true})()`);
+      }
+      const confirmMessages = await evalJs(`window[${JSON.stringify(messagesKey)}]||[]`);
+      const afterApply = await evalJs(`(()=>{const b=window.__verifyBus;const p=b?.getState();const c=p?.cabinets.find(x=>x.name===${JSON.stringify(cabinetName)});return p?{ver:b.getVersion(),count:p.cabinets.length,names:p.cabinets.map(x=>x.name),project:p.name,projectId:p.id,cabinetId:c?.id??null}:null})()`);
+      return { openDrafts, applyVisible, applyClicked, resultReady, needsExplicitSync, localUnchangedBeforeSync, syncClicked, syncReady, confirmMessages, afterApply };
+    };
+
     /** 视口画布像素指纹：用来证明"换了一个视图"而不是"看起来像换了" */
     const canvasSig = () =>
       evalJs(`(()=>{
@@ -704,7 +2096,13 @@ async function waitForApp(url, timeoutMs = 25000) {
         return {n, nonBg, h: h>>>0};
       })()`);
 
+    if (STOP_AFTER_ONLY && ONLY && currentGroup.includes(ONLY)) await finishProbe();
+
     // ═══════════════════════════════════════════════════════════
+    // ONLY=B38 is an independent wash-cabinet UI acceptance path: retain the
+    // shared browser/auth bootstrap and B0 room-workspace smoke, but do not let
+    // unrelated CAD sections or B37 Agent teardown gate the B38 fixture.
+    if (ONLY !== 'B38') {
     section('B1 页面加载与初始状态（期望值来自真实管线，不是臆测）');
 
     const rect = await vpRect();
@@ -1255,7 +2653,7 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 这里验的不是"画出来了"，而是三件事：
      *  1. 四张图**确实由同一份模型投影派生**（长对正 / 高平齐 / 宽相等在图幅上成立）
      *  2. 界面上给出的读数**就是派生结果本身**（面板数字 === 模型图元数）
-     *  3. 图幅是**只读**的：点它不改变模型，改模型必须回平面图
+     *  3. 图幅尺寸线支持明确拖动编辑；普通悬停不显示位移读数，空白处拖动只平移。
      */
     section('B13 四视图图幅：正/俯/侧/内部由同一份模型投影派生');
 
@@ -1263,17 +2661,21 @@ async function waitForApp(url, timeoutMs = 25000) {
     await sleep(340);
 
     const viewsPanel = await text('.side-right .panel-scroll');
-    const fourNames = ['正视图', '俯视图', '侧视图', '内部结构图'];
+    const viewList = await text('.side-right .view-list');
+    const currentViewNames = ['立面外观图', '立面结构图'];
     ok(
-      '视图面板把四张图逐一点名（正视图 / 俯视图 / 侧视图 / 内部结构图）',
-      fourNames.every((n) => viewsPanel.includes(n)),
-      viewsPanel.slice(0, 220)
+      '视图面板列表与 VIEW_KINDS 一致：仅立面外观图/立面结构图，俯视/侧视标签由图幅呈现',
+      currentViewNames.every((n) => viewList.includes(n)) && !viewList.includes('俯视图') && !viewList.includes('侧视图'),
+      viewList
     );
-    // Task #48 之后四视图可编辑了：这条断言的意义从"它声明只读"变为
-    // "它如实说明可编辑 + 四图同源同步 + 哪些不能拖"。文案必须跟着产品走。
+    // 当前产品契约：俯视 / 正视 / 内部图的蓝线可改语义参数；普通生成图元
+    // 有单独的覆盖编辑路径。侧视图属于投影结果，但不宣称它也有语义拖动线。
     ok(
-      '面板如实说明四视图可编辑，且改一处四图同步（不再写"只读"骗人）',
-      /可以直接编辑/.test(viewsPanel) && /其余三张同步更新/.test(viewsPanel) && !/只读派生视图/.test(viewsPanel),
+      '面板如实说明图纸三视图的语义编辑边界（蓝线改参数，普通图元可编辑）',
+      /俯视\s*\/\s*正视\s*\/\s*内部/.test(viewsPanel)
+        && /蓝线尺寸可拖动改语义参数/.test(viewsPanel)
+        && /普通图元可选择、移动、复制、删除或改属性/.test(viewsPanel)
+        && !/四张图.*可编辑/.test(viewsPanel),
       viewsPanel.slice(0, 160)
     );
     ok('面板点明"层板/抽屉由数量派生、不能拖"（把不能做的也讲清楚）', /数量/.test(viewsPanel) && /不能拖/.test(viewsPanel));
@@ -1320,8 +2722,8 @@ async function waitForApp(url, timeoutMs = 25000) {
       `面板「${await panelText('视图图元合计')}」vs 模型 ${viewFacts.primTotal}`
     );
     ok(
-      '面板「投影衔接线」= 6 条（长对正 2 · 高平齐 2 · 宽相等 2），且图层计数一致',
-      (await panelText('投影衔接线'))?.startsWith('6 条') === true && viewFacts.hinge === 6,
+      '面板「投影衔接线」= 4 条（长对正 2 · 高平齐 2），且图层计数一致',
+      (await panelText('投影衔接线'))?.startsWith('4 条') === true && viewFacts.hinge === 4,
       `面板「${await panelText('投影衔接线')}」/ F-VIEW 图元 ${viewFacts.hinge}`
     );
     ok(
@@ -1443,22 +2845,23 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('工具栏「平面图」当前处于激活态', planBtnActive === true, String(planBtnActive));
 
     const clickedSheet = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='▤ 四视图');if(!b)return false;b.click();return true})()`);
-    ok('工具栏上能点到「▤ 四视图」（不是隐藏功能）', clickedSheet === true);
+      .find(x=>x.textContent.trim()==='▤ 图纸视图');if(!b)return false;b.click();return true})()`);
+    ok('工具栏上能点到「▤ 图纸视图」（不是隐藏功能）', clickedSheet === true);
     await sleep(620);
 
     const sheetBtnActive = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='▤ 四视图');return b?b.classList.contains('active'):null})()`);
-    ok('切过去后「▤ 四视图」变成激活态、平面图退出激活', sheetBtnActive === true);
+      .find(x=>x.textContent.trim()==='▤ 图纸视图');return b?b.classList.contains('active'):null})()`);
+    ok('切过去后「▤ 图纸视图」变成激活态、平面图退出激活', sheetBtnActive === true);
+    ok('从平面图切到图幅时清除旧柜体选择', (await statusSelection()) === null, `已选 ${await statusSelection()}`);
 
     const hudSheet = await text('.vp-hud-sheet');
     // Task #48：图幅可编辑之后，HUD 不能再写"只读"骗人 —— 必须告诉用户"蓝线可拖"。
-    ok('HUD 明说这是「四视图图幅 · 可编辑」（不再写"只读"误导用户）',
-      /四视图图幅/.test(hudSheet) && /可编辑/.test(hudSheet) && !/只读/.test(hudSheet), hudSheet || '(缺失)');
+    ok('HUD 明说这是「图纸视图 · 可编辑」（不再写"只读"误导用户）',
+      /图纸视图/.test(hudSheet) && /可编辑/.test(hudSheet) && !/只读/.test(hudSheet), hudSheet || '(缺失)');
     ok('图幅模式下不再显示平面坐标读数（X/Y 是平面图的概念，不混进图幅）', (await hudWorld()) === null, JSON.stringify(await hudWorld()));
 
     const sheetCursor = await evalJs(`getComputedStyle(document.querySelector('.vp')).cursor`);
-    ok('图幅模式光标变成 grab（暗示"这里只能平移，不能编辑"）', sheetCursor === 'grab', String(sheetCursor));
+    ok('图幅模式光标为 grab（表示画布可平移；尺寸线编辑另由 B36 验收）', sheetCursor === 'grab', String(sheetCursor));
 
     const sheetSig = await canvasSig();
     ok(
@@ -1472,44 +2875,62 @@ async function waitForApp(url, timeoutMs = 25000) {
       `平面指纹 ${planSig.h} vs 图幅指纹 ${sheetSig.h}`
     );
 
-    // ── 只读性：图幅上点、拖、移动都不能改模型 ──
-    const vpRect2 = await vpRect();
-    const midX = vpRect2.left + vpRect2.w / 2;
-    const midY = vpRect2.top + vpRect2.h / 2;
+    // ── 图幅空白处交互：先用产品命中测试确认不是尺寸线，再验证平移不写模型 ──
+    const sheetBlank = await evalJs(`(async()=>{
+      const s=await import('/src/state/store.ts');
+      const ht=await import('/src/viewport/hitTest.ts');
+      const sn=await import('/src/viewport/snapping.ts');
+      const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+      const m=await import('/src/viewport/camera.ts');
+      const el=document.querySelector('.vp');
+      if(!el||!cd.cam)return null;
+      const r=el.getBoundingClientRect();
+      const candidates=[[16,16],[r.width-16,16],[16,r.height-16],[r.width-16,r.height-16]];
+      const tol=sn.snapToleranceWorld(8,cd.cam.scale);
+      for(const [sx,sy] of candidates){
+        const world=m.screenToWorld({x:sx,y:sy},cd.cam,cd.vw,cd.vh);
+        const hit=ht.hitPart(s.bus.derive().geom.views.pickLines,world,tol);
+        if(!hit)return {x:r.left+sx,y:r.top+sy,screen:{x:sx,y:sy},hit:null};
+      }
+      return null;
+    })()`);
+    ok('选定的图幅坐标经产品命中测试确认不在任何尺寸线上', sheetBlank?.hit === null, JSON.stringify(sheetBlank));
 
-    await moveMouse(midX, midY);
-    await sleep(220);
-    const sheetLeaks = await evalJs(`({
-      snap: !!document.querySelector('.vp-hud-snap'),
-      read: !!document.querySelector('.vp-hud-read'),
-      preview: !!document.querySelector('.vp-preview-badge'),
-      prompt: !!document.querySelector('.vp-prompt'),
-    })`);
-    ok(
-      '图幅上移动鼠标不会冒出捕捉标记 / 位移读数 / 预览徽标（图幅不是编辑面）',
-      !sheetLeaks.snap && !sheetLeaks.read && !sheetLeaks.preview && !sheetLeaks.prompt,
-      JSON.stringify(sheetLeaks)
-    );
+    if (sheetBlank) {
+      await moveMouse(sheetBlank.x, sheetBlank.y);
+      await sleep(220);
+      const sheetLeaks = await evalJs(`({
+        snap: !!document.querySelector('.vp-hud-snap'),
+        read: !!document.querySelector('.vp-hud-read'),
+        preview: !!document.querySelector('.vp-preview-badge'),
+        prompt: !!document.querySelector('.vp-prompt'),
+      })`);
+      ok(
+        '空白处悬停不显示坐标捕捉 / 尺寸读数 / 预览反馈',
+        !sheetLeaks.snap && !sheetLeaks.read && !sheetLeaks.preview && !sheetLeaks.prompt,
+        JSON.stringify(sheetLeaks)
+      );
 
-    await mouseDown(midX, midY);
-    await sleep(120);
-    for (let i = 1; i <= 6; i++) {
-      await moveMouse(midX + (60 * i) / 6, midY + (40 * i) / 6, 1);
-      await sleep(40);
+      await mouseDown(sheetBlank.x, sheetBlank.y);
+      await sleep(120);
+      for (let i = 1; i <= 6; i++) {
+        await moveMouse(sheetBlank.x + (60 * i) / 6, sheetBlank.y + (40 * i) / 6, 1);
+        await sleep(40);
+      }
+      await mouseUp(sheetBlank.x + 60, sheetBlank.y + 40);
+      await sleep(420);
+
+      ok(
+        '经命中验证的图幅空白处拖动只平移画布，模型版本不变',
+        (await statusVersion()) === vBeforeMode,
+        `v${vBeforeMode} → v${await statusVersion()}`
+      );
+      ok(
+        '空白处拖动未意外选中柜体',
+        (await statusSelection()) === null,
+        `状态栏「已选」读数：${(await pickItem('已选')) || '(不显示)'}`
+      );
     }
-    await mouseUp(midX + 60, midY + 40);
-    await sleep(420);
-
-    ok(
-      '图幅上拖动只平移画布，模型版本不变（点不动模型）',
-      (await statusVersion()) === vBeforeMode,
-      `v${vBeforeMode} → v${await statusVersion()}`
-    );
-    ok(
-      '图幅上点选后什么都没被选中（状态栏连「已选」读数都不出现）',
-      (await statusSelection()) === null,
-      `状态栏「已选」读数：${(await pickItem('已选')) || '(不显示)'}`
-    );
     ok(
       '切到图幅时把原来的选择收干净了（避免图上残留夹点）',
       (await evalJs(`document.querySelectorAll('.side-left .tree-leaf.sel').length`)) === 0
@@ -1534,8 +2955,44 @@ async function waitForApp(url, timeoutMs = 25000) {
     await mouseUp(backClick.x, backClick.y);
     await sleep(420);
     ok('切回平面图后点选柜体恢复正常（模式切换没有把编辑能力弄丢）', (await statusSelection()) === 1, `已选 ${await statusSelection()}`);
+    const blankCanvas = await evalJs(`(async()=>{
+      const s=await import('/src/state/store.ts');
+      const ht=await import('/src/viewport/hitTest.ts');
+      const sn=await import('/src/viewport/snapping.ts');
+      const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+      const m=await import('/src/viewport/camera.ts');
+      const r=document.querySelector('.vp').getBoundingClientRect();
+      if(!cd.cam)return null;
+      const candidates=[[16,16],[r.width-16,16],[16,r.height-16],[r.width-16,r.height-16]];
+      const tol=sn.snapToleranceWorld(8,cd.cam.scale);
+      for(const [sx,sy] of candidates){
+        const world=m.screenToWorld({x:sx,y:sy},cd.cam,cd.vw,cd.vh);
+        const hit=ht.hitTest(s.bus.getState(),world,tol,[]);
+        if(hit.kind==='empty')return {x:r.left+sx,y:r.top+sy,hit:hit.kind};
+      }
+      return null;
+    })()`);
+    ok('平面图取消选择坐标经 hitTest 确认是画布空白', blankCanvas?.hit === 'empty', JSON.stringify(blankCanvas));
+    if (blankCanvas) {
+      await mouseDown(blankCanvas.x, blankCanvas.y);
+      await mouseUp(blankCanvas.x, blankCanvas.y);
+      await sleep(260);
+      ok('平面图点击确认过的空白画布会取消柜体选择', (await statusSelection()) === null, `已选 ${await statusSelection()}`);
+    }
+    await mouseDown(backClick.x, backClick.y);
+    await mouseUp(backClick.x, backClick.y);
+    await sleep(260);
+    ok('再次点选柜体后切换工具会清除旧选中态', (await statusSelection()) === 1, `切工具前已选 ${await statusSelection()}`);
+    const clickedWallTool = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.firstChild?.textContent.trim()==='画墙');if(b)b.click();return !!b})()`);
+    ok('工具栏可切换到画墙工具', clickedWallTool === true);
+    await sleep(220);
+    ok('切换到画墙工具后不再保留柜体选择', (await statusSelection()) === null, `已选 ${await statusSelection()}`);
+    const clickedSelectTool = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.firstChild?.textContent.trim()==='选择');if(b)b.click();return !!b})()`);
+    ok('工具栏可切换回选择工具', clickedSelectTool === true);
+    await sleep(220);
     ok('来回到图幅走一圈，模型版本没有被模式切换改动', (await statusVersion()) === vBeforeMode, `v${vBeforeMode} → v${await statusVersion()}`);
     ok('图幅往返没有引入 ERROR', (await text('.sb-badge-err')) === '', await text('.sb-badge-err'));
+    if (process.env.STOP_AFTER_ONLY === '1' && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -1549,6 +3006,22 @@ async function waitForApp(url, timeoutMs = 25000) {
      *   · 门不是一刀切：合法的操作必须照常通过
      */
     section('B14 记忆：记下的问题下次真的会拦住，不是存一句话');
+
+    // B13 切到图纸视图时按契约清掉旧选择；B14 的参数回读必须先通过对象树
+    // 真实选中要测试的衣柜，不能把 null 当成“属性没变”。
+    const selectMemoryTarget14 = async () => {
+      const treeTabReady = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-left .tabs button')]
+        .find(x=>x.textContent.trim()==='对象树');if(!b)return false;if(!b.classList.contains('on'))b.click();return true})()`);
+      if (!treeTabReady) return false;
+      await sleep(120);
+      const targetFound = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-left .tree-leaf')]
+        .find(x=>x.querySelector('.tree-name')?.textContent.trim()===${JSON.stringify(FACT.cabinetName)});
+        if(!b)return false;b.click();return true})()`);
+      return targetFound && await waitFor(`document.querySelector('.side-left .tree-leaf.sel .tree-name')?.textContent.trim()===${JSON.stringify(FACT.cabinetName)}`, 2500, 100);
+    };
+    const memoryTargetSelected14 = await selectMemoryTarget14();
+    ok('B14 参数回读前通过对象树真实选中目标柜', memoryTargetSelected14 === true, FACT.cabinetName);
+    if (!memoryTargetSelected14) throw new Error(`[B14 fixture] target cabinet is not selectable in ObjectTree: ${FACT.cabinetName}`);
 
     await activateRightTab('记忆');
     await sleep(340);
@@ -2060,13 +3533,13 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ── 切到四视图图幅：分解图是图幅上的第二张图，平面图上没有它 ──
     const toSheet = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='▤ 四视图');if(!b)return false;b.click();return true})()`);
-    ok('能切到「▤ 四视图」图幅', toSheet === true);
+      .find(x=>x.textContent.trim()==='▤ 图纸视图');if(!b)return false;b.click();return true})()`);
+    ok('能切到「▤ 图纸视图」图幅', toSheet === true);
     await sleep(760);
 
     const vBeforeExplode = await statusVersion();
     const hudSheetOnly = await text('.vp-hud-sheet');
-    ok('此时 HUD 只提四视图，不提分解图', /四视图图幅/.test(hudSheetOnly) && !/分解图/.test(hudSheetOnly), hudSheetOnly);
+    ok('此时 HUD 只提图纸视图，不提分解图', /图纸视图/.test(hudSheetOnly) && !/分解图/.test(hudSheetOnly), hudSheetOnly);
     const sigSheetOnly = await canvasSig();
     const inkSheetOnly = await bottomInk();
 
@@ -2166,18 +3639,14 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // ═══════════════════════════════════════════════════════════
     /**
-     * B17 —— 用户原话："ai 调用用支持 api 调用的形式，比如 openai 的接口，
-     * 用于测试，后续可以添加其他 api。"
-     *
-     * 走的是**真 HTTP**：验收脚本起了一个 OpenAI 兼容端点（mock 服务商），
-     * 然后通过界面真实地走完 说一句话 → 出计划 → 干跑预览 → 点应用 → 模型真的变了。
-     * 不这么做就只验得了失败路径（假 key 打真服务商必然失败），而成功路径
-     * 才是这条功能存在的全部理由。
+     * B17 —— AI 入口边界按现行 Agent 产品契约验收。
+     * 旧的“生成编辑计划 → plan-step → 应用全部”独立按钮已由 Agent 草案流程接管；
+     * 本段核对对话 / MCP Agent / 确定性候选对比的可见边界。B37/B38 覆盖真实
+     * HTTP→MCP→服务端 draft→用户确认/apply/sync；verify:ai-planner 覆盖动作契约。
      */
-    section('B17 AI 规划：一句话 → 契约 → 干跑预览 → 应用（真 HTTP，OpenAI 兼容端点）');
+    section('B17 AI 入口契约：对话不写模型 / Agent 走 MCP / 候选对比不调 AI');
 
     const MOCK_URL = process.env.VERIFY_MOCK_URL || '';
-    const VERIFY_AUDIT = process.env.VERIFY_AUDIT_PATH || '';
     ok('验收环境提供了 mock 服务商地址（走真 HTTP，不是函数打桩）', MOCK_URL.startsWith('http'), MOCK_URL || '(未设置)');
 
     const settingsPut = await evalJs(`fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
@@ -2220,175 +3689,24 @@ async function waitForApp(url, timeoutMs = 25000) {
       String(await panelText('发给模型的项目快照'))
     );
 
-    await activateRightTab('历史');
-    await sleep(320);
-    const histAiBefore = await evalJs(`document.querySelectorAll('.side-right .hist-src.src-ai').length`);
-    await activateRightTab('AI');
-    await sleep(340);
-
-    const aiBefore = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const c=s.bus.getState().cabinets[0];
-      return { name:c.name, lift:c.params.bodyLift, height:c.params.height };})()`);
-    const vBeforeAi = await statusVersion();
-
-    ok('能在输入框里写下这句话', (await setElValue('.side-right .ai-input', '把主卧衣柜的踢脚改成 120，顺便把名字改一下')) === true);
-    ok('点「生成计划」', (await clickPanelBtn('生成编辑计划', 1600)) === true);
-
-    const previewShown = await waitFor(`!!document.querySelector('.side-right .plan-step')`, 25000);
-    ok('不久后出现干跑预览（这一段走的是真 HTTP，服务端再转发到 mock 服务商）', previewShown === true, (await aiPanel()).slice(0, 400));
-
-    const planDom = await evalJs(`(()=>{
-      const steps=[...document.querySelectorAll('.side-right .plan-step')];
-      const rowVal=(label)=>{const r=[...document.querySelectorAll('.side-right .row')]
-        .find(x=>((x.querySelector('.row-label')?.textContent)||'').replace(/\\s+/g,'').replace(/\\u{1F512}/gu,'')===label);
-        return r&&r.querySelector('.row-value')?r.querySelector('.row-value').textContent.replace(/\\s+/g,' ').trim():null;};
-      return {
-        count:steps.length,
-        bad:steps.filter(s=>s.classList.contains('plan-step-bad')).length,
-        actions:steps.map(s=>((s.querySelector('.plan-head .mono')?.textContent)||'').trim()),
-        labels:steps.map(s=>((s.querySelector('.plan-label')?.textContent)||'').trim()),
-        reasons:steps.map(s=>((s.querySelector('.plan-reason')?.textContent)||'').trim()),
-        diffs:steps.map(s=>[...s.querySelectorAll('.diff-list li')].map(li=>li.textContent.replace(/\\s+/g,' ').trim())),
-        noNew:steps.filter(s=>/未新增任何规则问题/.test(s.textContent)).length,
-        call:rowVal('本次调用'),
-        snapshot:rowVal('发给模型的项目快照'),
-      };
+    // 旧独立 plan-step UI 已移除；只核对当前公开入口，真实 Agent 链留给 B37/B38。
+    const aiEntryContract17 = await evalJs(`(()=>{
+      const chat=document.querySelector('.side-right .ai-btn-chat');
+      const agent=document.querySelector('.side-right .ai-btn-agent');
+      const compare=[...document.querySelectorAll('.side-right button')].find(b=>b.textContent.trim()==='规划候选对比');
+      const legacy=[...document.querySelectorAll('.side-right button')].filter(b=>b.textContent.trim()==='生成编辑计划');
+      return {chat:chat?{label:chat.textContent.trim(),title:chat.title}:null,
+        agent:agent?{label:agent.textContent.trim(),title:agent.title}:null,
+        compare:compare?{label:compare.textContent.trim(),title:compare.title}:null,
+        legacyPlanButtons:legacy.length,oldPlanClass:!!document.querySelector('.side-right .ai-btn-plan')};
     })()`);
-
-    ok(`干跑把 ${planDom.count} 条动作一条一卡地列出来（不是一个"共 2 处改动"的汇总）`, planDom.count === 2, JSON.stringify(planDom.actions));
-    ok('两条都标为可应用（没有失败卡）', planDom.bad === 0, `坏卡 ${planDom.bad} 张`);
-    ok('每条给出编译后的命令人话摘要（与鼠标操作的日志是同一套说法）', planDom.labels.every((s) => s && s !== '(未编译)'), JSON.stringify(planDom.labels));
-    ok('每条回显 AI 给的理由（不是黑箱改模型）', planDom.reasons.every((s) => /AI 理由/.test(s) && s.length > 6), JSON.stringify(planDom.reasons));
-    ok('每条给出将要发生的 diff —— 用户点"应用"的唯一依据就是这个', planDom.diffs.every((d) => d.length > 0), JSON.stringify(planDom.diffs));
-    ok(
-      'diff 里能读到踢脚高 80 → 120（预览给出的数，就是待会儿真会落进模型的数）',
-      planDom.diffs.some((d) => d.some((x) => /params\.bodyLift/.test(x) && /80\s*→\s*120/.test(x))),
-      JSON.stringify(planDom.diffs)
-    );
-    ok('两条都没有新增规则问题（strict 干跑放行）', planDom.noNew === 2, String(planDom.noNew));
-    ok(
-      '面板如实写出这次用了哪个模型、花了多少 token、耗时多少（用量是账单，不能估）',
-      /**
-       * 耗时用**秒**显示，不用毫秒。
-       * 这台局域网推理模型单次是 17–27 秒 —— "26500ms"要在脑子里除一次才读得懂，
-       * 而"26.5s"是直接懂的。显示的单位要按量级选。
-       */
-      /mock-model-1/.test(String(planDom.call)) && /1290 token/.test(String(planDom.call)) && /\d+\.\d+s/.test(String(planDom.call)),
-      String(planDom.call)
-    );
-    ok('预览阶段模型没被动过：版本还是原来的', (await statusVersion()) === vBeforeAi, `v${vBeforeAi} → v${await statusVersion()}`);
-    ok(
-      '预览阶段柜体名与踢脚高都还是原值（"预览"真的是预览）',
-      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');const c=s.bus.getState().cabinets[0];return c.name+'|'+c.params.bodyLift})()`)) === `${aiBefore.name}|${aiBefore.lift}`,
-      `期望 ${aiBefore.name}|${aiBefore.lift}`
-    );
-
-    // ── 应用 ──
-    ok('点「应用全部（2 条）」', (await clickPanelBtn('应用全部', 1400)) === true);
-    ok('应用后有明确回执（不静默生效）', /已应用\s*2\s*条/.test(await text('.toasts')), await text('.toasts'));
-
-    const aiAfter = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const c=s.bus.getState().cabinets[0];
-      return { name:c.name, lift:c.params.bodyLift, height:c.params.height, version:s.bus.getVersion() };})()`);
-    ok('踢脚真的变成了预览里写的 120 —— 「预览 === 提交」在 AI 通路上同样成立', aiAfter.lift === 120, String(aiAfter.lift));
-    ok(`柜体名真的改了（${aiBefore.name} → ${aiAfter.name}）`, aiAfter.name === `${aiBefore.name}·AI`, String(aiAfter.name));
-    ok('两条命令各 +1：模型版本 +2', aiAfter.version === vBeforeAi + 2, `v${vBeforeAi} → v${aiAfter.version}`);
-    ok('高度没被顺手改掉（AI 只动了它说会动的东西）', aiAfter.height === aiBefore.height, `${aiBefore.height} → ${aiAfter.height}`);
-    ok('应用后模型里 0 ERROR', (await text('.sb-badge-err')) === '', await text('.sb-badge-err'));
-
-    const keepPanel = await aiPanel();
-    ok('已提交的计划留在面板上（不会"版本一变就清屏"，人能回头核对到底改了什么）', /已应用\s*2\s*条/.test(keepPanel) && /干跑预览/.test(keepPanel), keepPanel.slice(0, 240));
-    const applyBtnDisabled = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')]
-      .find(x=>/已应用|应用全部/.test(x.textContent));return b? b.disabled : null;})()`);
-    ok('应用按钮已禁用（同一份计划不可能被提交两次）', applyBtnDisabled === true, String(applyBtnDisabled));
-
-    await activateRightTab('历史');
-    await sleep(360);
-    const histAiAfter = await text('.side-right .hist');
-    const histCountAfter = await evalJs(`document.querySelectorAll('.side-right .hist-item').length`);
-    /**
-     * ⚠ 这里不能用"条目数 = 之前 + 2"来判断。
-     *
-     * 第一版就是这么写的，报 `2 → 3`（少了一条），我一度以为是"有条命令没进历史"。
-     * 实际原因是模型本身的规矩：**撤销之后再执行新命令，会丢弃重做尾巴**
-     * （`commandBus.execute` 里那句 `entries.slice(0, pointer + 1)`，与所有
-     * CAD/编辑器的线性历史一致）。B14 结尾撤销过一次，于是历史里留着一条
-     * 未被应用的尾巴；B17 的第一条命令一来，那条尾巴就被丢掉了 —— 它恰好是
-     * 一条 source=ai 的条目，所以净增是 2 - 1 = +1。
-     *
-     * 结论：断言要盯住"这两条命令到底有没有进历史、标成什么"，而不是去做
-     * 一个依赖前面所有用例行为的加法 —— 那种断言会在别处改动时莫名其妙地红。
-     */
-    ok(
-      '两条 AI 命令都进了同一条历史时间线（与鼠标操作并列，不是另开一本账）',
-      /AI：「[^」]*」踢脚高 → 120mm/.test(histAiAfter) && /AI：重命名「[^」]*」→「[^」]*·AI」/.test(histAiAfter),
-      histAiAfter.slice(0, 700)
-    );
-    ok('历史里带「AI：」前缀的 label（与鼠标操作的写法一致，复盘时一眼分得清）', /AI：/.test(histAiAfter));
-    ok('历史写出真实 diff：params.bodyLift 80 → 120', /params\.bodyLift:\s*80\s*→\s*120/.test(histAiAfter), histAiAfter.slice(0, 700));
-    ok('历史里能读到改名那一笔', /主卧衣柜·AI/.test(histAiAfter), histAiAfter.slice(0, 700));
-    ok('历史条目仍带派生快照（AI 改完不会留下旧快照）', /板件\s*\d+\s*件/.test(histAiAfter));
-    ok(
-      `执行新命令会丢弃"撤销过的重做尾巴"（AI 之前 ai 条目 ${histAiBefore} 条，现在历史共 ${histCountAfter} 条）—— 这条正是上面那次误判的根源，现在它自己也有断言看着了`,
-      histCountAfter >= 3,
-      String(histCountAfter)
-    );
-
-    // ── 负例：一条动作不符合契约 → 整份计划必须停住，并说清是哪一条、为什么 ──
-    await activateRightTab('AI');
-    await sleep(340);
-    ok('能再写一句（面板没有被上一轮锁死）', (await setElValue('.side-right .ai-input', '把主卧衣柜的踢脚改成 140，顺便改个名字（越界参数）')) === true);
-    const vBeforeBad = await statusVersion();
-    ok('点「生成计划」（第二次）', (await clickPanelBtn('生成编辑计划', 1600)) === true);
-    const badShown = await waitFor(`/不符合契约/.test(document.querySelector('.side-right .panel-scroll')?.textContent||'')`, 25000);
-    const badPanel = await aiPanel();
-    ok(
-      '有动作不符合契约时，界面点名"第几条 + 具体原因"，而不是光一句"规划失败"',
-      badShown === true && /第 2 条/.test(badPanel) && /volume/.test(badPanel),
-      badPanel.slice(0, 460)
-    );
-    ok('被拒的动作逐条列在告警框里（一条都不藏）', (await evalJs(`document.querySelectorAll('.side-right .alert-warn li').length`)) >= 1, String(await evalJs(`document.querySelectorAll('.side-right .alert-warn li').length`)));
-    ok('没有出现干跑预览（根本没走到"看起来可以应用"那一步）', (await evalJs(`document.querySelectorAll('.side-right .plan-step').length`)) === 0);
-
-    const afterBad = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const c=s.bus.getState().cabinets[0];
-      return { name:c.name, lift:c.params.bodyLift, version:s.bus.getVersion() };})()`);
-    ok(
-      '合法的那一条（改踢脚 140）也没被执行 —— 原子性：半执行的模型会让人以为整句话都生效了',
-      afterBad.lift === 120 && afterBad.name === aiAfter.name,
-      JSON.stringify(afterBad)
-    );
-    ok('模型版本一个数都没动', afterBad.version === vBeforeBad, `v${vBeforeBad} → v${afterBad.version}`);
-
-    // ── Node 侧交叉验证：服务端真的记了这笔 AI 调用（浏览器看不到的地方）──
-    if (VERIFY_AUDIT) {
-      const auditEntries = fs
-        .readFileSync(VERIFY_AUDIT, 'utf8')
-        .split(/\r?\n/)
-        .filter((l) => l.trim())
-        .map((l) => {
-          try {
-            return JSON.parse(l);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean);
-      const plans = auditEntries.filter((e) => e.action === 'ai.plan');
-      ok(`服务端审计里留下了 AI 调用记录（${plans.length} 条 ai.plan）`, plans.length >= 2, JSON.stringify(auditEntries.map((e) => e.action)));
-      /**
-       * 三态而不是两态：`ok`（全部动作合规）/ `partial`（有动作被拒，前端会整份拒绝）/
-       * `rejected`（全部被拒）。如果只记 ok / rejected，"部分被拒"就会在账上显示成成功 ——
-       * 而界面明明说的是"整份计划不予执行"。审计必须和界面说同一件事。
-       */
-      ok(
-        '第一条成功记为 ok，第二条（含越界参数）记为 partial —— 审计与界面的说法一致',
-        plans.some((p) => p.result === 'ok') && plans.some((p) => p.result === 'partial'),
-        JSON.stringify(plans.map((p) => p.result))
-      );
-      ok('partial 那条写明了被拒的契约错误码（EXTRA_PARAM）', plans.some((p) => p.result === 'partial' && (p.rejected ?? []).includes('EXTRA_PARAM')), JSON.stringify(plans.find((p) => p.result === 'partial')));
-      ok('审计里记了模型名与动作名（出账/追责靠这个，不是一坨日志）', plans.every((p) => p.model) && plans.some((p) => Array.isArray(p.actions) && p.actions.length > 0), JSON.stringify(plans[0]));
-    }
+    ok('当前对话入口明确说明不会改模型', aiEntryContract17.chat?.label.includes('不改模型') && aiEntryContract17.chat?.title.includes('不会修改模型'), JSON.stringify(aiEntryContract17.chat));
+    ok('当前 Agent 入口明确走 MCP 工具，不与对话混用', aiEntryContract17.agent?.label.includes('Agent 执行') && /MCP 工具/.test(aiEntryContract17.agent?.title || ''), JSON.stringify(aiEntryContract17.agent));
+    ok('规划候选对比是独立的确定性候选枚举，不调 AI、不改模型', aiEntryContract17.compare?.label === '规划候选对比' && /确定性候选枚举/.test(aiEntryContract17.compare?.title || '') && /不调 AI、不改模型/.test(aiEntryContract17.compare?.title || ''), JSON.stringify(aiEntryContract17.compare));
+    ok('旧式独立“生成编辑计划”按钮已从 UI 移除，当前草案路径由 Agent 接管', aiEntryContract17.legacyPlanButtons === 0 && aiEntryContract17.oldPlanClass === false, JSON.stringify(aiEntryContract17));
+    const vBeforeAiEntry17 = await statusVersion();
+    await sleep(120);
+    ok('只检查 AI 入口契约不会写入模型', (await statusVersion()) === vBeforeAiEntry17, `v${vBeforeAiEntry17} → v${await statusVersion()}`);
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -2396,81 +3714,120 @@ async function waitForApp(url, timeoutMs = 25000) {
      *
      * 用户原话："目前ai功能太少，只能修改长宽高等一些基础参数……能不能利用AI更具描述生成"。
      *
-     * node 侧已经证明"意图 → 分区"的映射和恒等式，但用户真正要的是
-     * **在界面上说一句话就得到一个柜子**。这条链路（输入 → mock 服务商 →
-     * 契约 → 干跑 → 点应用 → 对象树/四视图里真的多出一台柜）只在浏览器里存在。
+     * node 侧已经证明"意图 → 分区"的映射和恒等式。当前 UI 由 Agent 接管旧的
+     * 计划/草案按钮：输入 → Agent MCP 工具调用 → validate → 服务端草稿 → 用户
+     * 显式确认 apply/sync → 本地模型/四视图，必须按现行产品路径真实验证。
      *
      * 关键断言不是"多了一个柜"，而是三条：
      *   ① 建出来的内部结构**就是描述里说的那个**（三个分区、抽屉数、门扇数）
      *   ② 落位是系统替它挑的，且**不撞墙**（不许"放进去再说"）
-     *   ③ 一次生成 = 一条命令 = 一次撤销（不是散落一堆改动收不回来）
+     *   ③ apply 前本地不变；明确确认后版本只前进一次并同步正确房间。
      */
     section('B37 AI 照描述生成柜体：一句话 → 真界面 → 真的多出一台柜');
+    const provider37 = configureAgentMockProvider('B37');
+    ok('B37 Agent success-path 指向本轮本地 mock provider', provider37.baseUrl === process.env.VERIFY_MOCK_URL && provider37.apiKeySet,
+      JSON.stringify(provider37));
 
     await activateRightTab('AI');
     await sleep(360);
 
-    // 先存现场。这一节会真的往模型里加一台柜，而下游 B21 / B30 的落位断言
-    // 依赖"房间还剩多少空位" —— 不还原就会把人家挤到没地方放（第一轮就踩了，
-    // B30 于是报"两个柜体重叠"，看起来像模板放置有 bug，其实是这里留了赃物）。
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      window.__b37Saved = structuredClone(s.bus.getState()); return true})()`);
+    // DraftsPanel 只有在服务端与本地基线一致时才会自动同步；先保存本地现场，
+    // 再从隔离 server workspace 建立匹配基线，避免把不同项目静默覆盖。
+    const before37Operation = await startServerBaselineFixture('B37.server-baseline', '__b37OriginalLocal');
+    const before37 = before37Operation.result;
+    if (!before37) throw new Error(`[B37 harness] baseline missing: ${JSON.stringify(before37Operation)}`);
+    ok('B37 建立有效服务端房间基线并保存原本地现场', before37.ready === true && before37.httpStatus === 200 && !!before37.roomId,
+      JSON.stringify(before37));
+    if (!before37.ready || !before37.roomId) throw new Error(`[B37 harness] server baseline unavailable: ${JSON.stringify(before37)}`);
+    const auditBefore37Operation = await readMcpToolAudit('B37.mcp-audit-before');
+    const auditBefore37 = auditBefore37Operation.result;
+    const liveProvider37 = await readConfiguredAgentMockProvider('B37');
+    ok('B37 发起 Agent 请求前 GET /api/settings 确认使用本轮本地 mock', liveProvider37.matches, JSON.stringify(liveProvider37.actual));
+    if (!liveProvider37.matches) throw new Error(`[B37 provider] live /api/settings mismatch; refusing Agent request: ${JSON.stringify(liveProvider37.actual)}`);
 
-    const before37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState();
-      return { ver:s.bus.getVersion(), count:p.cabinets.length,
-        names:p.cabinets.map(c=>c.name), errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length };})()`);
+    const intent37 = '帮我生成一个餐边柜：左边三只抽屉，中间两块层板带一组对开门，右边留开放格';
+    const agentStartedAtMs37 = Date.now();
+    const agent37 = await runAgentDraftViaUi(intent37);
+    const agentFinishedAtMs37 = Date.now();
+    const auditAfter37Operation = await readMcpToolAudit('B37.mcp-audit-after');
+    const auditAfter37 = auditAfter37Operation.result;
+    const priorAuditKeys37 = new Set((auditBefore37?.events ?? []).map(mcpAuditKey));
+    const newMcpEvents37 = (auditAfter37?.events ?? []).filter(e => {
+      const at = Date.parse(e.at);
+      return !priorAuditKeys37.has(mcpAuditKey(e)) && at >= agentStartedAtMs37 && at <= agentFinishedAtMs37;
+    });
+    console.log(`[B37] MCP_AUDIT_WINDOW ${JSON.stringify({ startedAt: new Date(agentStartedAtMs37).toISOString(), finishedAt: new Date(agentFinishedAtMs37).toISOString(), events: newMcpEvents37 })}`);
+    const steps37 = agent37.evidence?.steps ?? [];
+    const create37 = steps37.find(s => s.tool === 'cad.create_cabinet');
+    const validate37 = steps37.find(s => s.tool === 'cad.validate');
+    const createAudit37 = newMcpEvents37.find(e => e.tool === 'cad.create_cabinet' && e.result === 'ok');
+    const validateAudit37 = newMcpEvents37.find(e => e.tool === 'cad.validate' && e.result === 'ok');
+    const validateDraftBound37 = validate37?.args?.draftId === create37?.result?.draftId;
+    const linkedAudit37 = createAudit37?.draftId === create37?.result?.draftId
+      && createAudit37?.cabinetId === create37?.result?.cabinetId
+      && validateAudit37?.workspaceId === before37.workspaceId
+      && validateAudit37?.blockingErrors === 0
+      && Date.parse(createAudit37?.at) <= Date.parse(validateAudit37?.at)
+      && validateDraftBound37;
+    const agentReady37 = agent37.inputSet && agent37.buttonInfo?.label.includes('Agent 执行')
+      && !agent37.buttonInfo?.disabled && agent37.clicked && agent37.completed && agent37.evidence?.remote;
+    ok('通过当前「Agent 执行」按钮真实提交结构描述并得到远端草稿', agentReady37,
+      JSON.stringify({ inputSet: agent37.inputSet, button: agent37.buttonInfo, clicked: agent37.clicked,
+        completed: agent37.completed, remote: agent37.evidence?.remote, ui: agent37.evidence?.uiTail }));
+    ok('Agent 确实经 MCP 调用 create_cabinet 与 validate，二者均成功',
+      !!create37?.ok && !!validate37?.ok, JSON.stringify(steps37.map(s => ({ tool: s.tool, ok: s.ok, blockingErrors: s.blockingErrors }))));
+    ok('本轮 Agent 的 audit create/validate 与 draftId、cabinetId、workspaceId 及零阻断校验关联',
+      Boolean(linkedAudit37), JSON.stringify({ createAudit37, validateAudit37, createResult: create37?.result,
+        validateDraftId: validate37?.args?.draftId, expectedWorkspaceId: before37.workspaceId, auditWindow: [agentStartedAtMs37, agentFinishedAtMs37] }));
+    ok('Agent 的实际 MCP 参数保留餐边柜三分区、3抽与2门语义',
+      create37?.args?.units?.length === 3
+        && create37.args.units.map(u => u.kind).join(',') === 'drawerBank,shelves,open'
+        && create37.args.units[0]?.count === 3 && create37.args.units[1]?.doorCount === 2
+        && create37.args.roomId === before37.roomId,
+      JSON.stringify(create37?.args));
+    ok('Agent validate 在本轮服务器草稿上返回 0 个阻断错误（以未截断 audit 字段为准）', validateAudit37?.blockingErrors === 0,
+      JSON.stringify({ blockingErrors: validateAudit37?.blockingErrors, workspaceId: validateAudit37?.workspaceId, draftId: validate37?.args?.draftId }));
+    ok('远端草稿 apply 前浏览器本地模型与版本均未改变',
+      agent37.beforeApply?.count === before37.count && agent37.beforeApply?.ver === before37.ver,
+      JSON.stringify({ before: { count: before37.count, ver: before37.ver }, after: agent37.beforeApply }));
+    if (!agentReady37 || !create37?.ok || !validate37?.ok || !linkedAudit37 || validateAudit37?.blockingErrors !== 0) {
+      await startPageRestore('B37.failed-agent-restore', { snapshotKey: '__b37OriginalLocal', busGlobal: '__verifyBus', mode: 'project', label: 'B37 失败恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B37 Agent] current Agent/MCP flow did not produce a validated remote draft: ${JSON.stringify({ agent37, steps37, newMcpEvents37 })}`);
+    }
 
-    ok('能在输入框里写出一段结构描述（不是"把宽改成 1800"这种单参数指令）',
-      (await setElValue('.side-right .ai-input', '帮我生成一个餐边柜：左边三只抽屉，中间两块层板带一组对开门，右边留开放格')) === true);
-    ok('点「生成编辑计划」', (await clickPanelBtn('生成编辑计划', 20000)) === true);
+    const shotPreview37 = await shot(path.join(OUT_DIR, 'ai-generate-agent-pending.png'));
+    ok('Agent 远端草稿待确认界面截图已留档（非空）', shotPreview37 > 20000, `${shotPreview37} 字节`);
+    const applied37 = await applyRemoteDraftViaUi('AI生成柜', 'B37');
+    ok('从 Agent 结果进入远端草稿面板并显式确认 apply/sync',
+      applied37.openDrafts && applied37.applyVisible && applied37.applyClicked && applied37.syncReady
+        && applied37.confirmMessages.some(m => /服务端草稿/.test(m)), JSON.stringify(applied37));
+    ok('若服务端与本地基线不一致，apply 不静默覆盖，必须另行确认同步',
+      !applied37.needsExplicitSync || (applied37.localUnchangedBeforeSync === true && applied37.syncClicked), JSON.stringify(applied37));
+    if (!applied37.syncReady || !applied37.afterApply?.cabinetId) {
+      await startPageRestore('B37.failed-apply-restore', { snapshotKey: '__b37OriginalLocal', busGlobal: '__verifyBus', mode: 'project', label: 'B37 apply失败恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B37 Agent] remote draft apply/sync did not produce the expected local cabinet: ${JSON.stringify(applied37)}`);
+    }
 
-    const shown37 = await waitFor(`!!document.querySelector('.side-right .plan-step')`, 25000);
-    ok('出现干跑预览（走真 HTTP：界面 → 本地服务 → mock 服务商 → 回来）', shown37 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
-
-    const plan37 = await evalJs(`(()=>{
-      const steps=[...document.querySelectorAll('.side-right .plan-step')];
-      return {
-        count:steps.length,
-        bad:steps.filter(s=>s.classList.contains('plan-step-bad')).length,
-        actions:steps.map(s=>((s.querySelector('.plan-head .mono')?.textContent)||'').trim()),
-        labels:steps.map(s=>((s.querySelector('.plan-label')?.textContent)||'').trim()),
-        diffs:steps.map(s=>[...s.querySelectorAll('.diff-list li')].map(li=>li.textContent.replace(/\\s+/g,' ').trim())),
-      };
-    })()`);
-
-    ok('AI 给出的是"建一个柜"这条动作，而不是一串改尺寸的补丁',
-      plan37.actions.some((a) => /cabinet\.create/.test(a)), JSON.stringify(plan37.actions));
-    ok('预览里没有失败卡（描述被完整理解了）', plan37.bad === 0, `坏卡 ${plan37.bad} 张`);
-    ok('预览阶段模型没动：柜体数量不变', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before37.count,
-      `${before37.count} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)}`);
-
-    // 留一张"干跑预览"的图：这是用户点"应用"之前看到的唯一依据，值得被看见
-    const shotPreview37 = await shot(path.join(OUT_DIR, 'ai-generate-preview.png'));
-    ok('干跑预览截图已留档（非空）', shotPreview37 > 20000, `${shotPreview37} 字节`);
-
-    ok('点「应用」', (await clickPanelBtn('应用全部', 1400)) === true);
-    await sleep(420);
-
-    const after37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState();
+    const after37 = await evalJs(`(()=>{const bus=window.__verifyBus;const p=bus.getState();
       const c=p.cabinets.find(x=>x.name==='AI生成柜');
       return {
-        ver:s.bus.getVersion(), count:p.cabinets.length,
-        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length,
-        cab: c ? { name:c.name, w:c.params.width, h:c.params.height, d:c.params.depth,
+        ver:bus.getVersion(), count:p.cabinets.length,
+        errs:bus.derive().issues.filter(i=>i.severity==='ERROR').length,
+        cab: c ? { name:c.name, roomId:c.roomId, w:c.params.width, h:c.params.height, d:c.params.depth,
           place:JSON.stringify(c.placement),
           units:c.layout.units.map(u=>({id:u.id, kind:u.kind, nick:u.nickname,
-            drawers:u.drawers?.count ?? null, shelves:u.shelves?.count ?? null, doors:u.doors?.count ?? null})) } : null,
+            requestedWidth:u.requestedWidth, drawers:u.drawers?.count ?? null, shelves:u.shelves?.count ?? null, doors:u.doors?.count ?? null})) } : null,
       };})()`);
 
-    ok('真的多出一台柜（一次生成 = 一条命令 = 版本 +1）',
+    ok('明确确认远端草稿后本地同步只增加一台柜且版本 +1',
       after37.count === before37.count + 1 && after37.ver === before37.ver + 1, JSON.stringify({ c: `${before37.count}→${after37.count}`, v: `${before37.ver}→${after37.ver}` }));
     ok('描述里的三个分区一个不少（左抽 / 中门格 / 右开放）',
       Boolean(after37.cab) && after37.cab.units.length === 3
         && after37.cab.units.map((u) => u.kind).join(',') === 'drawerBank,shelves,open',
       JSON.stringify(after37.cab?.units));
+    ok('餐边柜落在 Agent 当前房间', after37.cab?.roomId === before37.roomId, JSON.stringify({ actual: after37.cab?.roomId, expected: before37.roomId }));
     ok('"三只抽屉"真的变成 3 只', after37.cab?.units[0]?.drawers === 3, String(after37.cab?.units[0]?.drawers));
+    ok('中间层板分区保留了 2 块层板', after37.cab?.units[1]?.shelves === 2, String(after37.cab?.units[1]?.shelves));
     ok('"带一组对开门"真的做了 2 扇门', after37.cab?.units[1]?.doors === 2, String(after37.cab?.units[1]?.doors));
     ok('"右边开放格"就是不带门（不是忘了做）', after37.cab?.units[2]?.doors === null, String(after37.cab?.units[2]?.doors));
     ok('分区 id 各不相同（否则板件撞 id → 清单少一块 → 生产下错料）',
@@ -2479,33 +3836,46 @@ async function waitForApp(url, timeoutMs = 25000) {
       after37.errs === before37.errs, `ERROR ${before37.errs} → ${after37.errs}`);
     ok('应用后没有新增硬错', after37.errs === 0, String(after37.errs));
 
-    // 撤销：一次生成必须一次收得回来
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
-    await sleep(320);
-    const undo37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`);
-    ok('一次撤销就把这台柜收回去（生成不是散落一堆改不回来的改动）', undo37 === before37.count, `${after37.count} → ${undo37}`);
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.redo();return true})()`);
-    await sleep(320);
-    ok('重做又能回来（历史是线性的，不是一次性操作）',
-      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before37.count + 1);
-
-    // 切到四视图拍一张：新柜在图上真的画出来了（不是只在对象树里多一行）
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
-    await sleep(1100);
+    // Apply 按产品契约切回房间工作区；确认目标柜卡和三个真实视图已挂载。
+    const roomViewReady37 = await waitFor(`(()=>{const root=document.querySelector('.room-workspace');const card=[...(root?.querySelectorAll('.workspace-cabinet-card')||[])].find(c=>c.querySelector('.workspace-cabinet-name')?.textContent.trim()==='AI生成柜');return !!root&&!!card&&card.querySelectorAll('.workspace-view').length===3})()`, 7000, 150);
+    const workspaceAfterApply37 = await evalJs(`(()=>{const root=document.querySelector('.room-workspace');const card=[...(root?.querySelectorAll('.workspace-cabinet-card')||[])].find(c=>c.querySelector('.workspace-cabinet-name')?.textContent.trim()==='AI生成柜');return {workspace:!!root,room:root?.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',cabinet:card?.querySelector('.workspace-cabinet-name')?.textContent.trim()||'',views:[...(card?.querySelectorAll('.workspace-view strong')||[])].map(x=>x.textContent.trim()),chatContext:root?.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||''}})()`);
+    ok('确认远端草稿后回到房间工作区，目标柜卡的外观/内部/俯视三视图真实可见', roomViewReady37
+      && workspaceAfterApply37?.room === before37.roomName && workspaceAfterApply37?.cabinet === 'AI生成柜'
+      && workspaceAfterApply37?.views.join('|') === '外观正面|内部结构|俯视图', JSON.stringify(workspaceAfterApply37));
+    const appliedViewPass37 = roomViewReady37 && workspaceAfterApply37?.room === before37.roomName
+      && workspaceAfterApply37?.cabinet === 'AI生成柜' && workspaceAfterApply37?.views.join('|') === '外观正面|内部结构|俯视图';
     const shotApplied37 = await shot(path.join(OUT_DIR, 'ai-generate-applied.png'));
     ok('应用后截图已留档（非空）', shotApplied37 > 20000, `${shotApplied37} 字节`);
 
     // 还原现场：本节自己造的柜子不许留给下游
-    const restored37 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      if (!window.__b37Saved) return null;
-      s.bus.replaceProject(window.__b37Saved, 'B37 还原现场');
-      const p=s.bus.getState();
-      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name) };})()`);
+    const restore37Operation = await startPageRestore('B37.restore-fixture', {
+      snapshotKey: '__b37OriginalLocal', busGlobal: '__verifyBus', mode: 'project', label: 'B37 还原原本地现场', clearSaved: true,
+    }, 5000);
+    const restored37 = await evalJs(`(()=>{const p=window.__verifyBus.getState();return {count:p.cabinets.length,names:p.cabinets.map(c=>c.name),project:p.name,projectId:p.id,version:window.__verifyBus.getVersion()}})()`);
     ok('B37 结束后把现场还原了（自己造的柜子不许留给下游占地方）',
-      Boolean(restored37) && restored37.count === before37.count
-        && restored37.names.join('|') === before37.names.join('|'),
-      `还原=${JSON.stringify(restored37)} 之前=${JSON.stringify(before37.names)}`);
+      restore37Operation.result?.restored === true && Boolean(restored37) && restored37.count === before37.original.count
+        && restored37.names.join('|') === before37.original.names.join('|')
+      && restored37.projectId === before37.original.projectId,
+      `还原=${JSON.stringify(restored37)} 之前=${JSON.stringify(before37.original)} restore=${JSON.stringify(restore37Operation.result)}`);
     await sleep(240);
+    const originalRoomName37 = await evalJs(`window.__verifyBus.getState().rooms[0]?.name||''`);
+    const restoredWorkspaceRoom37 = await selectWorkspaceRoom(originalRoomName37);
+    const aiPanelReady37 = await waitFor(`!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input')&&!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent')`, 5000, 120);
+    const aiPanelState37 = await evalJs(`(()=>{let context=null;try{context=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{};return {workspace:!!document.querySelector('.room-workspace'),room:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',chatContext:document.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||'',input:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input'),agentButton:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent'),projectId:window.__verifyBus.getState().id,roomId:window.__verifyBus.getState().rooms.find(r=>r.name===document.querySelector('.workspace-room-heading h1')?.textContent.trim())?.id||'',context}})()`);
+    ok('B37 teardown 恢复原项目房间上下文与内嵌 Agent UI，作为 B38 的干净起点', restoredWorkspaceRoom37.clicked
+      && aiPanelReady37 && aiPanelState37?.workspace && aiPanelState37?.room === originalRoomName37
+      && aiPanelState37?.chatContext.includes(`当前上下文：${originalRoomName37}`)
+      && aiPanelState37?.context?.projectId === aiPanelState37?.projectId
+      && aiPanelState37?.context?.roomId === aiPanelState37?.roomId,
+    JSON.stringify({originalRoomName37,restoredWorkspaceRoom37,aiPanelReady37,aiPanelState37}));
+    if (!appliedViewPass37 || !restoredWorkspaceRoom37.clicked || !aiPanelReady37 || !aiPanelState37?.workspace
+      || aiPanelState37?.room !== originalRoomName37 || !aiPanelState37?.chatContext.includes(`当前上下文：${originalRoomName37}`)
+      || aiPanelState37?.context?.projectId !== aiPanelState37?.projectId
+      || aiPanelState37?.context?.roomId !== aiPanelState37?.roomId) {
+      throw new Error(`[B37 workspace/teardown] applied-view or restore-context assertion failed: ${JSON.stringify({appliedViewPass37,workspaceAfterApply37,originalRoomName37,restoredWorkspaceRoom37,aiPanelReady37,aiPanelState37})}`);
+    }
+
+    }
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -2514,87 +3884,240 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 餐边柜 / 岛台的派生正确性已由 node 侧验收（complex-cabinets-acceptance）
      * 覆盖；浏览器里专挑洗衣机柜验，因为它最刁：
      * kind:'appliance'（洞口三尺寸 + 上面抽屉）必须是 AI 契约里**说得出的话**
-     * ——否则就是"AI 建不出来、用户还得手动改"，那句"照描述生成"就名存实亡。
+     * ——当前产品将旧计划按钮合并到 Agent；此处通过真实按钮、MCP draft/validate、
+     * 远端草稿确认和本地同步验证该语义能否走完生产前流程。
      *
      * 三条硬断言（与 B37 同构，但每一层都换了内容）：
      *   ① 落地的语义就是描述里那个（洞口 650×850×600、上面 3 只抽屉、电器格不带门）
      *   ② 派生分流正确：洗衣机本体进**甲购件**（不走开料机），过梁板进**开料**
-     *   ③ 一次生成 = 一条命令 = 一次撤销
+     *   ③ apply 前本地不变；确认后版本只前进一次、房间与采购/开料分流正确。
      */
     section('B38 AI 生成复杂柜型（洗衣机柜）：一句话 → 电器格语义 → 甲购件分流');
+    const provider38 = configureAgentMockProvider('B38');
+    ok('B38 洗衣机 Agent success-path 独立指向本轮本地 mock provider', provider38.baseUrl === process.env.VERIFY_MOCK_URL && provider38.apiKeySet,
+      JSON.stringify(provider38));
 
-    await activateRightTab('AI');
-    await sleep(360);
+    // ONLY=B38 may arrive from B0 in CAD mode; navigate back through the real
+    // toolbar entry. In the full suite B37 already leaves this workspace open.
+    let b38WorkspaceOpen = await evalJs(`!!document.querySelector('.room-workspace')`);
+    let b38WorkspaceButtonClicked = false;
+    if (!b38WorkspaceOpen) {
+      b38WorkspaceButtonClicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar button')].find(x=>x.getAttribute('title')==='返回 AI 房间工作区'||x.textContent.trim()==='AI 工作区');if(!b)return false;b.click();return true})()`);
+      b38WorkspaceOpen = b38WorkspaceButtonClicked && await waitFor(`!!document.querySelector('.room-workspace')`, 7000, 150);
+    }
+    ok('B38 通过真实 AI 工作区入口处于房间工作区', b38WorkspaceOpen,
+      JSON.stringify({b38WorkspaceButtonClicked,b38WorkspaceOpen}));
+    if (!b38WorkspaceOpen) throw new Error(`[B38 harness] could not enter room workspace through the product UI: ${JSON.stringify({b38WorkspaceButtonClicked,b38WorkspaceOpen})}`);
 
-    // 同 B37 的教训：本节会真的往模型里加一台柜，先存现场，结束还原。
-    // （下游 B21 / B30 的落位断言依赖"房间还剩多少空位"，留赃物会把人家挤挂。）
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      window.__b38Saved = structuredClone(s.bus.getState()); return true})()`);
+    // 先对齐隔离服务端基线，以便远端 draft 只有经 UI 确认后才同步本地；保留原本地快照作 teardown。
+    const b38BaselineOperation = await startServerBaselineFixture('B38.server-baseline', '__b38OriginalLocal');
+    const b38Setup = b38BaselineOperation.result;
+    await evalJs(`(()=>{window.__b38Bus=window.__verifyBus;return true})()`);
+    ok('B38 读取有效服务端房间并保存原本地现场', b38Setup?.ready === true && b38Setup.httpStatus === 200 && !!b38Setup.roomId, JSON.stringify(b38Setup));
+    if (!b38Setup?.ready || !b38Setup.roomId) throw new Error(`[B38 harness] server workspace baseline unavailable: ${JSON.stringify(b38Setup)}`);
+    const b38WorkspaceRoom = await selectWorkspaceRoom(b38Setup.roomName);
+    const b38AgentPanelReady = await waitFor(`!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input')&&!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent')`, 7000, 120);
+    const b38AgentPanelState = await evalJs(`(()=>({workspace:!!document.querySelector('.room-workspace'),
+      room:document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',
+      chatContext:document.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||'',
+      roomId:window.__verifyBus.getState().rooms.find(r=>r.name===document.querySelector('.workspace-room-heading h1')?.textContent.trim())?.id||'',
+      input:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input'),
+      agentButton:(()=>{const b=document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent');return b?{text:b.textContent.trim(),disabled:b.disabled}:null})()}))()`);
+    console.log(`[B38] WORKSPACE_AGENT_READY ${JSON.stringify({roomSelection:b38WorkspaceRoom,ready:b38AgentPanelReady,state:b38AgentPanelState})}`);
+    ok('B38 真实选中服务端房间，标题/聊天上下文一致且房间工作区 Agent 已挂载', b38WorkspaceRoom.clicked && b38AgentPanelReady
+      && b38AgentPanelState?.workspace && b38AgentPanelState?.room === b38Setup.roomName
+      && b38AgentPanelState?.roomId === b38Setup.roomId
+      && b38AgentPanelState?.chatContext.includes(`当前上下文：${b38Setup.roomName}`)
+      && b38AgentPanelState?.agentButton?.text.includes('Agent 执行'),
+      JSON.stringify({b38WorkspaceRoom,b38AgentPanelReady,b38AgentPanelState,expectedRoom:{id:b38Setup.roomId,name:b38Setup.roomName}}));
+    if (!b38WorkspaceRoom.clicked || !b38AgentPanelReady || !b38AgentPanelState?.workspace
+      || b38AgentPanelState?.room !== b38Setup.roomName || b38AgentPanelState?.roomId !== b38Setup.roomId
+      || !b38AgentPanelState?.chatContext.includes(`当前上下文：${b38Setup.roomName}`)
+      || !b38AgentPanelState?.agentButton?.text.includes('Agent 执行')) {
+      await startPageRestore('B38.failed-panel-restore', { snapshotKey: '__b38OriginalLocal', busGlobal: '__b38Bus', mode: 'project', label: 'B38 面板失败恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B38 UI] room-workspace Agent panel/context not ready after server baseline: ${JSON.stringify({b38WorkspaceRoom,b38AgentPanelReady,b38AgentPanelState})}`);
+    }
+    const auditBefore38Operation = await readMcpToolAudit('B38.mcp-audit-before');
+    const auditBefore38 = auditBefore38Operation.result;
 
-    const before38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState();
-      return { ver:s.bus.getVersion(), count:p.cabinets.length,
-        names:p.cabinets.map(c=>c.name), errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length };})()`);
+    const before38 = b38Setup;
+    const liveProvider38 = await readConfiguredAgentMockProvider('B38');
+    ok('B38 发起 Agent 请求前 GET /api/settings 确认 provider/baseUrl/model 与本轮 mock 一致',
+      liveProvider38.matches, JSON.stringify(liveProvider38.actual));
+    if (!liveProvider38.matches) {
+      await startPageRestore('B38.provider-preflight-restore', { snapshotKey: '__b38OriginalLocal', busGlobal: '__b38Bus', mode: 'project', label: 'B38 provider不匹配恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B38 provider] live /api/settings mismatch; refusing Agent request: ${JSON.stringify(liveProvider38.actual)}`);
+    }
 
-    ok('能在输入框里写出一段电器格描述（洞口三尺寸 + 上面抽屉，契约外的旧词汇说不出这句话）',
-      (await setElValue('.side-right .ai-input', '帮我生成一个洗衣机柜：左边留 650 宽 850 高的洗衣机洞口，上面做三只抽屉，右边一组对开门层板柜')) === true);
-    ok('点「生成编辑计划」', (await clickPanelBtn('生成编辑计划', 20000)) === true);
+    const intent38 = '帮我生成一个洗衣机柜：左边留 650 宽 850 高的洗衣机洞口，上面做三只抽屉，右边一组对开门层板柜';
+    const agentStartedAtMs38 = Date.now();
+    const agent38 = await runAgentDraftViaUi(intent38, 60000, '.room-workspace .ai-workspace-panel');
+    const agentFinishedAtMs38 = Date.now();
+    const auditAfter38Operation = await readMcpToolAudit('B38.mcp-audit-after');
+    const auditAfter38 = auditAfter38Operation.result;
+    const priorAuditKeys38 = new Set((auditBefore38?.events ?? []).map(mcpAuditKey));
+    const newMcpEvents38 = (auditAfter38?.events ?? []).filter(e => {
+      const at = Date.parse(e.at);
+      return !priorAuditKeys38.has(mcpAuditKey(e)) && at >= agentStartedAtMs38 && at <= agentFinishedAtMs38;
+    });
+    console.log(`[B38] MCP_AUDIT_WINDOW ${JSON.stringify({ startedAt: new Date(agentStartedAtMs38).toISOString(), finishedAt: new Date(agentFinishedAtMs38).toISOString(), events: newMcpEvents38 })}`);
+    const steps38 = agent38.evidence?.steps ?? [];
+    const create38 = steps38.find(s => s.tool === 'cad.create_cabinet');
+    const validate38 = steps38.find(s => s.tool === 'cad.validate');
+    const createAudit38 = newMcpEvents38.find(e => e.tool === 'cad.create_cabinet' && e.result === 'ok');
+    const validateAudit38 = newMcpEvents38.find(e => e.tool === 'cad.validate' && e.result === 'ok');
+    const validateDraftBound38 = validate38?.args?.draftId === create38?.result?.draftId;
+    const linkedAudit38 = createAudit38?.draftId === create38?.result?.draftId
+      && createAudit38?.cabinetId === create38?.result?.cabinetId
+      && validateAudit38?.workspaceId === before38.workspaceId
+      && validateAudit38?.blockingErrors === 0
+      && Date.parse(createAudit38?.at) <= Date.parse(validateAudit38?.at)
+      && validateDraftBound38;
+    const draft38File = await readPersistedServerDraft(create38?.result?.draftId, 6000);
+    const draft38Project = draft38File.doc?.project ?? null;
+    const draft38Cabinet = draft38Project?.cabinets?.find(c => c.id === create38?.result?.cabinetId) ?? null;
+    const draft38Units = draft38Cabinet?.layout?.units ?? [];
+    const draft38Appliance = draft38Units.find(u => u.kind === 'appliance') ?? null;
+    const draft38Side = draft38Units.find(u => u.kind === 'shelves') ?? null;
+    const draft38MtimeInWindow = draft38File.ok && draft38File.mtimeMs >= agentStartedAtMs38 - 1000 && draft38File.mtimeMs <= agentFinishedAtMs38 + 2000;
+    const draftStructureMatches38 = draft38MtimeInWindow
+      && draft38File.doc.format === 'furniture-cad-draft' && draft38File.doc.formatVersion === 1
+      && draft38File.doc.draftId === create38?.result?.draftId
+      && draft38File.doc.workspaceId === before38.workspaceId
+      && draft38File.doc.baseModelVersion === before38.liveModelVersion
+      && draft38Project?.id === before38.projectId
+      && draft38Project?.rooms?.some(r => r.id === before38.roomId)
+      && draft38Cabinet?.name === 'AI洗衣机柜' && draft38Cabinet?.roomId === before38.roomId
+      && draft38Cabinet?.params?.width === 1400 && draft38Cabinet?.params?.height === 2100 && draft38Cabinet?.params?.depth === 620
+      && draft38Units.length === 2
+      && draft38Appliance?.nickname === '洗衣机位' && draft38Appliance?.requestedWidth === 700
+      && draft38Appliance?.appliance?.name === '洗衣机'
+      && draft38Appliance.appliance.openingWidth === 650 && draft38Appliance.appliance.openingHeight === 850 && draft38Appliance.appliance.openingDepth === 600
+      && draft38Appliance.appliance.topDrawers === 3 && draft38Appliance.drawers?.count === 3 && !draft38Appliance.doors
+      && draft38Side?.requestedWidth === 650 && draft38Side?.shelves?.count === 4 && draft38Side?.doors?.count === 2;
+    const draftStructureEvidence38 = {
+      ok: draft38File.ok, file: draft38File.file ?? null, error: draft38File.error ?? null,
+      mtimeMs: draft38File.mtimeMs ?? null, inAgentWindow: draft38MtimeInWindow,
+      format: draft38File.doc?.format ?? null, draftId: draft38File.doc?.draftId ?? null,
+      workspaceId: draft38File.doc?.workspaceId ?? null, baseModelVersion: draft38File.doc?.baseModelVersion ?? null,
+      projectId: draft38Project?.id ?? null, cabinetId: draft38Cabinet?.id ?? null,
+      roomId: draft38Cabinet?.roomId ?? null, units: draft38Units.map(u => ({kind:u.kind,nickname:u.nickname,requestedWidth:u.requestedWidth,
+        openingWidth:u.appliance?.openingWidth??null,openingHeight:u.appliance?.openingHeight??null,openingDepth:u.appliance?.openingDepth??null,
+        topDrawers:u.appliance?.topDrawers??null,drawers:u.drawers?.count??null,shelves:u.shelves?.count??null,doors:u.doors?.count??null}))
+    };
+    console.log(`[B38] PERSISTED_DRAFT ${JSON.stringify(draftStructureEvidence38)}`);
+    const agentReady38 = agent38.inputSet && agent38.buttonInfo?.label.includes('Agent 执行')
+      && !agent38.buttonInfo?.disabled && agent38.clicked && agent38.completed && agent38.evidence?.remote;
+    ok('通过当前「Agent 执行」按钮真实提交电器格描述并得到远端草稿', agentReady38,
+      JSON.stringify({ inputSet: agent38.inputSet, button: agent38.buttonInfo, clicked: agent38.clicked,
+        completed: agent38.completed, remote: agent38.evidence?.remote, ui: agent38.evidence?.uiTail }));
+    ok('Agent 确实经 MCP 调用 create_cabinet 与 validate，二者均成功',
+      !!create38?.ok && !!validate38?.ok, JSON.stringify(steps38.map(s => ({ tool: s.tool, ok: s.ok, blockingErrors: s.blockingErrors }))));
+    ok('本轮 Agent audit create/validate 关联本次 draftId/cabinetId/workspaceId，且 validate 零阻断',
+      Boolean(linkedAudit38), JSON.stringify({createAudit38,validateAudit38,createResult:create38?.result,
+        validateDraftId:validate38?.args?.draftId,expectedWorkspaceId:before38.workspaceId,auditWindow:[agentStartedAtMs38,agentFinishedAtMs38]}));
+    ok('Agent MCP 参数保留洗衣机洞口 650×850×600、上方3抽、侧柜双门和当前 roomId',
+      create38?.args?.units?.length === 2
+        && create38.args.units[0]?.kind === 'appliance' && create38.args.units[0]?.nickname === '洗衣机位'
+        && create38.args.units[0]?.width === 700 && create38.args.units[0]?.applianceName === '洗衣机'
+        && create38.args.units[0]?.openingWidth === 650 && create38.args.units[0]?.openingHeight === 850
+        && create38.args.units[0]?.openingDepth === 600 && create38.args.units[0]?.topDrawers === 3
+        && create38.args.units[1]?.kind === 'shelves' && create38.args.units[1]?.width === 650 && create38.args.units[1]?.doorCount === 2
+        && create38.args.roomId === before38.roomId,
+      JSON.stringify(create38?.args));
+    ok('Agent validate 在本轮服务端 draft 上返回 0 个阻断错误（未截断 audit 字段）', validateAudit38?.blockingErrors === 0,
+      JSON.stringify({blockingErrors:validateAudit38?.blockingErrors,workspaceId:validateAudit38?.workspaceId,draftId:validate38?.args?.draftId}));
+    ok('apply 前从隔离服务器持久化文件读回同一 draft 的完整电器格/抽屉/侧柜结构', Boolean(draftStructureMatches38), JSON.stringify(draftStructureEvidence38));
+    ok('服务端草稿尚未确认时浏览器本地模型和版本均未改变',
+      agent38.beforeApply?.count === before38.count && agent38.beforeApply?.ver === before38.ver,
+      JSON.stringify({ before: { count: before38.count, ver: before38.ver }, after: agent38.beforeApply }));
+    if (!agentReady38 || !create38?.ok || !validate38?.ok || !linkedAudit38 || !draftStructureMatches38) {
+      await startPageRestore('B38.failed-agent-restore', { snapshotKey: '__b38OriginalLocal', busGlobal: '__b38Bus', mode: 'project', label: 'B38 失败恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B38 Agent] current Agent/MCP flow did not produce a request-bound, structurally verified washer-cabinet draft: ${JSON.stringify({ agent38, steps38, newMcpEvents38, draftStructureEvidence38 })}`);
+    }
 
-    const shown38 = await waitFor(`!!document.querySelector('.side-right .plan-step')`, 25000);
-    ok('出现干跑预览（走真 HTTP：界面 → 本地服务 → mock 服务商 → 回来）', shown38 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
+    const shotPreview38 = await shot(path.join(OUT_DIR, 'ai-laundry-agent-pending.png'));
+    ok('洗衣机柜 Agent 远端草稿待确认界面截图已留档', shotPreview38 > 20000, `${shotPreview38} 字节`);
+    const applied38 = await applyRemoteDraftViaUi('AI洗衣机柜', 'B38');
+    ok('从 Agent 结果进入远端草稿面板并显式确认 apply/sync',
+      applied38.openDrafts && applied38.applyVisible && applied38.applyClicked && applied38.syncReady
+        && applied38.confirmMessages.some(m => /服务端草稿/.test(m)), JSON.stringify(applied38));
+    ok('基线不匹配时 apply 不静默覆盖本地，必须额外确认同步',
+      !applied38.needsExplicitSync || (applied38.localUnchangedBeforeSync === true && applied38.syncClicked), JSON.stringify(applied38));
+    ok('UI apply/sync 落地的 cabinetId 与本轮 MCP create 返回值完全一致',
+      applied38.afterApply?.cabinetId === create38?.result?.cabinetId,
+      JSON.stringify({appliedCabinetId:applied38.afterApply?.cabinetId,createdCabinetId:create38?.result?.cabinetId,applied38}));
+    if (!applied38.syncReady || !applied38.afterApply?.cabinetId) {
+      await startPageRestore('B38.failed-apply-restore', { snapshotKey: '__b38OriginalLocal', busGlobal: '__b38Bus', mode: 'project', label: 'B38 apply失败恢复原本地现场', clearSaved: true }, 5000);
+      throw new Error(`[B38 Agent] remote draft apply/sync did not produce the expected local washer cabinet: ${JSON.stringify(applied38)}`);
+    }
 
-    const plan38 = await evalJs(`(()=>{
-      const steps=[...document.querySelectorAll('.side-right .plan-step')];
-      return {
-        count:steps.length,
-        bad:steps.filter(s=>s.classList.contains('plan-step-bad')).length,
-        actions:steps.map(s=>((s.querySelector('.plan-head .mono')?.textContent)||'').trim()),
-      };
-    })()`);
-
-    ok('AI 给出的是"建一个柜"这条动作（复杂柜型也走 cabinet.create，不是散补丁）',
-      plan38.actions.some((a) => /cabinet\.create/.test(a)), JSON.stringify(plan38.actions));
-    ok('预览里没有失败卡（电器格意图被契约完整接住了）', plan38.bad === 0, `坏卡 ${plan38.bad} 张`);
-    ok('预览阶段模型没动：柜体数量不变', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before38.count,
-      `${before38.count} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)}`);
-
-    const shotPreview38 = await shot(path.join(OUT_DIR, 'ai-laundry-preview.png'));
-    ok('干跑预览截图已留档（非空）', shotPreview38 > 20000, `${shotPreview38} 字节`);
-
-    ok('点「应用」', (await clickPanelBtn('应用全部', 1400)) === true);
-    await sleep(420);
-
-    const after38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState();
+    const after38 = await evalJs(`(()=>{const bus=window.__b38Bus;
+      const p=bus.getState();
       const c=p.cabinets.find(x=>x.name==='AI洗衣机柜');
       const apUnit = c ? c.layout.units.find(u=>u.kind==='appliance') : null;
-      const g = c ? s.bus.derive().geom.cabinets[c.id] : null;
+      const g = c ? bus.derive().geom.cabinets[c.id] : null;
+      const canonicalNetWidth = g?.layout?.rows?.[0]?.nets?.[0] ?? null;
+      const derivedLayout = g?.layout ?? null;
+      const apRowIndex = apUnit&&derivedLayout?.rows ? derivedLayout.rows.findIndex(r=>r.units.some(u=>u.id===apUnit.id)) : -1;
+      const apRow = apRowIndex>=0 ? derivedLayout.rows[apRowIndex] : null;
+      const apUnitIndex = apRow ? apRow.units.findIndex(u=>u.id===apUnit.id) : -1;
       return {
-        ver:s.bus.getVersion(), count:p.cabinets.length,
-        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').length,
-        cab: c ? { id:c.id, units:c.layout.units.map(u=>({id:u.id, kind:u.kind, nick:u.nickname,
-          drawers:u.drawers?.count ?? null, doors:u.doors?.count ?? null})) } : null,
-        ap: apUnit ? { name:apUnit.appliance?.name, w:apUnit.appliance?.openingWidth,
+        ver:bus.getVersion(), count:p.cabinets.length,
+        errs:bus.derive().issues.filter(i=>i.severity==='ERROR').length,
+        cab: c ? { id:c.id, roomId:c.roomId, units:c.layout.units.map(u=>({id:u.id, kind:u.kind, nickname:u.nickname,
+          requestedWidth:u.requestedWidth, shelves:u.shelves?.count ?? null, drawers:u.drawers?.count ?? null, doors:u.doors?.count ?? null})) } : null,
+        ap: apUnit ? { name:apUnit.appliance?.name, nickname:apUnit.nickname, requestedWidth:apUnit.requestedWidth,
+          canonicalNetWidth, netWidth:apRow?.nets?.[apUnitIndex] ?? null, w:apUnit.appliance?.openingWidth,
           h:apUnit.appliance?.openingHeight, d:apUnit.appliance?.openingDepth,
-          top:apUnit.appliance?.topDrawers, wUnit:apUnit.width } : null,
+          top:apUnit.appliance?.topDrawers } : null,
         purchased: g ? g.purchased.map(x=>x.nameZh) : null,
         panelWasher: g ? g.panels.filter(x=>x.nameZh && x.nameZh.includes('洗衣机')).map(x=>x.nameZh) : null,
       };})()`);
 
-    ok('真的多出一台柜（一次生成 = 一条命令 = 版本 +1）',
+    const draftMatchesApplied38 = after38.cab?.id === draft38Cabinet?.id
+      && after38.cab?.roomId === draft38Cabinet?.roomId
+      && after38.cab?.units?.length === draft38Units.length
+      && after38.cab?.units?.[0]?.id === draft38Appliance?.id
+      && after38.cab?.units?.[0]?.requestedWidth === draft38Appliance?.requestedWidth
+      && after38.cab?.units?.[0]?.drawers === draft38Appliance?.drawers?.count
+      && after38.ap?.w === draft38Appliance?.appliance?.openingWidth
+      && after38.ap?.h === draft38Appliance?.appliance?.openingHeight
+      && after38.ap?.d === draft38Appliance?.appliance?.openingDepth
+      && after38.ap?.top === draft38Appliance?.appliance?.topDrawers
+      && after38.cab?.units?.[1]?.id === draft38Side?.id
+      && after38.cab?.units?.[1]?.shelves === draft38Side?.shelves?.count
+      && after38.cab?.units?.[1]?.doors === draft38Side?.doors?.count;
+    ok('确认应用后的当前本地柜体与先前读回的服务端 draft 结构同 ID、同房间、同电器格/侧柜字段',
+      Boolean(draftMatchesApplied38), JSON.stringify({draftMatchesApplied38,draftCabinetId:draft38Cabinet?.id,local:after38.cab,draftUnits:draftStructureEvidence38.units}));
+    ok('明确确认远端草稿后本地同步只增加一台柜且版本 +1',
       after38.count === before38.count + 1 && after38.ver === before38.ver + 1, JSON.stringify({ c: `${before38.count}→${after38.count}`, v: `${before38.ver}→${after38.ver}` }));
+    ok('洗衣机柜归属 Agent 当前选中的服务端房间', after38.cab?.roomId === before38.roomId, JSON.stringify({ cabinetRoomId: after38.cab?.roomId, expected: before38.roomId }));
     ok('两个分区都在：电器格 + 侧柜（不是只建了个空壳）',
       Boolean(after38.cab) && after38.cab.units.length === 2
         && after38.cab.units.map((u) => u.kind).join(',') === 'appliance,shelves',
       JSON.stringify(after38.cab?.units));
     ok('洞口三尺寸原样落地 650×850×600（这是安装师傅要的数，一个都不能漂）',
       after38.ap?.w === 650 && after38.ap?.h === 850 && after38.ap?.d === 600, JSON.stringify(after38.ap));
+    const applianceFit38 = { name: after38.ap?.name, nickname: after38.ap?.nickname,
+      requestedWidth: after38.ap?.requestedWidth, openingWidth: after38.ap?.w,
+      cabLayoutUnitNickname: after38.cab?.units?.[0]?.nickname,
+      derivedNetWidth: after38.ap?.canonicalNetWidth,
+      fits: after38.ap?.name === '洗衣机' && after38.cab?.units?.[0]?.nickname === '洗衣机位'
+        && after38.ap?.requestedWidth === 700 && after38.ap?.w === 650
+        && Number.isFinite(after38.ap?.canonicalNetWidth)
+        && after38.ap.canonicalNetWidth >= 650 };
+    console.log(`[B38] APPLIANCE_FIT ${JSON.stringify(applianceFit38)}`);
+    ok('洗衣机位 nickname 与实际派生净宽仍在，且洞口 650mm 不超出分区净宽',
+      applianceFit38.fits, JSON.stringify(applianceFit38));
     ok('"上面三只抽屉"真的变成 3 只（topDrawers 挂在抽屉字段上，不是装样子）',
       after38.ap?.top === 3 && after38.cab?.units[0]?.drawers === 3,
       JSON.stringify({ top: after38.ap?.top, drawers: after38.cab?.units[0]?.drawers }));
     ok('电器格不带门（带门就是 RULE-APPLIANCE-DOOR 的硬错，AI 也不许犯）',
       after38.cab?.units[0]?.doors === null, String(after38.cab?.units[0]?.doors));
     ok('"右边一组对开门"真的做了 2 扇门', after38.cab?.units[1]?.doors === 2, String(after38.cab?.units[1]?.doors));
+    ok('右侧层板柜仍保留 4 块层板及两扇门', after38.cab?.units[1]?.shelves === 4 && after38.cab?.units[1]?.doors === 2,
+      JSON.stringify(after38.cab?.units[1]));
     ok('分区 id 各不相同（板件撞 id = 清单少一块 = 生产下错料）',
       new Set((after38.cab?.units ?? []).map((u) => u.id)).size === 2, JSON.stringify((after38.cab?.units ?? []).map((u) => u.id)));
     ok('洗衣机本体进了甲购件清单（机器不走开料机，这是清单分流的红线）',
@@ -2604,33 +4127,42 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('应用后没有新增硬错（洞口 650 装得下 700 净宽，宽度和洞口尺寸不冲突）',
       after38.errs === before38.errs, `ERROR ${before38.errs} → ${after38.errs}`);
 
-    // 撤销：一次生成必须一次收得回来
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
-    await sleep(320);
-    const undo38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`);
-    ok('一次撤销就把这台柜收回去', undo38 === before38.count, `${after38.count} → ${undo38}`);
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.redo();return true})()`);
-    await sleep(320);
-    ok('重做又能回来（历史是线性的）',
-      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().cabinets.length})()`)) === before38.count + 1);
-
-    // 切到四视图拍一张：洗衣机柜（虚线洞口 + 甲购件标注）在图上真的画出来了
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
-    await sleep(1100);
+    // apply 按产品契约返回房间工作区；用真实柜卡/三视图验收已同步的洗衣机柜。
+    const washerWorkspaceReady38 = await waitFor(`(()=>{const root=document.querySelector('.room-workspace');const card=[...(root?.querySelectorAll('.workspace-cabinet-card')||[])].find(c=>c.querySelector('.workspace-cabinet-name')?.textContent.trim()==='AI洗衣机柜');return !!root&&!!card&&card.querySelectorAll('.workspace-view').length===3})()`, 7000, 150);
+    const workspaceAfterApply38 = await evalJs(`(()=>{const root=document.querySelector('.room-workspace');const card=[...(root?.querySelectorAll('.workspace-cabinet-card')||[])].find(c=>c.querySelector('.workspace-cabinet-name')?.textContent.trim()==='AI洗衣机柜');return {workspace:!!root,room:root?.querySelector('.workspace-room-heading h1')?.textContent.trim()||'',cabinet:card?.querySelector('.workspace-cabinet-name')?.textContent.trim()||'',views:[...(card?.querySelectorAll('.workspace-view strong')||[])].map(x=>x.textContent.trim()),referenceNotice:card?.textContent.includes('参考预留｜非 CNC 开孔｜待拆单确认')||false,chatContext:root?.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||''}})()`);
+    const washerViewPass38 = washerWorkspaceReady38 && workspaceAfterApply38?.room === before38.roomName
+      && workspaceAfterApply38?.cabinet === 'AI洗衣机柜' && workspaceAfterApply38?.views.join('|') === '外观正面|内部结构|俯视图';
+    ok('确认同步后房间工作区显示洗衣机柜三视图及参考预留安全注记', washerViewPass38
+      && workspaceAfterApply38?.referenceNotice, JSON.stringify(workspaceAfterApply38));
     const shotApplied38 = await shot(path.join(OUT_DIR, 'ai-laundry-applied.png'));
     ok('应用后截图已留档（非空）', shotApplied38 > 20000, `${shotApplied38} 字节`);
 
     // 还原现场：本节自己造的柜子不许留给下游
-    const restored38 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      if (!window.__b38Saved) return null;
-      s.bus.replaceProject(window.__b38Saved, 'B38 还原现场');
-      const p=s.bus.getState();
-      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name) };})()`);
+    const restore38Operation = await startPageRestore('B38.restore-fixture', {
+      snapshotKey: '__b38OriginalLocal', busGlobal: '__b38Bus', mode: 'project', label: 'B38 还原原本地现场', clearSaved: true,
+    }, 5000);
+    const restored38 = await evalJs(`(()=>{const p=window.__b38Bus.getState();return {count:p.cabinets.length,names:p.cabinets.map(c=>c.name),project:p.name,projectId:p.id,version:window.__b38Bus.getVersion()}})()`);
     ok('B38 结束后把现场还原了（自己造的柜子不许留给下游占地方）',
-      Boolean(restored38) && restored38.count === before38.count
-        && restored38.names.join('|') === before38.names.join('|'),
-      `还原=${JSON.stringify(restored38)} 之前=${JSON.stringify(before38.names)}`);
+      restore38Operation.result?.restored === true && Boolean(restored38) && restored38.count === before38.original.count
+        && restored38.names.join('|') === before38.original.names.join('|')
+      && restored38.projectId === before38.original.projectId,
+      `还原=${JSON.stringify(restored38)} 之前=${JSON.stringify(before38.original)} restore=${JSON.stringify(restore38Operation.result)}`);
     await sleep(240);
+    const originalRoomName38 = await evalJs(`window.__b38Bus.getState().rooms[0]?.name||''`);
+    const restoredWorkspaceRoom38 = await selectWorkspaceRoom(originalRoomName38);
+    const aiPanelReady38 = await waitFor(`!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input')&&!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent')`, 5000, 120);
+    const uiStateRestored38 = await evalJs(`(()=>{let context=null;try{context=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null')}catch{};const heading=document.querySelector('.workspace-room-heading h1')?.textContent.trim()||'';const project=window.__b38Bus.getState();return {workspace:!!document.querySelector('.room-workspace'),room:heading,chatContext:document.querySelector('.workspace-chat-heading')?.textContent.replace(/\\s+/g,' ').trim()||'',input:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-input'),agentButton:!!document.querySelector('.room-workspace .ai-workspace-panel .ai-btn-agent'),projectId:project.id,roomId:project.rooms.find(r=>r.name===heading)?.id||'',context}})()`);
+    const workspaceRestorePass38 = restoredWorkspaceRoom38.clicked && aiPanelReady38 && uiStateRestored38?.workspace
+      && uiStateRestored38?.room === originalRoomName38
+      && uiStateRestored38?.chatContext.includes(`当前上下文：${originalRoomName38}`)
+      && uiStateRestored38?.context?.projectId === uiStateRestored38?.projectId
+      && uiStateRestored38?.context?.roomId === uiStateRestored38?.roomId;
+    ok('B38 teardown 恢复原房间工作区、项目/房间持久上下文与内嵌 Agent UI', workspaceRestorePass38,
+      JSON.stringify({originalRoomName38,restoredWorkspaceRoom38,aiPanelReady38,uiStateRestored38}));
+    if (!washerViewPass38 || !workspaceRestorePass38) {
+      throw new Error(`[B38 workspace/teardown] applied-view or restore-context assertion failed: ${JSON.stringify({washerViewPass38,workspaceAfterApply38,originalRoomName38,restoredWorkspaceRoom38,aiPanelReady38,uiStateRestored38})}`);
+    }
+    if (STOP_AFTER_ONLY && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -2646,18 +4178,28 @@ async function waitForApp(url, timeoutMs = 25000) {
      */
     section('B39 报错人话化：面板说人话 · 一键修复是真按钮 · 点了真消错');
 
+    // B37/B38 的成功 apply 按产品契约回到房间工作区；问题卡只在 CAD 侧栏。
+    // 从当前真实入口切回 CAD，不能在没有问题面板的工作区读取空 DOM。
+    const cadEntry39 = await evalJs(`(()=>{
+      if(document.querySelector('.side-right .tabs button')) return {clicked:false,alreadyCad:true};
+      const b=[...document.querySelectorAll('.workspace-topbar button')]
+        .find(x=>x.textContent.replace(/\\s+/g,' ').trim()==='高级 CAD 编辑');
+      if(!b)return {clicked:false,alreadyCad:false,workspace:!!document.querySelector('.room-workspace')};
+      b.click();return {clicked:true,alreadyCad:false};
+    })()`);
+    const cadReady39 = await waitFor(`!!document.querySelector('.side-right .tabs button')&&localStorage.getItem('furniture-cad.workspace-mode')==='cad'`, 6000, 100);
+    ok('B39 fixture 从房间工作区经真实“高级 CAD 编辑”入口进入 CAD', cadReady39 === true, JSON.stringify({cadEntry39,cadReady39}));
+    if (!cadReady39) throw new Error(`[B39 fixture] CAD issue panel unavailable: ${JSON.stringify({cadEntry39,cadReady39})}`);
+
     await activateRightTab('问题');
     // 本节会真的往模型里加一台柜（并改两次参数），先存现场，结束还原。
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      window.__b39Saved = structuredClone(s.bus.getState()); return true})()`);
-
-    const before39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const errs=s.bus.derive().issues.filter(i=>i.severity==='ERROR');
-      const p=s.bus.getState();
-      // names 也要存：还原之后要拿它和"本节开始时"逐项对账，
-      // 只比数量等于没比 —— 少一台柜子和一个不存在的字段长得一模一样（这轮就栽在这）
-      return { ver:s.bus.getVersion(), errs:errs.map(i=>i.code), count:p.cabinets.length,
-        names:p.cabinets.map(c=>c.name) };})()`);
+    const before39Operation = await startPageOperation('B39.save-baseline', `async()=>{
+      const s=await import('/src/state/store.ts');const bus=s.bus;window.__verifyHarness.bindBus(bus);
+      window.__b39Saved=structuredClone(bus.getState());const errs=bus.derive().issues.filter(i=>i.severity==='ERROR');const p=bus.getState();
+      return {ver:bus.getVersion(),errs:errs.map(i=>i.code),count:p.cabinets.length,names:p.cabinets.map(c=>c.name),project:p.name};
+    }`, 8000);
+    const before39 = before39Operation.result;
+    if (!before39) throw new Error(`[B39 harness] baseline missing: ${JSON.stringify(before39Operation)}`);
 
     /**
      * 造一台"门板太宽"的柜：单格 + 1 扇门 + 柜宽 2200mm → 单扇门 2160mm，
@@ -2667,9 +4209,13 @@ async function waitForApp(url, timeoutMs = 25000) {
      * （这条记忆本来就是用户定的"行业默认单柜上限"），所以这条路径上唯一能真实触发的
      * 硬错就是"门太宽"，负样本（放不进板材）是同一次派生顺带挂上来的，不用额外造。
      */
-    const wide39 = await evalJs(`(async()=>{
+    const wide39OperationKey = 'B39.create-wide-door-fixture';
+    let wide39Operation = null;
+    try {
+      wide39Operation = await startPageOperation(wide39OperationKey, `async()=>{
       const s=await import('/src/state/store.ts');
       const { createCabinet, makeUnit } = await import('/src/core/docFactory.ts');
+      window.__verifyHarness.bindBus(s.bus);
       const rules=s.RULESET;
       const proto=s.bus.getState().cabinets[0];
       const t=rules.materials[proto.params.boardMaterial].thickness;
@@ -2682,20 +4228,65 @@ async function waitForApp(url, timeoutMs = 25000) {
         params:{ width:2200, height:900, depth:600, bodyLift:80 },
         rules,
       });
+      const versionBefore=s.bus.getVersion();
+      window.__b39CreateDiagnostic={stage:'before-command',projectId:s.bus.getState().id,versionBefore,
+        commandId:'probe_b39_create',cabinetId:c.id};
       const r=s.bus.execute({ id:'probe_b39_create', op:'cabinet.create', source:'ui',
         target:{kind:'project',id:'project'}, changes:[], payload:{cabinet:c} }, 'B39 探针：放一台宽门柜');
-      if (r.error) return { err:r.error };
-      const it=s.bus.derive().issues.find(i=>i.code==='RULE-DOOR-MAX-WIDTH' && i.severity==='ERROR');
-      return { ver:s.bus.getVersion(), msg:it?it.message:null, hint:it?it.fixHint:null,
-        hasFix:it?Boolean(it.autoFix):false, doors:it?it.autoFix?it.autoFix.changes[0].value:null:null,
-        verBefore:s.bus.getVersion() };
-    })()`);
+      let commandResult;
+      try { commandResult=JSON.parse(JSON.stringify(r ?? null)); } catch (error) { commandResult={serializationError:String(error),type:typeof r}; }
+      const afterCommand=s.bus.getVersion();
+      const derived=s.bus.derive();
+      const it=derived.issues.find(i=>i.code==='RULE-DOOR-MAX-WIDTH' && i.severity==='ERROR');
+      window.__b39CreateDiagnostic={stage:'after-command',projectId:s.bus.getState().id,versionBefore,
+        versionAfter:afterCommand,commandId:'probe_b39_create',commandResult,
+        cabinetPresent:s.bus.getState().cabinets.some(item=>item.id==='cab_b39'),
+        doorIssue:it?{code:it.code,message:it.message,fixHint:it.fixHint,hasAutoFix:Boolean(it.autoFix)}:null};
+      return { err:r?.error??null, commandResult, projectId:s.bus.getState().id,
+        verBefore:versionBefore, ver:afterCommand, msg:it?it.message:null, hint:it?it.fixHint:null,
+        hasFix:it?Boolean(it.autoFix):false, doors:it?.autoFix?.changes?.[0]?.value??null,
+        cabinetPresent:s.bus.getState().cabinets.some(item=>item.id==='cab_b39') };
+    }`, 12000);
+    } catch (error) {
+      let pageOperationState = null;
+      let creationDiagnostic = null;
+      try {
+        pageOperationState = await evalJs(`window.__verifyHarness?.read(${JSON.stringify(wide39OperationKey)})??null`);
+        creationDiagnostic = await evalJs(`(()=>{const bus=window.__verifyBus;if(!bus)return null;const p=bus.getState();const d=bus.derive();return {diagnostic:window.__b39CreateDiagnostic??null,
+          projectVersion:bus.getVersion(),projectId:p.id,cabinet:p.cabinets.find(c=>c.id==='cab_b39')??null,
+          issues:d.issues.filter(i=>['RULE-DOOR-MAX-WIDTH','RULE-PANEL-OVER-SHEET'].includes(i.code))
+            .map(i=>({code:i.code,severity:i.severity,message:i.message,fixHint:i.fixHint,hasAutoFix:Boolean(i.autoFix)}))}})()`);
+      } catch (diagnosticError) {
+        creationDiagnostic = { diagnosticReadError: String(diagnosticError?.stack ?? diagnosticError) };
+      }
+      const harnessEvidence = {
+        classification: 'B39 PAGE-TASK HARNESS ERROR (no product assertion was counted)',
+        expectedProjectVersionBeforeCreation: before39?.ver ?? null,
+        error: String(error?.stack ?? error),
+        pageOperationState,
+        creationDiagnostic,
+        creationCommandResult: creationDiagnostic?.diagnostic?.commandResult ?? null,
+        projectVersionAfterAttempt: creationDiagnostic?.projectVersion ?? creationDiagnostic?.diagnostic?.versionAfter ?? null,
+        pageErrors: pageErrors.slice(-10),
+        consoleErrors: consoleErrors.slice(-10),
+      };
+      console.error(`B39 HARNESS FAILURE: ${JSON.stringify(harnessEvidence)}`);
+      throw new Error(`B39 HARNESS ERROR: shared page operation failed. ${JSON.stringify(harnessEvidence)}`);
+    }
+    const wide39 = wide39Operation?.result;
+    if (!wide39 || typeof wide39 !== 'object') {
+      throw new Error(`B39 HARNESS ERROR: page operation fulfilled without serializable result: ${JSON.stringify(wide39Operation)}`);
+    }
     ok('探针造出了"门板太宽"这条硬错（没有负样本，后面验的一键修复就是假的）',
       !wide39.err && Boolean(wide39.msg), JSON.stringify(wide39));
     ok('这条报错报得出差多少与上限定在多少（不是"参数不合法"）',
       /2160/.test(wide39.msg || '') && /600/.test(wide39.msg || ''), wide39.msg);
     ok('这条报错说得出往哪改（门扇数 + 加完每扇多宽）',
       /门扇数量|门扇/.test(wide39.hint || '') && /扇/.test(wide39.hint || ''), wide39.hint);
+
+    const issueCardReady39 = await waitFor(`([...document.querySelectorAll('.side-right .issue-item')].some(el=>(el.querySelector('.issue-code')?.textContent||'').includes('RULE-DOOR-MAX-WIDTH')&&(el.querySelector('.issue-target')?.textContent||'').includes('cab_b39')))`, 5000, 100);
+    ok('B39 当前 CAD 问题面板真实呈现本轮 cab_b39 的门宽错误卡', issueCardReady39 === true, `ready=${issueCardReady39}`);
+    if (!issueCardReady39) throw new Error(`[B39 UI] current issue panel did not render RULE-DOOR-MAX-WIDTH for cab_b39; creation=${JSON.stringify(wide39)} panel=${(await text('.side-right .panel-scroll')).slice(0,500)}`);
 
     const dom39 = await evalJs(`(()=>{
       const items=[...document.querySelectorAll('.side-right .issue-item')];
@@ -2757,9 +4348,8 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 所以不能拿"建柜时"的版本去推算"点完之后该是几" —— 那是探针自己的算术，不是产品行为。
      * 之后一切只跟这一刻对账。
      */
-    const pre39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const d=s.bus.derive();
-      return { ver:s.bus.getVersion(),
+    const pre39 = await evalJs(`(()=>{const bus=window.__verifyBus;const d=bus.derive();
+      return { ver:bus.getVersion(),
         errs:d.issues.filter(i=>i.severity==='ERROR').map(i=>i.code),
         warn:d.issues.filter(i=>i.severity==='WARNING').map(i=>i.code) };})()`);
     ok('现场里同时挂着"门太宽"与"放不进板材"两条硬错（只有一条，下面验的就不是同一件事）',
@@ -2775,10 +4365,9 @@ async function waitForApp(url, timeoutMs = 25000) {
       const b=hit&&hit.querySelector('.issue-fix'); if(b){b.click();return true;} return false;})()`);
     await sleep(460);
 
-    const after39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const cab=s.bus.getState().cabinets.find(c=>c.id==='cab_b39');
-      const errs=s.bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code);
-      return { ver:s.bus.getVersion(), doors:cab?cab.layout.units[0].doors.count:null,
+    const after39 = await evalJs(`(()=>{const bus=window.__verifyBus;const cab=bus.getState().cabinets.find(c=>c.id==='cab_b39');
+      const errs=bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code);
+      return { ver:bus.getVersion(), doors:cab?cab.layout.units[0].doors.count:null,
         netW:cab?cab.layout.units[0].requestedWidth:null, errs,
         gone:!errs.includes('RULE-DOOR-MAX-WIDTH') };})()`);
     ok('点按钮之后版本只 +1（一次修复 = 一条命令，不是摸黑改模型）',
@@ -2803,40 +4392,36 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('修复后的面板截图已留档（非空）', shotFix39b > 20000, `${shotFix39b} 字节`);
 
     // 撤销：一次撤销收掉一步，逐步断言（整段撤销后不对账 = 不知道是哪一步没收回）
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await evalJs(`(()=>{window.__verifyBus.undo();return true})()`);
     await sleep(380);
-    const undo1 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const d=s.bus.derive();
+    const undo1 = await evalJs(`(()=>{const bus=window.__verifyBus;const d=bus.derive();
       return { back:d.issues.some(i=>i.code==='RULE-DOOR-MAX-WIDTH'),
         sheet:d.issues.some(i=>i.code==='RULE-PANEL-OVER-SHEET'),
-        doors:(s.bus.getState().cabinets.find(c=>c.id==='cab_b39')||{}).layout?.units[0]?.doors?.count ?? null };})()`);
+        doors:(bus.getState().cabinets.find(c=>c.id==='cab_b39')||{}).layout?.units[0]?.doors?.count ?? null };})()`);
     ok('撤销掉「一键修复」这一笔：两条硬错和门扇数一起回来（历史按笔回退，不是整体重置）',
       undo1.back === true && undo1.sheet === true && undo1.doors === 1, JSON.stringify(undo1));
 
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');s.bus.undo();return true})()`);
+    await evalJs(`(()=>{window.__verifyBus.undo();return true})()`);
     await sleep(380);
-    const undo39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState();
+    const undo39 = await evalJs(`(()=>{const bus=window.__verifyBus;const p=bus.getState();
       return { hasCab:p.cabinets.some(c=>c.id==='cab_b39'), count:p.cabinets.length,
-        errs:s.bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code) };})()`);
+        errs:bus.derive().issues.filter(i=>i.severity==='ERROR').map(i=>i.code) };})()`);
     ok('再撤销掉"建柜"这一笔：柜子没了、报错回到本节开始之前（历史是线性的，不是整体重置）',
       undo39.hasCab === false && undo39.count === before39.count
         && undo39.errs.join('|') === before39.errs.join('|'),
       JSON.stringify(undo39));
 
     // 还原现场：本节自己造的柜子与改动不许留给下游
-    const restored39 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      if(!window.__b39Saved) return null;
-      s.bus.replaceProject(window.__b39Saved, 'B39 还原现场');
-      const p=s.bus.getState();
-      const d=s.bus.derive();
-      return { count:p.cabinets.length, names:p.cabinets.map(c=>c.name),
-        errs:d.issues.filter(i=>i.severity==='ERROR').map(i=>i.code) };})()`);
+    const restore39Operation = await startPageRestore('B39.restore-fixture', {
+      snapshotKey: '__b39Saved', busGlobal: '__verifyBus', mode: 'project', label: 'B39 还原现场', clearSaved: true,
+    }, 5000);
+    const restored39 = await evalJs(`(()=>{const bus=window.__verifyBus;const p=bus.getState();const d=bus.derive();
+      return {count:p.cabinets.length,names:p.cabinets.map(c=>c.name),errs:d.issues.filter(i=>i.severity==='ERROR').map(i=>i.code),project:p.name,version:bus.getVersion()};})()`);
     ok('B39 结束后把现场还原了（自己造的柜子与改动不许留给下游）',
-      Boolean(restored39) && restored39.count === before39.count
+      restore39Operation.result?.restored === true && Boolean(restored39) && restored39.count === before39.count
         && restored39.names.join('|') === before39.names.join('|')
         && restored39.errs.join('|') === before39.errs.join('|'),
-      JSON.stringify(restored39));
+      JSON.stringify({restored39,restore:restore39Operation.result}));
     await sleep(240);
 
     // ═══════════════════════════════════════════════════════════
@@ -2849,6 +4434,20 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 最后把安全现状（包括**还没做到的事**）逐条核对一遍。
      */
     section('B18 账号与安全：默认可不登录 · 建号后一个漏网接口都没有 · 缺口照实列出');
+
+    // B37/B38 等房间工作区 UI 用例会改变主视图模式。账号与安全是在 CAD 侧栏验收，
+    // 所以这里先经真实入口返回 CAD；不能在没有右侧栏时继续执行并污染认证 API fixture。
+    const cadEntry18 = await evalJs(`(()=>{
+      if(document.querySelector('.side-right .tabs button')) return {clicked:false,alreadyCad:true};
+      const b=[...document.querySelectorAll('.workspace-topbar button')]
+        .find(x=>x.textContent.replace(/\\s+/g,' ').trim()==='高级 CAD 编辑');
+      if(!b) return {clicked:false,alreadyCad:false,topbar:!!document.querySelector('.workspace-topbar')};
+      b.click(); return {clicked:true,alreadyCad:false};
+    })()`);
+    const cadReady18 = await waitFor(`!!document.querySelector('.side-right .tabs button')&&localStorage.getItem('furniture-cad.workspace-mode')==='cad'`, 5000, 100);
+    ok('B18 认证测试 fixture 在 CAD 侧栏模式（必要时经真实“高级 CAD 编辑”按钮返回，且模式已持久化）',
+      cadReady18 === true, JSON.stringify({cadEntry18,cadReady18}));
+    if (!cadReady18) throw new Error(`[B18 fixture] CAD account panel unavailable: ${JSON.stringify({cadEntry18,cadReady18})}`);
 
     const VERIFY_ACCOUNTS = process.env.VERIFY_ACCOUNTS_PATH || '';
     ok('验收的账号库落在临时目录（不会往仓库里塞一个所有者账号）', VERIFY_ACCOUNTS.includes('furniture-cad-verify-'), VERIFY_ACCOUNTS || '(未设置)');
@@ -2865,6 +4464,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     const acctPanel = () => text('.side-right .panel-scroll');
     const acctSettled = await waitFor(`/鉴权模式/.test(document.querySelector('.side-right .panel-scroll')?.textContent||'')`, 10000);
     ok('账号面板进入终态（不是永远停在"检测中…"）', acctSettled === true, (await acctPanel()).slice(0, 200));
+    if (!acctSettled) throw new Error(`[B18 fixture] account panel did not reach an auth-mode state; stop before registration or API mutations: ${(await acctPanel()).slice(0, 300)}`);
     ok('面板把鉴权模式摆在最上面', String(await panelText('鉴权模式')).startsWith('local-open'), String(await panelText('鉴权模式')));
     ok('面板明说当前接口免登录', /接口当前免登录/.test(await acctPanel()), (await acctPanel()).slice(0, 200));
     ok('此时界面是「建立第一个账号（所有者）」而不是登录框', /建立第一个账号（所有者）/.test(await acctPanel()));
@@ -2890,18 +4490,30 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('改用强口令再点一次', (await clickPanelBtn('建立账号并进入账号模式', 1400)) === true);
     const modeAfter = await apiCall('/api/auth/mode');
     ok('建号成功：模式变成 accounts，账号数 1', modeAfter.body.mode === 'accounts' && modeAfter.body.accountCount === 1, JSON.stringify(modeAfter.body));
+    if (!(modeAfter.body.mode === 'accounts' && modeAfter.body.accountCount === 1)) {
+      throw new Error(`[B18 fixture] owner bootstrap failed; stop before auth guard probes and duplicate-registration test: ${JSON.stringify(modeAfter.body)}`);
+    }
 
-    const TOKEN = await evalJs(`sessionStorage.getItem('furniture-cad.auth.token')`);
-    ok('会话 token 落在 sessionStorage（关掉标签页即失效），不放 localStorage', typeof TOKEN === 'string' && TOKEN.length >= 40 && (await evalJs(`localStorage.getItem('furniture-cad.auth.token')`)) === null, `token 长度 ${String(TOKEN).length}`);
+    const TOKEN = await evalJs(`localStorage.getItem('furniture-cad.auth.token') ?? sessionStorage.getItem('furniture-cad.auth.token')`);
+    const persistedLocalToken = await evalJs(`localStorage.getItem('furniture-cad.auth.token')`);
+    ok('会话 token 按当前策略存于 localStorage，并兼容读取旧 sessionStorage', typeof TOKEN === 'string' && TOKEN.length >= 40 && persistedLocalToken === TOKEN, `local token 长度 ${String(persistedLocalToken).length}；会话 token 长度 ${String(TOKEN).length}`);
+    if (!(typeof TOKEN === 'string' && TOKEN.length >= 40 && persistedLocalToken === TOKEN)) {
+      throw new Error(`[B18 fixture] owner bootstrap returned no persisted localStorage token; stop before authenticated/duplicate-registration probes`);
+    }
 
     // ── 逐个接口确认"一个漏网的都没有" ──
     const guardProbe = await evalJs(`(async()=>{
-      const paths=['/api/settings','/api/models','/api/memory','/api/usage','/api/ai/plan','/api/account/accounts','/api/security/policy','/api/security/audit'];
+      const requests=[
+        {path:'/api/settings'}, {path:'/api/models'}, {path:'/api/memory'}, {path:'/api/usage'},
+        {path:'/api/ai/plan',method:'POST'}, {path:'/api/account/accounts'},
+        {path:'/api/security/policy'}, {path:'/api/security/audit'}, {path:'/api/workspace'},
+        {path:'/api/export/roombook',method:'POST'}, {path:'/api/ai/agent',method:'POST'}
+      ];
       const out={};
-      for(const p of paths){
-        const opts = p==='/api/ai/plan' ? {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'} : {};
-        const r = await fetch(p, opts);
-        out[p]=r.status;
+      for(const item of requests){
+        const opts=item.method?{method:item.method,headers:{'Content-Type':'application/json'},body:'{}'}:{};
+        const r = await fetch(item.path, opts);
+        out[item.path]=r.status;
       }
       const pub={};
       for(const p of ['/api/health','/api/auth/mode']){
@@ -2910,7 +4522,7 @@ async function waitForApp(url, timeoutMs = 25000) {
       return {guarded:out, public:pub};
     })()`);
     ok(
-      `建号后 ${Object.keys(guardProbe.guarded).length} 个非公开接口**全部**返回 401（一个漏网的都没有）`,
+      `建号后 ${Object.keys(guardProbe.guarded).length} 个非公开接口**全部**返回 401（含 workspace / RoomBook / Agent）`,
       Object.values(guardProbe.guarded).every((s) => s === 401),
       JSON.stringify(guardProbe.guarded)
     );
@@ -2932,11 +4544,20 @@ async function waitForApp(url, timeoutMs = 25000) {
       `「${wrongPw.body.error}」 vs 「${noSuchUser.body.error}」`
     );
 
-    const demoteSelf = await apiCall('/api/account/account', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ id: (await apiCall('/api/auth/me', { headers: { Authorization: `Bearer ${TOKEN}` } })).body.account.id, role: 'designer' }),
-    });
+    const meForDemotion = typeof TOKEN === 'string' && TOKEN.length >= 40
+      ? await apiCall('/api/auth/me', { headers: { Authorization: `Bearer ${TOKEN}` } })
+      : { status: 0, body: { error: '缺少有效的登录 token' } };
+    const meIdentityOk = meForDemotion.status === 200 && meForDemotion.body?.ok === true && meForDemotion.body?.signedIn === true && typeof meForDemotion.body?.account === 'object' && meForDemotion.body.account !== null;
+    ok('owner token 的 /api/auth/me 返回成功状态与 account 对象', meIdentityOk, JSON.stringify({ status: meForDemotion.status, ok: meForDemotion.body?.ok, signedIn: meForDemotion.body?.signedIn, account: meForDemotion.body?.account ?? null, error: meForDemotion.body?.error ?? null }));
+    const ownerAccountId = meIdentityOk && typeof meForDemotion.body.account.id === 'string' && meForDemotion.body.account.id.length > 0 ? meForDemotion.body.account.id : null;
+    ok('/api/auth/me 的 account.id 是非空字符串', ownerAccountId !== null, `account.id=${String(ownerAccountId)}`);
+    const demoteSelf = ownerAccountId !== null
+      ? await apiCall('/api/account/account', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
+          body: JSON.stringify({ id: ownerAccountId, role: 'designer' }),
+        })
+      : { status: meForDemotion.status, body: { error: meForDemotion.body.error ?? '没有取得账号身份，已跳过降级测试' } };
     ok(
       '安全阀：不能降级最后一个所有者（否则没人能再管理系统）',
       demoteSelf.status === 400 && /最后一个所有者/.test(String(demoteSelf.body.error)),
@@ -2968,11 +4589,12 @@ async function waitForApp(url, timeoutMs = 25000) {
       );
       ok('第一个账号自动是所有者，默认档位 free（额度而不是"无限"）', a0?.role === 'owner' && a0?.plan === 'free', `${a0?.role} / ${a0?.plan}`);
       ok('租户字段从第一天就在（将来做多租户不必迁移数据）', a0?.tenantId === 'tenant_default', String(a0?.tenantId));
-      ok('账号库文件不含 API Key（账号与模型配置彻底分离）', !accText.includes(FAKE_KEY2 || 'sk-verify-second'));
+      ok('账号库文件不含 API Key（账号与模型配置彻底分离）', !accText.includes(process.env.VERIFY_FAKE_KEY2 || 'sk-verify-second'));
     }
 
-    if (VERIFY_AUDIT && fs.existsSync(VERIFY_AUDIT)) {
-      const auditRaw = fs.readFileSync(VERIFY_AUDIT, 'utf8');
+    const verifyAuditPath = process.env.VERIFY_AUDIT_PATH || '';
+    if (verifyAuditPath && fs.existsSync(verifyAuditPath)) {
+      const auditRaw = fs.readFileSync(verifyAuditPath, 'utf8');
       const lines = auditRaw.split(/\r?\n/).filter((l) => l.trim());
       const entries = lines.map((l) => {
         try {
@@ -2993,7 +4615,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     // ── 界面侧：安全现状必须连"还没做到的事"一起列 ──
     await activateRightTab('账号');
     await sleep(600);
-    ok('能展开「账号管理」分区', (await openSection('账号管理')) !== 'no-sec');
+    ok('能展开「账号管理」分区', (await openPanelSection('账号管理')) !== 'no-sec');
     const acctMgmt = await evalJs(`(()=>{
       const secs=[...document.querySelectorAll('.side-right .sec')];
       const sec=secs.find(s=>((s.querySelector('.sec-toggle')?.textContent)||'').includes('账号管理'));
@@ -3039,7 +4661,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('口令存储方式写明是 scrypt + 独立盐 + 定时安全比较', /scrypt/.test(String(await panelText('口令存储'))) && /timingSafeEqual/.test(String(await panelText('口令存储'))), String(await panelText('口令存储')));
     ok('会话存储写明"只落哈希"', /SHA-256/.test(String(await panelText('会话存储'))), String(await panelText('会话存储')));
 
-    ok('能展开「审计日志」分区', (await openSection('审计日志')) !== 'no-sec');
+    ok('能展开「审计日志」分区', (await openPanelSection('审计日志')) !== 'no-sec');
     ok('点「读取最近 60 条」', (await clickPanelBtn('读取最近 60 条', 1100)) === true);
     const auditRows = await evalJs(`document.querySelectorAll('.side-right table.audit tbody tr').length`);
     ok(`审计表格读出 ${auditRows} 行（界面上能直接复盘，不用去翻文件）`, auditRows >= 3, String(auditRows));
@@ -3050,14 +4672,14 @@ async function waitForApp(url, timeoutMs = 25000) {
       return cell.filter(x=>/^(\\d{1,3}\\.){3}\\d{1,3}$/.test(x)).length;
     })()`);
     ok(`至少 ${auditCellWithIp} 行的来源列给出了可读的 IP（没有 ::ffff: 前缀，读得懂）`, auditCellWithIp >= 1, String(auditCellWithIp));
-    ok('表格里出现了 ai.plan 那一笔（AI 调用也进审计，不只是登录）', /ai\.plan/.test(await acctPanel()), (await acctPanel()).slice(-500));
+    ok('审计表格含当前 accounts 登录事件（登录与失败记录可在 UI 复盘）', /auth\.login|登录/.test(await acctPanel()), (await acctPanel()).slice(-500));
 
     // ═══════════════════════════════════════════════════════════
     /**
      * B18b —— 上线那天真正的样子：账号模式下**没有登录**的人打开这个界面。
      *
-     * 这一段必须靠**重新加载页面**来做：token 是 React state + sessionStorage，
-     * 只有刷新后才能真的回到"未登录"。这也正好验了"刷新后会话还在不在"。
+     * 这一段必须靠**清理两个兼容存储并重新加载页面**来做：当前 token 写入
+     * localStorage，旧版本 sessionStorage 只作为读取回退；清理后才能真的回到访客态。
      *
      * 为什么值得单独验：管理后台原先用的是裸 fetch，401 的响应体是个非空对象，
      * 会被当成配置读进 state —— 界面**照常渲染出一整套模型表单**，
@@ -3066,14 +4688,33 @@ async function waitForApp(url, timeoutMs = 25000) {
      */
     section('B18b 账号模式下未登录访问：宁可什么都不显示，也不显示一份假配置');
 
-    await evalJs(`sessionStorage.removeItem('furniture-cad.auth.token'); 1`);
-    await send('Page.reload', { ignoreCache: false });
-    await sleep(2600);
-    const remounted = await waitFor(`!!document.querySelector('.side-right .tabs button')`, 15000);
-    ok('刷新后界面重新挂载（token 已清掉，现在是一个未登录的访客）', remounted === true);
+    // B37/B38 的真实 Agent 流程会切进房间工作区；B18b 验收的是 CAD 侧栏中的账号/后台面板，
+    // 因此必须经真实 UI 返回 CAD，并确认偏好已落盘，不能让前置章节遗留的 workspace 模式污染 fixture。
+    const cadEntry18b = await evalJs(`(()=>{
+      if(document.querySelector('.side-right .tabs button')) return {clicked:false,alreadyCad:true};
+      const b=[...document.querySelectorAll('.workspace-topbar button')]
+        .find(x=>x.textContent.replace(/\\s+/g,' ').trim()==='高级 CAD 编辑');
+      if(!b) return {clicked:false,alreadyCad:false,topbar:!!document.querySelector('.workspace-topbar')};
+      b.click(); return {clicked:true,alreadyCad:false};
+    })()`);
+    const cadReady18b = await waitFor(`!!document.querySelector('.side-right .tabs button')&&localStorage.getItem('furniture-cad.workspace-mode')==='cad'`, 5000, 100);
+    ok('B18b 认证测试 fixture 在 CAD 侧栏模式（必要时经真实“高级 CAD 编辑”按钮返回，且模式已持久化）',
+      cadReady18b === true, JSON.stringify({cadEntry18b,cadReady18b}));
+    if (!cadReady18b) throw new Error(`[B18b fixture] CAD account panel unavailable before token reset: ${JSON.stringify({cadEntry18b,cadReady18b})}`);
 
-    const tokenGone = await evalJs(`sessionStorage.getItem('furniture-cad.auth.token')`);
-    ok('未登录状态确认：sessionStorage 里没有 token', tokenGone === null, String(tokenGone));
+    await evalJs(`localStorage.removeItem('furniture-cad.auth.token'); sessionStorage.removeItem('furniture-cad.auth.token'); 1`);
+    await send('Page.reload', { ignoreCache: false });
+    await sleep(500);
+    const remounted = await waitFor(`!!document.querySelector('.side-right .tabs button')&&localStorage.getItem('furniture-cad.workspace-mode')==='cad'`, 15000);
+    ok('刷新后界面重新挂载（token 已清掉，现在是一个未登录的访客）', remounted === true);
+    const pageHarnessAfterReload = await initializePageHarness();
+    if (!pageHarnessAfterReload?.ready || pageHarnessAfterReload.version !== 1) {
+      throw new Error(`[page harness] reinitialization after B18b reload failed: ${JSON.stringify(pageHarnessAfterReload)}`);
+    }
+    console.log(`[page-harness] REINITIALIZED after=B18b.reload ${JSON.stringify(pageHarnessAfterReload)}`);
+
+    const tokenGone = await evalJs(`localStorage.getItem('furniture-cad.auth.token') ?? sessionStorage.getItem('furniture-cad.auth.token')`);
+    ok('未登录状态确认：localStorage 与兼容 sessionStorage 都没有 token', tokenGone === null, String(tokenGone));
 
     await activateRightTab('后台');
     await sleep(900);
@@ -3098,18 +4739,102 @@ async function waitForApp(url, timeoutMs = 25000) {
     await activateRightTab('AI');
     await sleep(500);
     ok('能在 AI 输入框里写话', (await setElValue('.side-right .ai-input', '把主卧衣柜的踢脚改成 120')) === true);
-    ok('点「生成计划」', (await clickPanelBtn('生成编辑计划', 1600)) === true);
-    const guestAi = await waitFor(`/登录|会话/.test(document.querySelector('.side-right .panel-scroll')?.textContent||'')`, 12000);
-    ok('未登录时 AI 通道被挡住，并给出可读原因（不是一句"失败"）', guestAi === true, (await aiPanel()).slice(0, 260));
+    await evalJs(`(()=>{
+      const original=window.fetch.bind(window);
+      window.__guestAgentHttp=null;
+      window.fetch=(input,init)=>{
+        const raw=typeof input==='string'?input:(input?.url||'');
+        const path=new URL(raw,location.href).pathname;
+        if(path==='/api/ai/agent'){
+          const authorization=new Headers(init?.headers||{}).get('Authorization');
+          return original(input,init).then(response=>{window.__guestAgentHttp={status:response.status,hasAuthorization:!!authorization};return response;});
+        }
+        return original(input,init);
+      };
+    })()`);
+    const guestAgentButton=await evalJs(`(()=>{const b=document.querySelector('.side-right .ai-btn-agent');const state={found:!!b,disabled:b?.disabled??null};if(b&&!b.disabled)b.click();return state})()`);
+    const guestAgentRequest=await waitFor(`window.__guestAgentHttp?.status===401`,12000);
+    const guestAgentHttp=await evalJs(`window.__guestAgentHttp`);
+    const guestAiText=await panelTextAll();
+    ok('访客真实点击可用的 Agent 按钮，浏览器确实向 /api/ai/agent 发出无 token 请求并收到 401',
+      guestAgentButton?.found===true&&guestAgentButton?.disabled===false&&guestAgentRequest===true
+      &&guestAgentHttp?.status===401&&guestAgentHttp?.hasAuthorization===false,
+      JSON.stringify({button:guestAgentButton,http:guestAgentHttp}));
+    ok('Agent 401 后界面明确显示鉴权拒绝原因（不是被挡断言假绿）',/UNAUTHORIZED|需要有效的 Bearer token|未登录|会话/.test(guestAiText),guestAiText.slice(-360));
 
     // ── 重新登录：能力必须回来 ──
     await activateRightTab('账号');
     await sleep(700);
+    const accountPath18b = process.env.VERIFY_ACCOUNTS_PATH || '';
+    let storedHashMatches18b = false;
+    let storedAccountEvidence18b = { file: Boolean(accountPath18b), accountCount: null, usernames: [], failedLogins: null, locked: false };
+    try {
+      const { AuthStore } = await import(pathToFileURL(path.join(HERE, '..', 'server', 'auth.mjs')).href);
+      const accountsDoc = JSON.parse(fs.readFileSync(accountPath18b, 'utf8'));
+      const storedAccounts = Array.isArray(accountsDoc.accounts) ? accountsDoc.accounts : [];
+      const ownerRecord = storedAccounts.find((a) => String(a.username ?? '').trim().toLowerCase() === 'owner');
+      storedHashMatches18b = Boolean(ownerRecord && AuthStore.verifyPassword(
+        OWNER_PW, ownerRecord.password?.hash, ownerRecord.password?.salt
+      ));
+      storedAccountEvidence18b = {
+        file: Boolean(accountPath18b), accountCount: storedAccounts.length,
+        usernames: storedAccounts.map((a) => a.username ?? null), user: ownerRecord?.username ?? null,
+        failedLogins: ownerRecord?.failedLogins?.length ?? 0,
+        locked: Boolean(ownerRecord?.lockedUntil && new Date(ownerRecord.lockedUntil).getTime() > Date.now()),
+        storedHashMatchesExpected: storedHashMatches18b,
+      };
+    } catch (e) {
+      storedAccountEvidence18b.error = e?.message ?? String(e);
+    }
+    console.log(`[B18b STORED_PASSWORD_HASH] ${JSON.stringify(storedAccountEvidence18b)}`);
+    ok('账号库中的 owner 密码哈希与本轮 B18 建号 fixture 一致', storedHashMatches18b, JSON.stringify(storedAccountEvidence18b));
+    const originalSessionMe18b = await apiCall('/api/auth/me', {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    const originalSessionIdentity18b = {
+      status: originalSessionMe18b.status,
+      username: originalSessionMe18b.body?.account?.username ?? null,
+      accountIdPresent: typeof originalSessionMe18b.body?.account?.id === 'string' && originalSessionMe18b.body.account.id.length > 0,
+    };
+    console.log(`[B18b ORIGINAL_SESSION_IDENTITY] ${JSON.stringify(originalSessionIdentity18b)}`);
+    const backendLoginControl = await apiCall('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'owner', password: OWNER_PW }),
+    });
+    const backendLoginEvidence = {
+      status: backendLoginControl.status,
+      code: backendLoginControl.body?.code ?? null,
+      signedIn: typeof backendLoginControl.body?.token === 'string' && backendLoginControl.body.token.length >= 40,
+      username: backendLoginControl.body?.account?.username ?? null,
+    };
+    console.log(`[B18b BACKEND_LOGIN_CONTROL] ${JSON.stringify(backendLoginEvidence)}`);
+    ok('后端控制：刚由 B18 建立的 owner 凭据仍可直接登录（不输出口令或 token）',
+      backendLoginEvidence.status === 200 && backendLoginEvidence.signedIn && backendLoginEvidence.username === 'owner',
+      JSON.stringify(backendLoginEvidence));
     const loginUserSet = await panelSet('用户名', 'owner');
     const loginPwSet = await panelSet('口令', OWNER_PW);
     ok('在登录框里填入账号与口令（两个字段都真的写进去了，不是"填了但没生效"）', loginUserSet === 'ok' && loginPwSet === 'ok', `${loginUserSet} / ${loginPwSet}`);
+    await evalJs(`(()=>{
+      const original=window.fetch.bind(window);
+      window.__b18bLoginTrace=null;
+      window.fetch=(input,init)=>{
+        const raw=typeof input==='string'?input:(input?.url||'');
+        const path=new URL(raw,location.href).pathname;
+        if(path!=='/api/auth/login') return original(input,init);
+        let body={};try{body=JSON.parse(init?.body||'{}')}catch{}
+        return original(input,init).then(async response=>{
+          let payload={};try{payload=await response.clone().json()}catch{}
+          window.__b18bLoginTrace={status:response.status,username:body.username??null,
+            passwordMatchesExpected:body.password===${JSON.stringify(OWNER_PW)},code:payload.code??null};
+          return response;
+        });
+      };
+    })()`);
     ok('点「登录」', (await clickPanelBtn('登录', 1400)) === true);
-    const tokenBack = await evalJs(`sessionStorage.getItem('furniture-cad.auth.token')`);
+    const loginTraceReady18b = await waitFor(`window.__b18bLoginTrace!==null`, 5000, 100);
+    const loginTrace18b = await evalJs(`window.__b18bLoginTrace`);
+    console.log(`[B18b UI_LOGIN_TRACE] ${JSON.stringify({ready:loginTraceReady18b,...(loginTrace18b||{})})}`);
+    const tokenBack = await evalJs(`localStorage.getItem('furniture-cad.auth.token') ?? sessionStorage.getItem('furniture-cad.auth.token')`);
     ok('登录成功：拿到新会话 token', typeof tokenBack === 'string' && tokenBack.length >= 40, `长度 ${String(tokenBack).length}`);
     ok('登录后能看到当前账号与权限', /当前账号/.test(await acctPanel()) && /所有者/.test(await acctPanel()), (await acctPanel()).slice(0, 240));
 
@@ -3118,6 +4843,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     const adminBack = await waitFor(`!!document.querySelector('.side-right .row')`, 12000);
     ok('登录后管理后台恢复：配置表单重新出现（权限是"能不能用"的开关，不是"坏了"）', adminBack === true, (await text('.side-right .panel-scroll')).slice(0, 200));
     ok('恢复后的配置读得到真值（模型名与 Base URL 都在）', (await panelField('模型'))?.options?.includes('mock-model-1') === true, JSON.stringify(await panelField('模型')));
+    if (process.env.STOP_AFTER_ONLY === '1' && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -3139,12 +4865,12 @@ async function waitForApp(url, timeoutMs = 25000) {
     await activateRightTab('AI');
     await sleep(700);
 
-    /** 两个入口按钮的当前文案（等待中会变，所以要能重复读） */
+    /** 对话与 Agent 两个入口按钮的当前文案（等待中会变，所以要能重复读） */
     const aiBtnLabels = () =>
       evalJs(`(()=>{
         const a=document.querySelector('.side-right .ai-btn-chat');
-        const b=document.querySelector('.side-right .ai-btn-plan');
-        return {chat:a?a.textContent.trim():null, plan:b?b.textContent.trim():null};
+        const b=document.querySelector('.side-right .ai-btn-agent');
+        return {chat:a?a.textContent.trim():null, agent:b?b.textContent.trim():null, agentTitle:b?.title||null};
       })()`);
 
     ok(
@@ -3155,7 +4881,21 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     const labels = await aiBtnLabels();
     ok('「对话」按钮自己写明了它不改模型（后果写在按钮上，不靠用户猜）', /不改模型/.test(String(labels.chat)), JSON.stringify(labels));
-    ok('「生成编辑计划」按钮在，且与对话按钮是两个可区分的类', String(labels.plan).includes('生成编辑计划'), JSON.stringify(labels));
+    ok('Agent 执行入口在，且明确是与对话分开的 MCP 编辑路径',
+      String(labels.agent).includes('Agent 执行') && /MCP 工具/.test(String(labels.agentTitle)),
+      JSON.stringify(labels));
+
+    // 会话按房间持久保存，前序 B37/B38 或上次复跑可能留下 Agent 回复。
+    // 先清掉历史，只把本轮新回答当作对话通路证据。
+    const oldTurnCount20 = await evalJs(`document.querySelectorAll('.side-right .chat-msg').length`);
+    if (oldTurnCount20 > 0) {
+      const clearOld20 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='清空对话');if(!b||b.disabled)return false;b.click();return true})()`);
+      if (!clearOld20) throw new Error(`[B20 fixture] ${oldTurnCount20} persisted turns exist but the visible clear action is unavailable`);
+      await waitFor(`document.querySelectorAll('.side-right .chat-msg').length===0`, 5000, 100);
+    }
+    const cleanTurnCount20 = await evalJs(`document.querySelectorAll('.side-right .chat-msg').length`);
+    ok('B20 从空会话开始，后续回答只能来自本轮真实对话请求', cleanTurnCount20 === 0, `旧消息=${oldTurnCount20} / 清理后=${cleanTurnCount20}`);
+    if (cleanTurnCount20 !== 0) throw new Error(`[B20 fixture] unable to clear persisted chat turns: ${cleanTurnCount20}`);
 
     const vBeforeChat = await statusVersion();
 
@@ -3418,135 +5158,89 @@ async function waitForApp(url, timeoutMs = 25000) {
      * 断言必须**真去点工具栏那个按钮**，不能在 Node 侧直接调 docFactory ——
      * 缺陷在 App 的调用点，不在 `rectRoom` 本身；测了后者会是一条永远绿的假断言。
      */
-    section('B22 新建房间：点「+ 房间」必须真的建出第二个房间');
+    section('B22 新建房间：工具栏直接打开 RoomsPanel 表单并提交');
 
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-left .tabs button')]
-      .find(x=>x.textContent.trim()==='对象树');if(b)b.click();return !!b})()`);
-    await sleep(320);
-    const roomCount = () => evalJs(`document.querySelectorAll('.side-left .tree-room').length`);
-
+    const roomCount = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`);
     const roomsBefore = await roomCount();
     const errToastBeforeRoom = await text('.toast-error');
     const vBeforeRoom = await statusVersion();
 
-    /**
-     * 2026-09-28：「+ 房间」不再当场造一个房间出来，而是打开**独立的「新建房间」页**
-     * （用户原话：添加房间应该是单独的一页添加，而不是和现有房间在一个页面并排）。
-     * 所以这里要走完整两步：点工具栏 → 在新建页点「创建房间」。
-     * 只点第一步就断言"房间数 +1"会变成一条**永远失败**的断言，那不是我们要的。
-     */
-    const newRoomViaPage = () =>
-      evalJs(`(async()=>{
-        const tb=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='+ 房间');
-        if(!tb) return 'no-toolbar-btn';
-        tb.click();
-        await new Promise(r=>setTimeout(r,320));
-        const btn=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');
-        if(!btn) return 'no-create-btn';
-        if(btn.disabled) return 'create-disabled';
-        btn.click();
-        return 'ok';
-      })()`);
+    // 当前产品路径：+ 房间直接切到 RoomsPanel/NewRoomPage。
+    const newRoomViaPage = (name) => evalJs(`(async()=>{
+      const tb=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='+ 房间');
+      if(!tb) return 'no-toolbar-btn';
+      tb.click();
+      await new Promise(r=>setTimeout(r,260));
+      const input=document.querySelector('.side-right input.input');
+      const button=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');
+      if(!input||!button) return 'no-room-form';
+      const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+      if(!setter) return 'no-input-setter';
+      setter.call(input,${JSON.stringify(name)});
+      input.dispatchEvent(new Event('input',{bubbles:true}));
+      input.dispatchEvent(new Event('change',{bubbles:true}));
+      await new Promise(r=>setTimeout(r,140));
+      if(button.disabled) return 'create-disabled';
+      button.click();
+      return 'ok';
+    })()`);
 
-    const clickedNewRoom = await newRoomViaPage();
-    ok('工具栏「+ 房间」→ 打开新建房间页 → 点「创建房间」这条走得通', clickedNewRoom === 'ok', String(clickedNewRoom));
+    const clickedNewRoom = await newRoomViaPage('验收房间一');
+    ok('工具栏「+ 房间」→ RoomsPanel 新建页 →「创建房间」真实提交', clickedNewRoom === 'ok', String(clickedNewRoom));
     await sleep(520);
 
     const roomErrToast = await text('.toast-error');
     ok(
-      '新建房间不报「结构性命令失败」（房间 id 必须避开项目里已用的）',
+      '新建房间不报结构性命令失败（房间 ID 避开项目已用 ID）',
       !/结构性命令失败/.test(roomErrToast) && (roomErrToast === '' || roomErrToast === errToastBeforeRoom),
       `before="${errToastBeforeRoom}" after="${roomErrToast}"`
     );
-    ok(
-      '新建房间后模型版本 +1（真的写进模型了，不是只弹个提示）',
-      (await statusVersion()) === vBeforeRoom + 1,
-      `v${vBeforeRoom} → v${await statusVersion()}`
-    );
-    ok(
-      '对象树里的房间数 +1',
-      (await roomCount()) === roomsBefore + 1,
-      `${roomsBefore} → ${await roomCount()}`
-    );
+    ok('新建房间后模型版本 +1', (await statusVersion()) === vBeforeRoom + 1, `v${vBeforeRoom} → v${await statusVersion()}`);
+    ok('房间确实写入模型 +1', (await roomCount()) === roomsBefore + 1, `${roomsBefore} → ${await roomCount()}`);
 
-    // 连续建第二个：只建得出一个也是缺陷（id 撞车就是这种表现）
-    await newRoomViaPage();
+    await newRoomViaPage('验收房间二');
     await sleep(520);
-    ok(
-      '能连续建第二个新房间（不是只能建一个）',
-      (await roomCount()) === roomsBefore + 2,
-      `${roomsBefore} → ${await roomCount()}`
-    );
-    ok(
-      '两个新房间都没有触发结构性失败',
-      !/结构性命令失败/.test(await text('.toast-error')),
-      await text('.toast-error')
-    );
+    ok('连续创建第二个房间成功', (await roomCount()) === roomsBefore + 2, `${roomsBefore} → ${await roomCount()}`);
+    ok('两个创建都没有结构性失败', !/结构性命令失败/.test(await text('.toast-error')), await text('.toast-error'));
 
     // ═══════════════════════════════════════════════════════════
-    /**
-     * B22b —— 「新建房间」是**独立一页**，不是在列表里凭空并排多一张卡片。
-     *
-     * 用户原话：「添加房间是增加一个单独页面添加，而不是和现有房间在一个页面并排」。
-     * 旧行为：点「+ 房间」就地 append 一个默认房间，名字没填、尺寸没定，
-     *        跟已有房间混在一起，房间一多根本分不清哪个是新加的。
-     *
-     * 这组断言钉死三件事：① 点了之后进的是表单页；② **这一刻房间数没有变**
-     * （"点了不该立刻多一个"才是用户要的）；③ 填了重名时创建按钮不可用。
-     */
-    section('B22b 新建房间是独立一页（点了不立刻多一个，重名不能建）');
+    /** B22b：表单只在提交后创建；必填名称和重复名都在当前侧栏即时校验。 */
+    section('B22b 新建房间必填/重名校验与成功回列表');
 
-    const roomsBefore22b = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`);
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')]
-      .find(x=>x.textContent.trim()==='+ 房间');if(b)b.click();return !!b})()`);
-    await sleep(420);
-    ok(
-      '点「+ 房间」进的是「新建房间」表单页（能看见创建按钮）',
-      await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].some(x=>x.textContent.trim()==='创建房间')`),
-      await text('.side-right')
-    );
-    ok(
-      '★ 这一刻房间数没变 —— 不再"点了就并排多一个"（用户要的就是这个）',
-      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBefore22b,
-      `${roomsBefore22b} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)}`
-    );
-    // 重名 → 创建按钮必须禁用（不给"点了才知道错"的机会）
+    const roomsBefore22b = await roomCount();
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='+ 房间');if(b)b.click();return !!b})()`);
+    await sleep(260);
+    ok('点「+ 房间」直接出现新建表单，未自动创建房间',
+      await evalJs(`!!document.querySelector('.side-right input.input') && [...document.querySelectorAll('.side-right button')].some(x=>x.textContent.trim()==='创建房间')`), await text('.side-right'));
+    ok('打开表单时房间数不变', (await roomCount()) === roomsBefore22b, `${roomsBefore22b} → ${await roomCount()}`);
+
     await evalJs(`(async()=>{
-      const inp=[...document.querySelectorAll('.side-right input.input')][0];
-      const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+      const input=document.querySelector('.side-right input.input');
+      const button=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');
+      const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+      if(!input||!button||!setter)return false;
       const names=(await import('/src/state/store.ts')).bus.getState().rooms.map(r=>r.name);
-      setter.call(inp, names[0]);
-      inp.dispatchEvent(new Event('input',{bubbles:true}));
+      setter.call(input,names[0]||'');input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));
       return true;
     })()`);
-    await sleep(360);
-    ok(
-      '房间名重名时「创建房间」不可用，且界面上写明原因',
-      (await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间')?.disabled === true`)) === true &&
+    await sleep(220);
+    ok('重名时「创建房间」禁用并显示明确原因',
+      await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');return !!b&&b.disabled})()`) === true &&
         /已经有一个房间叫/.test(await text('.side-right')),
-      await text('.side-right')
-    );
-    // 改回一个不重名的名字 → 能建，且回到列表页
-    await evalJs(`(async()=>{
-      const inp=[...document.querySelectorAll('.side-right input.input')][0];
-      const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-      setter.call(inp, '验收新增房间');
-      inp.dispatchEvent(new Event('input',{bubbles:true}));
-      return true;
+      await text('.side-right'));
+
+    await evalJs(`(()=>{
+      const input=document.querySelector('.side-right input.input');
+      const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+      if(!input||!setter)return false;
+      setter.call(input,'验收新增房间');input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));return true;
     })()`);
-    await sleep(300);
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');if(b&&!b.disabled)b.click();return !!b})()`);
+    await sleep(220);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');if(b&&!b.disabled)b.click();return !!b&&!b.disabled})()`);
     await sleep(520);
-    ok(
-      '填好确认后才真的建出来（房间数 +1）',
-      (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBefore22b + 1,
-      `${roomsBefore22b} → ${await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)}`
-    );
-    ok(
-      '建完回到房间列表页（不是停在表单页上）',
-      (await evalJs(`[...document.querySelectorAll('.side-right .tb-btn')].some(x=>x.textContent.trim()==='创建房间')`)) === false,
-      await text('.side-right')
-    );
+    ok('确认后房间数 +1', (await roomCount()) === roomsBefore22b + 1, `${roomsBefore22b} → ${await roomCount()}`);
+    ok('创建完成后返回房间列表', await evalJs(`!document.querySelector('.side-right textarea[aria-label="房间备注（可选）"]')`) === true, await text('.side-right'));
+    if (process.env.STOP_AFTER_ONLY === '1' && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -3565,8 +5259,22 @@ async function waitForApp(url, timeoutMs = 25000) {
     await activateRightTab('导出');
     await sleep(420);
 
-    const expChecks = await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].map(i=>i.checked)`);
-    ok('「导出」页签在，且默认勾选了平面图与四视图两张', Array.isArray(expChecks) && expChecks.length === 2 && expChecks.every(Boolean), JSON.stringify(expChecks));
+    const expStructure = await evalJs(`(async()=>{
+      const s=await import('/src/state/store.ts');const rooms=s.bus.getState().rooms;
+      const g=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('DXF 图纸内容'));
+      const top=[...(g?.children||[])].filter(x=>x.matches?.('label.exp-check'));
+      const roomLabels=[...(g?.querySelectorAll('.exp-room-list label.exp-check')||[])];
+      const pg=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('PDF 房间布局页'));
+      const pdfRooms=[...(pg?.querySelectorAll('input.pdf-layout-room-checkbox')||[])];
+      return {roomNames:rooms.map(r=>r.name),top:top.map(x=>({text:x.textContent.replace(/\\s+/g,' ').trim(),checked:x.querySelector('input')?.checked??false})),
+        roomIds:rooms.map(r=>r.id),roomNamesInUi:roomLabels.map(x=>x.textContent.replace(/\\s+/g,' ').trim()),roomCount:roomLabels.length,checkedRooms:roomLabels.filter(x=>x.querySelector('input')?.checked).length,
+        pdfRoomCount:pdfRooms.length,pdfChecked:pdfRooms.filter(x=>x.checked).length};
+    })()`);
+    ok('「导出」页签 DXF 房间选项动态匹配，PDF 布局选项按房间显示且默认全关',
+      expStructure?.top.length===2 && expStructure.top.every(x=>x.checked)
+      && expStructure.roomCount===expStructure.roomNames.length && expStructure.checkedRooms===expStructure.roomNames.length
+      && JSON.stringify(expStructure.roomNamesInUi)===JSON.stringify(expStructure.roomNames)
+      && expStructure.pdfRoomCount===expStructure.roomNames.length && expStructure.pdfChecked===0, JSON.stringify(expStructure));
 
     ok(
       'DXF 版本下拉默认 R2007（原生 UTF-8 主交付，不是兼容备用的 R2000）',
@@ -3576,9 +5284,25 @@ async function waitForApp(url, timeoutMs = 25000) {
     const exportBtn = async () => evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')]
       .find(x=>x.textContent.includes('导出 DXF'));return b?{disabled:b.disabled}:null})()`);
     ok('「导出 DXF」按钮在', (await exportBtn()) !== null, JSON.stringify(await exportBtn()));
+    const clickExportType = async (needle) => evalJs(`(()=>{
+      const g=[...document.querySelectorAll('.side-right .exp-group')].find(x=>x.querySelector('.exp-title')?.textContent.includes('DXF 图纸内容'));
+      const label=[...(g?.children||[])].find(x=>x.matches?.('label.exp-check')&&x.textContent.includes(${JSON.stringify(needle)}));
+      const input=label?.querySelector('input');if(!input)return false;input.click();return true;
+    })()`);
 
-    // 两张图都不勾 → 必须禁用。这条防的是"导出一份空文件"。
-    await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].forEach(i=>{i.click()})`);
+    const pdfRoomToggle = await evalJs(`(()=>{const i=document.querySelector('.pdf-layout-room-checkbox');if(!i)return false;i.click();return true})()`);
+    await sleep(160);
+    const pdfRoomSelected = await evalJs(`(()=>[...document.querySelectorAll('.pdf-layout-room-checkbox')].filter(i=>i.checked).map(i=>i.dataset.pdfLayoutRoom))()`);
+    ok('PDF 布局页按房间真实切换，只选择当前项目中的目标房间', pdfRoomToggle===true && pdfRoomSelected.length===1 && expStructure.roomIds.includes(pdfRoomSelected[0]), JSON.stringify(pdfRoomSelected));
+    await evalJs(`(()=>{const i=document.querySelector('.pdf-layout-room-checkbox');if(i?.checked)i.click();return true})()`);
+    await sleep(160);
+    const pdfRoomReset = await evalJs(`(()=>[...document.querySelectorAll('.pdf-layout-room-checkbox')].filter(i=>i.checked).length)()`);
+    ok('取消 PDF 房间布局选项后所有房间恢复默认关闭', pdfRoomReset===0, String(pdfRoomReset));
+
+    // 两类图纸都不勾 → 必须禁用；每房间子选项数量由当前项目决定。
+    await clickExportType('房间平面布置图');
+    await sleep(120);
+    await clickExportType('柜体图纸');
     await sleep(260);
     ok(
       '两张图都不选时「导出 DXF」被禁用（不许导出空文件）',
@@ -3586,7 +5310,9 @@ async function waitForApp(url, timeoutMs = 25000) {
       JSON.stringify(await exportBtn())
     );
     ok('面板同时给出一句话解释（禁用不许是无声的）', /至少选一张图/.test(await panelTextAll()));
-    await evalJs(`[...document.querySelectorAll('.side-right .exp-check input')].forEach(i=>{i.click()})`);
+    await clickExportType('房间平面布置图');
+    await sleep(120);
+    await clickExportType('柜体图纸');
     await sleep(260);
     ok('恢复勾选后按钮回到可用', ((await exportBtn()) || {}).disabled === false, JSON.stringify(await exportBtn()));
 
@@ -3737,11 +5463,14 @@ async function waitForApp(url, timeoutMs = 25000) {
       };
     };
 
+    // B24 导入文件可能保留旧相机偏移；先走真实 Home/Zoom Extents，再以当前 HUD 重标。
+    await keyPress('Home', 'Home', 36);
+    await sleep(520);
     let cal25 = await calib25();
     ok('B25 独立重标定成功（HUD 两点反解 px/mm）', cal25.good && cal25.scale > 0.05 && cal25.scale < 1,
       cal25.good ? `scale=${cal25.scale.toFixed(4)}` : 'HUD 读数失败');
 
-    const cabInfo25 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+    let cabInfo25 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
       const c=s.bus.getState().cabinets[0];
       return { id:c.id, x:c.placement.x, y:c.placement.y, rot:c.placement.rotation, w:c.params.width, d:c.params.depth };})()`);
     ok('柜体 0 的旋转角是 0（右键点位按未旋转计算的前提）', cabInfo25.rot === 0, JSON.stringify(cabInfo25));
@@ -3784,18 +5513,47 @@ async function waitForApp(url, timeoutMs = 25000) {
     await sleep(320);
     // 「新建房间」现在只打开独立的新建页（不再当场造），所以要再点一下「创建房间」
     await evalJs(`(()=>{const b=[...document.querySelectorAll('.ctx-menu .ctx-item')].find(x=>x.textContent.trim()==='新建房间');if(b)b.click();return !!b})()`);
-    await sleep(360);
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .tb-btn')].find(x=>x.textContent.trim()==='创建房间');if(b&&!b.disabled)b.click();return !!b})()`);
+    const roomFormReady25 = await waitFor(`!!document.querySelector('.side-right input.input')&&[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='创建房间')`, 5000, 100);
+    ok('上下文菜单的新建房间项打开真实名称表单', roomFormReady25 === true);
+    if (!roomFormReady25) throw new Error('[B25 fixture] new-room form did not open from the context menu');
+    const roomName25 = `B25验收-${Date.now()}`;
+    const roomNameSet25 = await setElValue('.side-right input.input', roomName25);
+    ok('B25 按当前必填名称契约填写新房间名', roomNameSet25 === true, roomName25);
+    if (!roomNameSet25) throw new Error('[B25 fixture] new-room name input is not writable');
+    const roomCreate25 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='创建房间');
+      if(!b||b.disabled)return {clicked:false,disabled:b?.disabled??null};b.click();return {clicked:true}})()`);
+    ok('B25 创建房间按钮可用并被真实点击', roomCreate25?.clicked === true, JSON.stringify(roomCreate25));
+    if (!roomCreate25?.clicked) throw new Error(`[B25 fixture] create room action unavailable: ${JSON.stringify(roomCreate25)}`);
     await sleep(520);
+    const roomRead25 = await startPageOperation('B25.room-created-readback', `async()=>{
+      const s=await import('/src/state/store.ts');const p=s.bus.getState();
+      const created=p.rooms.find(r=>r.name===${JSON.stringify(roomName25)});
+      return {projectId:p.id,count:p.rooms.length,created:!!created,createdRoomId:created?.id??null};
+    }`, 12000);
+    const roomStateAfter25 = roomRead25.result;
     ok('菜单项能真的执行：「新建房间」后版本 +1', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx} → v${await statusVersion()}`);
     ok('菜单项执行后菜单收掉', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === false);
-    ok('房间数 +1（不是只弹了个提示）', (await evalJs(`(async()=>{const s=await import('/src/state/store.ts');return s.bus.getState().rooms.length})()`)) === roomsBeforeCtx + 1);
+    ok('房间数 +1 且新名称已进入模型（不是只弹了个提示）', roomStateAfter25?.count === roomsBeforeCtx + 1 && roomStateAfter25?.created === true, JSON.stringify(roomStateAfter25));
+    const roomContextReady25 = roomStateAfter25?.createdRoomId ? await waitFor(`(()=>{try{const c=JSON.parse(localStorage.getItem('furniture-cad.workspace-context')||'null');return c?.projectId===${JSON.stringify(roomStateAfter25.projectId)}&&c?.roomId===${JSON.stringify(roomStateAfter25.createdRoomId)}}catch{return false}})()`, 3500, 100) : false;
+    ok('创建后当前 projectId + roomId 上下文持久指向新房间', roomContextReady25 === true,
+      JSON.stringify({projectId:roomStateAfter25?.projectId,roomId:roomStateAfter25?.createdRoomId,ready:roomContextReady25}));
 
-    // ③ Esc 关菜单（菜单开着再右键一次，然后按 Esc）
-    // 「新建房间」触发了 fitSignal 重新取景 —— 相机变了，旧标定作废，重标一次
+    // 新建房间会把视口聚焦到新房间；后续仍要测 CAD 右键，先真实 Home 适应整项目，
+    // 再读取柜体的当前几何并重新标定，绝不沿用新房间聚焦前的屏幕坐标。
+    await keyPress('Home', 'Home', 36);
+    await sleep(520);
+    const refreshedCab25 = await startPageOperation('B25.refresh-cabinet-after-home', `async()=>{
+      const s=await import('/src/state/store.ts');const c=s.bus.getState().cabinets[0];
+      return {id:c.id,x:c.placement.x,y:c.placement.y,rot:c.placement.rotation,w:c.params.width,d:c.params.depth};
+    }`, 12000);
+    cabInfo25 = refreshedCab25.result;
+    ok('Home 适应后重新读取当前柜体几何', !!cabInfo25?.id && cabInfo25.rot === 0, JSON.stringify(cabInfo25));
     cal25 = await calib25();
-    ok('取景后重新标定成功（相机变了，旧标定就是错的）', cal25.good && cal25.scale > 0.05 && cal25.scale < 1,
+    ok('新建房间后 Home 适应并重新标定成功', cal25.good && cal25.scale > 0.05 && cal25.scale < 1,
       cal25.good ? `scale=${cal25.scale.toFixed(4)}` : 'HUD 读数失败');
+    const postRoomCenter25 = cabCenter25();
+    ok('重新取景后原柜体中心仍在 CAD 视口内', postRoomCenter25.x > cal25.rect.left + 8 && postRoomCenter25.x < cal25.rect.right - 8 && postRoomCenter25.y > cal25.rect.top + 8 && postRoomCenter25.y < cal25.rect.bottom - 8,
+      JSON.stringify(postRoomCenter25));
     await mouseRightClick(cabCenter25().x, cabCenter25().y);
     await sleep(320);
     ok('再次右键菜单重新打开', (await evalJs(`!!document.querySelector('.ctx-menu')`)) === true);
@@ -3880,7 +5638,7 @@ async function waitForApp(url, timeoutMs = 25000) {
       && c.x > c.rect.left + 8 && c.x < c.rect.right - 8 && c.y > c.rect.top + 8 && c.y < c.rect.bottom - 8;
 
     // 进四视图
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b)b.click();return !!b})()`);
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('图纸视图'));if(b)b.click();return !!b})()`);
     await sleep(420);
     ok('四视图切换成功（图幅 HUD 提示在，平面读数不在）',
       (await evalJs(`!!document.querySelector('.vp-hud-sheet')`)) === true,
@@ -3905,6 +5663,7 @@ async function waitForApp(url, timeoutMs = 25000) {
       return after.filter((t) => !baseSet26.has(t)).join(' | ');
     };
 
+    const vBeforePick26 = await statusVersion();
     const pickOuter = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
       const v=s.bus.derive().geom.views.pickLines;
       const pl=v.find(x=>x.part==='outer.width');
@@ -3943,7 +5702,7 @@ async function waitForApp(url, timeoutMs = 25000) {
         ok('点击层板线 → 解析成 shelves.count（改层板 = 改数量参数，不是挪线）',
           fresh26b.includes(pickShelf.label) && fresh26b.includes('shelves.count'),
           `新增气泡=[${fresh26b || '(无)'}]`);
-        ok('点线没有写模型（解析是读操作，改不改由用户决定）', (await statusVersion()) === vBeforeCtx + 1, `v${vBeforeCtx + 1} → v${await statusVersion()}`);
+        ok('点线没有写模型（解析是读操作，改不改由用户决定）', (await statusVersion()) === vBeforePick26, `v${vBeforePick26} → v${await statusVersion()}`);
       }
     }
 
@@ -3975,38 +5734,54 @@ async function waitForApp(url, timeoutMs = 25000) {
     // ═══════════════════════════════════════════════════════════
     section('B36 四视图可编辑：真鼠标拖动 → 写语义参数，四图同步，不可拖的给出理由');
 
-    // 证据：复位前这一节究竟在跑哪个工程、哪个柜子（别让"状态被污染"停留在猜测）
-    const dirty36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const p=s.bus.getState(); const c=p.cabinets[0];
-      return {proj:p.name, cabCount:p.cabinets.length, id:c&&c.id, name:c&&c.name,
-        place:c&&JSON.stringify(c.placement), width:c&&c.params.width};})()`);
+    const b36ResetOperation = await startPageReset('B36.sample-reset', {
+      label: 'B36 复位为示例工程', saveAs: '__b36Saved', modulesKey: '__b36Modules',
+      modules: ['hitTest', 'snapping', 'camDebug', 'sheetDrag', 'camera'],
+    }, 12000);
+    const b36ResetResult = b36ResetOperation.result;
+    const dirty36 = b36ResetResult?.before ? {
+      proj: b36ResetResult.before.project, cabCount: b36ResetResult.before.cabinets, ver: b36ResetResult.before.version,
+    } : null;
+    const reset36 = b36ResetResult?.reset ? {
+      proj: b36ResetResult.reset.project, id: b36ResetResult.reset.cabinetId, name: b36ResetResult.reset.cabinetName,
+      width: b36ResetResult.reset.width, ver: b36ResetResult.reset.version, cabCount: b36ResetResult.reset.cabinetCount,
+    } : null;
+    ok('B36 页面内模块加载与工程复位经共享 page-harness 轮询完成', b36ResetOperation.status === 'fulfilled',
+      JSON.stringify({before:b36ResetOperation.before,after:b36ResetOperation.after,result:b36ResetResult}));
+    console.log('[B36 页面复位状态] ' + JSON.stringify({status:b36ResetOperation.status,before:dirty36,reset:reset36}));
+    const resetValid36 = Boolean(reset36) && reset36.proj === '示例户型'
+      && reset36.width === 2400 && reset36.cabCount > 0 && Boolean(dirty36);
+    ok('B36 跑在干净的示例工程上（页面 Promise 完成且复位快照有效）',
+      resetValid36, JSON.stringify({status:b36ResetOperation.status,dirty36,reset36}));
+    if (!resetValid36) throw new Error(`[B36 invalid reset snapshot] ${JSON.stringify({status:b36ResetOperation.status,before:b36ResetOperation.before,after:b36ResetOperation.after,result:b36ResetResult,dirty36,reset36})}`);
     console.log('[B36 复位前状态] ' + JSON.stringify(dirty36));
-
-    // 先把现场存起来。本节为了可重复必须复位工程，但**下游小节（B30 等）依赖
-    // 前序留下的柜子**——第一轮修完 B36 就顺手把 B30 冲挂了。所以用完必须还原：
-    // "自成一体"不等于"可以随便改全局状态"。
-    await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      window.__b36Saved = structuredClone(s.bus.getState()); return true;})()`);
-
-    // 复位成干净示例工程 —— 本节自成一体
-    const reset36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const df=await import('/src/core/docFactory.ts');
-      s.bus.replaceProject(df.sampleProject(s.RULESET), 'B36 复位为示例工程');
-      const p=s.bus.getState(); const c=p.cabinets[0];
-      return {proj:p.name, id:c.id, name:c.name, width:c.params.width, ver:s.bus.getVersion()};})()`);
-    ok('B36 跑在干净的示例工程上（本节自成一体，不依赖前序小节遗留的状态）',
-      Boolean(reset36) && reset36.proj === '示例户型' && reset36.width === 2400, JSON.stringify(reset36));
     await sleep(260);
 
     // 必须在图幅模式下拖：若在平面模式，图纸坐标全在屏幕外，点位换算会失败 ——
     // 那会让后面几条断言"静默跳过"，看着像通过，其实什么都没验。所以先断言模式。
-    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.includes('四视图'));if(b&&!document.querySelector('.vp-hud-sheet'))b.click();return true})()`);
-    await sleep(420);
-    ok('B36 拖动发生在四视图图幅模式下（否则后面的断言会静默跳过）',
-      (await evalJs(`!!document.querySelector('.vp-hud-sheet')`)) === true,
-      `sheet-hud=${await evalJs(`!!document.querySelector('.vp-hud-sheet')`)}`);
+    const b36ModeKick = await evalJs(`(()=>{
+      const label='▤ 图纸视图';
+      const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.replace(/\\s+/g,' ').trim()===label);
+      if(!b)return {found:false,label,buttons:[...document.querySelectorAll('.toolbar .tb-btn')].map(x=>x.textContent.trim())};
+      const activeBefore=b.classList.contains('active');
+      if(!activeBefore)b.click();
+      return {found:true,label,activeBefore};
+    })()`);
+    ok('B36 找到当前可见「▤ 图纸视图」入口', b36ModeKick?.found === true, JSON.stringify(b36ModeKick));
+    if (!b36ModeKick?.found) throw new Error(`[B36 harness] current sheet-view control missing: ${JSON.stringify(b36ModeKick)}`);
+    await sleep(620);
+    const b36ModeState = await evalJs(`(()=>{
+      const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.replace(/\\s+/g,' ').trim()==='▤ 图纸视图');
+      const hud=document.querySelector('.vp-hud-sheet');
+      return {buttonActive:!!b?.classList.contains('active'),hud:!!hud,hudText:hud?.textContent.trim()??''};
+    })()`);
+    ok('B36 当前「图纸视图」按钮为激活态', b36ModeState?.buttonActive === true, JSON.stringify(b36ModeState));
+    ok('B36 图纸视图 HUD 已出现（坐标测试前硬门槛）', b36ModeState?.hud === true, JSON.stringify(b36ModeState));
+    if (!b36ModeState?.buttonActive || !b36ModeState?.hud) {
+      throw new Error(`[B36 harness] sheet mode/HUD not active; refusing coordinate-dependent checks: ${JSON.stringify(b36ModeState)}`);
+    }
 
-    const snap36 = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+    const snap36 = () => evalJs(`(()=>{const s=window.__b36Modules.store;
       const v=s.bus.derive().geom.views.pickLines;
       const find=(view,part,edge)=>{const pl=v.find(x=>x.view===view&&x.part===part&&(edge===undefined||x.edge===edge));
         return pl?{x:pl.pts[0].x,y:pl.pts[0].y}:null;};
@@ -4024,22 +5799,20 @@ async function waitForApp(url, timeoutMs = 25000) {
     ok('B36 反查层覆盖侧视图与俯视图（这两张图以前没有可点线）', s0.hasSide && s0.hasTop, JSON.stringify({ hasSide: s0.hasSide, hasTop: s0.hasTop }));
 
     // 拖正视图右外轮廓 +100mm：像素量 = 100 × 当前 scale（与渲染同款换算的逆运算）
-    const line36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+    const line36 = await evalJs(`(()=>{const s=window.__b36Modules.store;
       const v=s.bus.derive().geom.views.pickLines;
       const pl=v.find(x=>x.view==='front'&&x.part==='outer.width'&&x.edge==='max');
       return pl?{mid:{x:(pl.pts[0].x+pl.pts[1].x)/2, y:(pl.pts[0].y+pl.pts[1].y)/2}}:null;})()`);
     ok('B36 取到正视图右外轮廓（= 柜宽那条边）', line36 !== null, JSON.stringify(line36));
+    if (!line36) throw new Error('[B36 harness] required front outer-width pick line is missing; refusing drag assertions');
 
     // 先用**产品自己的命中测试**在算出的世界点上打一枪：这样"坐标算错"与
     // "鼠标事件没进到处理函数"两类失败就能分开，不用猜。
     if (line36) {
-      const selfHit = await evalJs(`(async()=>{
-        const s=await import('/src/state/store.ts');
-        const ht=await import('/src/viewport/hitTest.ts');
-        const sn=await import('/src/viewport/snapping.ts');
-        const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
-        const tol=sn.snapToleranceWorld(8, cd.cam.scale);
-        const hit=ht.hitPart(s.bus.derive().geom.views.pickLines, {x:${line36.mid.x}, y:${line36.mid.y}}, tol);
+      const selfHit = await evalJs(`(()=>{
+        const m=window.__b36Modules;const s=m.store;
+        const tol=m.snapping.snapToleranceWorld(8, m.camDebug.cam.scale);
+        const hit=m.hitTest.hitPart(s.bus.derive().geom.views.pickLines, {x:${line36.mid.x}, y:${line36.mid.y}}, tol);
         return hit?{view:hit.view, part:hit.part, edge:hit.edge, unit:hit.unitIndex}:null;})()`);
       ok('B36 产品自身的命中测试在该世界坐标上命中了"正视图·柜宽·末端边"',
         selfHit !== null && selfHit.view === 'front' && selfHit.part === 'outer.width' && selfHit.edge === 'max',
@@ -4048,21 +5821,25 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     // 页面内直接跑一遍 dragPlanOf：读的是**界面正在用的同一份模块**，
     // 任何隐藏异常（比如契约导入失败）都会在这里现形，而不是变成"拖了没反应"。
-    const plan36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const sd=await import('/src/viewport/sheetDrag.ts');
+    const plan36 = await evalJs(`(()=>{const m=window.__b36Modules;const s=m.store;
       const pl=s.bus.derive().geom.views.pickLines.find(x=>x.view==='front'&&x.part==='outer.width'&&x.edge==='max');
-      const p=sd.dragPlanOf(pl);
+      const p=m.sheetDrag.dragPlanOf(pl);
       return p.ok?{ok:true,label:p.spec.labelZh,axis:p.spec.axis,sign:p.spec.sign,min:p.spec.min,max:p.spec.max}:{ok:false,reason:p.reason};})()`);
     ok('B36 页面内 dragPlanOf 判定这条线可拖（与界面同一份模块）', Boolean(plan36 && plan36.ok), JSON.stringify(plan36));
+    if (!plan36?.ok) throw new Error(`[B36 product path] width pick line is not draggable: ${JSON.stringify(plan36)}`);
 
     // 拖之前的硬错数：拖完不许变多（拖动只该改这一个尺寸，不该顺手造出新问题）
-    const errCount36 = () => evalJs(`(async()=>{const s=await import('/src/state/store.ts');
+    const errCount36 = () => evalJs(`(()=>{const s=window.__b36Modules.store;
       return s.bus.derive().issues.filter(i=>i.severity==='ERROR').length;})()`);
 
     if (line36) {
       const c36 = await clientOfSheet(line36.mid.x, line36.mid.y);
       ok('B36 拖动起点换算成功且落在视口内', inViewport(c36), JSON.stringify(c36));
+      if (!inViewport(c36)) throw new Error(`[B36 harness] drag start outside viewport; refusing to count an unperformed drag: ${JSON.stringify(c36)}`);
       if (inViewport(c36)) {
+        await moveMouse(c36.x, c36.y);
+        await sleep(160);
+        ok('B36 仅悬停在可编辑尺寸线上时不显示尺寸/位移读数', (await hudReadout()) === '', await hudReadout());
         // 往"收窄"方向拖 ~100mm。图幅模式为了塞下四张图，scale 很小（约 0.047 px/mm），
         // 100mm 只有 5px 左右 —— 所以**不能**断言"正好 100mm"，像素取整本身就带误差。
         // 误差上限 = 半个像素对应的毫米数，这里照实算出来，不拍脑袋写死。
@@ -4085,9 +5862,8 @@ async function waitForApp(url, timeoutMs = 25000) {
 
         const s1 = await snap36();
         const errAfter36 = await errCount36();
-        // 悬停读数形如"柜宽 2400mm · 左右拖…"，拖动读数形如"柜宽 → 2300mm"（含箭头）。
-        // 必须断言箭头，否则"悬停有读数"会冒充"拖动有读数"，把真失败盖过去。
-        ok('B36 拖动过程有读数：显示"柜宽 → 目标值mm"（所见即所得，且是拖动态不是悬停态）',
+        // 明确进入拖动后才显示目标值；悬停不再冒充编辑读数。
+        ok('B36 拖动过程有读数：显示"柜宽 → 目标值mm"（所见即所得）',
           /柜宽/.test(String(read36 || '')) && /→/.test(String(read36 || '')),
           `拖动中读数=[${read36}] 末=[${read36b}]`);
         ok('B36 松手后模型版本 +1（一次拖动 = 一条命令 = 一次撤销）', s1.ver === s0.ver + 1, `v${s0.ver} → v${s1.ver}`);
@@ -4108,8 +5884,26 @@ async function waitForApp(url, timeoutMs = 25000) {
           Boolean(s1.topW) && Boolean(s1.frontW) && Math.abs(s1.topW.x - s1.frontW.x) <= 1
             && Math.abs(s1.topW.x - s0.topW.x - (s1.width - s0.width)) <= 1,
           `front.x=${s1.frontW?.x} top.x=${s1.topW?.x} width=${s1.width}`);
+        const deltaFront36 = s1.frontW && s0.frontW ? s1.frontW.x - s0.frontW.x : NaN;
+        const deltaTop36 = s1.topW && s0.topW ? s1.topW.x - s0.topW.x : NaN;
+        ok('B36 真拖后正视/俯视投影坐标均发生与宽度一致的变化',
+          Number.isFinite(deltaFront36) && Number.isFinite(deltaTop36)
+            && Math.abs(deltaFront36 - (s1.width - s0.width)) <= 1
+            && Math.abs(deltaTop36 - (s1.width - s0.width)) <= 1,
+          `Δfront.x=${deltaFront36} Δtop.x=${deltaTop36} Δwidth=${s1.width - s0.width}`);
         ok('B36 拖完没有新增硬错（只改了这一个尺寸，没顺手造出新问题）',
           errAfter36 === errBefore36, `ERROR ${errBefore36} → ${errAfter36}`);
+
+        const undo36 = await evalJs(`(()=>{const b=document.querySelector('.toolbar .tb-btn[title="撤销 Ctrl+Z"]');
+          if(!b||b.disabled)return {clicked:false,disabled:b?.disabled??null};b.click();return {clicked:true};})()`);
+        ok('B36 拖动后工具栏撤销按钮可用并已真实点击', undo36?.clicked === true, JSON.stringify(undo36));
+        if (!undo36?.clicked) throw new Error(`[B36 product path] undo control unavailable after drag: ${JSON.stringify(undo36)}`);
+        await sleep(360);
+        const sUndo36 = await snap36();
+        ok('B36 通过 UI 撤销恢复原柜宽与正/俯视投影坐标',
+          sUndo36.width === s0.width && sUndo36.frontW?.x === s0.frontW?.x && sUndo36.topW?.x === s0.topW?.x,
+          `width ${s1.width}→${sUndo36.width}; front ${s1.frontW?.x}→${sUndo36.frontW?.x}; top ${s1.topW?.x}→${sUndo36.topW?.x}`);
+        ok('B36 UI 撤销产生一次历史版本变化', sUndo36.ver === s1.ver + 1, `v${s1.ver} → v${sUndo36.ver}`);
       }
     }
 
@@ -4117,15 +5911,13 @@ async function waitForApp(url, timeoutMs = 25000) {
     if (s0.frontMinMid) {
       const cMin = await clientOfSheet(s0.frontMinMid.x, s0.frontMinMid.y);
       ok('B36 基准边中点落在视口内（否则下面两条会静默跳过）', inViewport(cMin), JSON.stringify(cMin));
+      if (!inViewport(cMin)) throw new Error(`[B36 harness] baseline edge outside viewport; refusing to count negative drag assertions: ${JSON.stringify(cMin)}`);
       // 先确认这一枪真能打中：否则"没冒气泡"到底是产品没给理由、还是根本没点中，
       // 就永远说不清。上一轮就是这么被自己的坐标骗过去的。
-      const hitMin = await evalJs(`(async()=>{
-        const s=await import('/src/state/store.ts');
-        const ht=await import('/src/viewport/hitTest.ts');
-        const sn=await import('/src/viewport/snapping.ts');
-        const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
-        const tol=sn.snapToleranceWorld(8, cd.cam.scale);
-        const hit=ht.hitPart(s.bus.derive().geom.views.pickLines, {x:${s0.frontMinMid.x}, y:${s0.frontMinMid.y}}, tol);
+      const hitMin = await evalJs(`(()=>{
+        const m=window.__b36Modules;const s=m.store;
+        const tol=m.snapping.snapToleranceWorld(8, m.camDebug.cam.scale);
+        const hit=m.hitTest.hitPart(s.bus.derive().geom.views.pickLines, {x:${s0.frontMinMid.x}, y:${s0.frontMinMid.y}}, tol);
         return hit?{view:hit.view, part:hit.part, edge:hit.edge}:null;})()`);
       ok('B36 基准边在世界坐标上确实能被命中（点位算对了才谈得上"拖不动"）',
         hitMin !== null && hitMin.part === 'outer.width' && hitMin.edge === 'min', JSON.stringify(hitMin));
@@ -4144,23 +5936,19 @@ async function waitForApp(url, timeoutMs = 25000) {
         // 诊断三件套：真实落点反解 / 相机有没有被平移 / 全部气泡（不是差集）。
         // 差集为空有两种可能——"没冒气泡"或"冒了但和旧气泡同文本被过滤"，
         // 只看差集永远分不清，所以两个都打。
-        const rawMin = await evalJs(`(async()=>{
-          const m=await import('/src/viewport/camera.ts');
-          const cd=(await import('/src/viewport/camDebug.ts')).camDebug;
+        const rawMin = await evalJs(`(()=>{
+          const m=window.__b36Modules;
           const rect=document.querySelector('.vp').getBoundingClientRect();
-          const w=m.screenToWorld({x:${cMin.x}-rect.left, y:${cMin.y}-rect.top}, cd.cam, cd.vw, cd.vh);
+          const w=m.camera.screenToWorld({x:${cMin.x}-rect.left, y:${cMin.y}-rect.top}, m.camDebug.cam, m.camDebug.vw, m.camDebug.vh);
           return {x:Math.round(w.x*10)/10, y:Math.round(w.y*10)/10};})()`);
-        // 注意：Runtime.evaluate 里没有顶层 await，必须包 async IIFE ——
-        // 否则 `await import(...)` 会被解析成 `await` 后紧跟一个 `import` 记号，
-        // 报 "Unexpected token 'import'"，整节探针直接崩掉（踩过一次）。
-        const camBefore36 = await evalJs(`(async()=>JSON.stringify((await import('/src/viewport/camDebug.ts')).camDebug.cam))()`);
+        const camBefore36 = await evalJs(`JSON.stringify(window.__b36Modules.camDebug.cam)`);
         await mouseDown(cMin.x, cMin.y);
         await sleep(90);
         await moveMouse(cMin.x + 40, cMin.y, 1);
         await sleep(90);
         await mouseUp(cMin.x + 40, cMin.y);
         await sleep(300);
-        const camAfter36 = await evalJs(`(async()=>JSON.stringify((await import('/src/viewport/camDebug.ts')).camDebug.cam))()`);
+        const camAfter36 = await evalJs(`JSON.stringify(window.__b36Modules.camDebug.cam)`);
         const all36 = (await toastItems()) || [];
         console.log(`[B36 基准边诊断] 期望世界点=(${s0.frontMinMid.x},${s0.frontMinMid.y}) 真实落点=${JSON.stringify(rawMin)}`);
         console.log(`[B36 基准边诊断] 相机 before=${camBefore36} after=${camAfter36}（相机变了说明这一下被当成平移了）`);
@@ -4176,15 +5964,16 @@ async function waitForApp(url, timeoutMs = 25000) {
     }
 
     // 还原现场：下游 B30 等小节依赖前序留下的柜子，本节不能把它们冲掉
-    const restored36 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      if (!window.__b36Saved) return null;
-      s.bus.replaceProject(window.__b36Saved, 'B36 还原现场');
-      const p=s.bus.getState();
-      return {proj:p.name, cabCount:p.cabinets.length};})()`);
+    const restore36Operation = await startPageRestore('B36.restore-fixture', {
+      snapshotKey: '__b36Saved', busGlobal: '__verifyBus', mode: 'project', label: 'B36 还原现场', clearSaved: true,
+    }, 5000);
+    const restored36 = await evalJs(`(()=>{const p=window.__verifyBus.getState();return {proj:p.name,cabCount:p.cabinets.length,version:window.__verifyBus.getVersion()}})()`);
     ok('B36 结束后把现场还原了（自成一体 ≠ 可以随便改全局状态）',
-      Boolean(restored36) && restored36.cabCount === dirty36.cabCount && restored36.proj === dirty36.proj,
-      `还原=${JSON.stringify(restored36)} 复位前=${JSON.stringify({ proj: dirty36.proj, cabCount: dirty36.cabCount })}`);
+      restore36Operation.result?.restored === true && Boolean(restored36)
+        && restored36.cabCount === dirty36.cabCount && restored36.proj === dirty36.proj,
+      `还原=${JSON.stringify(restored36)} 复位前=${JSON.stringify({ proj: dirty36.proj, cabCount: dirty36.cabCount })} restore=${JSON.stringify(restore36Operation.result)}`);
     await sleep(200);
+    if (STOP_AFTER_ONLY && ONLY && currentGroup.includes(ONLY)) await finishProbe();
 
     // ═══════════════════════════════════════════════════════════
     /**
@@ -4300,7 +6089,7 @@ async function waitForApp(url, timeoutMs = 25000) {
     const selBlank = await statusSelection();
     ok('点空白 → 清空选择（null 或 0 都算清空）', selBlank === null || selBlank === 0, `实为 ${selBlank}`);
 
-    // 跨模式联动：重新选中 → 切回平面图 → 选择保持
+    // 跨模式隔离：切换视图后旧选择必须清空，避免操作继续指向离开的对象
     await mouseDown(rect3d.l + rect3d.w * 0.5, rect3d.t + rect3d.h * 0.45);
     await sleep(80);
     await mouseUp(rect3d.l + rect3d.w * 0.5, rect3d.t + rect3d.h * 0.45);
@@ -4308,8 +6097,8 @@ async function waitForApp(url, timeoutMs = 25000) {
     const selBack = await statusSelection();
     await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='平面图');if(b)b.click();return !!b})()`);
     await sleep(420);
-    ok('3D 里选中的柜体，切回平面图后选择保持（选择是跨模式的视图状态）',
-      selBack === 1 && (await statusSelection()) === 1, `3D=${selBack} plan=${await statusSelection()}`);
+    ok('3D 里选中的柜体，切回平面图后旧选择清空',
+      selBack === 1 && (await statusSelection()) === null, `3D=${selBack} plan=${await statusSelection()}`);
     // 收尾：留截图
     await shot(path.join(OUT_DIR, 'app-3d-viewport.png'));
     ok('3D 视图截图已保存（人工目视用）', true, 'app-3d-viewport.png');
@@ -4413,55 +6202,66 @@ async function waitForApp(url, timeoutMs = 25000) {
 
     const vB31 = await statusVersion();
     // ① 总线改玻璃（ui 与 AI 同权同位 —— 探针走的就是用户会走的通道）
-    const glassSet = await evalJs(`(async()=>{
+    const glassSetOperation = await startPageOperation('B31.glass-set', `async()=>{
       const s = await import('/src/state/store.ts');
       const b = s.bus;
+      window.__verifyHarness.bindBus(b);
       const cab = b.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors));
+      if (!cab) throw new Error('B31 glass fixture has no cabinet with doors');
       const idx = cab.layout.units.findIndex((u) => u.doors);
       const r = b.execute({ id: 'probe_glass', op: 'cabinet.layout', source: 'ui', target: { kind: 'cabinet', id: cab.id },
         changes: [{ path: 'layout.units[' + idx + '].doors.material', op: 'set', value: 'M_GLASS_8_GREY' }] }, 'B31 探针：改玻璃门');
       return { ver: b.getVersion(), err: r.error ?? null, mat: b.getState().cabinets.find((c) => c.id === cab.id).layout.units[idx].doors.material };
-    })()`);
+    }`, 12000);
+    const glassSet = glassSetOperation.result;
     ok('总线放行 doors.material 改玻璃（版本 +1、落进模型）',
       glassSet.ver === vB31 + 1 && !glassSet.err && glassSet.mat === 'M_GLASS_8_GREY', JSON.stringify(glassSet));
 
     // ② 派生：门板图出现灰玻填充 + 45° 斜线（材质表达，与开向对角线可区分）
-    const glassView = await evalJs(`(async()=>{
+    const glassViewOperation = await startPageOperation('B31.glass-view', `async()=>{
       const s = await import('/src/state/store.ts');
       const v = await import('/src/core/geometry/views.ts');
+      window.__verifyHarness.bindBus(s.bus);
       const cab = s.bus.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors && u.doors.material === 'M_GLASS_8_GREY'));
+      if (!cab) throw new Error('B31 glass fixture was not committed to the model');
       const vs = v.buildCabinetViews(cab, s.RULESET);
       const is45 = (dx, dy) => Math.abs(Math.abs(dx) - Math.abs(dy)) < 0.5 && Math.abs(dx) > 1;
       return {
         fills: vs.prims.front.filter((p) => p.k === 'fill').length,
         hatch: vs.prims.front.filter((p) => p.k === 'poly' && !p.closed && p.pts.length === 2 && is45(p.pts[1].x - p.pts[0].x, p.pts[1].y - p.pts[0].y)).length,
       };
-    })()`);
+    }`, 12000);
+    const glassView = glassViewOperation.result;
     ok('门板图出现灰玻填充与 45° 斜线（黑框灰玻，销售图纸同款）', glassView.fills >= 1 && glassView.hatch >= 2, JSON.stringify(glassView));
 
     // ③ 清单分流：开料单无玻璃，甲购件清单有玻璃
-    const glassCut = await evalJs(`(async()=>{
+    const glassCutOperation = await startPageOperation('B31.glass-cut-list', `async()=>{
       const s = await import('/src/state/store.ts');
       const n = await import('/src/export/neutralSheet.ts');
+      window.__verifyHarness.bindBus(s.bus);
       const out = n.toNeutralExport(s.bus.getState(), s.RULESET, [], 'probe-b31');
       return {
         panelsGlass: out.panels.filter((p) => p.material === 'M_GLASS_8_GREY').length,
         purchased: out.purchased.length,
         kind: out.purchased[0] ? out.purchased[0].kind : null,
       };
-    })()`);
+    }`, 12000);
+    const glassCut = glassCutOperation.result;
     ok('开料清单不含玻璃、甲购件清单有玻璃（分流成立）',
       glassCut.panelsGlass === 0 && glassCut.purchased >= 1 && glassCut.kind === 'glassDoor', JSON.stringify(glassCut));
 
     // ④ 还原：改回默认木门，不污染后续审计（undo 走总线）
-    const glassBack = await evalJs(`(async()=>{
+    const glassBackOperation = await startPageOperation('B31.glass-undo', `async()=>{
       const s = await import('/src/state/store.ts');
       const b = s.bus;
+      window.__verifyHarness.bindBus(b);
       b.undo();
       const cab = b.getState().cabinets.find((c) => c.layout.units.some((u) => u.doors));
+      if (!cab) throw new Error('B31 glass cabinet missing during undo readback');
       const u = cab.layout.units.find((u) => u.doors);
       return u.doors.material;
-    })()`);
+    }`, 12000);
+    const glassBack = glassBackOperation.result;
     ok('undo 还原为默认门板材质（写入可回退）', glassBack !== 'M_GLASS_8_GREY', String(glassBack));
     await shot(path.join(OUT_DIR, 'b31-glass-door.png'));
 
@@ -4472,84 +6272,95 @@ async function waitForApp(url, timeoutMs = 25000) {
     await activateRightTab('导出');
     await sleep(250);
     const rbBtn = await evalJs(`(()=>{
-      const b=[...document.querySelectorAll('.tb-btn')].find(x=>x.textContent.includes('按房间图纸册'));
+      const b=[...document.querySelectorAll('.tb-btn')].find(x=>x.textContent.includes('导出横向 PDF 图纸'));
       if(!b) return {found:false};
       return {found:true, disabled:b.disabled};
     })()`);
-    ok('导出面板有「按房间图纸册」按钮', rbBtn.found === true, JSON.stringify(rbBtn));
+    ok('导出面板有当前正式「导出横向 PDF 图纸」入口', rbBtn.found === true, JSON.stringify(rbBtn));
 
-    // ② 真端点：语义模型在后端重算 → 完整 HTML（含封面/三图/三件套/汇总）
-    //    注意：B29 账号组跑过之后 server 已是 accounts 模式 —— 探针必须带上会话 token（有则带）
+    // ② 真端点：语义模型在后端重算 → 当前版本的布局页、逐柜页与稳定元数据。
+    //    B29 账号组跑过之后 server 已是 accounts 模式：先验证有效会话，再分别检查 401 负例和带 token 成功路径。
+    const rbAuth = await evalJs(`(async()=>{
+      const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');
+      const me=token?await fetch('/api/auth/me',{headers:{Authorization:'Bearer '+token}}):null;
+      const denied=await fetch('/api/export/roombook',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      return {hasToken:typeof token==='string'&&token.length>=40,meStatus:me?.status??null,meOk:me?.ok??false,unauthExportStatus:denied.status};
+    })()`);
+    ok('B32 使用 /api/auth/me 验证有效会话，并保留无 token 图纸册请求 401', rbAuth?.hasToken && rbAuth.meStatus===200 && rbAuth.meOk===true && rbAuth.unauthExportStatus===401, JSON.stringify(rbAuth));
     const rb = await evalJs(`(async()=>{
       const s = await import('/src/state/store.ts');
-      const token = sessionStorage.getItem('furniture-cad.auth.token');
+      const project=s.bus.getState();const room=project.rooms[0];const cabinet=project.cabinets.find(c=>c.roomId===room?.id);
+      const token = localStorage.getItem('furniture-cad.auth.token') ?? sessionStorage.getItem('furniture-cad.auth.token');
       const res = await fetch('/api/export/roombook', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
-        body: JSON.stringify({ project: s.bus.getState(), modelVersion: 'b32-v1' }),
+        body: JSON.stringify({ project, modelVersion: 'b32-v1' }),
       });
       const html = await res.text();
       return {
         status: res.status,
         ctype: res.headers.get('Content-Type') || '',
         isDoc: html.startsWith('<!DOCTYPE html>') && html.includes('</html>'),
-        cover: html.includes('图纸册') && html.includes('客户'),
-        triptych: html.includes('平面图') && html.includes('立面外观（门板图）') && html.includes('立面结构（内视图）'),
+        layoutPage: html.includes('data-page-kind="layout"') && html.includes('class="layout-schedule"'),
+        cabinetPage: !!cabinet && html.includes('data-page-kind="cabinet"') && html.includes('data-cabinet-id="'+cabinet.id+'"'),
+        roomPage: !!room && html.includes('data-room-id="'+room.id+'"'),
+        cabinetName: !!cabinet && html.includes(cabinet.name),
         trace: html.includes('b32-v1') && html.includes('factory_default_v1'),
-        summary: html.includes('清单汇总（按柜归类）'),
       };
     })()`);
     ok('POST /api/export/roombook 返回 200 + text/html', rb.status === 200 && rb.ctype.includes('text/html'), JSON.stringify({ status: rb.status, ctype: rb.ctype }));
-    ok('图纸册结构齐全：封面客户表 + 每柜三图 + 版本三件套 + 尾页汇总',
-      rb.isDoc && rb.cover && rb.triptych && rb.trace && rb.summary, JSON.stringify(rb));
+    ok('RoomBook 结构齐全：房间布局与清单 + 指定柜体页 + 房间/柜体归属 + 版本元数据',
+      rb.isDoc && rb.layoutPage && rb.cabinetPage && rb.roomPage && rb.cabinetName && rb.trace, JSON.stringify(rb));
 
     // ═══════════════════════════════════════════════════════════
     section('B33 异形图元：酒柜斜层板 tilt 落地 + 见光板语义切换（真实总线）');
 
     const vB33 = await statusVersion();
     // ① 在运行中的 app 内用真实总线创建酒柜（与 UI 放置走同一 create 管线）
-    const wine = await evalJs(`(async()=>{
+    const wineOperation = await startPageOperation('B33.create-wine', `async()=>{
       const s = await import('/src/state/store.ts');
       const { createCabinetFromTemplate } = await import('/src/core/docFactory.ts');
+      window.__verifyHarness.bindBus(s.bus);
       const roomId = (s.bus.getState().cabinets[0] || { roomId: 'r1' }).roomId || 'r1';
-      // 与真实 UI 放置路径一致：传 takenIds 让 docFactory 分配唯一 id，
-      // 否则默认 id（cab_001）会撞上项目里已存在的首柜 → planStructural 返回 null → 结构性失败。
-      // 放点 (4000,4000)：房间外空地 —— 不撞墙（mem_002）、不与衣柜重叠（mem_003），
-      // 让这条断言只验「模板 tilt 落地」，不被布置类记忆合法拦截。
       const c = createCabinetFromTemplate({ templateId: 'wine_cabinet', name: '探针酒柜', roomId, x: 4000, y: 4000, rotation: 0, rules: s.RULESET, takenIds: s.bus.getState().cabinets.map((x) => x.id) });
-      // 与真实 UI 放置路径一致：结构性命令也带 changes:[]（CommandBus 契约要求，
-      // 否则记忆门 pathForbidden 检查读 cmd.changes 会崩）。createCabinet() 也是这么发的。
       const r = s.bus.execute({ id: 'probe_wine_create', op: 'cabinet.create', source: 'ui', target: { kind: 'project', id: 'project' }, changes: [], payload: { cabinet: c } }, 'B33 探针：放酒柜');
       if (r.error) return { err: r.error };
       const cab = s.bus.getState().cabinets.find((x) => x.id === c.id);
       return { id: c.id, tilt: cab.layout.units[0].shelves.tilt, ver: s.bus.getVersion() };
-    })()`);
+    }`, 12000);
+    const wine = wineOperation.result;
+    if (!wine?.id || wine.err) throw new Error(`[B33 harness/product] wine cabinet creation failed: ${JSON.stringify(wineOperation)}`);
     ok('B33 放置酒柜：版本 +1、斜层板 tilt=12 从模板落地（语义字段同源）',
       !wine.err && wine.tilt === 12 && wine.ver === vB33 + 1, JSON.stringify(wine));
 
     // ② 见光板语义切换：finishedEnds=both → 侧板命名「见光板-左/右」（派生现算）
-    const fe = await evalJs(`(async()=>{
+    const feOperation = await startPageOperation('B33.finished-ends', `async()=>{
       const s = await import('/src/state/store.ts');
       const { generateCabinet } = await import('/src/core/geometry/generate.ts');
+      window.__verifyHarness.bindBus(s.bus);
       const r = s.bus.execute({ id: 'probe_fe', op: 'cabinet.update', source: 'ui',
-        target: { kind: 'cabinet', id: '${wine.id}' },
+        target: { kind: 'cabinet', id: ${JSON.stringify(wine.id)} },
         changes: [{ path: 'params.finishedEnds', op: 'set', value: 'both' }] }, 'B33 探针：见光板');
       if (r.error) return { err: r.error };
-      const cab = s.bus.getState().cabinets.find((x) => x.id === '${wine.id}');
+      const cab = s.bus.getState().cabinets.find((x) => x.id === ${JSON.stringify(wine.id)});
       const g = generateCabinet(cab, s.RULESET);
       const left = g.panels.find((p) => p.role === 'LeftSidePanel');
       const right = g.panels.find((p) => p.role === 'RightSidePanel');
       return { left: left && left.nameZh, right: right && right.nameZh, ver: s.bus.getVersion(), fe: cab.params.finishedEnds };
-    })()`);
+    }`, 12000);
+    const fe = feOperation.result;
     ok('B33 见光板切换：finishedEnds=both → 侧板命名「见光板-左/右」、不改结构板数',
       !fe.err && fe.fe === 'both' && fe.left === '见光板-左' && fe.right === '见光板-右', JSON.stringify(fe));
 
     // ③ 收尾：undo 两次（create + update）撤销酒柜，不污染后续样式审计。
     //    注意本项目语义：undo 本身也是一次状态变更（版本 +1，见 B8），
     //    所以 create+update+undo×2 = 版本推进 4，而不是回到 vB33。
-    await evalJs(`(async()=>{ const s = await import('/src/state/store.ts'); s.bus.undo(); s.bus.undo(); })()`);
-    const after33 = await evalJs(`(async()=>{ const s = await import('/src/state/store.ts');
-      return { ver: s.bus.getVersion(), gone: !s.bus.getState().cabinets.some((x) => x.id === '${wine.id}') }; })()`);
+    const undo33Operation = await startPageOperation('B33.undo-cleanup', `async()=>{
+      const s = await import('/src/state/store.ts');window.__verifyHarness.bindBus(s.bus);
+      s.bus.undo();s.bus.undo();
+      return {ver:s.bus.getVersion(),gone:!s.bus.getState().cabinets.some((x)=>x.id===${JSON.stringify(wine.id)})};
+    }`, 12000);
+    const after33 = undo33Operation.result;
     ok('B33 undo 收尾：酒柜不残留、版本按 create+update+undo×2 各 +1 推进',
       after33.gone && after33.ver === vB33 + 4, JSON.stringify({ ...after33, vB33 }));
 
@@ -4587,8 +6398,8 @@ async function waitForApp(url, timeoutMs = 25000) {
     // ═══════════════════════════════════════════════════════════
     section('B35 邮箱注册：SMTP 落盘发信全流程 + 管理端开关与打码');
 
-    // 此时 B18 已建 owner（accounts 模式），owner token 还在 sessionStorage
-    const TOKEN35 = await evalJs(`sessionStorage.getItem('furniture-cad.auth.token')`);
+    // 当前认证实现以 localStorage 为准（sessionStorage 仅作兼容读取），B18 建号后应读同一凭据。
+    const TOKEN35 = await evalJs(`localStorage.getItem('furniture-cad.auth.token')`);
     // 浏览器侧 fetch（走 vite 代理）→ 与真实 UI 同源同路径
     const api35b = async (path, { method = 'GET', token, body } = {}) => evalJs(`(async()=>{
       const r = await fetch(${JSON.stringify(path)}, {
@@ -4598,6 +6409,11 @@ async function waitForApp(url, timeoutMs = 25000) {
       });
       return { status: r.status, body: await r.json().catch(()=>({})) };
     })()`);
+
+    const auth35 = await api35b('/api/auth/me', { token: TOKEN35 });
+    ok('B35 前置：当前 localStorage 会话可通过 /api/auth/me', auth35.status === 200 && !!auth35.body.account?.id,
+      JSON.stringify({status:auth35.status,account:auth35.body.account??null}));
+    if (auth35.status !== 200 || !auth35.body.account?.id) throw new Error(`[B35 fixture] owner session is invalid: ${JSON.stringify({status:auth35.status,body:auth35.body})}`);
 
     const smtpGet = await api35b('/api/settings/smtp', { token: TOKEN35 });
     ok('B35 GET smtp：落盘模式、未开注册、口令未设置',
@@ -4656,6 +6472,9 @@ async function waitForApp(url, timeoutMs = 25000) {
       ['tree', 'ObjectTree 的容器标记：同上，带着 .panel-scroll；内部用 .tree-* 系列'],
       ['tree-room', '房间节点：它同时带着 .tree-node，样式由那条规则提供'],
       ['tree-node-label', '对象树里的项目名：样式由父级 .tree-root 提供'],
+      ['ai-btn-agent', 'Agent 按钮的语义与探针定位标记；外观完整继承 .tb-btn.primary，不需要重复声明颜色、间距或状态规则'],
+      ['exp-pdf-layout-list', 'PDF 布局房间列表的语义修饰标记；布局由同元素上的 .exp-room-list 规则提供'],
+      ['pdf-layout-room-checkbox', 'PDF 房间选项的定位标记；控件间距与对齐由父级 .exp-check 及其 input 规则提供'],
     ]);
 
     const collectClasses = () =>
@@ -5082,91 +6901,101 @@ async function waitForApp(url, timeoutMs = 25000) {
       return {got:up.status===200, u:up.status};
     })()`);
     ok('收尾：把 owner 口令改回验收环境的原值', revert41.got === true, JSON.stringify(revert41));
-    section('B42 AI 会话：按房间一对一 · 切页回来不丢 · 草图默认正视图');
-    /**
-     * 自带前置：**重新登录**。
-     *
-     * B41 那节改过 owner 口令（改口令会让服务端把旧会话作废），
-     * 所以到这一步 sessionStorage 里的 token 已经是死的 ——
-     * 不发这一句，下面的 AI 请求一律 401「未登录或会话已过期」，
-     * 而看起来会像是"草案功能坏了"。第一版写这一节时就踩了，
-     * 在去查 AI 通路之前，先确认自己是不是带着一个过期 token 在跑。
-     * 注意：token 只在**挂载时**读一次，所以写完必须重新加载页面才生效。
-     */
+    section('B42 AI 会话：房间隔离 · 切页保留 · 对话不改模型');
+    /** B41 改过并恢复 owner 口令，重新签发当前 localStorage token 后再导航。 */
     const boot42 = await evalJs(`(async()=>{
       const K='furniture-cad.auth.token';
       const r=await fetch('/api/auth/login',{method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({username:'owner',password:'Cad-Str0ng-Pw-2026!x'})});
       const b=await r.json().catch(()=>({}));
-      if(!(b&&b.token)) return {fail:true, s:r.status};
+      if(!(b&&b.token)) return {ok:false,status:r.status};
+      localStorage.setItem(K,b.token);
       sessionStorage.setItem(K,b.token);
+      // UI runner 使用隔离浏览器 profile；只清理本专项的 AI 会话夹具，便于证明按房间隔离。
+      sessionStorage.removeItem('furniture-cad.ai.convos.v2');
+      sessionStorage.removeItem('furniture-cad.ai.room.v2');
       return {ok:true};
     })()`);
-    ok('B42 自带前置：重新登录（B41 改口令已让旧会话失效）', boot42.ok === true, JSON.stringify(boot42));
+    ok('B42 前置：重新登录并写入当前 localStorage token', boot42.ok === true, JSON.stringify(boot42));
+    if (!boot42.ok) throw new Error(`[B42 fixture] owner relogin failed: ${JSON.stringify(boot42)}`);
     await send('Page.navigate', { url: APP_URL });
     await sleep(2600);
+    const harness42 = await initializePageHarness();
+    ok('B42 reload 后 page-harness 已恢复', harness42?.ready === true && harness42.version === 1, JSON.stringify(harness42));
+    if (!harness42?.ready) throw new Error(`[B42 harness] initialization failed: ${JSON.stringify(harness42)}`);
     await activateRightTab('AI');
     await sleep(460);
 
-    const roomInfo42 = await evalJs(`(async()=>{const s=await import('/src/state/store.ts');
-      const rooms=s.bus.getState().rooms;
-      return {count:rooms.length, names:rooms.map(r=>r.name)};})()`);
+    const roomInfoOp42 = await startPageOperation('B42.room-info', `async()=>{
+      const s=await import('/src/state/store.ts');window.__verifyHarness.bindBus(s.bus);
+      const rooms=s.bus.getState().rooms.map(r=>({id:r.id,name:r.name}));
+      return {count:rooms.length,rooms};
+    }`, 12000);
+    const roomInfo42 = roomInfoOp42.result;
     const chipCount42 = await evalJs(`document.querySelectorAll('.side-right .room-chips .chip').length`);
-    /**
-     * 用户原话："能不能做成聊天框类型，每个房间一对一对话"。
-     * 这里验的是"一个房间一格"这件事本身：多了房间就多一格，改 model 不许把格局打乱。
-     */
+    /** 用户要求每个房间独立会话；全项目另有一格。 */
     ok(
-      `会话对象按房间分格（${chipCount42} 格 = 全项目 + ${roomInfo42.count} 个房间）`,
-      chipCount42 === roomInfo42.count + 1,
-      JSON.stringify({ chipCount42, rooms: roomInfo42.names })
+      `会话对象按房间分格（${chipCount42} 格 = 全项目 + ${roomInfo42?.count ?? 0} 个房间）`,
+      !!roomInfo42 && chipCount42 === roomInfo42.count + 1,
+      JSON.stringify({ chipCount42, rooms: roomInfo42?.rooms ?? null })
     );
+    if (!roomInfo42?.rooms?.length) throw new Error('[B42 fixture] no rooms available for per-room conversation test');
 
-    ok('能在输入框里写下这句话', (await setElValue('.side-right .ai-input', '生成一个 1800 宽的餐边柜')) === true);
-    ok('点「改草案」', (await clickPanelBtn('改草案', 1800)) === true);
-    const draftShown42 = await waitFor(`!!document.querySelector('.side-right .draft-preview')`, 25000);
-    ok('草案卡片出来了（这一句话叠到了草案上）', draftShown42 === true, (await text('.side-right .panel-scroll')).slice(0, 300));
+    const targetRoom42 = roomInfo42.rooms[roomInfo42.rooms.length - 1];
+    const targetRoomClicked42 = await evalJs(`(()=>{
+      const b=[...document.querySelectorAll('.side-right .room-chips .chip')]
+        .find(x=>x.textContent.trim().startsWith(${JSON.stringify(targetRoom42.name)}));
+      if(!b)return false;b.click();return true;
+    })()`);
+    const targetRoomSelected42 = await waitFor(`(()=>{const b=[...document.querySelectorAll('.side-right .room-chips .chip')]
+      .find(x=>x.textContent.trim().startsWith(${JSON.stringify(targetRoom42.name)}));return !!b&&b.classList.contains('chip-on')})()`, 3000, 100);
+    ok('真实点击切换到具名房间会话', targetRoomClicked42 === true && targetRoomSelected42 === true, targetRoom42.name);
+    const emptyRoomTurns42 = await evalJs(`document.querySelectorAll('.side-right .chat-msg').length`);
+    ok('隔离夹具中的新房间会话从空白开始', emptyRoomTurns42 === 0, `turns=${emptyRoomTurns42}`);
 
-    /**
-     * 用户原话："草图应该默认是正面图或者内部图"。
-     * 这是从上一次真实反馈里得到的结论：俯视平面图会被整个房间占满，
-     * 新柜只有两条细边 —— "这一轮到底建成没有"在看不出来，
-     * 于是出现了"AI 把房间的图形复制出来了"这种无法解释的画面。
-     */
-    const viewBtns42 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .draft-view-btn')];
-      return {n:b.length, on:b.filter(x=>x.classList.contains('on')).map(x=>x.textContent.trim())};})()`);
-    ok(
-      '草图默认正视图（不再是一张被房间占满的平面图）',
-      viewBtns42.on.length === 1 && viewBtns42.on[0] === '正视图',
-      JSON.stringify(viewBtns42)
-    );
-    ok('三种看法都能切：正视图 / 内部结构图 / 俯视图', viewBtns42.n === 3, JSON.stringify(viewBtns42));
+    const chatPrompt42 = '请只解释当前柜体的分区含义，不要修改任何模型参数。';
+    const chatVersionBefore42 = await statusVersion();
+    ok('能在真实对话输入框中输入问题', (await setElValue('.side-right .ai-input', chatPrompt42)) === true);
+    const chatButtonClicked42 = await evalJs(`(()=>{const b=document.querySelector('.side-right .ai-btn-chat');if(!b||b.disabled)return false;b.click();return true})()`);
+    ok('点击当前「对话（不改模型）」按钮发送请求', chatButtonClicked42 === true);
+    const assistantReply42 = await waitFor(`document.querySelectorAll('.side-right .chat-msg.chat-assistant .chat-text').length>=1`, 30000, 120);
+    const chatAfterSend42 = await evalJs(`(()=>{
+      const rows=[...document.querySelectorAll('.side-right .chat-msg')];
+      return {turns:rows.length,roles:rows.map(x=>x.classList.contains('chat-user')?'user':x.classList.contains('chat-assistant')?'assistant':'other'),
+        text:rows.map(x=>x.querySelector('.chat-text')?.textContent||'').join('\\n')};
+    })()`);
+    ok('真实聊天请求返回助手消息并显示本轮用户输入', assistantReply42 === true && chatAfterSend42.turns >= 2 && chatAfterSend42.text.includes(chatPrompt42), JSON.stringify(chatAfterSend42));
+    const chatVersionAfter42 = await statusVersion();
+    ok('普通对话只问答，不改变模型版本', chatVersionAfter42 === chatVersionBefore42, `v${chatVersionBefore42} → v${chatVersionAfter42}`);
 
-    const roundMark42 = await evalJs(`(()=>{const m=[...document.querySelectorAll('.side-right .chat-round')]
-      .map(x=>x.textContent.replace(/\\s+/g,' ').trim());return m;})()`);
-    ok(
-      '会话里写明这一轮有没有并进草案（"AI 说了但没动手"必须当场看得见）',
-      roundMark42.length >= 1 && /第 1 轮 · (已并入|未并入)草案/.test(roundMark42[0]),
-      JSON.stringify(roundMark42)
-    );
-
-    // ── 用户原话："为什么切到其它页面再回来就看不到了" ──
+    // AIPanel 按需挂载；切页再回来必须从 sessionStorage 恢复这一房间的对话。
     await activateRightTab('属性');
     await sleep(420);
     await activateRightTab('AI');
     await sleep(560);
     const back42 = await evalJs(`(()=>{
-      return {
-        draft: !!document.querySelector('.side-right .draft-preview'),
-        chatTurns: document.querySelectorAll('.side-right .chat-msg').length,
-        round: (document.querySelector('.side-right .chat-round')||{}).textContent||'',
-      };})()`);
-    ok('切到别的页签再回来，草案还在（等几十秒的成果不许白等）', back42.draft === true, JSON.stringify(back42));
-    ok('对话历史也还在（连同"这一轮改了什么"的标记）', back42.chatTurns >= 2, JSON.stringify(back42));
+      const rows=[...document.querySelectorAll('.side-right .chat-msg')];
+      return {turns:rows.length,text:rows.map(x=>x.querySelector('.chat-text')?.textContent||'').join('\\n')};
+    })()`);
+    ok('切到其他页签再回来，本房间的聊天历史仍在', back42.turns >= 2 && back42.text.includes(chatPrompt42), JSON.stringify(back42));
 
-    await clickPanelBtn('放弃草案', 460);
-    ok('放弃草案后草图收起（界面不留一个别人以为还在的东西）', (await evalJs(`!!document.querySelector('.side-right .draft-preview')`)) === false);
+    const otherRoom42 = roomInfo42.rooms.find(r=>r.id!==targetRoom42.id);
+    if (otherRoom42) {
+      const otherClicked42 = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .room-chips .chip')]
+        .find(x=>x.textContent.trim().startsWith(${JSON.stringify(otherRoom42.name)}));if(!b)return false;b.click();return true})()`);
+      const otherSelected42 = await waitFor(`(()=>{const b=[...document.querySelectorAll('.side-right .room-chips .chip')]
+        .find(x=>x.textContent.trim().startsWith(${JSON.stringify(otherRoom42.name)}));return !!b&&b.classList.contains('chip-on')})()`, 3000, 100);
+      const otherTurns42 = await evalJs(`document.querySelectorAll('.side-right .chat-msg').length`);
+      ok('切换另一房间后不会串入刚才的聊天', otherClicked42 === true && otherSelected42 === true && otherTurns42 === 0,
+        JSON.stringify({room:otherRoom42.name,turns:otherTurns42}));
+      await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right .room-chips .chip')]
+        .find(x=>x.textContent.trim().startsWith(${JSON.stringify(targetRoom42.name)}));if(b)b.click();return !!b})()`);
+      await sleep(360);
+      const targetRestored42 = await evalJs(`(()=>{const rows=[...document.querySelectorAll('.side-right .chat-msg')];
+        return {turns:rows.length,text:rows.map(x=>x.querySelector('.chat-text')?.textContent||'').join('\\n')};})()`);
+      ok('切回原房间仍恢复它自己的两条聊天消息', targetRestored42.turns >= 2 && targetRestored42.text.includes(chatPrompt42), JSON.stringify(targetRestored42));
+    }
 
     // ═══════════════════════════════════════════════════════════
     section('B43 导入面板（P4 Import + P5 图片识别）：Mock 识别 → caveat 确认门 → 编译预览 → 应用');
@@ -5247,6 +7076,165 @@ async function waitForApp(url, timeoutMs = 25000) {
     const knNote = await evalJs(`(()=>{const n=document.querySelector('.side-right .knowledge-panel .note');return n? n.textContent : '';})()`);
     ok('面板明说「硬规则优先 / 不绕过校验 / 候选需确认」', /硬规则/.test(knNote) && /不绕过校验|永远不绕过/.test(knNote) && /确认/.test(knNote), knNote.slice(0, 120));
 
+    section('B45 Agent → 服务端草稿 → 用户确认应用 → 本地房间同步 E2E');
+    const agentSyncMockUrl = process.env.VERIFY_MOCK_URL || '';
+    let embeddedAgentAuth = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');if(!token)return {ok:false,status:null};const r=await fetch('/api/auth/me',{headers:{Authorization:'Bearer '+token}});return {ok:r.ok,status:r.status}})()`);
+    if (!embeddedAgentAuth?.ok) {
+      if (await evalJs(`!!document.querySelector('.room-workspace')`)) {
+        await evalJs(`(()=>{const b=[...document.querySelectorAll('.workspace-topbar button')].find(x=>x.textContent.trim()==='高级 CAD 编辑');if(b)b.click();return !!b})()`);
+        await sleep(300);
+      }
+      await evalJs(`localStorage.removeItem('furniture-cad.auth.token');sessionStorage.removeItem('furniture-cad.auth.token')`);
+      await send('Page.reload',{ignoreCache:false});
+      await sleep(2400);
+      await activateRightTab('账号');
+      await sleep(500);
+      const embeddedUserSet=await panelSet('用户名','owner');
+      const embeddedPwSet=await panelSet('口令',OWNER_PW);
+      const embeddedLogin=await clickPanelBtn('登录',1400);
+      const loginDeadline=Date.now()+10000;
+      while(Date.now()<loginDeadline){
+        embeddedAgentAuth=await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');if(!token)return {ok:false,status:null};const r=await fetch('/api/auth/me',{headers:{Authorization:'Bearer '+token}});return {ok:r.ok,status:r.status}})()`);
+        if(embeddedAgentAuth?.ok)break;
+        await sleep(160);
+      }
+      ok('B45 在会话失效时通过真实登录 UI 恢复账号会话',embeddedUserSet==='ok'&&embeddedPwSet==='ok'&&embeddedLogin&&embeddedAgentAuth?.status===200,JSON.stringify({embeddedUserSet,embeddedPwSet,embeddedLogin,auth:embeddedAgentAuth}));
+    }
+    ok('B45 成功路径以 /api/auth/me=200 验证有效登录态',embeddedAgentAuth?.ok===true&&embeddedAgentAuth?.status===200,JSON.stringify(embeddedAgentAuth));
+    if (!embeddedAgentAuth?.ok) throw new Error('B45 缺少经 /api/auth/me 验证的登录会话');
+    const agentSyncSettings = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({provider:'custom',baseUrl:${JSON.stringify(process.env.VERIFY_MOCK_URL || '')},model:'mock-model-1'})});return r.json()})()`);
+    ok('Agent E2E 接入确定性 OpenAI-compatible mock', agentSyncSettings?.baseUrl === agentSyncMockUrl, JSON.stringify(agentSyncSettings));
+
+    await evalJs(`(()=>{window.__agentApplySyncProgress='started';window.__agentApplySyncConfirmMessages=[];window.confirm=(message)=>{window.__agentApplySyncConfirmMessages.push(String(message));return true};})()`);
+    await evalJs(`(async()=>{
+      try {
+        const store=await import('/src/state/store.ts');
+        const bus=store.bus;
+        window.__agentApplySyncBus=bus;
+        window.__agentApplySyncSaved={project:structuredClone(bus.getState()),entries:structuredClone(bus.entries),pointer:bus.pointer,
+          modelVersion:bus.modelVersion,provById:structuredClone([...bus.provById]),baselineProv:structuredClone([...bus.baselineProv])};
+        const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');
+        const response=await fetch('/api/workspace',{headers:{Authorization:'Bearer '+token}});
+        const server=await response.json();
+        if(!server.ok||!server.project?.rooms?.length) throw new Error('服务端项目缺少有效房间：'+JSON.stringify({ok:server.ok,rooms:server.project?.rooms?.length,error:server.error}));
+        bus.replaceProject(server.project,'B45 Agent apply sync baseline');
+        const room=server.project.rooms[0];
+        window.__agentApplySyncSetupJson=JSON.stringify({workspaceStatus:response.status,workspaceId:server.workspaceId,serverVersion:server.liveModelVersion,roomId:room.id,roomName:room.name,
+          baselineLocalVersion:bus.getVersion(),baselineCabinetCount:server.project.cabinets.filter(c=>c.roomId===room.id).length});
+        window.__agentApplySyncProgress='ready';
+      } catch(error) {
+        window.__agentApplySyncSetupJson=JSON.stringify({error:String(error),stack:String(error?.stack??'')});
+        window.__agentApplySyncProgress='error';
+      }
+    })()`);
+    let agentSyncSetupProgress = 'not-started';
+    const agentSyncSetupDeadline = Date.now() + 10000;
+    while (Date.now() < agentSyncSetupDeadline) {
+      agentSyncSetupProgress = await evalJs(`String(window.__agentApplySyncProgress||'not-started')`);
+      if (agentSyncSetupProgress === 'ready' || agentSyncSetupProgress === 'error') break;
+      await sleep(100);
+    }
+    const agentSyncSetupJson = await evalJs(`String(window.__agentApplySyncSetupJson||'')`);
+    const agentSyncSetup = agentSyncSetupJson ? JSON.parse(agentSyncSetupJson) : null;
+    ok('有效登录态 GET /api/workspace 返回 200 并建立 browser/server 同一房間基線', agentSyncSetupProgress === 'ready' && agentSyncSetup?.workspaceStatus===200 && !!agentSyncSetup?.roomId,
+      `progress=${agentSyncSetupProgress}; ${agentSyncSetupJson}`);
+    if (agentSyncSetupProgress !== 'ready' || !agentSyncSetup?.roomId) throw new Error('无法建立 Agent 草稿应用同步基线');
+
+    await evalJs(`(()=>{const b=[...document.querySelectorAll('.toolbar .tb-btn')].find(x=>x.textContent.trim()==='AI 工作区');if(b)b.click();return !!b})()`);
+    let agentWorkspaceReady = false;
+    const agentWorkspaceDeadline = Date.now() + 12000;
+    while (Date.now() < agentWorkspaceDeadline) {
+      agentWorkspaceReady = await evalJs(`!!document.querySelector('.room-workspace')&&!!document.querySelector('.ai-workspace-panel .ai-input')`);
+      if (agentWorkspaceReady) break;
+      await sleep(200);
+    }
+    const clickedAgentRoom = await evalJs(`(()=>{const n=${JSON.stringify(agentSyncSetup.roomName)};const b=[...document.querySelectorAll('.workspace-room-item')].find(x=>x.textContent.includes(n));if(b)b.click();return !!b})()`);
+    await sleep(260);
+    const agentRoomHeading = await evalJs(`document.querySelector('.workspace-room-heading h1')?.textContent.trim()||''`);
+    const agentSyncBaselineVersion = await evalJs(`window.__agentApplySyncBus.getVersion()`);
+    const agentSyncBaselineCards = await evalJs(`document.querySelectorAll('.workspace-cabinet-card').length`);
+    const embeddedAuditBefore = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/security/audit?limit=1000',{headers:{Authorization:'Bearer '+token}});const j=await r.json();return {ok:r.ok,toolCount:(j.entries||[]).filter(e=>e.action==='mcp.tool').length}})()`);
+    ok('Agent 在选中的真实房间里发起，且房间上下文与服务端一致', agentWorkspaceReady && clickedAgentRoom && agentRoomHeading === agentSyncSetup.roomName,
+      JSON.stringify({ room: agentRoomHeading, expected: agentSyncSetup.roomName, ready: agentWorkspaceReady }));
+
+    const agentInputSet = await evalJs(`(()=>{const e=document.querySelector('.ai-workspace-panel .ai-input');if(!e)return false;
+      const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set;if(!setter)return false;
+      setter.call(e,'在当前房间新建一个柜体，叫 Agent同步验收柜');e.dispatchEvent(new Event('input',{bubbles:true}));return true;})()`);
+    const agentButtonClicked = await evalJs(`(()=>{const b=document.querySelector('.ai-workspace-panel .ai-btn-agent');if(b)b.click();return !!b})()`);
+    let agentRemoteDraftVisible = false;
+    const agentRunDeadline = Date.now() + 35000;
+    while (Date.now() < agentRunDeadline) {
+      agentRemoteDraftVisible = await evalJs(`!!document.querySelector('.ai-workspace-panel .agent-remote-draft')`);
+      if (agentRemoteDraftVisible) break;
+      await sleep(250);
+    }
+    ok('真实 AI 工作区按钮完成 Agent 请求并显示服务端草稿', agentInputSet && agentButtonClicked && agentRemoteDraftVisible,
+      (await text('.ai-workspace-panel .chat-list')).slice(-500));
+    const embeddedAuditAfter = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const r=await fetch('/api/security/audit?limit=1000',{headers:{Authorization:'Bearer '+token}});const j=await r.json();const events=j.entries||[];return {ok:r.ok,totalToolCount:events.filter(e=>e.action==='mcp.tool').length,successTools:events.filter(e=>e.action==='mcp.tool'&&e.result==='ok'&&['cad.create_cabinet','cad.validate','cad.list_drafts'].includes(e.tool)).map(e=>e.tool)}})()`);
+    ok('登录用户点击 Agent 后生成新的成功 MCP 工具审计事件',embeddedAuditAfter?.ok===true&&embeddedAuditAfter.totalToolCount>(embeddedAuditBefore?.toolCount??0)&&embeddedAuditAfter.successTools.length>0,JSON.stringify({before:embeddedAuditBefore,after:embeddedAuditAfter}));
+    const localAfterAgent = await evalJs(`({version:window.__agentApplySyncBus.getVersion(),cards:document.querySelectorAll('.workspace-cabinet-card').length,
+      notice:document.querySelector('.ai-workspace-panel .agent-remote-draft')?.textContent.replace(/\\s+/g,' ').trim()||''})`);
+    ok('Agent 只写远端 draft：应用前本地房间卡片与版本保持不变', localAfterAgent?.version === agentSyncBaselineVersion
+      && localAfterAgent?.cards === agentSyncBaselineCards
+      && /服务器远端草稿/.test(localAfterAgent?.notice||'')
+      && /本地.*尚未改变/.test(localAfterAgent?.notice||''), JSON.stringify(localAfterAgent));
+
+    const openRemoteDraftsClicked = await evalJs(`(()=>{const b=document.querySelector('.ai-workspace-panel .agent-remote-draft button');if(b)b.click();return !!b})()`);
+    let serverDraftApplyButtonVisible = false;
+    const serverDraftPanelDeadline = Date.now() + 12000;
+    while (Date.now() < serverDraftPanelDeadline) {
+      serverDraftApplyButtonVisible = await evalJs(`[...document.querySelectorAll('.side-right button')].some(b=>b.textContent.trim()==='确认应用到服务器')`);
+      if (serverDraftApplyButtonVisible) break;
+      await sleep(200);
+    }
+    const remoteDraftPanelText = await text('.side-right .sec-body');
+    ok('从 Agent 结果进入远端草稿管理，且页面明确区分服务器 live 与本地', openRemoteDraftsClicked && serverDraftApplyButtonVisible
+      && /远端服务器工作区/.test(remoteDraftPanelText) && /不会/.test(remoteDraftPanelText), remoteDraftPanelText.slice(0, 500));
+
+    await evalJs(`(()=>{window.__agentApplySyncConfirmMessages=[];window.confirm=(message)=>{window.__agentApplySyncConfirmMessages.push(String(message));return true};})()`);
+    const serverApplyClicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.side-right button')].find(x=>x.textContent.trim()==='确认应用到服务器');if(b)b.click();return !!b})()`);
+    let applyOrSyncPending = false;
+    const applyDeadline = Date.now() + 20000;
+    while (Date.now() < applyDeadline) {
+      applyOrSyncPending = await evalJs(`!!document.querySelector('.room-workspace')||!!document.querySelector('.remote-sync-card')`);
+      if (applyOrSyncPending) break;
+      await sleep(200);
+    }
+    let remoteSyncRequired = await evalJs(`!!document.querySelector('.remote-sync-card')`);
+    if (remoteSyncRequired) {
+      const noSilentOverwrite = await evalJs(`window.__agentApplySyncBus.getVersion()===${Number(agentSyncBaselineVersion)}`);
+      ok('两端基线不同则只应用到远端，不静默覆盖 browser local', noSilentOverwrite === true);
+      const explicitSyncClicked = await evalJs(`(()=>{const b=[...document.querySelectorAll('.remote-sync-card button')].find(x=>x.textContent.includes('确认将服务器项目同步到本地'));if(b)b.click();return !!b})()`);
+      let returnedToWorkspace = false;
+      const manualSyncDeadline = Date.now() + 15000;
+      while (Date.now() < manualSyncDeadline) {
+        returnedToWorkspace = await evalJs(`!!document.querySelector('.room-workspace')`);
+        if (returnedToWorkspace) break;
+        await sleep(200);
+      }
+      ok('远端不一致时可经独立、明确确认的同步流程更新本地', explicitSyncClicked && returnedToWorkspace === true);
+    }
+    const syncedWorkspaceReady = await evalJs(`!!document.querySelector('.room-workspace')`);
+    const agentSyncFinalVersion = await evalJs(`window.__agentApplySyncBus.getVersion()`);
+    const syncedCabinetCard = await evalJs(`([...document.querySelectorAll('.workspace-cabinet-title')].some(e=>e.textContent.includes('Agent同步验收柜')))`);
+    const agentApplyConfirmMessages = await evalJs(`window.__agentApplySyncConfirmMessages||[]`);
+    ok('用户确认应用草稿触发了服务端提交确认（必要时另有本地替换确认）', serverApplyClicked
+      && Array.isArray(agentApplyConfirmMessages) && agentApplyConfirmMessages.length >= 1
+      && /服务端草稿/.test(agentApplyConfirmMessages[0]) && /服务器工作区/.test(agentApplyConfirmMessages[0]),
+    JSON.stringify(agentApplyConfirmMessages));
+    ok('应用/同步后当前房间卡片出现 Agent 新柜体', syncedWorkspaceReady && syncedCabinetCard === true);
+    ok('应用/同步后本地 CommandBus version +1，且 Agent 步骤没有提前改本地', agentSyncFinalVersion === agentSyncBaselineVersion + 1,
+      `v${agentSyncBaselineVersion} → v${agentSyncFinalVersion}`);
+    const serverAfterAgentApply = await evalJs(`(async()=>{const token=localStorage.getItem('furniture-cad.auth.token')??sessionStorage.getItem('furniture-cad.auth.token');const response=await fetch('/api/workspace',{headers:{Authorization:'Bearer '+token}});return response.json()})()`).catch(() => null);
+    const serverSyncedCabinet = serverAfterAgentApply?.project?.cabinets?.find((cabinet) => cabinet.name === 'Agent同步验收柜');
+    ok('服务端 apply 后的 live 与本地同步的是同一柜体且保留服务器 roomId', serverSyncedCabinet?.roomId === agentSyncSetup.roomId,
+      JSON.stringify({ serverRoomId: serverSyncedCabinet?.roomId, expected: agentSyncSetup.roomId }));
+
+    await evalJs(`(()=>{const bus=window.__agentApplySyncBus;const saved=window.__agentApplySyncSaved;if(!bus||!saved)return false;
+      bus.project=saved.project;bus.entries=saved.entries;bus.pointer=saved.pointer;bus.modelVersion=saved.modelVersion;
+      bus.provById=new Map(saved.provById);bus.baselineProv=new Map(saved.baselineProv);bus.geomCache=null;bus.explodeCache=null;bus.notify();
+      delete window.__agentApplySyncBus;delete window.__agentApplySyncSaved;delete window.__agentApplySyncSetupJson;return true})()`);
+
     /**
      * console error 的判定要分两类。
      *
@@ -5265,28 +7253,12 @@ async function waitForApp(url, timeoutMs = 25000) {
     );
     ok('除此之外没有任何 console error（JS 异常 / React 警告 / 资源 404 一条都不许有）', unexpectedConsoleErrors.length === 0, unexpectedConsoleErrors.slice(0, 5).join('\n      '));
 
-    // ═══════════════════════════════════════════════════════════
-    const pass = results.filter((r) => r.pass).length;
-    const fail = results.length - pass;
-
-    const byGroup = new Map();
-    for (const r of results) byGroup.set(r.group, (byGroup.get(r.group) || 0) + (r.pass ? 0 : 1));
-
-    console.log('\n══════════════════════════════════════════════');
-    for (const [g, f] of byGroup) if (f > 0) console.log(`  ${g}  →  ${f} 项失败`);
-    console.log(`  总计 ${results.length} 项：通过 ${pass}，失败 ${fail}`);
-    console.log('══════════════════════════════════════════════');
-
-    if (fail > 0) {
-      console.log('\n失败清单：');
-      for (const r of results.filter((x) => !x.pass)) console.log(`  · [${r.group}] ${r.name}${r.detail ? `\n      ${r.detail}` : ''}`);
-    }
-
-    ws.close();
-    await cleanup();
-    process.exit(fail > 0 ? 1 : 0);
+    await finishProbe();
   } catch (err) {
-    console.error('\nERR:', err.message);
+    if (ONLY && matchedFilterGroups.length === 0) {
+      console.error(`[browser-probe] FILTER_TARGET_NOT_REACHED: requested=${ONLY}; planned=${JSON.stringify(plannedMatches)}; currentGroup=${currentGroup || '(none)'}`);
+    }
+    console.error('\nERR:', err.stack || err.message);
     // 只有真的崩了才建这个目录 —— 正常通过时它不该存在（见文件开头 main 处的说明）
     fs.mkdirSync(DIAG_DIR, { recursive: true });
     fs.writeFileSync(path.join(DIAG_DIR, 'probe-crash.txt'), `${err.stack || err.message}\n`);

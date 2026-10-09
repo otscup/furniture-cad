@@ -20,7 +20,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-import type { EdgeSpec } from '../types.ts';
+import type { EdgeSpec, SharedPanelTrace } from '../types.ts';
 
 /** 制造的确定性状态：verified = 有规则/语义依据；unverified = 当前无法确认，不脑补 */
 export type MfgVerification = 'verified' | 'unverified';
@@ -149,7 +149,9 @@ export type MfgPartRole =
   | 'DrawerSide'
   | 'DrawerBack'
   | 'DrawerBottom'
-  | 'ApertureLintel';
+  | 'ApertureLintel'
+  | 'SharedTopPanel';
+
 
 /** 制造件回指的语义实体（单一真相源的溯源链） */
 export interface MfgPartSource {
@@ -209,6 +211,8 @@ export interface ManufacturingPart {
   /** 整体验证状态：任一 unverified 操作 → 'unverified'（整体诚实） */
   verification: MfgVerification;
   provenance: { ruleSetId: string; manufacturingRuleSetId: string };
+  /** 仅共享制造板件带此字段；贯穿清单和生产文件回读。 */
+  sharedPanelTrace?: SharedPanelTrace;
 }
 
 export interface ManufacturingProject {

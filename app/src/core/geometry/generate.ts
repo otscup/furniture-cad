@@ -52,6 +52,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const hardware: HardwareItem[] = [];
   const purchased: PurchasedItem[] = [];
   const plan: Prim[] = [];
+  const planReferenceLabels: string[] = [];
   const elevation: Prim[] = [];
 
   const p = cab.params;
@@ -75,6 +76,8 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const innerBottomZ = p.bodyLift + t;
   /** 双面柜（岛台）派生骨架：undefined = 单面柜 */
   const DB = L.double;
+  const isWallCabinet = (p.cabinetType ?? ((p.mountHeight ?? 0) > 0 ? 'wall' : 'base')) === 'wall';
+  const hasKick = !isWallCabinet && p.bodyLift > 0;
 
   const push = (pn: Omit<Panel, 'qty'> & { qty?: number }): void => {
     panels.push({ qty: 1, ...pn });
@@ -91,12 +94,16 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   push({ id: `P_${cabId}_RS`, role: 'RightSidePanel', nameZh: isFinished('right') ? '见光板-右' : '右侧板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: bodyH, width: p.depth, grain: 'length', edge: edge(null, E04, null, E1), edgeLabel: '前边 1mm；上端 1mm；下端 0.4mm（镜像）' + feLabel('right'), layer: layerOf(t) });
   push({ id: `P_${cabId}_TOP`, role: 'TopPanel', nameZh: '顶板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
   push({ id: `P_${cabId}_BOT`, role: 'BottomPanel', nameZh: '底板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.depth, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '前边 1mm', layer: layerOf(t) });
-  push({ id: `P_${cabId}_KICK`, role: 'KickBoard', nameZh: '踢脚板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+  if (hasKick) {
+    push({ id: `P_${cabId}_KICK`, role: 'KickBoard', nameZh: '踢脚板', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+  }
 
   // ── 双面柜（岛台）增件：共用中板 + 后踢脚，且**没有背板**（中板就是两排共用的"背"）──
   if (DB) {
     push({ id: `P_${cabId}_MID`, role: 'MiddlePanel', nameZh: '共用中板（双面）', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: bodyH, grain: 'length', edge: edge(null, null, null, null), edgeLabel: '不封边（藏于柜内）', layer: layerOf(t) });
-    push({ id: `P_${cabId}_KICKB`, role: 'KickBoardBack', nameZh: '踢脚板-后', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+    if (hasKick) {
+      push({ id: `P_${cabId}_KICKB`, role: 'KickBoardBack', nameZh: '踢脚板-后', belongsTo: cabId, group: '箱体', material: p.boardMaterial, thickness: t, length: innerW, width: p.bodyLift, grain: 'length', edge: edge(null, null, E1, null), edgeLabel: '上棱 1mm', layer: layerOf(t) });
+    }
     issues.push(buildIssue('DOUBLE-NO-BACKPANEL', { target: cabId, targetKind: 'cabinet', ctx: { cabName: cab.name, boardT: t, backRowDepth: DB.backRowDepth, midT: DB.midT, frontRowDepth: DB.frontRowDepth, depth: p.depth } }));
   }
 
@@ -389,8 +396,13 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
 
   const toWorld = (pts: Vec2[]): Vec2[] => polyLocalToWorld(pts, origin, rotation);
 
-  plan.push({ k: 'fill', pts: toWorld(rectPts(0, 0, W, D)), layer: L_PLAN, alpha: 0.12 });
-  plan.push({ k: 'poly', pts: toWorld(rectPts(0, 0, W, D)), closed: true, layer: L_PLAN, lw: 2 });
+  plan.push({ k: 'fill', pts: toWorld(rectPts(0, 0, W, D)), layer: L_PLAN, alpha: isWallCabinet ? 0.035 : 0.12 });
+  plan.push({ k: 'poly', pts: toWorld(rectPts(0, 0, W, D)), closed: true, layer: L_PLAN, lw: 2, ...(isWallCabinet ? { dash: [120, 70] } : {}) });
+  for (const cutout of p.counterCutouts ?? []) {
+    const pts = toWorld([{ x: cutout.x, y: cutout.y }, { x: cutout.x + cutout.width, y: cutout.y }, { x: cutout.x + cutout.width, y: cutout.y + cutout.depth }, { x: cutout.x, y: cutout.y + cutout.depth }]);
+    plan.push({ k: 'poly', pts, closed: true, layer: L_HW, lw: 1.6, dash: [90, 50] });
+    planReferenceLabels.push(`${cutout.name} ${cutout.width}×${cutout.depth}`);
+  }
 
   // 结构板（侧板/立板）在平面上是横跨进深的线；双面柜的立板各自只跨本排箱体
   const structLines: Array<[number, number, number, number]> = [
@@ -452,7 +464,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
         const oy0 = towardFront ? D - od : od;
         const oy1 = towardFront ? D : 0;
         plan.push({ k: 'poly', pts: toWorld([{ x: ox0, y: oy0 }, { x: ox1, y: oy0 }, { x: ox1, y: oy1 }, { x: ox0, y: oy1 }]), closed: true, layer: L_HW, lw: 1.2, dash: [90, 50] });
-        plan.push({ k: 'text', p: localToWorld({ x: (ox0 + ox1) / 2, y: (oy0 + oy1) / 2 }, origin, rotation), text: a.name, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+        planReferenceLabels.push(`${a.name} ${a.openingWidth}×${a.openingHeight}`);
       }
     });
   };
@@ -460,15 +472,29 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   L.rows.forEach((r) => drawFaceLines(r.units, r.nets, r.unitX0, D - t, true));
   if (DB) drawFaceLines(cab.layout.backUnits!, DB.backNets, DB.backUnitX0, t, false);
 
-  // 平面标注：柜体宽 + 深（贴在柜体外侧）
-  const dimY = -180;
+  // 预留说明放在投影框外的独立行；虚线框内只保留几何轮廓，避免标签被线条或隔板穿过。
+  planReferenceLabels.forEach((text, index) => {
+    plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: D + 220 + index * 120 }, origin, rotation), text, size: 65, layer: L_HW, align: 'c', rot: rotation });
+  });
+
+  // 平面标注：柜体宽 + 深（贴在柜体外侧）。吊柜与地柜尺寸线分行，避免投影重叠。
+  const dimY = isWallCabinet ? -350 : -180;
   plan.push({ k: 'poly', pts: toWorld([{ x: 0, y: dimY }, { x: W, y: dimY }]), closed: false, layer: L_DIM, lw: 0.8 });
   plan.push({ k: 'poly', pts: toWorld([{ x: 0, y: dimY - 30 }, { x: 0, y: 0 }]), closed: false, layer: L_DIM, lw: 0.8 });
   plan.push({ k: 'poly', pts: toWorld([{ x: W, y: dimY - 30 }, { x: W, y: 0 }]), closed: false, layer: L_DIM, lw: 0.8 });
   plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: dimY - 90 }, origin, rotation), text: `${W}`, size: 90, layer: L_DIM, align: 'c', rot: rotation });
 
-  plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: D / 2 - 60 }, origin, rotation), text: cab.name, size: 110, layer: L_TEXT, align: 'c', rot: rotation });
-  plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: D / 2 + 60 }, origin, rotation), text: `${W}×${p.height}×${D}`, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+  if (isWallCabinet) {
+    // 上柜文字放到两类柜体投影之外，并明确底标高；不再与地柜标签叠在同一行。
+    const labelY = D + 420 + planReferenceLabels.length * 130;
+    plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: labelY }, origin, rotation), text: `${cab.name} 吊柜底 ${p.mountHeight ?? 0}mm`, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+    plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: labelY + 110 }, origin, rotation), text: `${W}×${p.height}×${D}`, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+  } else {
+    // 地柜标注也移到投影外，水槽/灶具的台面预留标记不再被文字盖住。
+    const labelY = D + 720 + planReferenceLabels.length * 180;
+    plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: labelY }, origin, rotation), text: cab.name, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+    plan.push({ k: 'text', p: localToWorld({ x: W / 2, y: labelY + 110 }, origin, rotation), text: `${W}×${p.height}×${D}`, size: 80, layer: L_TEXT, align: 'c', rot: rotation });
+  }
 
   // ───────── 6. 2D 图元：立面（局部坐标，y 向上）─────────
   const baseY = p.bodyLift;

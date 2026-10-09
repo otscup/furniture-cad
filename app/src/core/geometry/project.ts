@@ -4,6 +4,7 @@ import { generateCabinet, getCabinetFootprint } from './generate.ts';
 import { buildProjectViews } from './views.ts';
 import { buildProjectBodies } from './bodies3d.ts';
 import { buildIssue } from '../rules/issueCatalog.ts';
+import { drawingSourceProblems, planSourceKeys as makePlanSourceKeys } from '../drawingEdits.ts';
 
 const L_WALL = 'A-WALL';
 const L_WALL_TEXT = 'A-TEXT';
@@ -42,12 +43,20 @@ function wallPrims(w: Wall): Prim[] {
 
 export function generateProject(project: Project, rules: RuleSet): ProjectGeometry {
   const plan: Prim[] = [];
+  const planSourceKeys: string[] = [];
+  const roomPlans: Record<string, Prim[]> = Object.fromEntries(project.rooms.map((room) => [room.id, []]));
+  const roomPlanSourceKeys: Record<string, string[]> = Object.fromEntries(project.rooms.map((room) => [room.id, []]));
   const cabinets: ProjectGeometry['cabinets'] = {};
   const issues: Issue[] = [];
 
   for (const room of project.rooms) {
     for (const w of room.walls) {
-      plan.push(...wallPrims(w));
+      const prims = wallPrims(w);
+      plan.push(...prims);
+      roomPlans[room.id]?.push(...prims);
+      const keys = makePlanSourceKeys(`wall:${w.id}`, prims);
+      planSourceKeys.push(...keys);
+      roomPlanSourceKeys[room.id]?.push(...keys);
     }
   }
 
@@ -57,6 +66,10 @@ export function generateProject(project: Project, rules: RuleSet): ProjectGeomet
       const g = generateCabinet(cab, rules);
       cabinets[cab.id] = g;
       plan.push(...g.plan);
+      roomPlans[cab.roomId]?.push(...g.plan);
+      const keys = makePlanSourceKeys(`cabinet:${cab.id}`, g.plan);
+      planSourceKeys.push(...keys);
+      roomPlanSourceKeys[cab.roomId]?.push(...keys);
       issues.push(...g.issues);
     } catch (e) {
       issues.push(
@@ -83,11 +96,19 @@ export function generateProject(project: Project, rules: RuleSet): ProjectGeomet
    * 这里如果再吞异常，会让"框架出问题"伪装成"这个项目没有视图"。
    */
   const views = buildProjectViews(project, rules);
+  for (const problem of drawingSourceProblems(project, planSourceKeys, views.sourceKeys)) {
+    const edit = problem.entity;
+    issues.push(buildIssue(problem.code, {
+      target: edit.id,
+      targetKind: 'project',
+      ctx: { editId: edit.id, sourceKey: edit.replacesSource ?? '', space: edit.space },
+    }));
+  }
 
   /** 3D 体块：同一份派生骨架的第三个视图（内部已对单柜失败容错） */
   const bodies3d = buildProjectBodies(project, rules);
 
-  return { cabinets, plan, issues, bbox, views, bodies3d };
+  return { cabinets, plan, planSourceKeys, roomPlans, roomPlanSourceKeys, issues, bbox, views, bodies3d };
 }
 
 function overlap(a: BBox, b: BBox): boolean {
@@ -111,17 +132,17 @@ function overlapArea(a: BBox, b: BBox): number {
  */
 export function detectCollisions(project: Project): Issue[] {
   const out: Issue[] = [];
-  const boxes: Array<{ id: string; name: string; bbox: BBox }> = [];
-
+  const boxes: Array<{ id: string; name: string; bbox: BBox; minZ: number; maxZ: number }> = [];
   for (const cab of project.cabinets) {
     const fp = getCabinetFootprint(cab);
     if (fp.length === 0) continue;
-    boxes.push({ id: cab.id, name: cab.name, bbox: bboxOf(fp) });
+    const minZ = cab.params.mountHeight ?? 0;
+    boxes.push({ id: cab.id, name: cab.name, bbox: bboxOf(fp), minZ, maxZ: minZ + cab.params.height });
   }
-
   for (let i = 0; i < boxes.length; i++) {
     for (let j = i + 1; j < boxes.length; j++) {
-      if (overlap(boxes[i].bbox, boxes[j].bbox)) {
+      const verticalOverlap = boxes[i].minZ < boxes[j].maxZ && boxes[i].maxZ > boxes[j].minZ;
+      if (verticalOverlap && overlap(boxes[i].bbox, boxes[j].bbox)) {
         out.push(
           buildIssue('RULE-CABINET-OVERLAP', {
             target: `${boxes[i].id} / ${boxes[j].id}`,

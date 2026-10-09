@@ -11,6 +11,7 @@ export type RightTab =
   | 'layers'
   | 'views'
   | 'rooms'
+  | 'projects'
   | 'variant'
   | 'export'
   | 'memory'
@@ -39,6 +40,7 @@ export function Toolbar(props: {
   snap: SnapSettings;
   setSnap: (s: SnapSettings) => void;
   onNewRoom: () => void;
+  onWorkspace: () => void;
   /** 放置柜体使用的柜型预设（与命令行 TPL 共用状态） */
   templateId: string;
   setTemplateId: (id: string) => void;
@@ -50,6 +52,7 @@ export function Toolbar(props: {
   /** 有会话才显示「退出登录」——免登录模式下没有可退的东西，给个按钮是骗人 */
   loggedIn: boolean;
   onLogout: () => void;
+  readOnly?: boolean;
 }): ReactNode {
   const t = props.snap;
   const toggle = (patch: Partial<SnapSettings>): void => props.setSnap({ ...t, ...patch });
@@ -70,7 +73,9 @@ export function Toolbar(props: {
             key={tool.id}
             type="button"
             className={`tb-btn ${props.tool === tool.id ? 'active' : ''}`}
+            data-testid={`toolbar-tool-${tool.id}`}
             title={`${tool.hint}（快捷键 ${tool.shortcut}）`}
+            disabled={props.readOnly && tool.id !== 'select'}
             onClick={() => props.setTool(tool.id)}
           >
             {tool.label}
@@ -82,10 +87,10 @@ export function Toolbar(props: {
       <div className="tb-sep" />
 
       <div className="tb-group">
-        <button type="button" className="tb-btn" disabled={!props.canUndo} title="撤销 Ctrl+Z" onClick={props.onUndo}>
+        <button type="button" className="tb-btn" disabled={props.readOnly || !props.canUndo} title="撤销 Ctrl+Z" onClick={props.onUndo}>
           ↶ 撤销
         </button>
-        <button type="button" className="tb-btn" disabled={!props.canRedo} title="重做 Ctrl+Y" onClick={props.onRedo}>
+        <button type="button" className="tb-btn" disabled={props.readOnly || !props.canRedo} title="重做 Ctrl+Y" onClick={props.onRedo}>
           ↷ 重做
         </button>
       </div>
@@ -96,7 +101,7 @@ export function Toolbar(props: {
         <button
           type="button"
           className={`tb-btn ${props.mode === 'plan' ? 'active' : ''}`}
-          title="平面图 —— 唯一可编辑的视图"
+          title="平面图 —— 房间与柜体布局编辑、放置和尺寸调整"
           onClick={() => props.setMode('plan')}
         >
           平面图
@@ -104,10 +109,10 @@ export function Toolbar(props: {
         <button
           type="button"
           className={`tb-btn ${props.mode === 'sheet' ? 'active' : ''}`}
-          title="四视图图幅：正视图 / 俯视图 / 侧视图 / 内部结构图（只读，由同一份数据投影派生）"
+          title="图纸视图：俯视图 / 正视图 / 内部结构图；图元可编辑，拖动尺寸线可编辑参数，空白处可平移"
           onClick={() => props.setMode('sheet')}
         >
-          ▤ 四视图
+          ▤ 图纸视图
         </button>
         <button
           type="button"
@@ -120,7 +125,7 @@ export function Toolbar(props: {
         <button
           type="button"
           className={`tb-btn ${props.explode ? 'active' : ''}`}
-          title="分解图（爆炸图）：按开料清单逐件摆开的轴测图，供生产装配参照。默认关闭 —— 四视图调整好之后再开"
+          title="分解图（爆炸图）：按开料清单逐件摆开的轴测图，供生产装配参照。默认关闭 —— 图纸视图调整好之后再开"
           onClick={() => props.setExplode(!props.explode)}
         >
           ✦ 分解图
@@ -158,12 +163,13 @@ export function Toolbar(props: {
       <div className="tb-sep" />
 
       <div className="tb-group">
-        <button type="button" className="tb-btn" title="新建一个 3.2×2.6m 矩形房间" onClick={props.onNewRoom}>
+        <button type="button" className="tb-btn" title="新建一个 3.2×2.6m 矩形房间" disabled={props.readOnly} onClick={props.onNewRoom}>
           + 房间
         </button>
         <select
           className="tb-select"
           title={`放置柜型：${CABINET_TEMPLATES.find((t) => t.id === props.templateId)?.hint ?? ''}（命令行 TPL 可切换）`}
+          disabled={props.readOnly}
           value={props.templateId}
           onChange={(e) => props.setTemplateId(e.target.value)}
         >
@@ -173,10 +179,10 @@ export function Toolbar(props: {
             </option>
           ))}
         </select>
-        <button type="button" className="tb-btn" disabled={!props.canDuplicate} title="复制选中柜体（Ctrl+D）" onClick={props.onDuplicate}>
+        <button type="button" className="tb-btn" disabled={props.readOnly || !props.canDuplicate} title="复制选中柜体（Ctrl+D）" onClick={props.onDuplicate}>
           复制
         </button>
-        <button type="button" className="tb-btn tb-danger" disabled={!props.canDelete} title="删除选中（Delete / E）" onClick={props.onDelete}>
+        <button type="button" className="tb-btn tb-danger" disabled={props.readOnly || !props.canDelete} title="删除选中（Delete / E）" onClick={props.onDelete}>
           删除
         </button>
       </div>
@@ -190,6 +196,10 @@ export function Toolbar(props: {
           </button>
         </div>
       ) : null}
+
+      <button type="button" className="tb-btn" title="返回 AI 房间工作区" onClick={props.onWorkspace}>
+        AI 工作区
+      </button>
 
       {/* 介绍页：新标签页打开。同标签页等于把当前这张未存盘的设计顶掉 —— 那不是入口，是删除 */}
       <a

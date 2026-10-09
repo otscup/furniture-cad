@@ -52,6 +52,7 @@ import {
 import { bboxOf } from '../src/core/geometry/transform.ts';
 import { generateProject } from '../src/core/geometry/project.ts';
 import { deriveContacts } from '../src/core/relations.ts';
+import { findDuplicateUnitIds } from '../src/core/unitIdentity.mjs';
 import { compileAction, type AiAction } from '../src/ai/compile.ts';
 import { commitPlan, dryRunPlan } from '../src/ai/planRunner.ts';
 
@@ -80,12 +81,30 @@ function eq(a: unknown, b: unknown): boolean {
 }
 type Box = { min: Vec2; max: Vec2 };
 
+/** 测试夹具按柜体 ID 分配 Unit ID，确保多柜项目共享全局唯一命名空间。 */
+function withUniqueUnitIds(cabinet: Cabinet): Cabinet {
+  let sequence = 0;
+  const assign = (units?: Array<{ id: string }>): void => {
+    for (const unit of units ?? []) {
+      sequence++;
+      unit.id = `${cabinet.id}_unit_${String(sequence).padStart(3, '0')}`;
+    }
+  };
+  if (cabinet.layout.rows?.length) {
+    for (const row of cabinet.layout.rows) assign(row.units);
+  } else {
+    assign(cabinet.layout.units);
+  }
+  assign(cabinet.layout.backUnits);
+  return cabinet;
+}
+
 // ───────────── 测试场景 ─────────────
 
 const ROOM = rectRoom({ name: '测试房', x: 0, y: 0, w: 9000, h: 6000, thickness: 100, height: 2700 });
 
 function mkCab(id: string, name: string, x: number, y: number, w: number, d: number, rotation = 0): Cabinet {
-  return createCabinet({
+  return withUniqueUnitIds(createCabinet({
     id,
     name,
     roomId: ROOM.id,
@@ -95,7 +114,7 @@ function mkCab(id: string, name: string, x: number, y: number, w: number, d: num
     rules,
     params: { ...defaultCabinetParams(rules), width: w, height: 2200, depth: d },
     units: defaultUnits(w, rules, d),
-  });
+  }));
 }
 
 function mkProject(cabs: Cabinet[], assemblies?: FurnitureAssembly[]): Project {
@@ -431,6 +450,9 @@ section('§10 设计疑问不拦截提交（提示不是硬规则），且 previ
 
   // ② 门脸贴邻居：warning 照报，但**不拦截**
   const bad = mkProject([armA(), mkCab('cab_B', '副臂B', 6000, 60, 900, 600, 90)]);
+  const fixtureDuplicates = findDuplicateUnitIds(bad);
+  ok('多柜 fixture 的 Unit ID 全局唯一（CommandBus 前置条件）', fixtureDuplicates.length === 0, JSON.stringify(fixtureDuplicates));
+  const originalBadB = bad.cabinets.find((c) => c.id === 'cab_B')!.placement;
   const badAction: AiAction = {
     action: 'cabinet.place',
     target: { cabinetName: '副臂B' },
@@ -438,14 +460,22 @@ section('§10 设计疑问不拦截提交（提示不是硬规则），且 previ
     reason: '验收：副臂贴主臂右侧（rot90，门脸朝内）',
     index: 0,
   };
+  const badResolution = resolvePlacement(
+    { relation: 'adjacent', targetId: 'cab_B', referenceId: 'cab_A', side: 'right' },
+    sceneFromProject(bad)
+  );
   const badBus = new CommandBus(bad, rules);
   const badRun = dryRunPlan({ bus: badBus, actions: [badAction] });
   const badFindings = badRun.design?.findings ?? [];
   ok('几何成立但门脸朝内 ⇒ 干跑预览里出现设计疑问', badRun.design?.status === 'warning' && badFindings.some((f) => f.code === 'DESIGN-FRONT-BLOCKED'), JSON.stringify(badRun.design?.status));
-  ok('有疑问也照样能提交（warning 不是拦截）', badRun.blockingErrors === 0 && badRun.errorCount === 0, JSON.stringify([badRun.blockingErrors, badRun.errorCount]));
+  ok('dryRun 的每一步均成功', badRun.steps.length === 1 && badRun.steps.every((step) => step.ok), JSON.stringify(badRun.steps.map((step) => ({ ok: step.ok, error: step.error }))));
+  ok('dryRun errorCount = 0', badRun.errorCount === 0, JSON.stringify(badRun.errorCount));
+  const badPreviewB = badRun.draft.cabinets.find((c) => c.id === 'cab_B')!.placement;
+  ok('dryRun 将目标柜从原位置移至解析后的新位置', badResolution.ok && !eq(badPreviewB, originalBadB) && eq(badPreviewB, badResolution.placement), JSON.stringify({ original: originalBadB, preview: badPreviewB, resolved: badResolution.ok ? badResolution.placement : badResolution }));
   const badCommit = commitPlan(badRun, badBus);
-  ok('确实提交成功（提示归提示，不偷偷拒绝）', badCommit.ok, badCommit.error ?? '');
+  ok('提交成功且 applied=1、skipped=0（warning 不拦截）', badCommit.ok && badCommit.applied === 1 && badCommit.skipped === 0, JSON.stringify(badCommit));
   const placed = badBus.getState().cabinets.find((c) => c.id === 'cab_B')!.placement;
+  ok('提交后的目标位置确实改变', placed.x !== originalBadB.x || placed.y !== originalBadB.y, JSON.stringify({ original: originalBadB, placed }));
   ok('提交后 rotation 仍是 90（系统没有"顺手"替用户改成 270）', placed.rotation === 90, JSON.stringify(placed));
   ok('提交后的位置与预览一致（可疑也不影响 preview===commit）',
     eq(placed, badRun.draft.cabinets.find((c) => c.id === 'cab_B')!.placement));

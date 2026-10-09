@@ -32,6 +32,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { registerWriteTools, WRITE_TOOLS } from './mcpWrite.mjs';
 import { registerExportTools, EXPORT_TOOLS } from './mcpExport.mjs';
+import { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT } from '../src/core/unitIdentity.mjs';
 
 /**
  * 两个工具都**没有输入参数**，但 `inputSchema` 不能就此省掉：
@@ -160,6 +161,12 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
         updatedAt: ws.getUpdatedAt(),
         schemaVersion: project?.schemaVersion ?? null,
         ruleSetId: project?.ruleSetId ?? null,
+        identityDiagnostics: ws.getUnitIdentityDiagnostics?.() ?? {
+          readOnly: Boolean(ws.getUnitIdentityConflict?.()),
+          code: ws.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+          message: ws.getUnitIdentityConflict?.() ?? null,
+          duplicateUnitIds: findDuplicateUnitIds(project).map((item) => ({ ...item, scope: 'live project' })),
+        },
         project,
       };
       auditToolCall(principal, TOOL_GET_STATE, 'ok', { workspaceId: ws.workspaceId, liveModelVersion: ws.getLiveModelVersion() });
@@ -172,23 +179,38 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
     {
       title: '校验当前工作区',
       description:
-        '只读：对当前 Workspace 的语义模型运行**既有** validator/derive（CommandBus.derive，含柜体校验、转角干涉、装配关系、空间校验），返回问题清单与派生汇总。不修改任何数据，也不建立新的验证体系。',
-      inputSchema: NO_ARGS,
+        '只读：对 live 或指定 draft 运行既有 CommandBus.derive（含柜体、装配、空间和碰撞校验），返回问题清单与派生汇总，不修改数据。',
+      inputSchema: z.object({ draftId: z.string().optional() }).default({}),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async () => {
+    async (args) => {
       const r = workspaceOrError(await getWorkspaceState(principal.actor));
       if (r.error) {
         auditToolCall(principal, TOOL_VALIDATE, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
         return r.error;
       }
       const ws = r.workspace;
-      const v = ws.validate();
+      let v;
+      if (args.draftId) {
+        const handle = ws.getDraft(args.draftId);
+        if (!handle) return toolError('DRAFT_NOT_FOUND', `draft 不存在：${args.draftId}`);
+        if (principal.mode !== 'local-open' && handle.owner !== principal.actor) return toolError('FORBIDDEN', '只能校验自己创建的 draft');
+        v = ws.validateDraft(args.draftId);
+        if (!v) return toolError('DRAFT_NOT_FOUND', `draft 不存在：${args.draftId}`);
+      } else {
+        v = ws.validate();
+      }
       const payload = {
         ok: true,
         workspaceId: ws.workspaceId,
         liveModelVersion: ws.getLiveModelVersion(),
         modelVersion: ws.getModelVersion(),
+        identityDiagnostics: ws.getUnitIdentityDiagnostics?.() ?? {
+          readOnly: Boolean(ws.getUnitIdentityConflict?.()),
+          code: ws.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+          message: ws.getUnitIdentityConflict?.() ?? null,
+          duplicateUnitIds: [],
+        },
         /** ERROR 总数 —— 决定"能不能交付/导出"，与既有语义一致 */
         blockingErrors: v.blockingErrors,
         derived: v.derived,
@@ -247,7 +269,7 @@ export function createMcpHandler({ auth, getWorkspaceState, audit = () => {} }) 
     try {
       audit(entry);
     } catch {
-      /* 见上 */
+      /* 审计写入失败不改变 /mcp 响应；健康接口另报 dataWritable。 */
     }
   };
 

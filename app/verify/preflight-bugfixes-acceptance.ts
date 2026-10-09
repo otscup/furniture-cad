@@ -28,11 +28,11 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-
+import { serializeProjectFile } from '../src/core/projectFile.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 const APP = join(here, '..');
 const APP_URL = pathToFileURL(APP + '/').href;
@@ -187,17 +187,18 @@ function serverEnv(dir: string): NodeJS.ProcessEnv {
     APP_ACCOUNTS_PATH: join(dir, 'accounts.json'),
     APP_AUDIT_PATH: join(dir, 'audit.jsonl'),
     APP_MEM_PATH: join(dir, 'mem.jsonl'),
+    APP_WORKSPACE_PATH: join(dir, 'workspace.json'),
     PORT: String(PORT_PREF),
     APP_HOST: '127.0.0.1',
     APP_PYTHON: PY,
   };
 }
 
-async function startServer(dir: string): Promise<{ base: string; stop: () => void }> {
+async function startServer(dir: string, tempDir?: string): Promise<{ base: string; stop: () => void }> {
   writeFileSync(join(dir, '.env'), 'AI_PROVIDER=deepseek\n');
   const srv = spawn(process.execPath, ['--experimental-strip-types', join(APP, 'server', 'server.mjs')], {
     cwd: APP,
-    env: serverEnv(dir),
+    env: { ...serverEnv(dir), ...(tempDir ? { TMPDIR: tempDir } : {}) },
   });
   let buf = '';
   srv.stdout?.on('data', (d: Buffer) => (buf += d));
@@ -316,8 +317,8 @@ let detail_dxf_residue = -1;
   const dir = mkdtempSync(join(tmpdir(), 'furnicad-gate-'));
   let stop = () => {};
   try {
-    const { base, stop: s } = await startServer(dir);
-    stop = s;
+    const exportTempDir = join(dir, 'dxf-tmp');
+    mkdirSync(exportTempDir, { recursive: true });
     let payload: unknown = null;
     const samplePath = join(APP, 'verify', 'samples', 'sample-project.json');
     if (existsSync(samplePath)) {
@@ -333,27 +334,90 @@ let detail_dxf_residue = -1;
       `);
       payload = JSON.parse(childOut.out);
     }
-    const tmp = tmpdir();
+    const seedTime = new Date().toISOString();
+    const workspaceEnvelope = JSON.parse(serializeProjectFile(payload as Parameters<typeof serializeProjectFile>[0])) as Record<string, unknown>;
+    Object.assign(workspaceEnvelope, {
+      workspaceId: 'preflight-bugfixes-dxf',
+      owner: 'local-open',
+      account: 'local-open',
+      liveModelVersion: 1,
+      updatedAt: seedTime,
+    });
+    writeFileSync(join(dir, 'workspace.json'), JSON.stringify(workspaceEnvelope, null, 2), 'utf8');
+    const { base, stop: s } = await startServer(dir, exportTempDir);
+    stop = s;
+    const snapshotResponse = await fetch(`${base}/api/workspace`);
+    const snapshotText = await snapshotResponse.text();
+    if (!snapshotResponse.ok) {
+      throw new Error(`GET /api/workspace status=${snapshotResponse.status} body=${snapshotText.slice(0, 1200)}`);
+    }
+    const snapshot = JSON.parse(snapshotText) as {
+      project: unknown;
+      workspaceId: string;
+      liveModelVersion: number;
+      projectSnapshotId: string;
+      projectSnapshotHash: string;
+      projectSnapshotVersion: number;
+    };
+    const snapshotValid = Boolean(snapshot.project)
+      && snapshot.projectSnapshotVersion === snapshot.liveModelVersion
+      && snapshot.projectSnapshotId === `${snapshot.workspaceId}:v${snapshot.projectSnapshotVersion}:${snapshot.projectSnapshotHash}`
+      && snapshot.projectSnapshotHash.length > 0;
+    if (!snapshotValid) {
+      throw new Error(`GET /api/workspace returned invalid live snapshot: ${JSON.stringify({
+        workspaceId: snapshot.workspaceId,
+        projectSnapshotId: snapshot.projectSnapshotId,
+        projectSnapshotHash: snapshot.projectSnapshotHash,
+        projectSnapshotVersion: snapshot.projectSnapshotVersion,
+        liveModelVersion: snapshot.liveModelVersion,
+      })}`);
+    }
+    const tmp = exportTempDir;
     // 先快照已存在的 furniture-dxf-*（历史遗留不算本次导出新增），只断言"无新增"。
     const before = new Set(readdirSync(tmp).filter((n) => n.startsWith('furniture-dxf-')));
     const r = await fetch(`${base}/api/export/dxf`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project: payload, which: ['plan'], modelVersion: 'v-test' }),
+      body: JSON.stringify({
+        project: snapshot.project,
+        projectSnapshotId: snapshot.projectSnapshotId,
+        projectSnapshotHash: snapshot.projectSnapshotHash,
+        projectSnapshotVersion: snapshot.projectSnapshotVersion,
+        which: ['plan'],
+        modelVersion: `v${snapshot.projectSnapshotVersion}`,
+      }),
     });
-    detail_dxf_export_ok = r.ok;
-    // 必须消费完响应体，服务端才会触发 stream 'end' → 清理临时目录
-    await r.text().catch(() => '');
+    detail_dxf_export_ok = r.status === 200;
+    // 必须完整消费响应体，服务端才会触发 stream 'end' → 清理临时目录。
+    const responseBytes = Buffer.from(await r.arrayBuffer());
+    const contentType = r.headers.get('content-type') ?? '';
+    let responseBody: unknown = { contentType, bytes: responseBytes.byteLength };
+    if (r.status !== 200) {
+      const rawBody = responseBytes.toString('utf8');
+      try { responseBody = JSON.parse(rawBody); } catch { responseBody = rawBody.slice(0, 2000); }
+    }
+    const responseCode = responseBody && typeof responseBody === 'object' && !Array.isArray(responseBody)
+      ? (responseBody as Record<string, unknown>).code ?? null
+      : null;
+    console.log(`  DXF HTTP response: ${JSON.stringify({ status: r.status, code: responseCode, body: responseBody })}`);
     // 清理是异步的：轮询等待本次新增的临时目录消失（最多 ~2s）
     let fresh = -1;
+    let afterCount = -1;
     for (let i = 0; i < 40; i++) {
       const now = readdirSync(tmp).filter((n) => n.startsWith('furniture-dxf-'));
+      afterCount = now.length;
       fresh = now.filter((n) => !before.has(n)).length;
       if (fresh === 0) break;
       await new Promise((rr) => setTimeout(rr, 50));
     }
     detail_dxf_residue = fresh;
-    ok('DXF 导出成功后临时目录无新增 furniture-dxf-* 残留', r.ok && fresh === 0, `ok=${r.ok} fresh=${fresh}`);
+    console.log(`  DXF live snapshot: ${JSON.stringify({ id: snapshot.projectSnapshotId, hash: snapshot.projectSnapshotHash, version: snapshot.projectSnapshotVersion })}`);
+    console.log(`  DXF temp directories: ${JSON.stringify({ before: before.size, after: afterCount, fresh })}`);
+    ok(
+      'DXF 导出成功后临时目录无新增 furniture-dxf-* 残留',
+      r.status === 200 && fresh === 0,
+      `status=${r.status} code=${JSON.stringify(responseCode)} body=${JSON.stringify(responseBody)}; snapshot=${snapshot.projectSnapshotId}; before=${before.size} after=${afterCount} fresh=${fresh}`,
+    );
   } catch (e) {
     ok('DXF 临时目录清理', false, String(e).slice(0, 300));
   } finally {
@@ -512,7 +576,7 @@ const VERIFY_DXF = join(APP, 'py', 'verify_dxf.py');
 await mutate(
   'P2-②',
   VERIFY_DXF,
-  '        "auditIssues": [str(i) for i in Auditor(doc).run()][:20],',
+  '        "auditIssues": [str(issue) for issue in Auditor(doc).run()][:20],',
   '        "auditIssues": len(ezdxf.audit(doc, renumber=False)) if False else None,',
   async () => {
     const src = readFileSync(VERIFY_DXF, 'utf8');

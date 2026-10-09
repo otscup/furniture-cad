@@ -5,7 +5,7 @@ import { EXPLODE_LANE_STEP, EXPLODE_TIER_BASE } from '../../core/geometry/assemb
 import { Pill, Row, Section, Text } from './common.tsx';
 
 /**
- * 视图面板 —— 把「四视图是怎么来的、哪里是假设」摆在界面上。
+ * 视图面板 —— 把「图纸视图是怎么来的、哪里是假设」摆在界面上。
  *
  * 这一栏存在的理由：
  *  1. 视图不是画出来的，是**投影派生**的；用户有权知道派生规则
@@ -25,6 +25,7 @@ export function ViewsPanel(props: {
   const geom = props.bus.derive().geom;
   const vs = geom.views;
   const cabs = props.bus.getState().cabinets;
+  const displayedViewKinds = VIEW_KINDS.filter((kind) => kind !== 'side');
   const first = cabs.length > 0 ? vs.placements[cabs[0].id] : undefined;
   const ex = props.explode ? props.bus.deriveExplode(true) : null;
 
@@ -44,22 +45,20 @@ export function ViewsPanel(props: {
             className={`tb-btn ${props.mode === 'sheet' ? 'active' : ''}`}
             onClick={() => props.setMode('sheet')}
           >
-            ▤ 四视图图幅
+            ▤ 图纸视图（三视图）
           </button>
         </div>
         <div className="hint-line">
-          四视图<strong>可以直接编辑</strong>：把鼠标放到图上一条线，蓝线=可拖（拖它改对应尺寸），
-          红虚线=这条看得见但拖不动（状态栏会说明原因）。四张图来自同一份模型，
-          <strong>在任意一张图上改完，其余三张同步更新</strong> —— 不需要、也不存在"手动同步"。
+          俯视 / 正视 / 内部<strong>可以直接编辑</strong>：蓝线尺寸可拖动改语义参数；普通图元可选择、移动、复制、删除或改属性。修改模型生成线只创建当前视图覆盖，不改柜体生产参数。
         </div>
         <div className="hint-line">
-          可拖的：柜宽（正/俯视图左右拖）、柜高（正/侧视图上下拖）、柜深（侧视图左右拖、俯视图上下拖）、
+          可拖的：柜宽（正/俯视图左右拖）、柜高（正视图上下拖）、柜深（俯视图上下拖）、
           踢脚高、分区分界（左右两区此消彼长，总宽不变）、门扇中缝。
           层板/抽屉分格由<strong>数量</strong>派生，不能拖 —— 请改数量或让 AI 改。
         </div>
       </Section>
 
-      <Section title={`四视图（${cabs.length} 个柜体）`}>
+      <Section title={`图纸视图（${cabs.length} 个柜体）`}>
         {cabs.length === 0 ? (
           <div className="hint-line">项目里还没有柜体，先在平面图里放一个。</div>
         ) : (
@@ -73,7 +72,7 @@ export function ViewsPanel(props: {
               </Text>
             </Row>
             <div className="view-list">
-              {VIEW_KINDS.map((k) => (
+              {displayedViewKinds.map((k) => (
                 <div key={k} className="view-item">
                   <div className="view-item-head">
                     <b>{VIEW_NAME[k]}</b>
@@ -84,7 +83,7 @@ export function ViewsPanel(props: {
               ))}
             </div>
             <div className="hint-line">
-              排版：立面外观图 + 立面结构图并排，每柜一块、上下叠放（PDF 式）。
+              屏幕图幅包含俯视、外观立面和内部立面；PDF/DXF 复用同一套视图覆盖数据。
             </div>
           </>
         )}
@@ -101,7 +100,7 @@ export function ViewsPanel(props: {
           </button>
         </div>
         <div className="hint-line">
-          分解图是<strong>可选的生产图</strong>：四视图调整好之后再开。它按开料清单<b>逐件</b>把板件摆开（轴测投影 30°），
+          分解图是<strong>可选的生产图</strong>：图纸视图调整好之后再开。它按开料清单<b>逐件</b>把板件摆开（轴测投影 30°），
           件号与明细栏和清单一一对应。关闭时<strong>连装配数据都不会算</strong>，零开销。
         </div>
         {ex && ex.enabled ? (

@@ -70,6 +70,7 @@ const EXPECTED_TOOLS = [
   'cad.get_state',
   'cad.validate',
   'cad.create_cabinet',
+  'cad.create_assembly',
   'cad.place_cabinet',
   'cad.update_object',
   'cad.delete_object',
@@ -83,6 +84,15 @@ const EXPECTED_TOOLS = [
   'cad.export_dxf',
   'cad.export_bom_csv',
   'cad.export_roombook',
+  'cad.export_pdf',
+];
+/** /api/health 保留 ALLOWED_TOOLS 的注册顺序，和 tools/list 的字母序分开断言。 */
+const EXPECTED_HEALTH_TOOLS = [
+  'cad.get_state', 'cad.validate', 'cad.create_cabinet', 'cad.place_cabinet',
+  'cad.update_object', 'cad.delete_object', 'cad.submit_proposal', 'cad.list_drafts',
+  'cad.apply_draft', 'cad.discard_draft', 'cad.create_room', 'cad.draw_wall',
+  'cad.duplicate_object', 'cad.create_assembly', 'cad.export_dxf', 'cad.export_bom_csv',
+  'cad.export_roombook', 'cad.export_pdf',
 ];
 /** 明令禁止的工具词根：目前无（S6 已做，IR-3 已开放）。保留空数组占位。 */
 const FORBIDDEN_ROOTS = [];
@@ -368,7 +378,7 @@ console.log(`\n夹具 L（local-open）server :${L.port}  workspace=${L.wsPath}`
     JSON.stringify(names)
   );
   const tools = list.json?.result?.tools ?? [];
-  const READ_TOOLS = ['cad.get_state', 'cad.validate', 'cad.list_drafts', 'cad.export_dxf', 'cad.export_bom_csv', 'cad.export_roombook'];
+  const READ_TOOLS = ['cad.get_state', 'cad.validate', 'cad.list_drafts', 'cad.export_dxf', 'cad.export_bom_csv', 'cad.export_roombook', 'cad.export_pdf'];
   ok(
     '①3c 读工具声明 readOnlyHint=true、写工具声明 readOnlyHint=false（只读是**声明**出来的，不是口头的）',
     tools.filter((t: any) => READ_TOOLS.includes(t.name)).every((t: any) => t.annotations?.readOnlyHint === true) &&
@@ -730,7 +740,7 @@ section('⑥ Regression：/api/* 行为未被 /mcp 改动');
   await waitWorkspaceLoaded(A.port);
   const h = await api(A.port, '/api/health', { method: 'GET' });
   ok('⑥1 /api/health 仍免鉴权 200（白名单没动）', h.status === 200 && h.json?.ok === true, `status=${h.status}`);
-  ok('⑥1b /api/health 新增 mcp 自述且工具清单=10 个工具', JSON.stringify(h.json?.mcp?.tools) === JSON.stringify(EXPECTED_TOOLS) && h.json?.mcp?.path === '/mcp', JSON.stringify(h.json?.mcp));
+  ok('⑥1b /api/health 新增 mcp 自述且工具清单=18 个工具', JSON.stringify(h.json?.mcp?.tools) === JSON.stringify(EXPECTED_HEALTH_TOOLS) && h.json?.mcp?.path === '/mcp', JSON.stringify(h.json?.mcp));
   ok('⑥1c /api/health 报 workspace.ok=true（真实工作区已装载）且 loading=false', h.json?.workspace?.ok === true && h.json?.workspace?.loading === false && h.json?.workspace?.workspaceId === 'ws_fixture_s2', JSON.stringify(h.json?.workspace));
 
   const mode = await api(A.port, '/api/auth/mode', { method: 'GET' });

@@ -25,11 +25,19 @@
  */
 import type { Project } from '../core/types.ts';
 import { parseProjectFile, serializeProjectFile } from '../core/projectFile.ts';
+import { findDuplicateUnitIds, unitIdentityConflictMessage } from '../core/unitIdentity.mjs';
 
 const KEY = 'furnicad.draft.v1';
+let projectStorageReadOnly = false;
+
+/** App 收到服务端只读诊断后设置；项目草稿的所有写/删路径共用此栅栏。 */
+export function setProjectStorageReadOnly(readOnly: boolean): void {
+  projectStorageReadOnly = readOnly;
+}
 
 /** 保存草稿，返回保存时间（ISO）；失败返回 ''（调用方据此不更新界面的"已保存"） */
 export function saveDraft(project: Project): string {
+  if (projectStorageReadOnly || findDuplicateUnitIds(project).length || hasStoredDuplicateUnitIds()) return '';
   const savedAt = new Date().toISOString();
   try {
     localStorage.setItem(KEY, serializeProjectFile(project, savedAt));
@@ -42,6 +50,20 @@ export function saveDraft(project: Project): string {
 export interface DraftRecord {
   project: Project;
   savedAt: string;
+  identityConflict?: string;
+}
+
+export function hasStoredDuplicateUnitIds(): boolean {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return false;
+    const envelope = JSON.parse(raw) as { project?: unknown };
+    // serializeProjectFile writes project fields at the envelope root; accept a nested
+    // legacy wrapper too, so every persisted representation is scanned before writes.
+    return findDuplicateUnitIds(envelope.project ?? envelope).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** 读草稿。不存在 / 内容非法 → null（顺手清掉坏草稿，下次别再被它绊倒） */
@@ -53,21 +75,29 @@ export function loadDraft(): DraftRecord | null {
     return null;
   }
   if (!raw) return null;
-  const r = parseProjectFile(raw);
+  const r = parseProjectFile(raw, { allowDuplicateUnitIds: true });
   if (!r.ok) {
-    try {
-      localStorage.removeItem(KEY);
-    } catch {
-      /* 清不掉就算了，loadDraft 下次照样返回 null */
+    if (!projectStorageReadOnly) {
+      try {
+        localStorage.removeItem(KEY);
+      } catch {
+        /* 清不掉就算了，loadDraft 下次照样返回 null */
+      }
     }
     return null;
   }
-  return { project: r.project, savedAt: r.savedAt };
+  const duplicates = findDuplicateUnitIds(r.project);
+  return {
+    project: r.project,
+    savedAt: r.savedAt,
+    ...(duplicates.length ? { identityConflict: unitIdentityConflictMessage('localStorage project', duplicates) } : {}),
+  };
 }
 
 /** 手动丢弃草稿（用于「新建项目」：不清的话一刷新又回来了） */
 export function clearDraft(): void {
   try {
+    if (projectStorageReadOnly || hasStoredDuplicateUnitIds()) return;
     localStorage.removeItem(KEY);
   } catch {
     /* 同上，静默 */

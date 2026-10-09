@@ -27,7 +27,9 @@ import sys
 from pathlib import Path
 
 import ezdxf
+from ezdxf import bbox
 from ezdxf.enums import TextEntityAlignment
+from ezdxf.math import Matrix44
 
 TXT_STYLE = "HZ"
 
@@ -117,6 +119,71 @@ def align_of(a: str):
     }.get(a, TextEntityAlignment.LEFT)
 
 
+A3_WIDTH_MM = 420.0
+A3_HEIGHT_MM = 297.0
+A3_MARGIN_MM = 5.0
+
+
+def setup_a3_layout(layout) -> None:
+    """Set a real A3 landscape paper space that plots at 1:1 in millimeters."""
+    layout.page_setup(
+        size=(A3_WIDTH_MM, A3_HEIGHT_MM),
+        margins=(A3_MARGIN_MM, A3_MARGIN_MM, A3_MARGIN_MM, A3_MARGIN_MM),
+        units="mm",
+        scale=(1, 1),
+        name="ISO_A3",
+        # Keep the drawing device-independent; the recipient chooses their printer/PDF driver.
+        device="none",
+    )
+    layout.set_plot_type(5)  # Plot paper-space layout, not model extents.
+    # page_setup() creates a model-space viewport. Furniture entities are directly in
+    # paper space, so that viewport would show the PLAN and overlap the cabinet sheet.
+    for viewport in list(layout.query("VIEWPORT")):
+        layout.delete_entity(viewport)
+
+
+def fit_layout_to_a3(layout) -> dict | None:
+    """Fit the complete paper-space drawing, including text, inside A3 margins.
+
+    Geometry and annotations are transformed together with one uniform factor. This
+    is only a paper-coordinate conversion: no view, dimension, label, or relationship
+    is recomputed. Lineweights remain paper-space lineweights in millimeters.
+    """
+    entities = list(layout)
+    if not entities:
+        return None
+    ext = bbox.extents(entities, fast=False)
+    if not ext.has_data:
+        return None
+
+    min_x, min_y = float(ext.extmin.x), float(ext.extmin.y)
+    max_x, max_y = float(ext.extmax.x), float(ext.extmax.y)
+    width, height = max_x - min_x, max_y - min_y
+    usable_w = A3_WIDTH_MM - 2 * A3_MARGIN_MM
+    usable_h = A3_HEIGHT_MM - 2 * A3_MARGIN_MM
+    if width <= 0 or height <= 0 or usable_w <= 0 or usable_h <= 0:
+        raise ValueError(f"无法将 DXF 布局映射至 A3：边界 {width:g}×{height:g}")
+
+    scale = min(usable_w / width, usable_h / height)
+    offset_x = (A3_WIDTH_MM - scale * (min_x + max_x)) / 2
+    offset_y = (A3_HEIGHT_MM - scale * (min_y + max_y)) / 2
+    transform = Matrix44(
+        (scale, 0, 0, 0),
+        (0, scale, 0, 0),
+        (0, 0, 1, 0),
+        (offset_x, offset_y, 0, 1),
+    )
+    for entity in entities:
+        entity.transform(transform)
+
+    return {
+        "scale": scale,
+        "offsetX": offset_x,
+        "offsetY": offset_y,
+        "sourceBounds": {"minX": min_x, "minY": min_y, "maxX": max_x, "maxY": max_y},
+    }
+
+
 def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
     if "meta" not in data:
         raise ValueError("中立交换 JSON 缺少 meta 字段（顶层必须有 meta）")
@@ -184,140 +251,14 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                 pr["p"] = {"x": base_x, "y": base_y - idx * step}
                 idx += 1
 
-    # ── v8 修复：DIMENSION 和 LEADER 实体生成 ──
-    # TS 侧把尺寸画成 poly+text（F-DIM 层），引线画成 poly+text（F-ANNOT-RED 层）。
-    # 这里把它们转成真正的 DXF DIMENSION / LEADER 实体，否则下游 CAD 软件认不出。
-    def build_dimensions(target_space, prims_list, std_layer_fn):
-        """从 F-DIM 层的 poly+text 生成 DXF DIMENSION 实体。"""
-        import re
-        # 收集 DIM 层的 text（数字）和 poly（直线）
-        dim_texts = []  # (x, y, text)
-        dim_lines = []  # [(x1,y1),(x2,y2)]
-        for pr in prims_list:
-            if not isinstance(pr, dict):
-                continue
-            layer = pr.get("layer", "")
-            std = std_layer_fn(layer)
-            if std != "DIM":
-                continue
-            if pr.get("k") == "text":
-                t = str(pr.get("text", "")).strip()
-                # 尺寸数字：纯数字（可能带小数）
-                if re.fullmatch(r'\d+(\.\d+)?', t):
-                    p = pr.get("p", {})
-                    dim_texts.append((float(p.get("x", 0)), float(p.get("y", 0)), t))
-            elif pr.get("k") == "poly":
-                pts = pr.get("pts", [])
-                if len(pts) == 2:
-                    dim_lines.append((
-                        (float(pts[0]["x"]), float(pts[0]["y"])),
-                        (float(pts[1]["x"]), float(pts[1]["y"])),
-                    ))
-        if not dim_texts or not dim_lines:
-            return 0
-        count = 0
-        for tx, ty, txt in dim_texts:
-            # 找最近的直线（距离文本中心最近的线段中点）
-            best = None
-            best_d = float('inf')
-            for (x1, y1), (x2, y2) in dim_lines:
-                mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-                d = ((mx - tx) ** 2 + (my - ty) ** 2) ** 0.5
-                # 只考虑长度 >50 的直线（排除箭头小线）
-                seg_len = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-                if seg_len < 50:
-                    continue
-                if d < best_d:
-                    best_d = d
-                    best = ((x1, y1), (x2, y2))
-            if best is None:
-                continue
-            (x1, y1), (x2, y2) = best
-            try:
-                # 用文本位置作为尺寸线位置，线段端点作为界线原点
-                dim = target_space.add_linear_dim(
-                    base=(tx, ty),
-                    p1=(x1, y1),
-                    p2=(x2, y2),
-                    text=txt,
-                    dxfattribs={"layer": "DIM"},
-                )
-                dim.render()
-                count += 1
-            except Exception:
-                # DIMENSION 生成失败不阻断导出（poly+text 本体已在）
-                continue
-        return count
-
-    def build_leaders(target_space, prims_list, std_layer_fn):
-        """从 F-ANNOT-RED 层的 poly+text 生成 DXF LEADER 实体。"""
-        annot_texts = []  # (x, y, text)
-        annot_lines = []  # [(x1,y1),(x2,y2)]
-        for pr in prims_list:
-            if not isinstance(pr, dict):
-                continue
-            layer = pr.get("layer", "")
-            std = std_layer_fn(layer)
-            if std != "ANNOT_RED":
-                continue
-            if pr.get("k") == "text":
-                t = str(pr.get("text", "")).strip()
-                if t:
-                    p = pr.get("p", {})
-                    annot_texts.append((float(p.get("x", 0)), float(p.get("y", 0)), t))
-            elif pr.get("k") == "poly":
-                pts = pr.get("pts", [])
-                if len(pts) == 2 and not pr.get("closed"):
-                    annot_lines.append((
-                        (float(pts[0]["x"]), float(pts[0]["y"])),
-                        (float(pts[1]["x"]), float(pts[1]["y"])),
-                    ))
-        if not annot_texts:
-            return 0
-        count = 0
-        for tx, ty, txt in annot_texts:
-            # 找最近的引线（文本下方 500 范围内的垂直线优先）
-            best = None
-            best_d = float('inf')
-            for (x1, y1), (x2, y2) in annot_lines:
-                # 引线一端应在文本附近
-                d1 = ((x1 - tx) ** 2 + (y1 - ty) ** 2) ** 0.5
-                d2 = ((x2 - tx) ** 2 + (y2 - ty) ** 2) ** 0.5
-                d = min(d1, d2)
-                if d < best_d and d < 800:
-                    best_d = d
-                    best = ((x1, y1), (x2, y2))
-            if best is None:
-                continue
-            (x1, y1), (x2, y2) = best
-            try:
-                # LEADER：从文本位置指向引线远端
-                # 确定哪端离文本远（目标点），哪端近（文本端）
-                d1 = ((x1 - tx) ** 2 + (y1 - ty) ** 2) ** 0.5
-                far = (x2, y2) if d1 < ((x2 - tx) ** 2 + (y2 - ty) ** 2) ** 0.5 else (x1, y1)
-                leader = target_space.add_leader(
-                    vertices=[(tx, ty - 40), far],
-                    dxfattribs={"layer": "ANNOT_RED"},
-                )
-                # 关联文本注解
-                try:
-                    leader.set_annotation(
-                        target_space.add_text(txt, height=170,
-                                            dxfattribs={"layer": "ANNOT_RED"}),
-                        leader_style="mtext",
-                    )
-                except Exception:
-                    pass
-                count += 1
-            except Exception:
-                continue
-        return count
-
+    # F-DIM 与 F-ANNOT-RED 的线和文字已经由 TypeScript 按语义位置生成，
+    # 禁止按最近邻猜配 DIMENSION/LEADER：会关联到错误线段并重复绘制。
+    # stats 中保留兼容字段（均为 0）；图元数量由逐个序列化和验收对账保障。
     # ── 多 sheet：一张图纸一个 paper space layout ──
     # 旧逻辑把所有 sheet 的图元都扔进 modelspace，会重叠。
     # 现在每个 sheet 独立一个 layout（图纸空间），互不干扰。
-    # PLAN（平面布置图）保留在 modelspace（它是 1:1 的建筑底图）；
-    # SHEET_*（家具生产图）进各自的 paper space layout。
+    # 房间 PLAN 与逐柜生产图都进入独立 A3 横向 paper space，
+    # 统一映射后按 1:1 出图；modelspace 不承载可打印图纸，避免 PLAN 与柜体图重叠。
     def sanitize_layout_name(name: str, idx: int) -> str:
         # DXF layout 名：去特殊字符，限长
         safe = "".join(c if (c.isalnum() or c in "_-") else "_" for c in name)
@@ -328,29 +269,16 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
         sheet_name = str(sh.get("name", f"SHEET_{si}"))
         # v8：先分散 (0,0) 的柜名 TEXT
         distribute_zero_texts(sh.get("prims", []) or [])
-        # PLAN 进 modelspace，其余进 paper space layout
-        if sheet_name == "PLAN":
-            target_space = msp
-            space_label = "modelspace"
-        else:
-            layout_name = sanitize_layout_name(sh.get("nameZh") or sheet_name, si)
-            # 重名时加后缀
-            base_name = layout_name
-            suffix = 1
-            while layout_name in doc.layouts:
-                suffix += 1
-                layout_name = f"{base_name}_{suffix}"
-            doc.layouts.new(layout_name)
-            target_space = doc.layouts.get(layout_name)
-            # 2026-10-04：删掉 ezdxf 自动创建的视口（用户说左下角缩略图看着像 bug）
-            for vp in list(target_space.query('VIEWPORT')):
-                # 保留主视口 (*Active)，删掉其他的
-                # 实际上新 layout 只有一个视口，直接删掉避免缩略图
-                try:
-                    target_space.delete_entity(vp)
-                except Exception:
-                    pass
-            space_label = f"layout:{layout_name}"
+        layout_name = sanitize_layout_name(sh.get("nameZh") or sheet_name, si)
+        # 重名时加后缀
+        base_name = layout_name
+        suffix = 1
+        while layout_name in doc.layouts:
+            suffix += 1
+            layout_name = f"{base_name}_{suffix}"
+        doc.layouts.new(layout_name)
+        target_space = doc.layouts.get(layout_name)
+        setup_a3_layout(target_space)
         stats["sheets"] += 1
 
         for pi, pr in enumerate(sh.get("prims", []) or []):
@@ -416,10 +344,9 @@ def build(data: dict, out_path: Path, dxfversion: str = "R2007") -> dict:
                     f"图元损坏：sheet[{si}] prim[{pi}] kind={kind!r} 字段缺失或类型错误：{e}"
                 ) from e
 
-        # v8：生成 DIMENSION 和 LEADER 实体（TS 侧只给了 poly+text，这里转成真实体）
-        stats["dimension"] += build_dimensions(target_space, sh.get("prims", []) or [], std_layer_for)
-        stats["leader"] += build_leaders(target_space, sh.get("prims", []) or [], std_layer_for)
-
+        # 仅导出上方循环逐个写入的权威图元，不生成重复尺寸或引线实体。
+        # Paper space is measured in plotted millimeters; fit all entities and text extents together.
+        fit_layout_to_a3(target_space)
     # 生产数据三件套写进文件的自定义属性：模型版本 + 生成器版本 + 规则集版本。
     # 主方案红线：交付物必须能完整复现，光靠一个文件名做不到 —— 文件会被改名。
     try:

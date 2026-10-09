@@ -5,6 +5,7 @@ import { buildFrontPickLines, buildSideTopPickLines } from './pickLines.ts';
 import type { PickLine } from './pickLines.ts';
 import { bboxOf } from './transform.ts';
 import { LabelPlacer, primVisualExtent } from './labels.ts';
+import { sheetSourceKeys } from '../drawingEdits.ts';
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -240,6 +241,40 @@ export class DimLayout {
 
   add(intent: DimIntent): void {
     this.intents.push(intent);
+  }
+
+  /** 返回指定方向尺寸链最外侧的偏移，用于在摆放相邻视图前预留实际标注带宽。 */
+  outermostOffset(side: DimIntent['side']): number {
+    const groups = new Map<string, DimIntent[]>();
+    for (const intent of this.intents) {
+      if (intent.side !== side) continue;
+      const key = intent.chain ?? '';
+      const group = groups.get(key) ?? [];
+      group.push(intent);
+      groups.set(key, group);
+    }
+
+    let outermost = 0;
+    for (const items of groups.values()) {
+      const axial = (it: DimIntent): number =>
+        it.orientation === 'h' ? Math.min(it.p0.x, it.p1.x) : Math.min(it.p0.y, it.p1.y);
+      const axialEnd = (it: DimIntent): number =>
+        it.orientation === 'h' ? Math.max(it.p0.x, it.p1.x) : Math.max(it.p0.y, it.p1.y);
+      const textHalf = (it: DimIntent): number => (it.txt.length * 110 * DIM_TEXT_CHAR_W) / 2;
+      const sorted = [...items].sort((a, b) => axial(a) - axial(b));
+      const levelEnds: number[] = [];
+
+      for (const intent of sorted) {
+        const start = axial(intent) - textHalf(intent);
+        const end = axialEnd(intent) + textHalf(intent);
+        let level = 0;
+        while (level < levelEnds.length && start < levelEnds[level]!) level++;
+        if (level >= levelEnds.length) levelEnds.push(end);
+        else levelEnds[level] = Math.max(levelEnds[level]!, end);
+        outermost = Math.max(outermost, intent.baseOffset + level * DIM_LEVEL_STEP);
+      }
+    }
+    return outermost;
   }
 
   /**
@@ -576,6 +611,11 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   T.rect(0, t, 0, bodyD, layerOfThickness(t), 1); // 左侧板
   T.rect(W - t, W, 0, bodyD, layerOfThickness(t), 1); // 右侧板
   T.rect(t, W - t, 0, bodyD, layerOfThickness(t), 1); // 顶板
+  const topCallouts: Array<{ x: number; text: string }> = [];
+  for (const cutout of p.counterCutouts ?? []) {
+    T.rect(cutout.x, cutout.x + cutout.width, cutout.y, cutout.y + cutout.depth, L_HW, 1.6, HIDDEN_DASH);
+    topCallouts.push({ x: W / 2, text: `${cutout.name} ${cutout.width}×${cutout.depth}` });
+  }
   // 中立板：**逐行取并集**（多行柜里各行中立板可以落在不同 X，只画第一行会漏）
   const topDividerXs = new Set<number>();
   rowCtxs.forEach((ctx) => {
@@ -615,6 +655,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         const od = Math.min(u.appliance.openingDepth, bodyD);
         const ax0 = x0 + (ctx.nets[i]! - ow) / 2;
         T.rect(ax0, ax0 + ow, D - od, D, L_HW, 1.2, HIDDEN_DASH);
+        topCallouts.push({ x: ax0 + ow / 2, text: `${u.appliance.name} ${u.appliance.openingWidth}×${u.appliance.openingHeight}` });
       }
       if (u.shelves && u.shelves.count > 0) {
         const s = shelfSpanXIn(ctx, i);
@@ -651,6 +692,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       }
     });
   }
+  // 标签锚点位于柜体俯视轮廓外；单柜图排版器会把这条注释带纳入真实 bbox。
+  topCallouts.forEach((item, index) => T.text(item.x, D + 160 + index * 120, item.text, 65, L_HW, 'c'));
 
   // ═══════════════ 3. 侧视图（从左往右看）═══════════════
   // 横轴 = 进深 Y（左边贴正视图 = 柜背，右边 = 柜门）；纵轴 = 高度 Z。
@@ -982,7 +1025,9 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const rodZ = rowZ0 + u.rod.heightFromBottom;
           const n = Math.min(3, Math.max(2, Math.floor(netW / 350)));
           const isLong = rowNH >= 1200; // 长衣/短衣按净高区分
-          const garmentH = isLong ? Math.min(900, rowNH - u.rod.heightFromBottom - 50) : Math.min(600, rowNH - u.rod.heightFromBottom - 50);
+          // 衣服肩线在挂杆下 70mm；衣摆与本行顶面至少留 50mm，不能只按杆高算衣长。
+          const maxGarmentH = rowNH - u.rod.heightFromBottom - 70 - 50;
+          const garmentH = isLong ? Math.min(900, maxGarmentH) : Math.min(600, maxGarmentH);
           if (garmentH > 200) {
             for (let k = 0; k < n; k++) {
               const hx = x0 + (netW * (k + 1)) / (n + 1);
@@ -1287,8 +1332,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
               } else if (widths.length === 1) {
                 // 单扇门：v8 恢复 X 对角线（对标参考 PDF）
                 const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
-                if (hingeLeft) diag(right, zTop, left, zBot);  // v8 恢复
-                else diag(left, zTop, right, zBot);  // v8 恢复
+                if (hingeLeft) diag(left, zTop, right, zBot);
+                else diag(right, zTop, left, zBot);
                 // v8：虚线箭头改竖向（上下开门方向，对标参考 PDF）
                 // 用户要求：虚线双向 <> 覆盖整个门板
                 const cx = (left + right) / 2;
@@ -1305,8 +1350,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 for (let j = 0; j < widths.length; j++) {
                   const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
                   const r2 = l2 + widths[j];
-                  if (side) diag(r2, zTop, l2, zBot);  // v8 恢复：X 实线
-                  else diag(l2, zTop, r2, zBot);  // v8 恢复：X 实线
+                  if (side) diag(l2, zTop, r2, zBot);
+                  else diag(r2, zTop, l2, zBot);
                   // v8：多扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
                   // 用户要求：虚线双向 <> 覆盖整个门板
                   const j_cx = (l2 + r2) / 2;
@@ -1328,7 +1373,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           P.line(x0 + 2, x0 + netW - 2, rz, rz, L_HW, 1.6, ROD_DASH);
         }
 
-        // 电器格洞口：虚线框 + 名称与洞口尺寸（外观图上机器就在洞里，内部图同样标）。洞口自本行内空底起算。
+        // 电器格洞口：前视只保留虚线净空框，名称/尺寸统一放到俯视图外侧注释带，避开红色尺寸链。
         if (u.kind === 'appliance' && u.appliance) {
           const a = u.appliance;
           const ow = Math.min(a.openingWidth, netW);
@@ -1336,7 +1381,6 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const az = apertureZIn(ctx, u);
           if (az) {
             P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, 1.2, HIDDEN_DASH);
-            P.text(ax0 + ow / 2, (az.z0 + az.z1) / 2, `${a.name} ${a.openingWidth}×${a.openingHeight}`, 80, L_TEXT, 'c');
           }
         }
       });
@@ -1499,6 +1543,8 @@ function primPoints(p: Prim): Vec2[] {
 export interface ProjectViewSet {
   /** 所有柜体的四视图 + 衔接线 + 标注，合并成一份可直接渲染的图元表 */
   prims: Prim[];
+  /** 与 prims 一一对应；front/internal 的序号与单柜视图生成器一致。 */
+  sourceKeys: string[];
   bbox: BBox | null;
   /** 每个柜体图幅的平移量（把 buildCabinetViews 的 (0,0) 平移到这里） */
   placements: Record<string, Vec2>;
@@ -1518,36 +1564,39 @@ export interface ProjectViewSet {
  */
 export function buildProjectViews(project: Project, rules: RuleSet): ProjectViewSet {
   const prims: Prim[] = [];
+  const sourceKeys: string[] = [];
   const pickLines: PickLine[] = [];
   const placements: Record<string, Vec2> = {};
   const titles: ProjectViewSet['titles'] = [];
   const seen = new Map<string, number>();
-  // PDF 式排版：每个柜子一个块（立面外观 + 立面结构并排），块与块上下叠放，
-  // 不再是所有柜子挤成一横排。
-  let cursorY = 0;
+  // 每个柜子一个块（立面外观 + 立面结构并排），块与块横向排列。
+  let cursorX = 0;
 
   for (const cab of project.cabinets) {
     let vs: ViewSet;
     try {
-      vs = buildCabinetViews(cab, rules, { x: 0, y: cursorY });
+      vs = buildCabinetViews(cab, rules, { x: cursorX, y: 0 });
     } catch {
       continue; // 单柜派生失败不能拖垮整幅图（与 generateProject 同样的容错策略）
     }
     const { W, H } = vs.dims;
-    // 块内：立面外观在左，立面结构在右（PDF 排版）
-    const blockW = W + vs.gaps.gapInt + W;
-    const blockH = H;
+    // 以生成器实际 origin 为准，不能漏掉正视图到内部图之间的侧视图与间距。
+    const fx = vs.meta.front.origin.x;
+    const fy = vs.meta.front.origin.y;
+    const ix0 = vs.meta.internal.origin.x;
+    const blockW = ix0 + W - fx;
 
-    // 只取 front + internal 的图元；labels/hinge 按位置过滤掉顶视图/侧视图的
-    // （buildCabinetViews 仍生成四视图的 labels，但三视图模式下只用其中两视图的）
-    const fx = 0, fy = cursorY;
-    const ix0 = fx + W + vs.gaps.gapInt;
+    // 高级图幅显示 top + front + internal；side 暂留给单柜视图与尺寸拾取。
+    // cabinet top 与房间 PLAN 是不同坐标空间：前者用于生产图，后者用于落位图。
     const M = 700; // 过滤边距：小于最小视图间距 780，确保顶/侧视图的标注被排除
     const inFrontOrInternal = (x: number, y: number): boolean => {
       const inFront = x >= fx - M && x <= fx + W + M && y >= fy - M && y <= fy + H + 1200;
       const inInternal = x >= ix0 - M && x <= ix0 + W + M && y >= fy - M && y <= fy + H + 1200;
       return inFront || inInternal;
     };
+    const top = vs.meta.top;
+    const inDisplayedView = (x: number, y: number): boolean => inFrontOrInternal(x, y) ||
+      (x >= top.origin.x - M && x <= top.origin.x + top.w + M && y >= top.origin.y - M && y <= top.origin.y + top.h + 1200);
     const labelPos = (pr: Prim): { x: number; y: number } | null => {
       if (pr.k === 'text') return pr.p;
       if (pr.k === 'poly' && pr.pts.length) {
@@ -1558,7 +1607,7 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
     };
     const filteredLabels = vs.labels.filter(pr => {
       const pos = labelPos(pr);
-      return pos ? inFrontOrInternal(pos.x, pos.y) : true;
+      return pos ? inDisplayedView(pos.x, pos.y) : true;
     });
     // hinge：只保留正视图的垂直对正线和正视/内部的高平齐线，去掉顶/侧视图的宽相等线
     const filteredHinge = vs.hinge.filter(pr => {
@@ -1566,14 +1615,23 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
       return pos ? inFrontOrInternal(pos.x, pos.y) : true;
     });
 
-    prims.push(...vs.prims.front, ...vs.prims.internal, ...filteredHinge, ...filteredLabels);
+    const cabinetPrims = [...vs.prims.top, ...vs.prims.front, ...vs.prims.internal, ...filteredHinge, ...filteredLabels];
+    prims.push(...cabinetPrims);
+    sourceKeys.push(
+      ...sheetSourceKeys(cab.id, 'top', vs.prims.top),
+      ...sheetSourceKeys(cab.id, 'front', vs.prims.front),
+      ...sheetSourceKeys(cab.id, 'internal', vs.prims.internal),
+      ...sheetSourceKeys(cab.id, 'aux:hinge', filteredHinge),
+      ...sheetSourceKeys(cab.id, 'aux:label', filteredLabels),
+    );
     pickLines.push(...vs.pickLines);
 
-    placements[cab.id] = { x: 0, y: cursorY };
-    titles.push({ cabinetId: cab.id, name: cab.name, at: { x: blockW / 2, y: cursorY } });
+    placements[cab.id] = { x: fx, y: fy };
+    titles.push({ cabinetId: cab.id, name: cab.name, at: { x: fx + blockW / 2, y: fy } });
     for (const a of vs.assumptions) seen.set(a, (seen.get(a) ?? 0) + 1);
 
-    cursorY += blockH + CABINET_VIEW_GAP;
+    const cabinetBBox = cabinetPrims.length ? bboxOf(cabinetPrims.flatMap(primVisualExtent)) : null;
+    cursorX = Math.max(fx + blockW, cabinetBBox?.max.x ?? fx + blockW) + CABINET_VIEW_GAP;
   }
 
   /**
@@ -1586,6 +1644,7 @@ export function buildProjectViews(project: Project, rules: RuleSet): ProjectView
   const assumptions = [...seen.keys()];
   return {
     prims,
+    sourceKeys,
     bbox,
     placements,
     titles,

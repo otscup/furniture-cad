@@ -29,6 +29,7 @@ export function PlanRunView(props: {
   /** 应用按钮文案；缺省时按"已应用/应用全部 N 条"自适应 */
   applyLabel?: string;
   dismissLabel?: string;
+  readOnly?: boolean;
 }): ReactNode {
   const { run, onApply, onDismiss, lastApply } = props;
   const applyLabel = props.applyLabel ?? (run.committed ? `✓ 已应用 ${run.okCount} 条` : `应用全部（${run.okCount} 条）`);
@@ -86,7 +87,7 @@ export function PlanRunView(props: {
         </div>
       ))}
       <div className="btn-row">
-        <button type="button" className="tb-btn primary" disabled={run.okCount === 0 || run.committed} onClick={onApply}>
+        <button type="button" className="tb-btn primary" disabled={props.readOnly || run.okCount === 0 || run.committed} onClick={onApply}>
           {applyLabel}
         </button>
         <button type="button" className="tb-btn" onClick={onDismiss}>

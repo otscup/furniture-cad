@@ -18,9 +18,10 @@
  *    比一句"导入失败：房间 id 重复"危险得多。前者把事故推迟到生产现场。
  * ══════════════════════════════════════════════════════════════════════
  */
-import type { Project } from './types.ts';
+import type { DrawingEntity, Project } from './types.ts';
 import { toFileProject } from './layoutModel.ts';
 import { partitionModelIntents } from './designIntent/validate.ts';
+import { findDuplicateUnitIds } from './unitIdentity.mjs';
 
 export const PROJECT_FILE_FORMAT = 'furniture-cad-project';
 export const PROJECT_FILE_FORMAT_VERSION = 1;
@@ -71,7 +72,8 @@ export function serializeProjectFile(project: Project, savedAt = new Date().toIS
 export function resolveSchemaVersion(project: Project): string {
   const hasRows = project.cabinets.some((c) => Array.isArray(c.layout?.rows) && c.layout.rows.length > 1);
   const hasAssemblies = Array.isArray(project.assemblies) && project.assemblies.length > 0;
-  return hasRows || hasAssemblies ? '0.3' : '0.2';
+  const hasSharedPanels = Array.isArray(project.sharedPanels) && project.sharedPanels.length > 0;
+  return hasSharedPanels ? '0.4' : hasRows || hasAssemblies ? '0.3' : '0.2';
 }
 
 export type ParseResult =
@@ -91,6 +93,14 @@ function checkIdsUnique(ids: Iterable<{ id: string }>, what: string, seen: Set<s
   return null;
 }
 
+function checkIdsPresent(ids: Iterable<{ id: string }>, what: string, seen: Set<string>): string | null {
+  for (const obj of ids) {
+    if (typeof obj?.id !== 'string' || obj.id === '') return `${what} 缺少 id`;
+    seen.add(obj.id);
+  }
+  return null;
+}
+
 /**
  * 两个分区序列是否"同一批分区、同一顺序"。
  * 用于判定多行文件里的 `units` 镜像是否与 `rows[0].units` 一致 ——
@@ -101,7 +111,7 @@ function sameUnitIds(a: Array<{ id?: unknown }> | undefined, b: Array<{ id?: unk
   return a.every((u, i) => u != null && u.id === b[i]?.id);
 }
 
-export function parseProjectFile(raw: string): ParseResult {
+export function parseProjectFile(raw: string, options: { allowDuplicateUnitIds?: boolean } = {}): ParseResult {
   // ① JSON 语法
   let env: unknown;
   try {
@@ -135,6 +145,36 @@ export function parseProjectFile(raw: string): ParseResult {
   if (!Array.isArray(p.cabinets)) return { ok: false, error: 'project.cabinets 必须是数组' };
 
   const warnings: string[] = [];
+  if (p.drawingEdits !== undefined) {
+    if (!Array.isArray(p.drawingEdits)) {
+      warnings.push('project.drawingEdits 不是数组，已清空二维图元覆盖');
+      delete (p as unknown as Record<string, unknown>).drawingEdits;
+    } else {
+      const seenDrawingIds = new Set<string>();
+      const safeDrawings: DrawingEntity[] = [];
+      for (const candidate of p.drawingEdits as unknown[]) {
+        const e = candidate as Partial<DrawingEntity> | null;
+        if (e?.space === 'sheet' && (!['top', 'front', 'internal'].includes(e.view ?? '') || typeof e.cabinetId !== 'string' || !e.cabinetId)) {
+          return { ok: false, error: `二维图元 ${e.id ?? '(无 ID)'} 指向未支持的 sheet 视图；当前只支持绑定柜体的 top/front/internal。未加载文件，避免静默丢图。` };
+        }
+        const valid = Boolean(e && typeof e.id === 'string' && e.id && !seenDrawingIds.has(e.id) &&
+          (e.space === 'plan' || e.space === 'sheet') &&
+          ['line', 'polyline', 'text', 'dimension', 'leader'].includes(e.kind ?? '') &&
+          Array.isArray(e.points) && e.points.length <= 500 && e.points.every(q => Number.isFinite(q?.x) && Number.isFinite(q?.y) && Math.abs(q.x) <= 1_000_000 && Math.abs(q.y) <= 1_000_000) &&
+          Number.isFinite(e.textSize) && Number.isFinite(e.lineWidth) && e.textSize! >= 1 && e.textSize! <= 10000 && e.lineWidth! >= 0.1 && e.lineWidth! <= 100 &&
+          typeof e.layer === 'string' && e.layer.length <= 80 && ['manual', 'model-override'].includes(e.provenance ?? '') &&
+          (e.replacesSource === undefined || (typeof e.replacesSource === 'string' && e.replacesSource.length > 0 && e.replacesSource.length <= 512)) &&
+          (e.rot === undefined || (Number.isFinite(e.rot) && Math.abs(e.rot) <= 360000)) &&
+          (e.closed === undefined || typeof e.closed === 'boolean') &&
+          (e.dash === undefined || (Array.isArray(e.dash) && e.dash.length <= 16 && e.dash.every(n => Number.isFinite(n) && n > 0 && n <= 10000))) &&
+          (e.text === undefined || (typeof e.text === 'string' && e.text.length <= 2000)));
+        if (!valid) { warnings.push('已丢弃一条结构非法的二维图元覆盖'); continue; }
+        seenDrawingIds.add(e!.id!);
+        safeDrawings.push(e as DrawingEntity);
+      }
+      p.drawingEdits = safeDrawings;
+    }
+  }
   if (typeof p.ruleSetId !== 'string' || p.ruleSetId === '') {
     warnings.push('project.ruleSetId 缺失，将按当前规则集加载并重新校验');
   }
@@ -150,11 +190,14 @@ export function parseProjectFile(raw: string): ParseResult {
   // ④ 房间与墙
   for (const r of p.rooms as unknown[]) {
     if (typeof r !== 'object' || r === null || Array.isArray(r)) return { ok: false, error: 'rooms 里有非法成员' };
-    const room = r as { id: unknown; name: unknown; walls: unknown };
+    const room = r as { id: unknown; name: unknown; note?: unknown; walls: unknown };
     if (typeof room.id !== 'string' || room.id === '') return { ok: false, error: `房间缺少 id` };
     if (roomIds.has(room.id)) return { ok: false, error: `房间 id 重复：${room.id}` };
     roomIds.add(room.id);
     if (typeof room.name !== 'string' || room.name === '') return { ok: false, error: `房间 ${room.id} 缺少 name` };
+    if (room.note !== undefined && (typeof room.note !== 'string' || room.note.length > 500)) {
+      return { ok: false, error: `房间 ${room.id} 的 note 必须是最多 500 字符的字符串` };
+    }
     if (!Array.isArray(room.walls)) return { ok: false, error: `房间 ${room.id} 的 walls 不是数组` };
     const dupWall = checkIdsUnique(room.walls as { id: string }[], `房间 ${room.id} 的墙`, wallIds);
     if (dupWall) return { ok: false, error: dupWall };
@@ -300,7 +343,7 @@ export function parseProjectFile(raw: string): ParseResult {
          * 记录 → 生产下错料）。`unitIds` 是项目级的 Set，所以这条同时保证
          * 行内唯一、行间唯一、跨柜唯一 —— 一道检查管三层。
          */
-        const dupRowUnit = checkIdsUnique(row.units as { id: string }[], `柜体 ${cab.id} 的行 ${row.id} 的分区`, unitIds);
+        const dupRowUnit = (options.allowDuplicateUnitIds ? checkIdsPresent : checkIdsUnique)(row.units as { id: string }[], `柜体 ${cab.id} 的行 ${row.id} 的分区`, unitIds);
         if (dupRowUnit) return { ok: false, error: dupRowUnit };
       }
       if (hasUnits && !sameUnitIds(layout.units as Array<{ id: unknown }>, rows[0]!.units as Array<{ id: unknown }>)) {
@@ -310,7 +353,7 @@ export function parseProjectFile(raw: string): ParseResult {
       if (!hasUnits) return { ok: false, error: `柜体 ${cab.id} 缺少 layout.units` };
       const flat = layout.units as unknown[];
       if (flat.length === 0) return { ok: false, error: `柜体 ${cab.id} 的分区是空的 —— 至少保留一个分区，否则不是柜子` };
-      const dupUnit = checkIdsUnique(flat as { id: string }[], `柜体 ${cab.id} 的分区`, unitIds);
+      const dupUnit = (options.allowDuplicateUnitIds ? checkIdsPresent : checkIdsUnique)(flat as { id: string }[], `柜体 ${cab.id} 的分区`, unitIds);
       if (dupUnit) return { ok: false, error: dupUnit };
     }
   }
@@ -427,6 +470,13 @@ export function parseProjectFile(raw: string): ParseResult {
     }
   }
 
+  if (!options.allowDuplicateUnitIds) {
+    const duplicates = findDuplicateUnitIds(p);
+    if (duplicates.length) {
+      const details = duplicates.map(({ id, locations }) => `${id}（${locations.join('、')}）`).join('；');
+      return { ok: false, error: `Unit/backUnit ID 重复：${details}` };
+    }
+  }
   const savedAt = typeof o.savedAt === 'string' ? o.savedAt : '';
   return { ok: true, project: p, savedAt, warnings };
 }

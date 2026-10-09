@@ -35,10 +35,12 @@ import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
+import { hashProjectSnapshot } from './projectHash.mjs';
+import { findDuplicateUnitIds, unitIdentityConflictMessage, WORKSPACE_UNIT_ID_CONFLICT } from '../src/core/unitIdentity.mjs';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
 import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
-import { exportDxf, exportCutlist, exportRoombook } from './exportCore.mjs';
+import { exportDxf, exportCutlist, exportRoombook, exportPdf } from './exportCore.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
 // P10.0 S2：MCP 基础层（Streamable HTTP /mcp）与它读取的服务端 Workspace 实体。
@@ -537,6 +539,117 @@ function json(res, code, body) {
   const text = JSON.stringify(body, null, 2);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
+}
+
+function workspaceUnavailable(res, state, fallbackStatus = 500) {
+  const identityConflict = state?.code === 'WORKSPACE_UNIT_ID_CONFLICT';
+  return json(res, identityConflict ? 409 : fallbackStatus, {
+    ok: false,
+    error: state?.error ?? '服务端工作区不可用',
+    code: state?.code ?? 'WORKSPACE_UNAVAILABLE',
+  });
+}
+
+function workspaceIdentityConflict(res, workspace) {
+  const message = workspace?.getUnitIdentityConflict?.();
+  if (!message) return false;
+  json(res, 409, { ok: false, code: 'WORKSPACE_UNIT_ID_CONFLICT', error: message });
+  return true;
+}
+
+function exportFailure(res, prefix, error) {
+  const blocked = error?.code === 'EXPORT_BLOCKED';
+  const identityConflict = error?.code === 'WORKSPACE_UNIT_ID_CONFLICT';
+  return json(res, blocked || identityConflict ? 422 : 500, {
+    ok: false,
+    code: error?.code ?? 'EXPORT_FAILED',
+    error: `${prefix}${error?.message ?? String(error)}`,
+    ...(blocked ? { blockingErrors: error.issues.length, issues: error.issues } : {}),
+  });
+}
+
+function freezeProjectSnapshot(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) freezeProjectSnapshot(child);
+  }
+  return value;
+}
+
+/** 在无 await 的同步区间一次性读取版本与深拷贝，后续导出不得回读可变 live。 */
+function captureLiveProjectSnapshot(workspace) {
+  const project = freezeProjectSnapshot(workspace.getProjectSnapshot());
+  const projectSnapshotVersion = workspace.getLiveModelVersion();
+  const projectSnapshotHash = hashProjectSnapshot(project);
+  return Object.freeze({
+    project,
+    projectSnapshotId: `${workspace.workspaceId}:v${projectSnapshotVersion}:${projectSnapshotHash}`,
+    projectSnapshotHash,
+    projectSnapshotVersion,
+  });
+}
+
+/** 正式导出共用的 fail-closed 门槛。成功后仅返回刚捕获的不可变服务器副本。 */
+function confirmExportSnapshot(body, workspace) {
+  const live = captureLiveProjectSnapshot(workspace);
+  const required = ['projectSnapshotId', 'projectSnapshotHash', 'projectSnapshotVersion'];
+  const missing = required.filter((field) => body?.[field] === undefined || body[field] === null || body[field] === '');
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      code: 'EXPORT_SNAPSHOT_REQUIRED',
+      error: `正式导出缺少已确认快照元数据：${missing.join('、')}。请先读取当前服务器 live 快照后重试。`,
+      mismatchFields: missing,
+      live,
+    };
+  }
+
+  const mismatchFields = [];
+  if (body.projectSnapshotId !== live.projectSnapshotId) mismatchFields.push('projectSnapshotId');
+  if (body.projectSnapshotHash !== live.projectSnapshotHash) mismatchFields.push('projectSnapshotHash');
+  if (body.projectSnapshotVersion !== live.projectSnapshotVersion) mismatchFields.push('projectSnapshotVersion');
+  if (!body.project || typeof body.project !== 'object' || Array.isArray(body.project) || hashProjectSnapshot(body.project) !== live.projectSnapshotHash) {
+    mismatchFields.push('project');
+  }
+  if (mismatchFields.length > 0) {
+    return {
+      ok: false,
+      code: 'EXPORT_SNAPSHOT_CONFLICT',
+      error: '提交内容或快照元数据与服务器当前 live 项目不一致，正式导出已拒绝。请重新读取服务器快照并确认后重试。',
+      mismatchFields,
+      live,
+    };
+  }
+  return { ok: true, snapshot: live };
+}
+
+function exportSnapshotConflict(res, check) {
+  cors(res);
+  const payload = {
+    ok: false,
+    code: check.code,
+    error: check.error,
+    mismatchFields: check.mismatchFields,
+    projectSnapshotId: check.live.projectSnapshotId,
+    projectSnapshotHash: check.live.projectSnapshotHash,
+    projectSnapshotVersion: check.live.projectSnapshotVersion,
+  };
+  const text = JSON.stringify(payload, null, 2);
+  res.writeHead(409, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(text),
+    'Cache-Control': 'no-store',
+  });
+  res.end(text);
+}
+
+function exportSnapshotHeaders(snapshot) {
+  return {
+    'Cache-Control': 'no-store',
+    'X-Project-Snapshot-Id': snapshot.projectSnapshotId,
+    'X-Project-Snapshot-Hash': snapshot.projectSnapshotHash,
+    'X-Project-Snapshot-Version': String(snapshot.projectSnapshotVersion),
+  };
 }
 
 async function readBody(req) {
@@ -1475,13 +1588,23 @@ async function handleApi(req, res, pathname) {
    */
   if (pathname === '/api/workspace' && req.method === 'GET') {
     const ws = await getWorkspaceState(gate.account?.id);
-    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
-    const project = ws.workspace.getProjectSnapshot();
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const snapshot = captureLiveProjectSnapshot(ws.workspace);
+    const identityDiagnostics = ws.workspace.getUnitIdentityDiagnostics?.() ?? {
+      readOnly: Boolean(ws.workspace.getUnitIdentityConflict?.()),
+      code: ws.workspace.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+      message: ws.workspace.getUnitIdentityConflict?.() ?? null,
+      duplicateUnitIds: findDuplicateUnitIds(snapshot.project).map((item) => ({ ...item, scope: 'live project' })),
+    };
     return json(res, 200, {
       ok: true,
-      project,
+      project: snapshot.project,
+      identityDiagnostics,
       liveModelVersion: ws.workspace.getLiveModelVersion(),
       workspaceId: ws.workspace.workspaceId,
+      projectSnapshotId: snapshot.projectSnapshotId,
+      projectSnapshotHash: snapshot.projectSnapshotHash,
+      projectSnapshotVersion: snapshot.projectSnapshotVersion,
     });
   }
 
@@ -1493,14 +1616,69 @@ async function handleApi(req, res, pathname) {
    */
   if (pathname === '/api/drafts' && req.method === 'GET') {
     const ws = await getWorkspaceState(gate.account?.id);
-    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    if (!ws.ok) return workspaceUnavailable(res, ws);
     const drafts = ws.workspace.listDrafts().map((d) => ({
       draftId: d.draftId,
+      runId: d.runId,
+      revision: d.revision,
       owner: d.owner,
       createdAt: d.createdAt,
       baseModelVersion: d.baseModelVersion,
+      baseProjectHash: d.baseProjectHash,
+      liveModelVersion: d.liveModelVersion,
+      liveProjectHash: d.liveProjectHash,
+      draftHash: d.draftHash,
+      isStale: d.isStale,
+      staleReason: d.staleReason,
+      canApply: d.canApply,
     }));
-    return json(res, 200, { ok: true, drafts, liveModelVersion: ws.workspace.getLiveModelVersion() });
+    return json(res, 200, {
+      ok: true,
+      drafts,
+      liveModelVersion: ws.workspace.getLiveModelVersion(),
+      identityDiagnostics: ws.workspace.getUnitIdentityDiagnostics?.() ?? {
+        readOnly: Boolean(ws.workspace.getUnitIdentityConflict?.()),
+        code: ws.workspace.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+        message: ws.workspace.getUnitIdentityConflict?.() ?? null,
+        duplicateUnitIds: [],
+      },
+    });
+  }
+
+  // 实时预览只读服务端 draft；草稿仍未写入 live，应用仍须走既有确认入口。
+  if (pathname.startsWith('/api/drafts/') && req.method === 'GET') {
+    let draftId;
+    try { draftId = decodeURIComponent(pathname.slice('/api/drafts/'.length)); }
+    catch { return json(res, 400, { ok: false, error: 'draftId 编码无效', code: 'DRAFT_ID_INVALID' }); }
+    if (!draftId || draftId.includes('/')) return json(res, 400, { ok: false, error: 'draftId 无效', code: 'DRAFT_ID_INVALID' });
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const handle = ws.workspace.getDraft(draftId);
+    if (handle && gate.mode !== 'local-open' && handle.owner !== gate.account?.id && !ROLES[gate.account?.role]?.canManage) {
+      return json(res, 403, { ok: false, error: '只能预览自己的草稿', code: 'FORBIDDEN' });
+    }
+    const project = ws.workspace.draftState(draftId);
+    const validation = ws.workspace.validateDraft(draftId);
+    if (!handle || !project || !validation) return json(res, 404, { ok: false, error: `草稿不存在：${draftId}`, code: 'DRAFT_NOT_FOUND' });
+    const freshness = ws.workspace.getDraftFreshness(draftId);
+    const identityDiagnostics = ws.workspace.getUnitIdentityDiagnostics?.() ?? {
+      readOnly: Boolean(ws.workspace.getUnitIdentityConflict?.()),
+      code: ws.workspace.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+      message: ws.workspace.getUnitIdentityConflict?.() ?? null,
+      duplicateUnitIds: findDuplicateUnitIds(project).map((item) => ({ ...item, scope: `draft ${draftId}` })),
+    };
+    return json(res, 200, {
+      ok: true,
+      draftId,
+      owner: handle.owner,
+      baseModelVersion: handle.baseModelVersion,
+      baseProjectHash: handle.baseProjectHash,
+      ...freshness,
+      workspaceId: ws.workspace.workspaceId,
+      project,
+      identityDiagnostics,
+      validation: { blockingErrors: validation.blockingErrors, issues: validation.issues },
+    });
   }
 
   if (pathname.startsWith('/api/drafts/') && pathname.endsWith('/apply') && req.method === 'POST') {
@@ -1508,21 +1686,104 @@ async function handleApi(req, res, pathname) {
     if (gate.mode !== 'local-open' && !ROLES[gate.account?.role]?.canManage) {
       return json(res, 403, { ok: false, error: '需要管理权限', code: 'FORBIDDEN' });
     }
-    const draftId = pathname.split('/')[3];
+    let draftId;
+    try { draftId = decodeURIComponent(pathname.slice('/api/drafts/'.length, -'/apply'.length)); }
+    catch { return json(res, 400, { ok: false, error: 'draftId 编码无效', code: 'DRAFT_ID_INVALID' }); }
+    if (!draftId || draftId.includes('/')) return json(res, 400, { ok: false, error: 'draftId 无效', code: 'DRAFT_ID_INVALID' });
+    const body = await readBody(req);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || body.__raw !== undefined) {
+      return json(res, 400, { ok: false, error: 'apply 请求体必须是合法 JSON 对象。', code: 'REQUEST_INVALID' });
+    }
+    if (typeof body.syncId !== 'undefined' && (typeof body.syncId !== 'string' || !body.syncId.trim() || body.syncId.length > 200)) {
+      return json(res, 400, { ok: false, error: 'syncId 必须是 1–200 个字符的非空字符串。', code: 'SYNC_ID_INVALID' });
+    }
+    const confirmationFields = ['runId', 'draftId', 'revision', 'draftHash', 'localVersion', 'remoteVersion'];
+    const missing = confirmationFields.filter((field) => body[field] === undefined || body[field] === null || body[field] === '');
+    if (missing.length > 0) {
+      return json(res, 400, {
+        ok: false,
+        error: `apply 必须提供完整确认元数据，缺少：${missing.join('、')}。请重新读取预览并明确确认。`,
+        code: 'APPLY_METADATA_REQUIRED',
+        missingFields: missing,
+      });
+    }
+    if (typeof body.runId !== 'string' || !body.runId.trim() || body.runId.length > 200
+      || typeof body.draftId !== 'string' || !body.draftId.trim()
+      || !Number.isSafeInteger(body.revision) || body.revision < 0 || typeof body.draftHash !== 'string' || !/^[a-f0-9]{64}$/i.test(body.draftHash)
+      || !Number.isSafeInteger(body.localVersion) || body.localVersion < 0
+      || !Number.isSafeInteger(body.remoteVersion) || body.remoteVersion < 0) {
+      return json(res, 400, { ok: false, error: 'runId/draftId/draftHash 必须有效，revision/localVersion/remoteVersion 必须是非负安全整数。', code: 'APPLY_METADATA_INVALID' });
+    }
     const ws = await getWorkspaceState(gate.account?.id);
-    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
-    const r = await ws.workspace.applyDraft(draftId);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    let r;
+    try {
+      r = await ws.workspace.applyDraft(draftId, {
+        syncId: body.syncId,
+        runId: body.runId,
+        draftId: body.draftId,
+        revision: body.revision,
+        draftHash: body.draftHash,
+        localVersion: body.localVersion,
+        remoteVersion: body.remoteVersion,
+        ...(body.baseModelVersion === undefined ? {} : { baseModelVersion: body.baseModelVersion }),
+        ...(body.baseProjectHash === undefined ? {} : { baseProjectHash: body.baseProjectHash }),
+      });
+    } catch (error) {
+      if (error?.code === 'APPLY_COMMITTED_CLEANUP_FAILED') {
+        auth.audit({ action: 'draft.apply', actor: gate.account?.id, draftId, result: 'committed_cleanup_failed', syncId: error.syncId });
+        return json(res, 500, {
+          ok: false,
+          code: error.code,
+          committed: true,
+          retryable: true,
+          syncId: error.syncId,
+          draftId: error.draftId,
+          newVersion: error.newVersion,
+          liveModelVersion: ws.workspace.getLiveModelVersion(),
+          receipt: error.receipt,
+          error: error.message,
+        });
+      }
+      throw error;
+    }
     if (!r.ok) {
-      return json(res, 409, { ok: false, error: r.message, code: r.code });
+      return json(res, r.code === 'SYNC_ID_INVALID' ? 400 : 409, {
+        ok: false,
+        error: r.message,
+        code: r.code,
+        draftId: r.draftId,
+        baseVersion: r.baseVersion,
+        currentVersion: r.currentVersion,
+        baseProjectHash: r.baseProjectHash,
+        currentProjectHash: r.currentProjectHash,
+      });
     }
     auth.audit({ action: 'draft.apply', actor: gate.account?.id, draftId, result: 'ok' });
-    return json(res, 200, { ok: true, newVersion: r.newVersion });
+    return json(res, 200, {
+      ok: true,
+      syncId: r.syncId,
+      draftId: r.draftId,
+      runId: r.runId,
+      revision: r.revision,
+      draftHash: r.hash,
+      ...(r.localVersion === undefined ? {} : { localVersion: r.localVersion }),
+      remoteVersion: r.remoteVersion,
+      baseModelVersion: r.baseModelVersion,
+      baseProjectHash: r.baseProjectHash,
+      newVersion: r.newVersion,
+      liveModelVersion: r.newVersion,
+      workspaceId: r.workspaceId,
+      project: r.project,
+    });
   }
 
   if (pathname.startsWith('/api/drafts/') && pathname.endsWith('/discard') && req.method === 'POST') {
     const draftId = pathname.split('/')[3];
     const ws = await getWorkspaceState(gate.account?.id);
-    if (!ws.ok) return json(res, 500, { ok: false, error: ws.error, code: 'WORKSPACE_UNAVAILABLE' });
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const identityRejected = workspaceIdentityConflict(res, ws.workspace);
+    if (identityRejected) return identityRejected;
     const h = ws.workspace.getDraft(draftId);
     if (!h) return json(res, 404, { ok: false, error: `draft 不存在：${draftId}`, code: 'DRAFT_NOT_FOUND' });
     // 归属者或 manage（与 MCP cad.discard_draft 一致）；local-open 直接放行
@@ -1532,8 +1793,7 @@ async function handleApi(req, res, pathname) {
         return json(res, 403, { ok: false, error: '只能丢弃自己的草稿', code: 'FORBIDDEN' });
       }
     }
-    ws.workspace.discardDraft(draftId);
-    await ws.workspace.deleteDraftFile(draftId);
+    await ws.workspace.discardDraft(draftId);
     auth.audit({ action: 'draft.discard', actor: gate.account?.id, draftId, result: 'ok' });
     return json(res, 200, { ok: true });
   }
@@ -1545,6 +1805,42 @@ async function handleApi(req, res, pathname) {
    */
   if (pathname === '/api/ai/agent' && req.method === 'POST') {
     const body = await readBody(req);
+    const requestedRoomId = typeof body.roomId === 'string' ? body.roomId.trim() : '';
+    const unassignedSentinel = /^_+unassigned__$/.test(requestedRoomId);
+    if (body.roomContext === 'unassigned' || body.unassignedRoom === true || unassignedSentinel) {
+      return json(res, 409, {
+        ok: false,
+        code: 'ROOM_CONTEXT_REQUIRED',
+        error: '未分配房间中的柜体不能执行 Agent 创建或修改操作，请先选择真实房间或将柜体分配到房间。',
+      });
+    }
+    if (!requestedRoomId) {
+      return json(res, 409, {
+        ok: false,
+        code: 'ROOM_CONTEXT_REQUIRED',
+        error: 'Agent 操作需要一个真实房间上下文，请先选择房间后重试。',
+      });
+    }
+    // 浏览器的本地语义模型与 MCP 服务端工作区尚未自动接线。不能只相信前端 roomId：
+    // 先在当前账号的服务端项目里核验，错位时在模型/MCP 执行前失败关闭，防止单房间回退错放。
+    const agentWorkspace = await getWorkspaceState(gate.account?.id);
+    if (!agentWorkspace.ok) {
+      return workspaceUnavailable(res, {
+        ...agentWorkspace,
+        error: `服务端工作区不可用，Agent 操作已拒绝：${agentWorkspace.error ?? '未知错误'}`,
+      }, 503);
+    }
+    const agentIdentityRejected = workspaceIdentityConflict(res, agentWorkspace.workspace);
+    if (agentIdentityRejected) return agentIdentityRejected;
+    const agentProject = agentWorkspace.workspace.getProjectSnapshot();
+    const serverRoom = agentProject.rooms.find((room) => room.id === requestedRoomId);
+    if (!serverRoom) {
+      return json(res, 409, {
+        ok: false,
+        code: 'ROOM_CONTEXT_MISMATCH',
+        error: `当前房间 ID「${requestedRoomId}」不属于服务端工作区。浏览器本地项目与服务端工作区尚未同步；为避免柜体进入错误房间，Agent 操作已拒绝。请先同步/选择服务端工作区中的房间。`,
+      });
+    }
     const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
     const key = env.AI_API_KEY || '';
     const model = body.model || env.AI_MODEL || s.model;
@@ -1569,6 +1865,9 @@ async function handleApi(req, res, pathname) {
         visionResult: body.visionResult || null,
         draftId: body.draftId || null,
         history: Array.isArray(body.history) ? body.history : null,
+        roomId: serverRoom.id,
+        // 服务端 workspace 的房间名是真源，避免前端传入 stale/mismatched name。
+        roomName: serverRoom.name,
         token: userToken,
         mcpBaseUrl,
         aiConfig: {
@@ -1590,7 +1889,7 @@ async function handleApi(req, res, pathname) {
    * 项目目录管理（多项目）。
    * GET  /api/projects              列出项目
    * POST /api/projects              创建项目 {name}
-   * POST /api/projects/:id/activate 切换当前项目（需重启 workspace）
+   * POST /api/projects/:id/activate 先校验目标身份，再原子切换当前项目
    * DELETE /api/projects/:id        删除项目
    */
   // 项目目录按账号隔离
@@ -1613,20 +1912,82 @@ async function handleApi(req, res, pathname) {
   }
   const activateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/activate$/);
   if (activateMatch && req.method === 'POST') {
-    const { setActiveProject, getProjectFilePath } = await import('./projects.mjs');
-    const projectId = decodeURIComponent(activateMatch[1]);
+    const { setActiveProject, getProjectFilePath, migrateIfNeeded } = await import('./projects.mjs');
+    let projectId;
+    try { projectId = decodeURIComponent(activateMatch[1]); }
+    catch { return json(res, 400, { ok: false, error: '项目 ID 编码无效', code: 'PROJECT_ID_INVALID' }); }
+    if (!/^[a-zA-Z0-9_-]+$/u.test(projectId)) return json(res, 400, { ok: false, error: '项目 ID 无效', code: 'PROJECT_ID_INVALID' });
+    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    const accountId = gate.account?.id || 'local-open';
+    const projectFilePath = getProjectFilePath(DATA_DIR, projectId);
+    if (!existsSync(projectFilePath)) return json(res, 404, { ok: false, error: `项目不存在：${projectId}`, code: 'PROJECT_NOT_FOUND' });
     try {
+      const targetEnvelope = JSON.parse(readFileSync(projectFilePath, 'utf8'));
+      const targetProject = targetEnvelope?.project ?? targetEnvelope;
+      if (!targetProject || typeof targetProject !== 'object' || Array.isArray(targetProject)) {
+        return json(res, 422, { ok: false, error: '目标项目文件格式无效', code: 'PROJECT_LOAD_FAILED' });
+      }
+      if (targetProject.id && targetProject.id !== projectId) {
+        return json(res, 409, { ok: false, error: '目标文件中的 Project ID 与目录不一致', code: 'PROJECT_ID_MISMATCH' });
+      }
+      const duplicateUnitIds = findDuplicateUnitIds(targetProject);
+      if (duplicateUnitIds.length > 0) {
+        const message = unitIdentityConflictMessage('project', duplicateUnitIds);
+        return json(res, 409, {
+          ok: false,
+          code: WORKSPACE_UNIT_ID_CONFLICT,
+          error: message,
+          identityDiagnostics: { readOnly: true, code: WORKSPACE_UNIT_ID_CONFLICT, message, duplicateUnitIds },
+        });
+      }
+      // 在单独候选 Workspace 中读取目标并验证。直到所有检查通过前，不改 active-project.json，
+      // 也不替换当前账号的 workspaceStates entry。
+      const currentState = await openAccountWorkspace(accountId);
+      if (!currentState.ok) return workspaceUnavailable(res, currentState);
+      const candidateState = await openWorkspace({
+        filePath: projectFilePath,
+        owner: accountId,
+        account: accountId,
+        onEvent: (event) => auth.audit(event),
+      });
+      if (!candidateState.ok) return json(res, 422, { ok: false, error: candidateState.error || '目标项目无法载入', code: 'PROJECT_LOAD_FAILED' });
+      const candidate = candidateState.workspace;
+      const identityDiagnostics = candidate.getUnitIdentityDiagnostics?.() ?? {
+        readOnly: Boolean(candidate.getUnitIdentityConflict?.()),
+        code: candidate.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+        message: candidate.getUnitIdentityConflict?.() ?? '',
+        duplicateUnitIds: findDuplicateUnitIds(candidate.getProjectSnapshot?.() ?? {}),
+      };
+      const identityConflict = candidate.getUnitIdentityConflict?.();
+      if (identityConflict || identityDiagnostics.readOnly || identityDiagnostics.duplicateUnitIds?.length) {
+        const message = identityConflict || identityDiagnostics.message || '目标项目存在历史重复 Unit ID；当前项目保持不变。';
+        return json(res, 409, {
+          ok: false,
+          code: WORKSPACE_UNIT_ID_CONFLICT,
+          error: message,
+          identityDiagnostics: { ...identityDiagnostics, readOnly: true, code: WORKSPACE_UNIT_ID_CONFLICT },
+        });
+      }
+
       setActiveProject(DATA_DIR, projectId);
-      // 注意：切换项目后需要重启服务才能加载新 workspace（workspace 在启动时打开）
-      // 这里返回新路径，前端提示用户刷新
+      const nextState = { ...candidateState, ok: true };
+      const entry = workspaceStates.get(accountId) ?? { state: nextState, loading: Promise.resolve(nextState) };
+      entry.state = nextState;
+      entry.loading = Promise.resolve(nextState);
+      workspaceStates.set(accountId, entry);
+      const snapshot = captureLiveProjectSnapshot(candidate);
       return json(res, 200, {
         ok: true,
         activeId: projectId,
-        needReload: true,
-        message: '已切换项目，请刷新页面加载新项目',
+        project: snapshot.project,
+        liveModelVersion: snapshot.projectSnapshotVersion,
+        projectSnapshotId: snapshot.projectSnapshotId,
+        projectSnapshotHash: snapshot.projectSnapshotHash,
+        projectSnapshotVersion: snapshot.projectSnapshotVersion,
+        identityDiagnostics: candidate.getUnitIdentityDiagnostics?.() ?? { readOnly: false, code: null, message: '', duplicateUnitIds: [] },
       });
     } catch (e) {
-      return json(res, 400, { ok: false, error: e?.message ?? '切换失败' });
+      return json(res, 500, { ok: false, error: e?.message ?? '切换失败', code: 'PROJECT_SWITCH_FAILED' });
     }
   }
   const deleteMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
@@ -2204,15 +2565,20 @@ async function handleApi(req, res, pathname) {
 
   if (pathname === '/api/export/dxf' && req.method === 'POST') {
     const body = await readBody(req);
-    const project = body.project;
-    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const confirmed = confirmExportSnapshot(body, ws.workspace);
+    if (!confirmed.ok) return exportSnapshotConflict(res, confirmed);
+    const { project, ...snapshot } = confirmed.snapshot;
     const which = Array.isArray(body.which) && body.which.length ? body.which.filter((x) => x === 'plan' || x === 'sheet') : ['plan', 'sheet'];
     if (which.length === 0) return json(res, 400, { ok: false, error: 'which 只能是 plan / sheet' });
+    const planRoomIds = Array.isArray(body.planRoomIds) ? body.planRoomIds.filter((id) => typeof id === 'string') : undefined;
     const version = body.version === 'R2000' ? 'R2000' : 'R2007'; // R2000/GBK 只作兼容备用
     try {
-      const { buffer, filename: base, info } = await exportDxf(project, { which, version, modelVersion: body.modelVersion });
+      const { buffer, filename: base, info } = await exportDxf(project, { which, version, modelVersion: `v${snapshot.projectSnapshotVersion}`, planRoomIds });
       res.writeHead(200, {
         'Content-Type': 'application/dxf',
+        ...exportSnapshotHeaders(snapshot),
         // 中文文件名必须走 RFC 5987，否则浏览器下载下来是乱码
         'Content-Disposition': `attachment; filename="export.dxf"; filename*=UTF-8''${encodeURIComponent(base)}`,
         'X-Export-Info': encodeURIComponent(JSON.stringify(info)),
@@ -2220,44 +2586,78 @@ async function handleApi(req, res, pathname) {
       res.end(buffer);
       return;
     } catch (e) {
-      return json(res, 500, { ok: false, error: `DXF 导出失败：${e.message}` });
+      return exportFailure(res, 'DXF 导出失败：', e);
     }
   }
 
   /** 开料单（板件清单）。纯文本 CSV，Excel 直接能开 —— 加 BOM 否则中文乱码。 */
   if (pathname === '/api/export/cutlist' && req.method === 'POST') {
     const body = await readBody(req);
-    const project = body.project;
-    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const confirmed = confirmExportSnapshot(body, ws.workspace);
+    if (!confirmed.ok) return exportSnapshotConflict(res, confirmed);
+    const { project, ...snapshot } = confirmed.snapshot;
     try {
-      const { csv, filename: base, stats } = await exportCutlist(project, { modelVersion: body.modelVersion });
+      const { csv, filename: base, stats } = await exportCutlist(project, { modelVersion: `v${snapshot.projectSnapshotVersion}` });
       res.writeHead(200, {
         'Content-Type': 'text/csv; charset=utf-8',
+        ...exportSnapshotHeaders(snapshot),
         'Content-Disposition': `attachment; filename="cutlist.csv"; filename*=UTF-8''${encodeURIComponent(base)}`,
         'X-Export-Stats': encodeURIComponent(JSON.stringify(stats)),
       });
       res.end(csv);
       return;
     } catch (e) {
-      return json(res, 500, { ok: false, error: `开料单生成失败：${e.message}` });
+      return exportFailure(res, '开料单生成失败：', e);
     }
   }
 
   /** 按房间排序的图纸册（HTML 打印版）。浏览器打开后「打印 → 另存为 PDF」。 */
   if (pathname === '/api/export/roombook' && req.method === 'POST') {
     const body = await readBody(req);
-    const project = body.project;
-    if (!project || typeof project !== 'object') return json(res, 400, { ok: false, error: '缺少 project' });
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const confirmed = confirmExportSnapshot(body, ws.workspace);
+    if (!confirmed.ok) return exportSnapshotConflict(res, confirmed);
+    const { project, ...snapshot } = confirmed.snapshot;
     try {
-      const { html, filename: base } = await exportRoombook(project, { modelVersion: body.modelVersion });
+      const { html, filename: base } = await exportRoombook(project, { modelVersion: `v${snapshot.projectSnapshotVersion}` });
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
+        ...exportSnapshotHeaders(snapshot),
         'Content-Disposition': `attachment; filename="roombook.html"; filename*=UTF-8''${encodeURIComponent(base)}`,
       });
       res.end(html);
       return;
     } catch (e) {
-      return json(res, 500, { ok: false, error: `图纸册生成失败：${e.message}` });
+      return exportFailure(res, '图纸册生成失败：', e);
+    }
+  }
+
+  /** 真正的横向 PDF：由服务端固定 A3 纸幅/边距/字体渲染，不依赖用户打印设置。 */
+  if (pathname === '/api/export/pdf' && req.method === 'POST') {
+    const body = await readBody(req);
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const confirmed = confirmExportSnapshot(body, ws.workspace);
+    if (!confirmed.ok) return exportSnapshotConflict(res, confirmed);
+    const { project, ...snapshot } = confirmed.snapshot;
+    try {
+      const layoutRoomIds = Array.isArray(body.layoutRoomIds) ? body.layoutRoomIds.filter((id) => typeof id === 'string') : [];
+      const { pdf, pageCount, filename: base } = await exportPdf(project, { modelVersion: `v${snapshot.projectSnapshotVersion}`, layoutRoomIds });
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        ...exportSnapshotHeaders(snapshot),
+        'Content-Length': String(pdf.length),
+        'X-PDF-Page-Count': String(pageCount),
+        'Content-Disposition': `attachment; filename="drawing.pdf"; filename*=UTF-8''${encodeURIComponent(base)}`,
+        'Cache-Control': 'no-store',
+      });
+      res.end(pdf);
+      return;
+    } catch (e) {
+      return exportFailure(res, 'PDF 图纸生成失败：', e);
     }
   }
 
@@ -2331,7 +2731,13 @@ const server = createServer((req, res) => {
     return res.end();
   }
   if (pathname.startsWith('/api/')) {
-    handleApi(req, res, pathname).catch((e) => json(res, 500, { ok: false, error: e.message }));
+    handleApi(req, res, pathname).catch((e) => {
+      if (!res.headersSent) json(res, 500, { ok: false, error: e.message });
+      else {
+        console.error(`[api] handler failed after response: ${e?.message ?? e}`);
+        try { res.end(); } catch { /* response already closed */ }
+      }
+    });
     return;
   }
   serveStatic(req, res, pathname);

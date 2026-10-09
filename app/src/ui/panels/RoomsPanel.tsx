@@ -34,7 +34,8 @@ export function RoomsPanel(props: {
   onFocusRoom: (id: string) => void;
   view: RoomsView;
   onViewChange: (v: RoomsView) => void;
-  onCreated: () => void;
+  onCreated: (roomId: string) => void;
+  readOnly?: boolean;
 }): ReactNode {
   const { bus, run, onToast, onFocusRoom, view, onViewChange, onCreated } = props;
   const project = bus.getState();
@@ -77,6 +78,7 @@ export function RoomsPanel(props: {
         onCancel={() => onViewChange('list')}
         onCreated={onCreated}
         onDone={() => onViewChange('list')}
+        readOnly={props.readOnly}
       />
     );
   }
@@ -85,7 +87,7 @@ export function RoomsPanel(props: {
     <div className="panel-scroll">
       <Section title={`房间管理（${project.rooms.length}）`}>
         <div className="btn-row">
-          <button type="button" className="tb-btn primary" onClick={() => onViewChange('new')}>
+          <button type="button" className="tb-btn primary" disabled={props.readOnly} onClick={() => onViewChange('new')}>
             + 新建房间
           </button>
         </div>
@@ -109,6 +111,7 @@ export function RoomsPanel(props: {
                   <TextField value={room.name} onCommit={(v) => onRename(room, index, v)} />
                   <Pill kind={cabs > 0 ? 'INFO' : 'muted'}>{cabs} 个柜体</Pill>
                 </div>
+                {room.note ? <div className="room-note">{room.note}</div> : null}
 
                 <Row label="尺寸（宽×高）">
                   {hasWalls ? (
@@ -181,37 +184,26 @@ function NewRoomPage(props: {
   run: (cmd: import('../../core/commandBus.ts').Command) => boolean;
   onToast: (kind: 'ok' | 'info' | 'error', msg: string) => void;
   onCancel: () => void;
-  onCreated: () => void;
+  onCreated: (roomId: string) => void;
   onDone: () => void;
+  readOnly?: boolean;
 }): ReactNode {
   const { bus, run, onToast, onCancel, onCreated, onDone } = props;
   const project = bus.getState();
-
-  /** 默认落位：排在现有房间的右边，留 200 间隙 —— 一眼看得出"这是新加的" */
-  const defaultX = (): number => {
-    let maxX = 0;
-    for (const r of project.rooms) for (const wl of r.walls) maxX = Math.max(maxX, wl.start.x, wl.end.x);
-    return project.rooms.length === 0 ? 0 : Math.round(maxX) + 200;
-  };
-
   const suggested = `房间${project.rooms.length + 1}`;
   const [name, setName] = useState(suggested);
-  const [w, setW] = useState(3200);
-  const [h, setH] = useState(2600);
-  const [x, setX] = useState(defaultX);
-  const [y, setY] = useState(0);
+  const [note, setNote] = useState('');
 
-  /** 唯一一处校验：问题写在界面上，同时让「创建」按钮不可用 —— 不给"点了才知道错"的机会 */
+  /** 名称必填且唯一；尺寸采用轻量新建的安全默认值，之后可在房间面板调整。 */
   const problem = (): string => {
     const t = name.trim();
     if (!t) return '房间名不能为空';
     if (project.rooms.some((r) => r.name === t)) return `已经有一个房间叫「${t}」`;
-    if (!(w >= 300 && w <= 20000)) return '宽度要在 300–20000mm 之间';
-    if (!(h >= 300 && h <= 20000)) return '高度要在 300–20000mm 之间';
     return '';
   };
 
   const onCreate = (): void => {
+    if (props.readOnly) return;
     const bad = problem();
     if (bad) {
       onToast('error', bad);
@@ -226,13 +218,16 @@ function NewRoomPage(props: {
       takenIds.add(r.id);
       for (const wl of r.walls) takenIds.add(wl.id);
     }
-    const room = rectRoom({ name: name.trim(), x, y, w, h, takenIds });
+    let maxX = 0;
+    for (const r of project.rooms) for (const wl of r.walls) maxX = Math.max(maxX, wl.start.x, wl.end.x);
+    const x = project.rooms.length === 0 ? 0 : Math.round(maxX) + 200;
+    const room = rectRoom({ name: name.trim(), note, x, y: 0, w: 3200, h: 2600, takenIds });
     if (!run(CMD.createRoomCommand(room))) {
       onToast('error', '新建房间被总线拒绝');
       return;
     }
-    onToast('ok', `已新建房间「${room.name}」${w}×${h}mm`);
-    onCreated();
+    onToast('ok', `已新建房间「${room.name}」3200×2600mm`);
+    onCreated(room.id);
     onDone();
   };
 
@@ -247,33 +242,24 @@ function NewRoomPage(props: {
           </button>
         </div>
         <div className="hint-line">
-          填好再创建 —— 创建后才会出现在房间列表里。异形（非矩形）房间请用平面图里的「画墙」工具。
+          填写名称即可创建；默认矩形为 3200×2600mm，之后可在房间面板调整尺寸。异形房间请用平面图里的「画墙」工具。
         </div>
 
         <Row label="名称">
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：主卧" />
+          <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：主卧" maxLength={80} required aria-label="房间名称" />
         </Row>
-        <Row label="宽（X 向）">
-          <input className="input" type="number" min={300} max={20000} step={50} value={w} onChange={(e) => setW(Number(e.target.value))} />
-        </Row>
-        <Row label="高（Y 向）">
-          <input className="input" type="number" min={300} max={20000} step={50} value={h} onChange={(e) => setH(Number(e.target.value))} />
-        </Row>
-        <Row label="落位 X">
-          <input className="input" type="number" step={50} value={x} onChange={(e) => setX(Number(e.target.value))} />
-        </Row>
-        <Row label="落位 Y">
-          <input className="input" type="number" step={50} value={y} onChange={(e) => setY(Number(e.target.value))} />
+        <Row label="备注（可选）">
+          <textarea className="input" value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} rows={3} aria-label="房间备注（可选）" />
         </Row>
 
-        <Row label="预览">
-          <Text mono>{`矩形 · 4 面墙 · ${w}×${h}mm`}</Text>
+        <Row label="默认规格">
+          <Text mono>矩形 · 4 面墙 · 3200×2600mm</Text>
         </Row>
 
         {bad ? <div className="hint-line">{bad}</div> : null}
 
         <div className="btn-row">
-          <button type="button" className="tb-btn primary" disabled={bad !== ''} onClick={onCreate}>
+          <button type="button" className="tb-btn primary" disabled={props.readOnly || bad !== ''} onClick={onCreate}>
             创建房间
           </button>
           <button type="button" className="tb-btn" onClick={onCancel}>

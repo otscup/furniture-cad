@@ -436,7 +436,7 @@ for (const c of [case2, case4]) {
   const twoD = L.rowDividers.every((z) => side.some((p) => p.k === 'poly' && p.pts.some((pt) => Math.abs(pt.y - z) < 1)));
   // DXF 的唯一源：中立导出（sheet）
   const neutral = toNeutralExport(projOf(c.cab), rules, ['sheet'], 'TEST');
-  const sheet = neutral.sheets.find((s) => s.name === 'SHEET')!;
+  const sheet = neutral.sheets.find((s) => s.cabinetId === c.cab.id);
 
   ok(`${c.name}：BOM 行隔板数 === 3D 行隔板数 === 行数−1`, bomDividers === boxDividers && boxDividers === nRow - 1,
     `BOM=${bomDividers} 3D=${boxDividers} 行=${nRow}`);
@@ -444,10 +444,11 @@ for (const c of [case2, case4]) {
     `rowDividers=${JSON.stringify(L.rowDividers)}`);
   ok(`${c.name}：3D 行隔板盒的 Z 中心 = 派生 Z + 半板厚`, L.rowDividers.every((z) => bodies.some((b: Box3D) => b.role === 'rowDivider' && Math.abs(b.cz - (z + L.boardT / 2)) < 1e-6)),
     JSON.stringify(bodies.filter((b) => b.role === 'rowDivider').map((b) => b.cz)));
-  ok(`${c.name}：中立导出（DXF 源）图元非空、且图幅含全部分区文字`, sheet.prims.length > 0);
+  ok(`${c.name}：中立导出有独立柜体布局且 cabinetId 可追溯`, !!sheet && sheet.cabinetId === c.cab.id);
+  ok(`${c.name}：中立导出（DXF 源）图元非空、且图幅含全部分区文字`, !!sheet && sheet.prims.length > 0);
   ok(`${c.name}：中立导出 = 四视图同一条链路（图元数与视图图元数同源）`, (() => {
     const total = (['front', 'top', 'side', 'internal'] as const).reduce((a, v) => a + vs.prims[v].length, 0);
-    return sheet.prims.length >= total; // 中立导出 = 视图图元 + 标注 + 衔接线
+    return !!sheet && sheet.prims.length >= total; // 中立导出 = 视图图元 + 标注 + 衔接线
   })());
   ok(`${c.name}：BOM 中立板长度逐行不同（证明清单也认行，不是拿整柜高套）`, (() => {
     const lens = new Set(g.panels.filter((p) => p.role === 'DividerPanel').map((p) => p.length));

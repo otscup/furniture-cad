@@ -16,10 +16,11 @@
  *   任何"只拷 import 闭包"的方案都会漏掉它 —— verify:image-closure 已单独守住这条。
  * ══════════════════════════════════════════════════════════════════════
  */
-import { existsSync, readFileSync, readdirSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { writeFileAtomic } from './writeQueue.mjs';
+import { deleteFileAtomic, enqueueWrite, writeFileAtomic } from './writeQueue.mjs';
+import { hashProjectSnapshot } from './projectHash.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..');
@@ -39,6 +40,9 @@ export const RULES_PATH = join(ROOT, 'src', 'core', 'ruleset', 'factory-default.
  */
 export async function openWorkspace(opts) {
   const { filePath, owner = 'local-open', account = 'local-open', onEvent = () => {} } = opts;
+  const fileSystem = opts.fileSystemAdapter
+    ?? globalThis[Symbol.for('furniture-cad.workspaceFileSystemAdapter')]
+    ?? { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, writeFileSync, unlinkSync };
   /**
    * 事件通知是**旁路**，绝不能反过来决定装载结果。
    * 真踩过：审计文件不可写时（数据目录只读 / 路径某一层是文件），onEvent 里那声
@@ -56,7 +60,7 @@ export async function openWorkspace(opts) {
   const { WorkspaceStore } = await import('../src/workspace/workspace.ts');
   const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'));
   /** 落盘仍经同一个进程内串行写队列 —— 与账号库写入口是同一条保护。 */
-  const persist = (content) => writeFileAtomic(filePath, content);
+  const persist = (content) => writeFileAtomic(filePath, content, fileSystem);
 
   /**
    * draft 持久化（P10.0 · S4）。
@@ -65,29 +69,40 @@ export async function openWorkspace(opts) {
    * 写仍经串行写队列；content 为 null = 删除（apply/discard 后）。
    */
   const draftsDir = join(dirname(filePath), 'drafts');
+  const quarantineDir = join(draftsDir, 'quarantine');
   const persistDraft = async (draftId, content) => {
     const safeId = String(draftId).replace(/[^a-zA-Z0-9_-]/g, '_');
     const p = join(draftsDir, `${safeId}.json`);
     if (content === null) {
-      // 删除：调用方（apply/discard 后）已 await 完之前的 save，不存在写竞争；幂等
-      const { unlinkSync } = await import('node:fs');
-      try {
-        unlinkSync(p);
-      } catch {
-        /* 文件不存在也不报错 */
-      }
+      // 与 saveDraft 共用每路径队列：之前的写先完成，删除之后不会再被排队旧写复活。
+      await deleteFileAtomic(p, fileSystem);
       return;
     }
-    mkdirSync(draftsDir, { recursive: true });
-    await writeFileAtomic(p, content);
+    fileSystem.mkdirSync(draftsDir, { recursive: true });
+    await writeFileAtomic(p, content, fileSystem);
+  };
+  const quarantineDraft = async (draftId) => {
+    const safeId = String(draftId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const source = join(draftsDir, `${safeId}.json`);
+    await enqueueWrite(source, () => {
+      if (!fileSystem.existsSync(source)) return;
+      fileSystem.mkdirSync(quarantineDir, { recursive: true });
+      let destination;
+      let suffix = 0;
+      do {
+        destination = join(quarantineDir, `${safeId}.${Date.now().toString(36)}.${process.pid}.${suffix}.corrupt`);
+        suffix += 1;
+      } while (fileSystem.existsSync(destination));
+      fileSystem.renameSync(source, destination);
+    });
   };
   const loadDrafts = async () => {
-    if (!existsSync(draftsDir)) return [];
-    return readdirSync(draftsDir)
+    if (!fileSystem.existsSync(draftsDir)) return [];
+    return fileSystem.readdirSync(draftsDir)
       .filter((f) => f.endsWith('.json'))
-      .map((f) => ({ draftId: f.replace(/\.json$/, ''), content: readFileSync(join(draftsDir, f), 'utf8') }));
+      .map((f) => ({ draftId: f.replace(/\.json$/, ''), content: fileSystem.readFileSync(join(draftsDir, f), 'utf8') }));
   };
-  const draftIO = { persistDraft, loadDrafts };
+  const draftIO = { persistDraft, loadDrafts, quarantineDraft, projectHash: hashProjectSnapshot };
 
   if (existsSync(filePath)) {
     try {
@@ -95,7 +110,7 @@ export async function openWorkspace(opts) {
         filePath,
         rules,
         persist,
-        readRaw: () => readFileSync(filePath, 'utf8'),
+        readRaw: () => fileSystem.readFileSync(filePath, 'utf8'),
         ...draftIO,
       });
       const dl = await workspace.loadPersistedDrafts();
@@ -116,7 +131,7 @@ export async function openWorkspace(opts) {
        * 如实回报，由 /mcp 工具返回结构化错误，服务器其余部分照常工作。
        */
       notify({ action: 'workspace.load', result: 'fail', filePath, error: String(e?.message ?? e) });
-      return { ok: false, error: String(e?.message ?? e), filePath };
+      return { ok: false, error: String(e?.message ?? e), ...(e?.code ? { code: e.code } : {}), filePath };
     }
   }
 

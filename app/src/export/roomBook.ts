@@ -2,6 +2,7 @@ import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/typ
 import { generateProject } from '../core/geometry/project.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
 import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
+import { buildCabinetViews } from '../core/geometry/views.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
 import { cabinetWarningIssues, formatCabinetWarning } from './warningNotes.ts';
@@ -99,6 +100,116 @@ export function buildRoomPlanCallouts(cabinets: Cabinet[]): { prims: Prim[]; lab
   return { prims, labels };
 }
 
+/**
+ * 房间整体正面立面图：把房间内所有柜子的正面视图拼到一张图上。
+ *
+ * 布局规则（v1）：
+ * - X 轴 = 柜子 placement.x（世界坐标），按实际左右位置摆放
+ * - Y 轴 = mountHeight（吊柜离地高度）+ 柜体高度方向；地柜从地面（Y=0）起画
+ * - 只支持 rotation=0 的一字形布局；转角（rotation≠0）的柜子跳过并在下方注记
+ * - 前后重叠（Y 进深不同）的柜子：只保留最前排（placement.y 最小）的，避免糊成一团
+ */
+export function buildRoomElevation(
+  cabinets: Cabinet[],
+  rules: RuleSet,
+): { prims: Prim[]; skipped: string[]; bounds: { minX: number; maxX: number; maxY: number } } {
+  const prims: Prim[] = [];
+  const skipped: string[] = [];
+
+  // 按 X 排序；Y 进深分组，只取每组最前排
+  // 注意：垂直方向（mountHeight）不同的柜子不算重叠，地柜+吊柜上下叠放是正常情况
+  const sorted = [...cabinets].sort((a, b) => a.placement.x - b.placement.x);
+  const frontRow: Cabinet[] = [];
+  const usedRanges: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+  for (const cab of sorted) {
+    if (Math.abs(cab.placement.rotation % 360) > 1 && Math.abs(cab.placement.rotation % 360 - 360) > 1) {
+      skipped.push(cab.name);
+      continue;
+    }
+    const x0 = cab.placement.x;
+    const x1 = x0 + cab.params.width;
+    const y0 = cab.params.mountHeight ?? 0;
+    const y1 = y0 + cab.params.height;
+    // X 重叠且垂直方向也重叠 → 才是前后遮挡关系，留 Y（进深）最靠前的
+    const overlapIdx = usedRanges.findIndex((r) => x0 < r.x1 && x1 > r.x0 && y0 < r.y1 && y1 > r.y0);
+    if (overlapIdx >= 0) {
+      const existing = frontRow[overlapIdx]!;
+      if (cab.placement.y < existing.placement.y) {
+        frontRow[overlapIdx] = cab;
+        usedRanges[overlapIdx] = { x0, x1, y0, y1 };
+      } else {
+        skipped.push(cab.name);
+      }
+      continue;
+    }
+    frontRow.push(cab);
+    usedRanges.push({ x0, x1, y0, y1 });
+  }
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let maxY = 0;
+
+  for (const cab of frontRow) {
+    let vs;
+    try {
+      vs = buildCabinetViews(cab, rules, { x: 0, y: 0, gapTop: 0, gapSide: 0, gapInt: 0 });
+    } catch {
+      skipped.push(cab.name);
+      continue;
+    }
+    const dx = cab.placement.x;
+    const dy = cab.params.mountHeight ?? 0;
+    const W = cab.params.width;
+    const H = cab.params.height;
+    minX = Math.min(minX, dx);
+    maxX = Math.max(maxX, dx + W);
+    maxY = Math.max(maxY, dy + H);
+
+    const move = (p: { x: number; y: number }) => ({ x: p.x + dx, y: p.y + dy });
+    for (const pr of vs.prims.front) {
+      if (pr.k === 'text') {
+        // 立面拼图不带单柜的尺寸文字，只留柜名（下方统一标注）
+        continue;
+      } else {
+        prims.push({ ...pr, pts: pr.pts.map(move) });
+      }
+    }
+    // 柜名标注在柜子下方
+    prims.push({
+      k: 'text',
+      p: { x: dx + W / 2, y: dy - 140 },
+      text: cab.name,
+      size: 110,
+      layer: 'F-TEXT',
+      align: 'c',
+    });
+    // 宽度尺寸标注（柜子顶部上方）
+    const topY = dy + H;
+    prims.push({ k: 'poly', pts: [{ x: dx, y: topY + 120 }, { x: dx + W, y: topY + 120 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'poly', pts: [{ x: dx, y: topY + 60 }, { x: dx, y: topY + 180 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'poly', pts: [{ x: dx + W, y: topY + 60 }, { x: dx + W, y: topY + 180 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'text', p: { x: dx + W / 2, y: topY + 260 }, text: `${W}`, size: 95, layer: 'F-DIM', align: 'c' });
+  }
+
+  if (!isFinite(minX)) {
+    minX = 0; maxX = 0;
+  }
+
+  // 地面线
+  if (frontRow.length > 0) {
+    const gx0 = minX - 400;
+    const gx1 = maxX + 400;
+    prims.push({ k: 'poly', pts: [{ x: gx0, y: 0 }, { x: gx1, y: 0 }], closed: false, layer: 'F-BORDER', lw: 2.5 });
+    // 地面线下方的填充示意
+    for (let x = gx0; x < gx1; x += 220) {
+      prims.push({ k: 'poly', pts: [{ x, y: 0 }, { x: x - 120, y: -160 }], closed: false, layer: 'F-BORDER', lw: 1 });
+    }
+  }
+
+  return { prims, skipped, bounds: { minX, maxX, maxY } };
+}
+
 const PAD = 120;
 
 /** Y-up CAD primitives to a self-contained SVG with readable, unmirrored text. */
@@ -158,6 +269,10 @@ export interface RoomBookSection {
   roomName: string;
   layoutSvg: string;
   layoutSafetyNote: string | null;
+  /** 房间整体正面立面图（SVG）；无柜子或全部跳过时为 null */
+  elevationSvg: string | null;
+  /** 立面图中被跳过的柜子名（转角/被遮挡） */
+  elevationSkipped: string[];
   cabinets: RoomBookCabinet[];
 }
 
@@ -202,11 +317,14 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     const layoutSafetyNote = group.cabinets.some((cabinet) =>
       (cabinet.params.counterCutouts?.length ?? 0) > 0 || allUnits(cabinet.layout).some((unit) => unit.kind === 'appliance' && unit.appliance)
     ) ? '参考预留｜非 CNC 开孔｜待拆单确认。柜体编号通过引线对应下方清单；图中虚线/洞口为设计参考，须按实机与拆单复核，不代表已完成加工。' : null;
+    const elevation = buildRoomElevation(group.cabinets, rules);
     return {
     roomId: group.room.id,
     roomName: group.room.name,
     layoutSvg: primsToSvg([...cleanLayoutPrims, ...callouts.prims], 'room-layout'),
     layoutSafetyNote,
+    elevationSvg: elevation.prims.length > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
+    elevationSkipped: elevation.skipped,
     cabinets: group.cabinets.map((cabinet, index) => {
       const generated = geometry.cabinets[cabinet.id];
       const warningNotes = generated
@@ -369,6 +487,15 @@ export function roomBookHtml(book: RoomBook, options: { layoutRoomIds?: string[]
       pages.push(
         `<section class="page layout-page" data-page-kind="layout" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间布局"><div class="layout-heading">${esc(section.roomName)} · 房间布局（单位：mm）</div>${layoutNote}<div class="sheet-wrap">${section.layoutSvg}</div>${schedule}</section>`,
       );
+      // 房间整体正面立面图：地柜在下、吊柜在上，上下对应
+      if (section.elevationSvg) {
+        const skippedNote = section.elevationSkipped.length > 0
+          ? `<aside class="layout-safety-note">立面图未包含：${esc(section.elevationSkipped.join('、'))}（转角或被前排遮挡，仅显示一字形最前排）</aside>`
+          : '';
+        pages.push(
+          `<section class="page layout-page" data-page-kind="elevation" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间立面"><div class="layout-heading">${esc(section.roomName)} · 房间立面（单位：mm）</div>${skippedNote}<div class="sheet-wrap">${section.elevationSvg}</div>${schedule}</section>`,
+        );
+      }
     }
     for (const cabinet of section.cabinets) {
       const noteBlocks = [

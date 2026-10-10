@@ -103,11 +103,16 @@ export function buildRoomPlanCallouts(cabinets: Cabinet[]): { prims: Prim[]; lab
 /**
  * 房间整体正面立面图：把房间内所有柜子的正面视图拼到一张图上。
  *
- * 布局规则（v1）：
+ * 布局规则：
  * - X 轴 = 柜子 placement.x（世界坐标），按实际左右位置摆放
  * - Y 轴 = mountHeight（吊柜离地高度）+ 柜体高度方向；地柜从地面（Y=0）起画
  * - 只支持 rotation=0 的一字形布局；转角（rotation≠0）的柜子跳过并在下方注记
- * - 前后重叠（Y 进深不同）的柜子：只保留最前排（placement.y 最小）的，避免糊成一团
+ * - 前后遮挡：X 重叠且垂直方向也重叠的柜子，只保留最前排（placement.y 最小）的；
+ *   地柜+吊柜上下叠放不算遮挡（垂直方向不重叠），正常显示
+ *
+ * 标注：
+ * - 每个柜子：下方柜名、上方宽度尺寸；吊柜左侧标离地高度
+ * - 整体：底部总宽度、右侧总高度、地面线
  */
 export function buildRoomElevation(
   cabinets: Cabinet[],
@@ -175,10 +180,11 @@ export function buildRoomElevation(
         prims.push({ ...pr, pts: pr.pts.map(move) });
       }
     }
-    // 柜名标注在柜子下方
+    // 柜名标注在柜子下方（地柜避开地面线，吊柜紧贴柜底）
+    const nameY = dy === 0 ? dy - 320 : dy - 140;
     prims.push({
       k: 'text',
-      p: { x: dx + W / 2, y: dy - 140 },
+      p: { x: dx + W / 2, y: nameY },
       text: cab.name,
       size: 110,
       layer: 'F-TEXT',
@@ -190,6 +196,13 @@ export function buildRoomElevation(
     prims.push({ k: 'poly', pts: [{ x: dx, y: topY + 60 }, { x: dx, y: topY + 180 }], closed: false, layer: 'F-DIM', lw: 1 });
     prims.push({ k: 'poly', pts: [{ x: dx + W, y: topY + 60 }, { x: dx + W, y: topY + 180 }], closed: false, layer: 'F-DIM', lw: 1 });
     prims.push({ k: 'text', p: { x: dx + W / 2, y: topY + 260 }, text: `${W}`, size: 95, layer: 'F-DIM', align: 'c' });
+    // 吊柜离地高度标注（左侧）
+    if (dy > 0) {
+      prims.push({ k: 'poly', pts: [{ x: dx - 120, y: 0 }, { x: dx - 120, y: dy }], closed: false, layer: 'F-DIM', lw: 1 });
+      prims.push({ k: 'poly', pts: [{ x: dx - 180, y: 0 }, { x: dx - 60, y: 0 }], closed: false, layer: 'F-DIM', lw: 1 });
+      prims.push({ k: 'poly', pts: [{ x: dx - 180, y: dy }, { x: dx - 60, y: dy }], closed: false, layer: 'F-DIM', lw: 1 });
+      prims.push({ k: 'text', p: { x: dx - 220, y: dy / 2 }, text: `${dy}`, size: 95, layer: 'F-DIM', align: 'c', rot: 90 });
+    }
   }
 
   if (!isFinite(minX)) {
@@ -205,6 +218,18 @@ export function buildRoomElevation(
     for (let x = gx0; x < gx1; x += 220) {
       prims.push({ k: 'poly', pts: [{ x, y: 0 }, { x: x - 120, y: -160 }], closed: false, layer: 'F-BORDER', lw: 1 });
     }
+    // 总宽度标注（地面线下方）
+    const dimY = -520;
+    prims.push({ k: 'poly', pts: [{ x: minX, y: dimY }, { x: maxX, y: dimY }], closed: false, layer: 'F-DIM', lw: 1.2 });
+    prims.push({ k: 'poly', pts: [{ x: minX, y: dimY - 80 }, { x: minX, y: dimY + 80 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'poly', pts: [{ x: maxX, y: dimY - 80 }, { x: maxX, y: dimY + 80 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'text', p: { x: (minX + maxX) / 2, y: dimY - 160 }, text: `总宽 ${maxX - minX}`, size: 110, layer: 'F-DIM', align: 'c' });
+    // 总高度标注（右侧）
+    const dimX = maxX + 500;
+    prims.push({ k: 'poly', pts: [{ x: dimX, y: 0 }, { x: dimX, y: maxY }], closed: false, layer: 'F-DIM', lw: 1.2 });
+    prims.push({ k: 'poly', pts: [{ x: dimX - 80, y: 0 }, { x: dimX + 80, y: 0 }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'poly', pts: [{ x: dimX - 80, y: maxY }, { x: dimX + 80, y: maxY }], closed: false, layer: 'F-DIM', lw: 1 });
+    prims.push({ k: 'text', p: { x: dimX + 160, y: maxY / 2 }, text: `总高 ${maxY}`, size: 110, layer: 'F-DIM', align: 'c', rot: 90 });
   }
 
   return { prims, skipped, bounds: { minX, maxX, maxY } };
@@ -493,7 +518,7 @@ export function roomBookHtml(book: RoomBook, options: { layoutRoomIds?: string[]
           ? `<aside class="layout-safety-note">立面图未包含：${esc(section.elevationSkipped.join('、'))}（转角或被前排遮挡，仅显示一字形最前排）</aside>`
           : '';
         pages.push(
-          `<section class="page layout-page" data-page-kind="elevation" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间立面"><div class="layout-heading">${esc(section.roomName)} · 房间立面（单位：mm）</div>${skippedNote}<div class="sheet-wrap">${section.elevationSvg}</div>${schedule}</section>`,
+          `<section class="page layout-page" data-page-kind="elevation" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间正面立面"><div class="layout-heading">${esc(section.roomName)} · 房间立面（正面视角，单位：mm）</div>${skippedNote}<div class="sheet-wrap">${section.elevationSvg}</div>${schedule}</section>`,
         );
       }
     }

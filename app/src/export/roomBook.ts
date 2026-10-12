@@ -2,7 +2,7 @@ import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/typ
 import { generateProject } from '../core/geometry/project.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
 import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
-import { buildCabinetViews } from '../core/geometry/views.ts';
+import { buildCabinetViews, type ViewSet } from '../core/geometry/views.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
 import { cabinetWarningIssues, formatCabinetWarning } from './warningNotes.ts';
@@ -117,7 +117,9 @@ export function buildRoomPlanCallouts(cabinets: Cabinet[]): { prims: Prim[]; lab
 export function buildRoomElevation(
   cabinets: Cabinet[],
   rules: RuleSet,
-): { prims: Prim[]; skipped: string[]; bounds: { minX: number; maxX: number; maxY: number } } {
+  /** 可选：预计算的 ViewSet 缓存（key=柜子 id），传了就不再重复调 buildCabinetViews */
+  viewSetCache?: Map<string, ViewSet>,
+): { prims: Prim[]; skipped: string[]; rendered: number } {
   const prims: Prim[] = [];
   const skipped: string[] = [];
 
@@ -139,9 +141,17 @@ export function buildRoomElevation(
     const overlapIdx = usedRanges.findIndex((r) => x0 < r.x1 && x1 > r.x0 && y0 < r.y1 && y1 > r.y0);
     if (overlapIdx >= 0) {
       const existing = frontRow[overlapIdx]!;
+      const prev = usedRanges[overlapIdx]!;
       if (cab.placement.y < existing.placement.y) {
         frontRow[overlapIdx] = cab;
-        usedRanges[overlapIdx] = { x0, x1, y0, y1 };
+        // [fix] 遮挡记录取并集只增不减：后进的小柜子不能把大柜子的遮挡范围缩掉，
+        // 否则后续柜子会误判为"不重叠"而被错误保留
+        usedRanges[overlapIdx] = {
+          x0: Math.min(prev.x0, x0),
+          x1: Math.max(prev.x1, x1),
+          y0: Math.min(prev.y0, y0),
+          y1: Math.max(prev.y1, y1),
+        };
       } else {
         skipped.push(cab.name);
       }
@@ -154,15 +164,23 @@ export function buildRoomElevation(
   let minX = Infinity;
   let maxX = -Infinity;
   let maxY = 0;
+  // [fix] 实际产出几何的柜子数：全部 buildCabinetViews 都抛异常时，不画地面线、
+  // 调用方据此 suppressed 立面页，避免输出"只有地面线"的误导性空图
+  let rendered = 0;
 
   for (const cab of frontRow) {
-    let vs;
-    try {
-      vs = buildCabinetViews(cab, rules, { x: 0, y: 0, gapTop: 0, gapSide: 0, gapInt: 0 });
-    } catch {
-      skipped.push(cab.name);
-      continue;
+    let vs: ViewSet | undefined = viewSetCache?.get(cab.id);
+    if (!vs) {
+      try {
+        vs = buildCabinetViews(cab, rules, { x: 0, y: 0, gapTop: 0, gapSide: 0, gapInt: 0 });
+      } catch {
+        skipped.push(cab.name);
+        continue;
+      }
+      // 顺手回填缓存，同一批调用内复用
+      viewSetCache?.set(cab.id, vs);
     }
+    rendered++;
     const dx = cab.placement.x;
     const dy = cab.params.mountHeight ?? 0;
     const W = cab.params.width;
@@ -209,8 +227,8 @@ export function buildRoomElevation(
     minX = 0; maxX = 0;
   }
 
-  // 地面线
-  if (frontRow.length > 0) {
+  // 地面线：只有确实有柜子产出几何才画，避免"只有地面线"的误导性空图
+  if (rendered > 0) {
     const gx0 = minX - 400;
     const gx1 = maxX + 400;
     prims.push({ k: 'poly', pts: [{ x: gx0, y: 0 }, { x: gx1, y: 0 }], closed: false, layer: 'F-BORDER', lw: 2.5 });
@@ -232,7 +250,7 @@ export function buildRoomElevation(
     prims.push({ k: 'text', p: { x: dimX + 160, y: maxY / 2 }, text: `总高 ${maxY}`, size: 110, layer: 'F-DIM', align: 'c', rot: 90 });
   }
 
-  return { prims, skipped, bounds: { minX, maxX, maxY } };
+  return { prims, skipped, rendered };
 }
 
 const PAD = 120;
@@ -342,13 +360,24 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     const layoutSafetyNote = group.cabinets.some((cabinet) =>
       (cabinet.params.counterCutouts?.length ?? 0) > 0 || allUnits(cabinet.layout).some((unit) => unit.kind === 'appliance' && unit.appliance)
     ) ? '参考预留｜非 CNC 开孔｜待拆单确认。柜体编号通过引线对应下方清单；图中虚线/洞口为设计参考，须按实机与拆单复核，不代表已完成加工。' : null;
-    const elevation = buildRoomElevation(group.cabinets, rules);
+    // [fix] 预计算本房间所有柜子的 ViewSet，供立面图复用，避免重复调 buildCabinetViews
+    // TODO: buildFurnitureSheet 内部也调 buildCabinetViews，理想情况应把这份缓存继续往下传，
+    // 彻底消除 roomBook 构建时的双倍计算。目前先解决立面图内部的重复（缓存回填机制已就绪）。
+    const viewSetCache = new Map<string, ViewSet>();
+    for (const cabinet of group.cabinets) {
+      try {
+        viewSetCache.set(cabinet.id, buildCabinetViews(cabinet, rules, { x: 0, y: 0, gapTop: 0, gapSide: 0, gapInt: 0 }));
+      } catch {
+        // 单柜失败不影响其他柜子，buildRoomElevation 内会按 skipped 处理
+      }
+    }
+    const elevation = buildRoomElevation(group.cabinets, rules, viewSetCache);
     return {
     roomId: group.room.id,
     roomName: group.room.name,
     layoutSvg: primsToSvg([...cleanLayoutPrims, ...callouts.prims], 'room-layout'),
     layoutSafetyNote,
-    elevationSvg: elevation.prims.length > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
+    elevationSvg: elevation.rendered > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
     elevationSkipped: elevation.skipped,
     cabinets: group.cabinets.map((cabinet, index) => {
       const generated = geometry.cabinets[cabinet.id];

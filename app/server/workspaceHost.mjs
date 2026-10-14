@@ -36,10 +36,19 @@ export const RULES_PATH = join(ROOT, 'src', 'core', 'ruleset', 'factory-default.
  * @param {string} [opts.owner]   新建时的归属账号（local-open 模式下为 'local-open'）
  * @param {string} [opts.account]
  * @param {(event: object) => void} [opts.onEvent] 装载/新建/失败事件（供审计）
+ * @param {(draftId: string, content: string | null) => void} [opts.onDraftChange] 草稿增改删实时回调（供 SSE 推送）
+ * @param {(content: string) => void} [opts.onWorkspaceChange] 工作区 live 提交实时回调（供 SSE 推送）
  * @returns {Promise<{ok:true, workspace:any} | {ok:false, error:string, filePath:string}>}
  */
 export async function openWorkspace(opts) {
-  const { filePath, owner = 'local-open', account = 'local-open', onEvent = () => {} } = opts;
+  const {
+    filePath,
+    owner = 'local-open',
+    account = 'local-open',
+    onEvent = () => {},
+    onDraftChange = null,
+    onWorkspaceChange = null,
+  } = opts;
   const fileSystem = opts.fileSystemAdapter
     ?? globalThis[Symbol.for('furniture-cad.workspaceFileSystemAdapter')]
     ?? { existsSync, readFileSync, readdirSync, mkdirSync, renameSync, writeFileSync, unlinkSync };
@@ -60,7 +69,16 @@ export async function openWorkspace(opts) {
   const { WorkspaceStore } = await import('../src/workspace/workspace.ts');
   const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'));
   /** 落盘仍经同一个进程内串行写队列 —— 与账号库写入口是同一条保护。 */
-  const persist = (content) => writeFileAtomic(filePath, content, fileSystem);
+  const persist = async (content) => {
+    await writeFileAtomic(filePath, content, fileSystem);
+    if (typeof onWorkspaceChange === 'function') {
+      try {
+        onWorkspaceChange(content);
+      } catch {
+        /* 实时广播异常不阻塞持久化 */
+      }
+    }
+  };
 
   /**
    * draft 持久化（P10.0 · S4）。
@@ -76,10 +94,24 @@ export async function openWorkspace(opts) {
     if (content === null) {
       // 与 saveDraft 共用每路径队列：之前的写先完成，删除之后不会再被排队旧写复活。
       await deleteFileAtomic(p, fileSystem);
+      if (typeof onDraftChange === 'function') {
+        try {
+          onDraftChange(draftId, null);
+        } catch {
+          /* 实时广播异常不阻塞持久化 */
+        }
+      }
       return;
     }
     fileSystem.mkdirSync(draftsDir, { recursive: true });
     await writeFileAtomic(p, content, fileSystem);
+    if (typeof onDraftChange === 'function') {
+      try {
+        onDraftChange(draftId, content);
+      } catch {
+        /* 实时广播异常不阻塞持久化 */
+      }
+    }
   };
   const quarantineDraft = async (draftId) => {
     const safeId = String(draftId).replace(/[^a-zA-Z0-9_-]/g, '_');

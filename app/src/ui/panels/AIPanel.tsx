@@ -9,6 +9,7 @@ import { QuotaMeter } from '../QuotaMeter.tsx';
 import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot.ts';
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
 import { parseImageVisionImport } from '../../ai/import/imageVisionAdapter.ts';
+import { mergeVisionResults } from '../../ai/vision/visionResultToNormalized.ts';
 import { compileImport } from '../../ai/import/compileImport.ts';
 import {
   finalizeDraft,
@@ -330,7 +331,7 @@ function loadRoomId(): string {
   }
 }
 
-export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void; /** 房间工作区与聊天共享当前房间上下文。 */ workspaceRoomId?: string; onWorkspaceRoomChange?: (roomId: string) => void; workspaceContext?: boolean; onOpenRemoteDrafts?: () => void; readOnly?: boolean }): ReactNode {
+export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void; /** 房间工作区与聊天共享当前房间上下文。 */ workspaceRoomId?: string; onWorkspaceRoomChange?: (roomId: string) => void; workspaceContext?: boolean; onOpenRemoteDrafts?: () => void; onLiveDraftChange?: (preview: (RemoteDraftPreviewState & { stepText?: string }) | null) => void; readOnly?: boolean }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
   // ── P10.1 识图：待发送的图片列表（data URL）与各自类型 ──
@@ -452,8 +453,58 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       }
     };
     void refreshRemoteState();
+    let es: EventSource | null = null;
+    if (typeof EventSource !== 'undefined') {
+      try {
+        const streamUrl = props.token
+          ? `/api/workspace/stream?token=${encodeURIComponent(props.token)}`
+          : '/api/workspace/stream';
+        es = new EventSource(streamUrl);
+        es.onmessage = (evt) => {
+          if (cancelled) return;
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload.type === 'draft.deleted') {
+              remotePreviewIdRef.current = null;
+              setRemoteDraftPreview(null);
+              props.onLiveDraftChange?.(null);
+              void refreshRemoteState();
+            } else if ((payload.type === 'draft.updated' || payload.type === 'agent.step') && (payload.project || payload.draftProject)) {
+              const proj = payload.project ?? payload.draftProject;
+              const dId = payload.draftId;
+              if (dId && proj) {
+                if (remotePreviewIdRef.current !== dId) {
+                  remotePreviewIdRef.current = dId;
+                  setRemotePreviewOpen(true);
+                }
+                const stepText = payload.step ? `${payload.step.tool}${payload.step.ok ? ' ✓' : ' ✗'}` : undefined;
+                const next: RemoteDraftPreviewState = {
+                  draftId: dId,
+                  baseModelVersion: payload.baseModelVersion ?? payload.freshness?.baseModelVersion ?? 0,
+                  liveModelVersion: payload.liveModelVersion ?? payload.freshness?.liveModelVersion ?? 0,
+                  project: proj,
+                  blockingErrors: payload.validation?.blockingErrors ?? 0,
+                };
+                setRemoteDraftPreview(next);
+                props.onLiveDraftChange?.({ ...next, stepText });
+              }
+            } else if (payload.type === 'workspace.updated' && payload.project) {
+              setRemoteProjectMismatch(stableProjectJson(payload.project) !== stableProjectJson(bus.getState()));
+            }
+          } catch {
+            /* ignore malformed SSE */
+          }
+        };
+      } catch {
+        /* fallback to polling */
+      }
+    }
     const timer = window.setInterval(() => { void refreshRemoteState(); }, 2200);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      if (es) es.close();
+    };
   }, [props.token, bus, version, activeRoomId]);
   const convo: Convo = convos[activeRoomId] ?? emptyConvo();
 
@@ -667,6 +718,8 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           roomId: isUnassignedRoomContext ? workspaceSelectedRoomId : activeRoom?.id,
           roomName: isUnassignedRoomContext ? '未分配房间' : activeRoom?.name,
           roomContext: isUnassignedRoomContext ? 'unassigned' : undefined,
+          // 若本地工作区刚新建了房间但服务端尚未有该 roomId（且非 __syncOnlyBus 探针态），自动附带 autoSyncProject 避免 409 错位
+          ...(!(window as any).__syncOnlyBus ? { autoSyncProject: bus.getState() } : {}),
           images: imgs.map(i => ({ dataUrl: i.dataUrl, mode: i.mode, name: i.name })),
           history,
         }),
@@ -759,8 +812,9 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     setImageUrl('');
     setBusyKind('vision');
     try {
-      // 逐张识别
+      // 逐张识别 + 多图（效果图+尺寸图）自动联合融合
       let convo = next;
+      const collectedResults: Array<{ result: any; mode: 'render' | 'dimension'; name: string }> = [];
       for (const img of imgs) {
         const r = await fetch('/api/ai/vision', {
           method: 'POST',
@@ -773,6 +827,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           continue;
         }
         const vr = j.result;
+        collectedResults.push({ result: vr, mode: img.mode, name: img.name });
         const summary = summarizeVision(vr, img.mode);
         convo = [...convo, {
           role: 'assistant',
@@ -781,6 +836,15 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           model: j.model, ms: j.ms,
         }];
         if (j.quota) setQuota(j.quota);
+      }
+      if (collectedResults.length > 1) {
+        const fused = mergeVisionResults(collectedResults);
+        const fusedSummary = summarizeVision(fused, 'dimension');
+        convo = [...convo, {
+          role: 'assistant',
+          text: `【✨ 效果图+尺寸图联合融合结果】\n${fusedSummary}`,
+          visionResult: JSON.stringify(fused, null, 2),
+        }];
       }
       setConvo({ chat: convo });
     } catch (e) {

@@ -49,6 +49,8 @@ export interface ExportPanelProps {
   projectSnapshotVersion: number | null;
   unconfirmedSharedPanelDraft?: boolean;
   onOpenRemoteDrafts: () => void;
+  onSyncLocalToServer?: () => Promise<boolean> | void;
+  onCleanStaleOverrides?: () => void;
   onToast: (kind: ToastKind, msg: string) => void;
   readOnly?: boolean;
 }
@@ -92,6 +94,7 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
   const [planRoomIds, setPlanRoomIds] = useState<string[] | null>(null);
   const [pdfLayoutSelection, setPdfLayoutSelection] = useState<{ roomKey: string; ids: string[] }>({ roomKey: '', ids: [] });
   const [sheet, setSheet] = useState(true);
+  const [sheetMode, setSheetMode] = useState<'room' | 'both' | 'cabinet'>('room');
   const [dxfVersion, setDxfVersion] = useState<'R2007' | 'R2000'>('R2007');
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState<string>('');
@@ -231,6 +234,7 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
           which: [plan ? 'plan' : null, sheet ? 'sheet' : null].filter(Boolean),
           planRoomIds: plan && kind === 'dxf' && selectedPlanRoomIds.length < allRoomIds.length ? selectedPlanRoomIds : undefined,
           layoutRoomIds: kind === 'pdf' ? selectedPdfLayoutRoomIds : undefined,
+          sheetMode,
           version: dxfVersion,
           modelVersion: `v${props.projectSnapshotVersion}`,
         }),
@@ -321,6 +325,13 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
           <div className="ts">优先修复：{errors[0].message}</div>
           {errors[0].fixHint ? <div className="ts">修复建议：{errors[0].fixHint}</div> : null}
           {errors.length > 1 ? <div className="ts">另有 {errors.length - 1} 条错误；全部清除后即可导出。</div> : null}
+          {props.onCleanStaleOverrides && errors.some((e) => e.code === 'DRAWING-SOURCE-STALE' || e.code === 'DRAWING-SOURCE-AMBIGUOUS') ? (
+            <div style={{ marginTop: 6 }}>
+              <button type="button" className="tb-btn primary" onClick={props.onCleanStaleOverrides} data-testid="clean-stale-overrides-btn">
+                🧹 一键清理已失效二维图元覆盖并解锁导出
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : (
         <div className="ts">
@@ -338,8 +349,15 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
       {props.remoteStatusDiffers ? (
         <div className="vissue vissue-error" role="alert" data-testid="export-blocked-remote-mismatch">
           <b>生产导出已阻止：网页模型与服务器 live v{props.remoteLiveModelVersion} 不一致。</b>
-          <div>网页预览/生产图可能对应不同版本。先核对服务端草稿，再明确确认同步；同步完成后此阻断会解除。</div>
-          <button type="button" className="tb-btn" onClick={props.onOpenRemoteDrafts}>查看草稿并确认同步</button>
+          <div>网页预览/生产图可能对应不同版本。先核对服务端草稿，或直接将当前网页修改同步到服务器后即可解锁导出。</div>
+          <div className="btn-row" style={{ marginTop: 6 }}>
+            {props.onSyncLocalToServer ? (
+              <button type="button" className="tb-btn primary" data-testid="sync-local-to-server-btn" onClick={() => void props.onSyncLocalToServer?.()}>
+                ⚡ 立即同步当前网页修改到服务器并解锁导出
+              </button>
+            ) : null}
+            <button type="button" className="tb-btn" onClick={props.onOpenRemoteDrafts}>查看草稿并确认同步</button>
+          </div>
         </div>
       ) : null}
       {!props.remoteStatusReady && !props.remoteStatusDiffers ? (
@@ -353,6 +371,13 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
         <div className="vissue vissue-error" role="alert" data-testid="export-blocked-local-snapshot">
           <b>正式导出已阻止：网页中的项目与最近确认的服务器快照不一致。</b>
           <div>请先同步工作区或刷新页面重新读取快照，再导出。不会将本地修改伪装成服务器确认快照；项目 JSON 存档仍可使用。</div>
+          {props.onSyncLocalToServer ? (
+            <div style={{ marginTop: 6 }}>
+              <button type="button" className="tb-btn primary" data-testid="sync-local-snapshot-btn" onClick={() => void props.onSyncLocalToServer?.()}>
+                ⚡ 立即将本地修改同步到服务器并解锁导出
+              </button>
+            </div>
+          ) : null}
         </div>
       ) : null}
       {snapshotConflictNote ? (
@@ -404,6 +429,22 @@ export function ExportPanel(props: ExportPanelProps): ReactNode {
         <div className="ts vnote">
           房间平面图和柜体图分别进入独立 A3 横向布局；几何统一适配页面，打印设置保持毫米 1:1。
         </div>
+      </div>
+
+      <div className="exp-group">
+        <div className="exp-title">四视图图纸模式（PDF / DXF / 打印版共用）</div>
+        <label className="exp-check">
+          <input type="radio" name="export-sheet-mode" checked={sheetMode === 'room'} onChange={() => setSheetMode('room')} />
+          整房/整墙一体化四视图（推荐，对标标准图幅：每房一页完整展示地柜+吊柜+高柜）
+        </label>
+        <label className="exp-check">
+          <input type="radio" name="export-sheet-mode" checked={sheetMode === 'both'} onChange={() => setSheetMode('both')} />
+          整房一体化总图 + 逐柜拆单详图
+        </label>
+        <label className="exp-check">
+          <input type="radio" name="export-sheet-mode" checked={sheetMode === 'cabinet'} onChange={() => setSheetMode('cabinet')} />
+          仅逐柜独立生产图（一柜一页）
+        </label>
       </div>
 
       <div className="exp-group">

@@ -72,26 +72,27 @@ const GAP_RANGE = ((): { min: number; max: number } => {
 })();
 
 const ANCHOR_REASON =
-  '这条是基准边（尺寸从这一端起算）。模型没有"平移基准"这个概念，改尺寸请拖另一端';
+  '这条是基准边（尺寸从这一端起算）。模型没有"平移基准"这个概念，改尺寸请拖另一端（或按住 Shift 键拖此边）';
 
 /**
  * 一条可点线段能不能拖、拖了改什么。
  * 只看 {part, view, edge} —— 永远不看坐标：坐标是派生值，拿它当依据就又回到改几何了。
  */
-export function dragPlanOf(pl: PickLine): DragPlan {
+export function dragPlanOf(pl: PickLine, opts?: { allowAnchorDrag?: boolean }): DragPlan {
   const label = PART_ZH[pl.part];
+  const allowMin = opts?.allowAnchorDrag === true;
   switch (pl.part) {
     case 'outer.width': {
       // 正视图（横向 X）与俯视图（横向 X）都在拖同一根宽轴
       if (pl.view !== 'front' && pl.view !== 'top') return { ok: false, labelZh: label, reason: '这张图上这条线不代表柜宽' };
-      if (pl.edge !== 'max') return { ok: false, labelZh: label, reason: ANCHOR_REASON };
+      if (pl.edge !== 'max' && !allowMin) return { ok: false, labelZh: label, reason: ANCHOR_REASON };
       return {
         ok: true,
         spec: {
           part: pl.part,
           labelZh: '柜宽',
           axis: 'x',
-          sign: 1,
+          sign: pl.edge === 'min' ? -1 : 1,
           hintZh: '左右拖 = 改柜宽',
           ...SIZE_RANGE.width,
           read: (c) => c.params.width,
@@ -101,14 +102,14 @@ export function dragPlanOf(pl: PickLine): DragPlan {
     }
     case 'outer.height': {
       if (pl.view !== 'front' && pl.view !== 'side') return { ok: false, labelZh: label, reason: '这张图上这条线不代表柜高' };
-      if (pl.edge !== 'max') return { ok: false, labelZh: label, reason: ANCHOR_REASON };
+      if (pl.edge !== 'max' && !allowMin) return { ok: false, labelZh: label, reason: ANCHOR_REASON };
       return {
         ok: true,
         spec: {
           part: pl.part,
           labelZh: '柜高',
           axis: 'y',
-          sign: 1,
+          sign: pl.edge === 'min' ? -1 : 1,
           hintZh: '上下拖 = 改柜高',
           ...SIZE_RANGE.height,
           read: (c) => c.params.height,
@@ -117,17 +118,18 @@ export function dragPlanOf(pl: PickLine): DragPlan {
       };
     }
     case 'outer.depth': {
-      if (pl.edge !== 'max') return { ok: false, labelZh: label, reason: ANCHOR_REASON };
+      if (pl.edge !== 'max' && !allowMin) return { ok: false, labelZh: label, reason: ANCHOR_REASON };
       // 侧视图：横向就是进深；俯视图：纵向是进深**且反向**（y = ty0 - Y）
       const axis: 'x' | 'y' | null = pl.view === 'side' ? 'x' : pl.view === 'top' ? 'y' : null;
       if (!axis) return { ok: false, labelZh: label, reason: '这张图上这条线不代表柜深' };
+      const baseSign = pl.view === 'top' ? -1 : 1;
       return {
         ok: true,
         spec: {
           part: pl.part,
           labelZh: '柜深',
           axis,
-          sign: pl.view === 'top' ? -1 : 1,
+          sign: (pl.edge === 'min' ? -baseSign : baseSign) as 1 | -1,
           hintZh: pl.view === 'side' ? '左右拖 = 改柜深' : '上下拖 = 改柜深',
           ...SIZE_RANGE.depth,
           read: (c) => c.params.depth,

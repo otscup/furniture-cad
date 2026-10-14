@@ -529,15 +529,18 @@ export function migrateDuplicateUnitIds(raw: string): { fixed: boolean; content?
     const cabId = String(cab.id ?? 'cab');
     const layout = cab.layout as Record<string, unknown> | undefined;
     if (!layout) continue;
-    if (Array.isArray(layout.units)) {
-      fixUnits(layout.units as Array<Record<string, unknown>>, cabId);
-    }
-    if (Array.isArray(layout.rows)) {
+    if (Array.isArray(layout.rows) && layout.rows.length > 0) {
       for (const row of layout.rows as Array<Record<string, unknown>>) {
         if (Array.isArray(row.units)) {
           fixUnits(row.units as Array<Record<string, unknown>>, cabId);
         }
       }
+      const firstRowUnits = (layout.rows[0] as Record<string, unknown> | undefined)?.units;
+      if (Array.isArray(firstRowUnits)) {
+        layout.units = structuredClone(firstRowUnits);
+      }
+    } else if (Array.isArray(layout.units)) {
+      fixUnits(layout.units as Array<Record<string, unknown>>, cabId);
     }
     if (Array.isArray(layout.backUnits)) {
       fixUnits(layout.backUnits as Array<Record<string, unknown>>, cabId);

@@ -58,6 +58,8 @@ export interface CommandPayload {
   room?: Room;
   wall?: Wall;
   roomId?: string;
+  /** room.delete 连同房间内柜体与组合一并级联删除 */
+  cascade?: boolean;
   /** room.resize 的新尺寸（mm） */
   w?: number;
   h?: number;
@@ -1093,7 +1095,7 @@ export class CommandBus {
        * → 悬空柜体（生成器读不到房间 → 尺寸/归属全乱）。与其静默留下孤儿，不如明确拦下，
        * 让用户先把柜体移走/删掉。这和 cabinet.create「没有房间不能建柜」是同一道防线的两头。
        */
-      if (cmd.op === 'room.delete') {
+      if (cmd.op === 'room.delete' && !cmd.payload?.cascade) {
         const rid = cmd.payload?.roomId;
         const n = this.project.cabinets.filter((c) => c.roomId === rid).length;
         if (n > 0) {
@@ -1438,7 +1440,14 @@ export class CommandBus {
       const row = targetRowOf(cab);
       if (!row) return null; // 多行柜未指定行 → 拒绝，绝不猜（猜错＝把分区加到别的楼层）
       const unit = structuredClone(p.unit!);
-      if (!unit.id) unit.id = nextId('unit', row.units.map((u) => u.id));
+      const allProjectUnitIds = new Set<string>();
+      for (const existingCab of draft.cabinets) {
+        for (const u of allUnits(existingCab.layout)) allProjectUnitIds.add(u.id);
+        for (const u of existingCab.layout.backUnits ?? []) allProjectUnitIds.add(u.id);
+      }
+      if (!unit.id || allProjectUnitIds.has(unit.id)) {
+        unit.id = nextId('unit', allProjectUnitIds);
+      }
       if (row.units.some((u) => u.id === unit.id)) return null;
       if (typeof unit.requestedWidth !== 'number') {
         const rest = cab.params.width - row.units.reduce((a, u) => a + u.requestedWidth, 0);
@@ -1665,8 +1674,52 @@ export class CommandBus {
 
     if (cmd.op === 'room.create') {
       const room = structuredClone(p.room!);
-      if (!room.id) room.id = nextId('room', draft.rooms.map((r) => r.id));
-      if (draft.rooms.some((r) => r.id === room.id)) return null;
+      if (!room.id || draft.rooms.some((r) => r.id === room.id)) {
+        room.id = nextId('room', draft.rooms.map((r) => r.id));
+      }
+      // 确保新房间的墙体 ID 全局唯一，不与已有房间墙体撞号
+      const takenWallIds = new Set<string>();
+      for (const existingRoom of draft.rooms) {
+        for (const w of existingRoom.walls) takenWallIds.add(w.id);
+      }
+      for (const w of room.walls) {
+        if (!w.id || takenWallIds.has(w.id)) {
+          w.id = nextId('wall', takenWallIds);
+        }
+        takenWallIds.add(w.id);
+      }
+      // 自动防重叠：若新房间带墙且包围盒与已有房间墙体包围盒发生重叠（如 AI/MCP 默认传了 x=0,y=0），自动向右平移错开
+      if (room.walls.length > 0 && draft.rooms.length > 0) {
+        const bboxOfWalls = (walls: Wall[]) => {
+          if (walls.length === 0) return null;
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const w of walls) {
+            for (const pt of [w.start, w.end]) {
+              if (pt.x < minX) minX = pt.x;
+              if (pt.y < minY) minY = pt.y;
+              if (pt.x > maxX) maxX = pt.x;
+              if (pt.y > maxY) maxY = pt.y;
+            }
+          }
+          return maxX > minX && maxY > minY ? { minX, minY, maxX, maxY } : null;
+        };
+        const newBox = bboxOfWalls(room.walls);
+        if (newBox) {
+          const existingBoxes = draft.rooms.map((r) => bboxOfWalls(r.walls)).filter((b): b is NonNullable<typeof b> => b !== null);
+          const overlaps = existingBoxes.some(
+            (b) => newBox.minX < b.maxX && newBox.maxX > b.minX && newBox.minY < b.maxY && newBox.maxY > b.minY
+          );
+          if (overlaps) {
+            const maxExistingX = existingBoxes.reduce((m, b) => Math.max(m, b.maxX), 0);
+            const dx = Math.round(maxExistingX + 800 - newBox.minX);
+            const dy = Math.round(0 - newBox.minY);
+            for (const w of room.walls) {
+              w.start = { x: Math.round(w.start.x + dx), y: Math.round(w.start.y + dy) };
+              w.end = { x: Math.round(w.end.x + dx), y: Math.round(w.end.y + dy) };
+            }
+          }
+        }
+      }
       const index = draft.rooms.length;
       return {
         sideEffects: [{ kind: 'insertRoom', room, index }],
@@ -1680,8 +1733,23 @@ export class CommandBus {
       const i = findRoom(draft, rid);
       if (i < 0) return null;
       const room = structuredClone(draft.rooms[i]);
+      const sideEffects: SideEffect[] = [];
+      if (p.cascade) {
+        const asms = draft.assemblies ?? [];
+        for (let ai = asms.length - 1; ai >= 0; ai--) {
+          if (asms[ai]!.roomId === rid) {
+            sideEffects.push({ kind: 'removeAssembly', asm: structuredClone(asms[ai]!), index: ai });
+          }
+        }
+        for (let ci = draft.cabinets.length - 1; ci >= 0; ci--) {
+          if (draft.cabinets[ci]!.roomId === rid) {
+            sideEffects.push({ kind: 'removeCabinet', cab: structuredClone(draft.cabinets[ci]!), index: ci });
+          }
+        }
+      }
+      sideEffects.push({ kind: 'removeRoom', room, index: i });
       return {
-        sideEffects: [{ kind: 'removeRoom', room, index: i }],
+        sideEffects,
         diff: [{ path: '(room.delete)', from: `${room.name}`, to: null }],
       };
     }

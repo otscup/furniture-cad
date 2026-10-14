@@ -199,6 +199,8 @@ export function toNeutralExport(
   panelsOverride?: Panel[],
   /** 可选房间级 PLAN 范围；undefined 表示全部房间，空数组表示不导出 PLAN。 */
   selectedRoomIds?: string[],
+  /** 图纸粒度：cabinet=逐柜分图（默认兼容既有测试），room=整房/整墙一体化四视图，both=整房总图+逐柜分图 */
+  sheetMode: 'room' | 'cabinet' | 'both' = 'cabinet',
 ): NeutralExport {
   const geom = generateProject(project, rules);
   // cabinets 是 { [cabinetId]: CabinetGeometry }，不是数组 —— 取出值再聚合
@@ -260,10 +262,27 @@ export function toNeutralExport(
   }
 
   if (which.includes('sheet')) {
-    // ── 一柜一 DXF layout：所有三视图来自该柜同一份语义模型 ──
     const groups = groupByRoom(project);
     let sheetIndex = 0;
     for (const group of groups) {
+      if ((sheetMode === 'room' || sheetMode === 'both') && group.cabinets.length > 0) {
+        sheetIndex += 1;
+        const roomSheet = buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜` });
+        const roomSuffix = group.room.id.replace(/[^A-Za-z0-9]/g, '').slice(-8) || String(sheetIndex);
+        const roomPrims = [...roomSheet.prims];
+        if (group.cabinets.some((c) => hasUnmachinedReference(c))) {
+          roomPrims.push(safetyNotePrim(450, 9650, 180));
+        }
+        sheets.push({
+          name: `ROOM_${String(sheetIndex).padStart(3, '0')}_${roomSuffix}`,
+          nameZh: `${group.room.name}·整体柜四视图`,
+          kind: 'cabinet',
+          roomId: group.room.id,
+          bbox: bboxOf(roomPrims),
+          prims: roomPrims.map(toNeutralPrim),
+        });
+      }
+      if (sheetMode === 'room') continue;
       for (const cabinet of group.cabinets) {
         sheetIndex += 1;
         const sheet = buildFurnitureSheet(group.room, [cabinet], project, rules, { furnitureName: cabinet.name });

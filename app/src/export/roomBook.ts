@@ -1,7 +1,7 @@
 import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
-import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
+import { buildFurnitureSheet, computeUnfoldedWallX, groupByRoom } from './furnitureSheet.ts';
 import { buildCabinetViews, type ViewSet } from '../core/geometry/views.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
@@ -125,41 +125,9 @@ export function buildRoomElevation(
 
   // 按 X 排序；Y 进深分组，只取每组最前排
   // 注意：垂直方向（mountHeight）不同的柜子不算重叠，地柜+吊柜上下叠放是正常情况
-  const sorted = [...cabinets].sort((a, b) => a.placement.x - b.placement.x);
-  const frontRow: Cabinet[] = [];
-  const usedRanges: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
-  for (const cab of sorted) {
-    if (Math.abs(cab.placement.rotation % 360) > 1 && Math.abs(cab.placement.rotation % 360 - 360) > 1) {
-      skipped.push(cab.name);
-      continue;
-    }
-    const x0 = cab.placement.x;
-    const x1 = x0 + cab.params.width;
-    const y0 = cab.params.mountHeight ?? 0;
-    const y1 = y0 + cab.params.height;
-    // X 重叠且垂直方向也重叠 → 才是前后遮挡关系，留 Y（进深）最靠前的
-    const overlapIdx = usedRanges.findIndex((r) => x0 < r.x1 && x1 > r.x0 && y0 < r.y1 && y1 > r.y0);
-    if (overlapIdx >= 0) {
-      const existing = frontRow[overlapIdx]!;
-      const prev = usedRanges[overlapIdx]!;
-      if (cab.placement.y < existing.placement.y) {
-        frontRow[overlapIdx] = cab;
-        // [fix] 遮挡记录取并集只增不减：后进的小柜子不能把大柜子的遮挡范围缩掉，
-        // 否则后续柜子会误判为"不重叠"而被错误保留
-        usedRanges[overlapIdx] = {
-          x0: Math.min(prev.x0, x0),
-          x1: Math.max(prev.x1, x1),
-          y0: Math.min(prev.y0, y0),
-          y1: Math.max(prev.y1, y1),
-        };
-      } else {
-        skipped.push(cab.name);
-      }
-      continue;
-    }
-    frontRow.push(cab);
-    usedRanges.push({ x0, x1, y0, y1 });
-  }
+  const unfoldedX = computeUnfoldedWallX(cabinets);
+  const xOf = (c: Cabinet): number => unfoldedX.get(c.id) ?? c.placement.x;
+  const frontRow = [...cabinets].sort((a, b) => xOf(a) - xOf(b));
 
   let minX = Infinity;
   let maxX = -Infinity;
@@ -181,7 +149,7 @@ export function buildRoomElevation(
       viewSetCache?.set(cab.id, vs);
     }
     rendered++;
-    const dx = cab.placement.x;
+    const dx = xOf(cab);
     const dy = cab.params.mountHeight ?? 0;
     const W = cab.params.width;
     const H = cab.params.height;
@@ -316,6 +284,8 @@ export interface RoomBookSection {
   elevationSvg: string | null;
   /** 立面图中被跳过的柜子名（转角/被遮挡） */
   elevationSkipped: string[];
+  /** 整房/整墙一体化 2x2 四视图生产图纸（对标《世园润府》标准图幅：地柜俯视+吊柜俯视+正面外观+内部结构+右侧规格栏） */
+  roomSheetSvg: string | null;
   cabinets: RoomBookCabinet[];
 }
 
@@ -372,6 +342,9 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       }
     }
     const elevation = buildRoomElevation(group.cabinets, rules, viewSetCache);
+    const roomWholeSheet = group.cabinets.length > 0
+      ? buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜` })
+      : null;
     return {
     roomId: group.room.id,
     roomName: group.room.name,
@@ -379,6 +352,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     layoutSafetyNote,
     elevationSvg: elevation.rendered > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
     elevationSkipped: elevation.skipped,
+    roomSheetSvg: roomWholeSheet ? primsToSvg(roomWholeSheet.prims, 'dwg-sheet room-whole-sheet') : null,
     cabinets: group.cabinets.map((cabinet, index) => {
       const generated = geometry.cabinets[cabinet.id];
       const warningNotes = generated
@@ -525,8 +499,12 @@ const CSS = `
  * HTML 打印版未指定时保留历史全房间布局；正式 PDF 调用方显式传空数组，默认只出逐柜页。
  * 页面身份同时写入 data 属性和图框文字，便于自动化检查与后续追溯。
  */
-export function roomBookHtml(book: RoomBook, options: { layoutRoomIds?: string[] } = {}): string {
+export function roomBookHtml(
+  book: RoomBook,
+  options: { layoutRoomIds?: string[]; sheetMode?: 'room' | 'cabinet' | 'both' } = {},
+): string {
   const pages: string[] = [];
+  const sheetMode = options.sheetMode ?? 'cabinet';
   const layoutRoomIds = new Set(options.layoutRoomIds ?? book.sections.map((section) => section.roomId));
   for (const section of book.sections) {
     const scheduleItems = (cabinets: RoomBookCabinet[]) => cabinets.map((cabinet) =>
@@ -541,27 +519,32 @@ export function roomBookHtml(book: RoomBook, options: { layoutRoomIds?: string[]
       pages.push(
         `<section class="page layout-page" data-page-kind="layout" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间布局"><div class="layout-heading">${esc(section.roomName)} · 房间布局（单位：mm）</div>${layoutNote}<div class="sheet-wrap">${section.layoutSvg}</div>${schedule}</section>`,
       );
-      // 房间整体正面立面图：地柜在下、吊柜在上，上下对应
-      if (section.elevationSvg) {
-        const skippedNote = section.elevationSkipped.length > 0
-          ? `<aside class="layout-safety-note">立面图未包含：${esc(section.elevationSkipped.join('、'))}（转角或被前排遮挡，仅显示一字形最前排）</aside>`
-          : '';
-        pages.push(
-          `<section class="page layout-page" data-page-kind="elevation" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 房间正面立面"><div class="layout-heading">${esc(section.roomName)} · 房间立面（正面视角，单位：mm）</div>${skippedNote}<div class="sheet-wrap">${section.elevationSvg}</div>${schedule}</section>`,
-        );
-      }
     }
-    for (const cabinet of section.cabinets) {
-      const noteBlocks = [
-        ...(cabinet.safetyNote ? [`<div class="cabinet-safety-note">${esc(cabinet.safetyNote)}</div>`] : []),
-        ...cabinet.warningNotes.map((note) => `<div class="cabinet-warning-note" role="note">${esc(note)}</div>`),
-      ].join('');
-      const noteStack = noteBlocks
-        ? `<aside class="cabinet-note-stack" aria-label="${esc(cabinet.name)}生产警告与加工说明">${noteBlocks}</aside>`
+    if ((sheetMode === 'room' || sheetMode === 'both') && section.roomSheetSvg) {
+      const roomNotes = section.cabinets.flatMap((cab) => [
+        ...(cab.safetyNote ? [`<div class="cabinet-safety-note">${esc(cab.name)}：${esc(cab.safetyNote)}</div>`] : []),
+        ...cab.warningNotes.map((note) => `<div class="cabinet-warning-note" role="note">${esc(note)}</div>`),
+      ]).join('');
+      const roomNoteStack = roomNotes
+        ? `<aside class="cabinet-note-stack" aria-label="${esc(section.roomName)}整体生产警告与加工说明">${roomNotes}</aside>`
         : '';
       pages.push(
-        `<section class="page cabinet-page" data-page-kind="cabinet" data-room-id="${esc(section.roomId)}" data-cabinet-id="${esc(cabinet.id)}" aria-label="${esc(section.roomName)} / ${esc(cabinet.name)}"><div class="sheet-wrap">${cabinet.sheetSvg}</div>${noteStack}</section>`,
+        `<section class="page cabinet-page room-whole-page" data-page-kind="room-sheet" data-room-id="${esc(section.roomId)}" aria-label="${esc(section.roomName)} / 整体柜四视图"><div class="sheet-wrap">${section.roomSheetSvg}</div>${roomNoteStack}</section>`,
       );
+    }
+    if (sheetMode === 'cabinet' || sheetMode === 'both') {
+      for (const cabinet of section.cabinets) {
+        const noteBlocks = [
+          ...(cabinet.safetyNote ? [`<div class="cabinet-safety-note">${esc(cabinet.safetyNote)}</div>`] : []),
+          ...cabinet.warningNotes.map((note) => `<div class="cabinet-warning-note" role="note">${esc(note)}</div>`),
+        ].join('');
+        const noteStack = noteBlocks
+          ? `<aside class="cabinet-note-stack" aria-label="${esc(cabinet.name)}生产警告与加工说明">${noteBlocks}</aside>`
+          : '';
+        pages.push(
+          `<section class="page cabinet-page" data-page-kind="cabinet" data-room-id="${esc(section.roomId)}" data-cabinet-id="${esc(cabinet.id)}" aria-label="${esc(section.roomName)} / ${esc(cabinet.name)}"><div class="sheet-wrap">${cabinet.sheetSvg}</div>${noteStack}</section>`,
+        );
+      }
     }
   }
   for (const panel of book.sharedPanels) {

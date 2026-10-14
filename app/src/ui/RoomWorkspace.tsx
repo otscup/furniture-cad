@@ -571,7 +571,7 @@ export function RoomWorkspace(props: {
                                   onBlur={(e) => {
                                     const val = Math.round(Number(e.target.value));
                                     if (Number.isFinite(val) && val > 0 && val !== (cabinet.params.mountHeight ?? 0)) {
-                                      props.bus.execute(setCabinetParam(cabinet, 'mountHeight', val, `离地高 → ${val}mm`));
+                                      props.bus.execute(setCabinetParam(cabinet, 'mountHeight', String(val), `离地高 → ${val}mm`));
                                     }
                                   }}
                                   onKeyDown={(e) => {

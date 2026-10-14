@@ -2,7 +2,8 @@ import { lazy, Suspense, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { CommandBus } from '../core/commandBus.ts';
 import { assemblyConfirmationStatus } from '../core/assemblyConfirmation.ts';
-import { confirmAssembly, resizeCabinet, setCabinetParam } from '../core/commands.ts';
+import { confirmAssembly, deleteRoomCommand, resizeCabinet, resizeRoomCommand, setCabinetParam } from '../core/commands.ts';
+import { deoverlapProjectRooms } from '../core/unitIdentity.mjs';
 import { buildFurnitureSheet } from '../export/furnitureSheet.ts';
 import { buildCabinetViews } from '../core/geometry/views.ts';
 import { allUnits } from '../core/layoutModel.ts';
@@ -151,6 +152,48 @@ export function RoomWorkspace(props: {
   };
 
   const [wholeSheetOpen, setWholeSheetOpen] = useState(true);
+  const [centerViewMode, setCenterViewMode] = useState<'sheet' | '3d' | 'plan'>('sheet');
+  const [threeScope, setThreeScope] = useState<'room' | 'all'>('room');
+  const [confirmDeleteRoom, setConfirmDeleteRoom] = useState(false);
+
+  const activeRoomDims = useMemo(() => {
+    if (!activeRoom || activeRoom.room.walls.length === 0) return null;
+    const xs = activeRoom.room.walls.flatMap((w) => [w.start.x, w.end.x]);
+    const ys = activeRoom.room.walls.flatMap((w) => [w.start.y, w.end.y]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    return { w: Math.round(maxX - minX), h: Math.round(maxY - minY), minX: Math.round(minX), minY: Math.round(minY) };
+  }, [activeRoom, props.version]);
+
+  const hasOverlappingRooms = useMemo(() => {
+    const boxes = props.project.rooms
+      .filter((r) => r.walls.length > 0)
+      .map((r) => {
+        const xs = r.walls.flatMap((w) => [w.start.x, w.end.x]);
+        const ys = r.walls.flatMap((w) => [w.start.y, w.end.y]);
+        return { minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) };
+      })
+      .filter((b) => b.maxX > b.minX && b.maxY > b.minY);
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i]!, b = boxes[j]!;
+        if (a.minX < b.maxX && a.maxX > b.minX && a.minY < b.maxY && a.maxY > b.minY) return true;
+      }
+    }
+    return false;
+  }, [props.project.rooms, props.version]);
+
+  const roomPlanSvg = useMemo(() => {
+    if (!activeRoom || activeRoom.unassigned) return null;
+    try {
+      const geom = props.bus.derive().geom;
+      const prims = geom.roomPlans?.[activeRoom.room.id] ?? geom.plan;
+      if (!prims || prims.length === 0) return null;
+      return primsToSvg(prims, 'workspace-room-plan-svg');
+    } catch {
+      return null;
+    }
+  }, [activeRoom, props.bus, props.version]);
   const wholeRoomSheetSvg = useMemo(() => {
     if (!activeRoom || activeRoom.cabinets.length === 0) return null;
     try {
@@ -284,10 +327,27 @@ export function RoomWorkspace(props: {
                   {activeRoom.room.note ? <p className="workspace-room-note">备注：{activeRoom.room.note}</p> : null}
                   <p>按地柜、吊柜等集中展示整组；每台柜仍可单独编辑，逐柜生产图保持独立交付。</p>
                 </div>
-                <div className="workspace-room-actions">
+                <div className="workspace-room-actions" style={{ flexWrap: 'wrap' }}>
                   {canAddCabinet ? (
                     <button type="button" className="workspace-button workspace-button-primary" onClick={openCabinetForm} disabled={props.readOnly} title={props.readOnly ? '历史重复 Unit ID 项目只读；须显式修复/迁移后才能创建' : undefined}>
                       ＋ 添加柜体
+                    </button>
+                  ) : null}
+                  {hasOverlappingRooms ? (
+                    <button
+                      type="button"
+                      className="workspace-button workspace-button-warning"
+                      disabled={props.readOnly}
+                      data-testid="workspace-deoverlap-rooms-button"
+                      onClick={() => {
+                        const { project: nextProj, movedRooms } = deoverlapProjectRooms(props.project);
+                        if (movedRooms.length > 0) {
+                          props.bus.replaceProject(nextProj, `自动错开重叠房间（${movedRooms.map((r: { roomName: string }) => r.roomName).join('、')}）`);
+                        }
+                      }}
+                      title="检测到多个房间在 (0,0) 坐标重叠，点击一键横向错开房间与房内柜体"
+                    >
+                      📐 错开重叠房间
                     </button>
                   ) : null}
                   {props.remoteDiffers && props.onSyncLocalToServer ? (
@@ -295,11 +355,183 @@ export function RoomWorkspace(props: {
                       ⚡ 同步修改到云端
                     </button>
                   ) : null}
+                  {!activeRoom.unassigned ? (
+                    !confirmDeleteRoom ? (
+                      <button
+                        type="button"
+                        className="workspace-button workspace-button-quiet"
+                        disabled={props.readOnly}
+                        data-testid="workspace-delete-room-button"
+                        onClick={() => {
+                          if (activeRoom.cabinets.length === 0) {
+                            props.bus.execute(deleteRoomCommand(activeRoom.room.id, activeRoom.room.name, 'ui', false));
+                          } else {
+                            setConfirmDeleteRoom(true);
+                          }
+                        }}
+                        title={activeRoom.cabinets.length > 0 ? `删除房间「${activeRoom.room.name}」（含 ${activeRoom.cabinets.length} 台柜体，点击后确认）` : `删除空房间「${activeRoom.room.name}」`}
+                      >
+                        删除房间
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className="workspace-button workspace-button-warning"
+                          disabled={props.readOnly}
+                          data-testid="workspace-confirm-delete-room-button"
+                          onClick={() => {
+                            props.bus.execute(deleteRoomCommand(activeRoom.room.id, activeRoom.room.name, 'ui', true));
+                            setConfirmDeleteRoom(false);
+                          }}
+                        >
+                          确认连同 {activeRoom.cabinets.length} 柜删除
+                        </button>
+                        <button
+                          type="button"
+                          className="workspace-button workspace-button-quiet"
+                          onClick={() => setConfirmDeleteRoom(false)}
+                        >
+                          取消
+                        </button>
+                      </>
+                    )
+                  ) : null}
                   <button type="button" className="workspace-button workspace-button-quiet" onClick={() => props.onOpenCad(undefined, activeRoom.room.id)} disabled={props.readOnly} title={props.readOnly ? '历史重复 Unit ID 项目只读；须显式修复/迁移后才能编辑' : '旧版 CAD 高级编辑入口继续保留'}>
                     高级 CAD
                   </button>
                 </div>
               </div>
+
+              <div className="workspace-center-mode-bar" data-testid="workspace-center-mode-bar" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', padding: '8px 12px', background: '#f8fafc', border: '1px solid var(--line)', borderRadius: 8 }}>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className={`workspace-button ${centerViewMode === 'sheet' ? 'workspace-button-primary' : 'workspace-button-quiet'}`}
+                    onClick={() => setCenterViewMode('sheet')}
+                  >
+                    📐 整墙 2×2 生产四视图
+                  </button>
+                  <button
+                    type="button"
+                    className={`workspace-button ${centerViewMode === '3d' ? 'workspace-button-primary' : 'workspace-button-quiet'}`}
+                    data-testid="workspace-mode-3d"
+                    onClick={() => setCenterViewMode('3d')}
+                  >
+                    🧊 全房 3D 空间预览
+                  </button>
+                  <button
+                    type="button"
+                    className={`workspace-button ${centerViewMode === 'plan' ? 'workspace-button-primary' : 'workspace-button-quiet'}`}
+                    data-testid="workspace-mode-plan"
+                    onClick={() => setCenterViewMode('plan')}
+                  >
+                    🗺️ 2D 房间平面与尺寸
+                  </button>
+                </div>
+                {activeRoomDims ? (
+                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>
+                    房间尺寸：{activeRoomDims.w} × {activeRoomDims.h} mm · 坐标起点 ({activeRoomDims.minX}, {activeRoomDims.minY})
+                  </span>
+                ) : null}
+              </div>
+
+              {centerViewMode === '3d' ? (
+                <section className="workspace-whole-room-sheet" aria-label={`${activeRoom.room.name} 3D 空间预览`} data-testid="workspace-inline-3d-stage">
+                  <header className="workspace-whole-room-head">
+                    <div>
+                      <strong>🧊 {activeRoom.room.name} · 实时 3D 空间预览（支持鼠标拖拽旋转 / 滚轮缩放 / 点击选中柜体）</strong>
+                      <span>单页集成 3D 视图，无需切换到旧版复杂页面；下方修改柜体宽/高/深时 3D 实时联动更新</span>
+                    </div>
+                    <div className="workspace-room-actions">
+                      <button
+                        type="button"
+                        className={`workspace-button ${threeScope === 'room' ? 'workspace-button-primary' : 'workspace-button-quiet'}`}
+                        onClick={() => setThreeScope('room')}
+                      >
+                        仅看当前房间
+                      </button>
+                      <button
+                        type="button"
+                        className={`workspace-button ${threeScope === 'all' ? 'workspace-button-primary' : 'workspace-button-quiet'}`}
+                        onClick={() => setThreeScope('all')}
+                      >
+                        全项目所有房间
+                      </button>
+                    </div>
+                  </header>
+                  <div style={{ height: 440, width: '100%', position: 'relative', borderRadius: 6, overflow: 'hidden', border: '1px solid var(--line)' }}>
+                    <Suspense fallback={<div className="workspace-3d-loading">正在载入 3D 视图…</div>}>
+                      <ThreeViewport
+                        bus={props.bus}
+                        version={props.version}
+                        selection={props.selection}
+                        setSelection={props.setSelection}
+                        roomFilterId={threeScope === 'room' && !activeRoom.unassigned ? activeRoom.room.id : undefined}
+                      />
+                    </Suspense>
+                  </div>
+                </section>
+              ) : null}
+
+              {centerViewMode === 'plan' ? (
+                <section className="workspace-whole-room-sheet" aria-label={`${activeRoom.room.name} 2D 平面布置图`} data-testid="workspace-inline-plan-stage">
+                  <header className="workspace-whole-room-head">
+                    <div>
+                      <strong>🗺️ {activeRoom.room.name} · 2D 房间平面俯视与墙体尺寸</strong>
+                      <span>展示当前房间的四面墙体与柜体平面落位；可直接修改房间长宽或进入 CAD 自由画墙</span>
+                    </div>
+                    {activeRoomDims && !props.readOnly ? (
+                      <div className="workspace-quick-dims" style={{ marginTop: 0 }}>
+                        <label>
+                          房宽
+                          <input
+                            className="input"
+                            type="number"
+                            min={600}
+                            max={20000}
+                            defaultValue={activeRoomDims.w}
+                            key={`rw-${activeRoom.room.id}-${activeRoomDims.w}`}
+                            onBlur={(e) => {
+                              const val = Math.round(Number(e.target.value));
+                              if (Number.isFinite(val) && val >= 600 && val !== activeRoomDims.w) {
+                                props.bus.execute(resizeRoomCommand(activeRoom.room.id, val, activeRoomDims.h));
+                              }
+                            }}
+                          />
+                        </label>
+                        <label>
+                          房深
+                          <input
+                            className="input"
+                            type="number"
+                            min={600}
+                            max={20000}
+                            defaultValue={activeRoomDims.h}
+                            key={`rh-${activeRoom.room.id}-${activeRoomDims.h}`}
+                            onBlur={(e) => {
+                              const val = Math.round(Number(e.target.value));
+                              if (Number.isFinite(val) && val >= 600 && val !== activeRoomDims.h) {
+                                props.bus.execute(resizeRoomCommand(activeRoom.room.id, activeRoomDims.w, val));
+                              }
+                            }}
+                          />
+                        </label>
+                      </div>
+                    ) : null}
+                  </header>
+                  {roomPlanSvg ? (
+                    <div
+                      className="workspace-whole-room-canvas"
+                      role="img"
+                      aria-label={`${activeRoom.room.name} 2D平面图`}
+                      dangerouslySetInnerHTML={{ __html: roomPlanSvg }}
+                    />
+                  ) : (
+                    <div className="hint-line">当前房间暂无墙体平面图元</div>
+                  )}
+                </section>
+              ) : null}
 
               {props.liveDraftPreview && liveDraftSheetSvg ? (
                 <section className="workspace-live-draft-stage" aria-label="MCP 与 Agent 实时绘制同步预览" data-testid="workspace-live-draft-stage">
@@ -571,7 +803,7 @@ export function RoomWorkspace(props: {
                                   onBlur={(e) => {
                                     const val = Math.round(Number(e.target.value));
                                     if (Number.isFinite(val) && val > 0 && val !== (cabinet.params.mountHeight ?? 0)) {
-                                      props.bus.execute(setCabinetParam(cabinet, 'mountHeight', String(val), `离地高 → ${val}mm`));
+                                      props.bus.execute(setCabinetParam(cabinet, 'mountHeight', val, `离地高 → ${val}mm`));
                                     }
                                   }}
                                   onKeyDown={(e) => {

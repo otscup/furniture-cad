@@ -501,15 +501,15 @@ export function createRoomCommand(room: Room, source: CommandSource = 'ui'): Com
   };
 }
 
-export function deleteRoomCommand(roomId: string, roomName: string, source: CommandSource = 'ui'): Command {
+export function deleteRoomCommand(roomId: string, roomName: string, source: CommandSource = 'ui', cascade = false): Command {
   return {
     id: newCommandId('room.delete'),
     op: 'room.delete',
     source,
     target: { kind: 'project', id: 'project' },
     changes: [],
-    payload: { roomId },
-    label: `删除房间「${roomName}」`,
+    payload: cascade ? { roomId, cascade: true } : { roomId },
+    label: cascade ? `删除房间「${roomName}」（含房内柜体）` : `删除房间「${roomName}」`,
   };
 }
 

@@ -331,7 +331,7 @@ function loadRoomId(): string {
   }
 }
 
-export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void; /** 房间工作区与聊天共享当前房间上下文。 */ workspaceRoomId?: string; onWorkspaceRoomChange?: (roomId: string) => void; workspaceContext?: boolean; onOpenRemoteDrafts?: () => void; onLiveDraftChange?: (preview: (RemoteDraftPreviewState & { stepText?: string }) | null) => void; readOnly?: boolean }): ReactNode {
+export function AIPanel(props: { bus: CommandBus; version: number; token: string | null; /** 当前选中的柜体 id —— scope:"selection" 的圈选目标 */ selection: string[]; onToast?: (kind: 'ok' | 'info' | 'warn' | 'error', text: string) => void; /** 房间工作区与聊天共享当前房间上下文。 */ workspaceRoomId?: string; onWorkspaceRoomChange?: (roomId: string) => void; workspaceContext?: boolean; onOpenRemoteDrafts?: () => void; onQuickApplyDraft?: (draftId: string) => void; onLiveDraftChange?: (preview: (RemoteDraftPreviewState & { stepText?: string }) | null) => void; readOnly?: boolean }): ReactNode {
   const { bus, version } = props;
   const [text, setText] = useState('');
   // ── P10.1 识图：待发送的图片列表（data URL）与各自类型 ──
@@ -699,6 +699,45 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
     setPendingImages([]);
     setBusyKind('agent');
     try {
+      // 若本轮附带了图片（尤其是效果图+尺寸图双图），先自动调用 /api/ai/vision 提取并融合结构化尺寸结果；
+      // 若本轮未附带新图片，但上文刚做过「识别图片」，自动携带最近一次 visionResult 供 Agent 精准建模。
+      let resolvedVisionResult: unknown = undefined;
+      if (imgs.length > 0 && !(window as any).__syncOnlyBus) {
+        try {
+          const collected: Array<{ result: any; mode: 'render' | 'dimension'; name: string }> = [];
+          for (const img of imgs) {
+            const vrRes = await fetch('/api/ai/vision', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
+              body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: q || undefined }),
+            });
+            if (vrRes.ok) {
+              const vrJson = await vrRes.json();
+              if (vrJson?.ok && vrJson.result) {
+                collected.push({ result: vrJson.result, mode: img.mode, name: img.name });
+              }
+            }
+          }
+          if (collected.length > 1) {
+            resolvedVisionResult = mergeVisionResults(collected);
+          } else if (collected.length === 1) {
+            resolvedVisionResult = collected[0]!.result;
+          }
+        } catch {
+          /* vision 预提取失败不阻断 Agent 主调用 */
+        }
+      }
+      if (!resolvedVisionResult) {
+        const lastVisionTurn = [...chat].reverse().find((t) => Boolean(t.visionResult));
+        if (lastVisionTurn?.visionResult) {
+          try {
+            resolvedVisionResult = JSON.parse(lastVisionTurn.visionResult);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+
       // 带上历史对话（最近 10 轮），Agent 能理解追问（"再高一点"、"改成三抽屉"）
       const history = chat.slice(-10).map(t => ({
         role: t.role,
@@ -720,6 +759,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           roomContext: isUnassignedRoomContext ? 'unassigned' : undefined,
           // 若本地工作区刚新建了房间但服务端尚未有该 roomId（且非 __syncOnlyBus 探针态），自动附带 autoSyncProject 避免 409 错位
           ...(!(window as any).__syncOnlyBus ? { autoSyncProject: bus.getState() } : {}),
+          ...(resolvedVisionResult ? { visionResult: resolvedVisionResult } : {}),
           images: imgs.map(i => ({ dataUrl: i.dataUrl, mode: i.mode, name: i.name })),
           history,
         }),
@@ -1333,11 +1373,26 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                           <div className="hint">
                             草稿 {agentDraftIds(m.agentSteps).join('、')} 保存在服务端工作区；浏览器本地房间卡片和模型版本尚未改变。请确认应用并完成同步。
                           </div>
-                          {props.onOpenRemoteDrafts ? (
-                            <button type="button" className="tb-btn primary" onClick={props.onOpenRemoteDrafts}>
-                              查看远端草稿并确认同步
-                            </button>
-                          ) : null}
+                          <div className="btn-row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                            {props.onQuickApplyDraft ? (
+                              <button
+                                type="button"
+                                className="tb-btn primary"
+                                disabled={props.readOnly}
+                                onClick={() => {
+                                  const ids = agentDraftIds(m.agentSteps);
+                                  if (ids.length > 0) props.onQuickApplyDraft?.(ids[ids.length - 1]!);
+                                }}
+                              >
+                                ✅ 一键采纳到当前画布
+                              </button>
+                            ) : null}
+                            {props.onOpenRemoteDrafts ? (
+                              <button type="button" className="tb-btn" onClick={props.onOpenRemoteDrafts}>
+                                查看远端草稿详情
+                              </button>
+                            ) : null}
+                          </div>
                         </div>
                       ) : null}
                       <details className="chat-agent" open={!m.agentOk}>

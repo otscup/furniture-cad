@@ -211,6 +211,7 @@ function pythonExe() {
     join(ROOT, '.venv', 'Scripts', 'python.exe'),
     join(ROOT, '..', '.venv', 'Scripts', 'python.exe'),
     join(ROOT, '..', '.venv', 'bin', 'python'),
+    'python3',
     'python',
   ]
     .filter(Boolean)
@@ -334,6 +335,22 @@ try {
  * - 旧单文件 data/workspace.json 首次由 admin 账号认领（迁移）
  */
 const workspaceStates = new Map(); // accountId -> {state, loading}
+const workspaceStreams = new Map(); // accountId -> Set<ServerResponse>
+
+/** 向当前账号下的所有浏览器 SSE 连接实时推送草稿/工作区/Agent 步骤事件 */
+function broadcastWorkspaceEvent(accountId, payload) {
+  const aid = accountId || "local-open";
+  const clients = workspaceStreams.get(aid);
+  if (!clients || clients.size === 0) return;
+  const line = `data: ${JSON.stringify({ ...payload, accountId: aid, timestamp: new Date().toISOString() })}\n\n`;
+  for (const clientRes of [...clients]) {
+    try {
+      clientRes.write(line);
+    } catch {
+      clients.delete(clientRes);
+    }
+  }
+}
 
 /** 账号的工作区目录 */
 function accountWorkspaceDir(accountId) {
@@ -384,6 +401,51 @@ async function openAccountWorkspace(accountId) {
     owner: aid,
     account: aid,
     onEvent: (e) => auth.audit(e),
+    onDraftChange: (draftId, content) => {
+      if (content === null) {
+        broadcastWorkspaceEvent(aid, { type: "draft.deleted", draftId });
+        return;
+      }
+      try {
+        const parsed = JSON.parse(content);
+        const wsObj = entry.state?.workspace;
+        const freshness = wsObj?.getDraftFreshness?.(draftId) ?? null;
+        const validation = wsObj?.validateDraft?.(draftId) ?? null;
+        broadcastWorkspaceEvent(aid, {
+          type: "draft.updated",
+          draftId,
+          runId: parsed.runId ?? freshness?.runId,
+          revision: parsed.revision ?? freshness?.revision ?? 0,
+          baseModelVersion: parsed.baseModelVersion,
+          baseProjectHash: parsed.baseProjectHash,
+          liveModelVersion: wsObj?.getLiveModelVersion?.() ?? parsed.baseModelVersion,
+          draftHash: freshness?.draftHash ?? "",
+          canApply: freshness?.canApply ?? true,
+          isStale: freshness?.isStale ?? false,
+          project: parsed.project ?? null,
+          validation: validation ? { blockingErrors: validation.blockingErrors, issues: validation.issues } : undefined,
+        });
+      } catch {
+        broadcastWorkspaceEvent(aid, { type: "draft.updated", draftId });
+      }
+    },
+    onWorkspaceChange: () => {
+      try {
+        const wsObj = entry.state?.workspace;
+        if (!wsObj) return;
+        const snap = captureLiveProjectSnapshot(wsObj);
+        broadcastWorkspaceEvent(aid, {
+          type: "workspace.updated",
+          liveModelVersion: snap.projectSnapshotVersion,
+          projectSnapshotId: snap.projectSnapshotId,
+          projectSnapshotHash: snap.projectSnapshotHash,
+          projectSnapshotVersion: snap.projectSnapshotVersion,
+          project: snap.project,
+        });
+      } catch {
+        broadcastWorkspaceEvent(aid, { type: "workspace.updated" });
+      }
+    },
   })
     .then((s) => {
       entry.state = s;
@@ -698,7 +760,16 @@ const PUBLIC_API = new Set([
 function bearer(req) {
   const h = req.headers?.authorization ?? '';
   const m = /^Bearer\s+(.+)$/i.exec(String(h));
-  return m ? m[1].trim() : '';
+  if (m) return m[1].trim();
+  if (typeof req.url === 'string' && req.url.startsWith('/api/workspace/stream')) {
+    try {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      return (u.searchParams.get('token') ?? '').trim();
+    } catch {
+      return '';
+    }
+  }
+  return '';
 }
 
 /** 客户端标识：只用于审计，不做信任判断 */
@@ -781,6 +852,7 @@ async function handleApi(req, res, pathname) {
     pathname === '/api/ai/vision' ||
     pathname === '/api/ai/vision/fetch' ||
     pathname === '/api/ai/agent' ||
+    (pathname === '/api/workspace' && (req.method === 'PUT' || req.method === 'POST')) ||
     pathname === '/api/projects' ||
     pathname.startsWith('/api/projects/');
   const gate = requireAuth(req, res, pathname, { manage: managePaths, design: designPaths });
@@ -1609,6 +1681,115 @@ async function handleApi(req, res, pathname) {
   }
 
   /**
+   * 浏览器本地修改同步至服务端工作区（PUT /api/workspace）。
+   * 含防空覆盖水位线保护：若本地声明 clientHasLocalEdits=false 且云端已有版本演进，
+   * 不覆盖云端，直接将云端快照回传给前端注水。
+   */
+  if (pathname === '/api/workspace' && (req.method === 'PUT' || req.method === 'POST')) {
+    const body = await readBody(req);
+    const ws = await getWorkspaceState(gate.account?.id);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const syncRes = await ws.workspace.syncClientProject(body?.project, {
+      expectedLiveVersion: typeof body?.expectedLiveVersion === 'number' ? body.expectedLiveVersion : undefined,
+      clientHasLocalEdits: typeof body?.clientHasLocalEdits === 'boolean' ? body.clientHasLocalEdits : true,
+      force: body?.force === true,
+      reason: typeof body?.reason === 'string' ? body.reason : 'browser sync',
+    });
+    if (!syncRes.ok) {
+      const snapshot = captureLiveProjectSnapshot(ws.workspace);
+      return json(res, syncRes.code === 'PROJECT_INVALID' ? 400 : 409, {
+        ok: false,
+        code: syncRes.code,
+        error: syncRes.message,
+        liveModelVersion: snapshot.projectSnapshotVersion,
+        projectSnapshotId: snapshot.projectSnapshotId,
+        projectSnapshotHash: snapshot.projectSnapshotHash,
+        projectSnapshotVersion: snapshot.projectSnapshotVersion,
+        project: snapshot.project,
+      });
+    }
+    const snapshot = captureLiveProjectSnapshot(ws.workspace);
+    const identityDiagnostics = ws.workspace.getUnitIdentityDiagnostics?.() ?? {
+      readOnly: Boolean(ws.workspace.getUnitIdentityConflict?.()),
+      code: ws.workspace.getUnitIdentityConflict?.() ? WORKSPACE_UNIT_ID_CONFLICT : null,
+      message: ws.workspace.getUnitIdentityConflict?.() ?? null,
+      duplicateUnitIds: findDuplicateUnitIds(snapshot.project).map((item) => ({ ...item, scope: 'live project' })),
+    };
+    auth.audit({
+      actor: gate.account?.id ?? 'local-open',
+      action: 'workspace.sync',
+      result: syncRes.hydratedFromServer ? 'hydrated_from_server' : syncRes.unchanged ? 'unchanged' : 'updated',
+      liveModelVersion: snapshot.projectSnapshotVersion,
+    });
+    return json(res, 200, {
+      ok: true,
+      unchanged: syncRes.unchanged,
+      hydratedFromServer: syncRes.hydratedFromServer,
+      project: snapshot.project,
+      identityDiagnostics,
+      liveModelVersion: snapshot.projectSnapshotVersion,
+      workspaceId: ws.workspace.workspaceId,
+      projectSnapshotId: snapshot.projectSnapshotId,
+      projectSnapshotHash: snapshot.projectSnapshotHash,
+      projectSnapshotVersion: snapshot.projectSnapshotVersion,
+    });
+  }
+
+  /**
+   * 服务端工作区与 MCP/Agent 草稿实时流（GET /api/workspace/stream，SSE）。
+   * 浏览器打开后保持长连接，MCP 或内置 Agent 每画一步立即推送到浏览器主视口预览。
+   */
+  if (pathname === '/api/workspace/stream' && req.method === 'GET') {
+    const aid = gate.account?.id || 'local-open';
+    const ws = await getWorkspaceState(aid);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+    let clients = workspaceStreams.get(aid);
+    if (!clients) {
+      clients = new Set();
+      workspaceStreams.set(aid, clients);
+    }
+    clients.add(res);
+    const snapshot = captureLiveProjectSnapshot(ws.workspace);
+    const drafts = ws.workspace.listDrafts();
+    const latestDraftMeta = drafts.length > 0 ? drafts[drafts.length - 1] : null;
+    const latestDraftProject = latestDraftMeta ? ws.workspace.draftState(latestDraftMeta.draftId) : null;
+    const initEvent = {
+      type: 'init',
+      workspaceId: ws.workspace.workspaceId,
+      liveModelVersion: snapshot.projectSnapshotVersion,
+      projectSnapshotId: snapshot.projectSnapshotId,
+      projectSnapshotHash: snapshot.projectSnapshotHash,
+      projectSnapshotVersion: snapshot.projectSnapshotVersion,
+      project: snapshot.project,
+      drafts,
+      latestDraft: latestDraftMeta && latestDraftProject
+        ? { ...latestDraftMeta, project: latestDraftProject }
+        : null,
+      timestamp: new Date().toISOString(),
+    };
+    res.write(`data: ${JSON.stringify(initEvent)}\n\n`);
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(heartbeat);
+        clients.delete(res);
+      }
+    }, 15000);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      clients.delete(res);
+    });
+    return;
+  }
+
+  /**
    * 草稿管理 HTTP 接口（P10.1）。
    * MCP 的 draft 在服务端，工作台之前没有入口看 —— 这三个接口补上。
    * 权限与 MCP 工具对齐：list=登录即可看；apply=manage（admin+）；
@@ -1832,8 +2013,19 @@ async function handleApi(req, res, pathname) {
     }
     const agentIdentityRejected = workspaceIdentityConflict(res, agentWorkspace.workspace);
     if (agentIdentityRejected) return agentIdentityRejected;
-    const agentProject = agentWorkspace.workspace.getProjectSnapshot();
-    const serverRoom = agentProject.rooms.find((room) => room.id === requestedRoomId);
+    let agentProject = agentWorkspace.workspace.getProjectSnapshot();
+    let serverRoom = agentProject.rooms.find((room) => room.id === requestedRoomId);
+    if (!serverRoom && body.autoSyncProject && typeof body.autoSyncProject === 'object') {
+      const syncRes = await agentWorkspace.workspace.syncClientProject(body.autoSyncProject, {
+        clientHasLocalEdits: true,
+        force: true,
+        reason: 'agent auto-sync room context',
+      });
+      if (syncRes.ok) {
+        agentProject = agentWorkspace.workspace.getProjectSnapshot();
+        serverRoom = agentProject.rooms.find((room) => room.id === requestedRoomId);
+      }
+    }
     if (!serverRoom) {
       return json(res, 409, {
         ok: false,
@@ -1875,6 +2067,19 @@ async function handleApi(req, res, pathname) {
           apiKey: key,
           model,
           timeoutMs: Number(env.AI_TIMEOUT_MS ?? 120000),
+        },
+        onStep: (step, activeDraftId) => {
+          const aid = gate.account?.id || 'local-open';
+          const dId = activeDraftId || step?.draftId || null;
+          const draftProject = dId ? agentWorkspace.workspace.draftState(dId) : null;
+          const freshness = dId ? agentWorkspace.workspace.getDraftFreshness(dId) : null;
+          broadcastWorkspaceEvent(aid, {
+            type: 'agent.step',
+            step,
+            draftId: dId,
+            draftProject,
+            freshness,
+          });
         },
       });
       // 记账
@@ -2008,9 +2213,17 @@ async function handleApi(req, res, pathname) {
     const key = env.AI_API_KEY || '';
     const model = body.model || env.AI_MODEL || s.model;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
-    if (typeof body.image !== 'string' || !body.image) return json(res, 400, { ok: false, error: 'image 不能为空（应为 data URL）' });
-    // mode: 'render'（效果图，默认）| 'dimension'（尺寸图/平面布置图，带标注）
-    const visionMode = body.mode === 'dimension' ? 'dimension' : 'render';
+    const multiImages = Array.isArray(body.images)
+      ? body.images.filter((img) => img && typeof img.dataUrl === 'string' && img.dataUrl)
+      : [];
+    const primaryImage = typeof body.image === 'string' && body.image ? body.image : (multiImages[0]?.dataUrl ?? '');
+    if (!primaryImage) return json(res, 400, { ok: false, error: 'image 不能为空（应为 data URL）' });
+    const hasDimensionImg = body.mode === 'dimension' || multiImages.some((img) => img.mode === 'dimension');
+    const hasRenderImg = body.mode === 'render' || multiImages.some((img) => img.mode !== 'dimension');
+    // mode: 'render'（效果图，默认）| 'dimension'（尺寸图/平面布置图，带标注）| 'fusion'（效果图+尺寸图联合识别）
+    const visionMode = (multiImages.length > 1 && hasDimensionImg && hasRenderImg)
+      ? 'fusion'
+      : (body.mode === 'dimension' ? 'dimension' : 'render');
     if (gate.account) {
       const q = auth.checkQuota(gate.account.id, { generation: true });
       if (!q.ok) return json(res, 429, { ok: false, error: q.error, code: q.code, quota: q.view });
@@ -2063,8 +2276,15 @@ async function handleApi(req, res, pathname) {
           {
             role: 'user',
             content: [
-              { type: 'text', text: userText },
-              { type: 'image_url', image_url: { url: body.image } },
+              {
+                type: 'text',
+                text: multiImages.length > 1
+                  ? `${userText}\n（已附 ${multiImages.length} 张图：${multiImages.map((img, i) => `图${i + 1}[${img.mode === 'dimension' ? '尺寸图-优先提取精确尺寸标注' : '效果图-提取柜体分格与门抽外观'}]`).join('、')}；请将效果图外观结构与尺寸图标注数值融合为同一套柜体列表，精确尺寸以尺寸图标注为准，source 填 "annotation"，scale.known 填 true。）`
+                  : userText,
+              },
+              ...(multiImages.length > 1
+                ? multiImages.map((img) => ({ type: 'image_url', image_url: { url: img.dataUrl } }))
+                : [{ type: 'image_url', image_url: { url: primaryImage } }]),
             ],
           },
         ],
@@ -2575,7 +2795,8 @@ async function handleApi(req, res, pathname) {
     const planRoomIds = Array.isArray(body.planRoomIds) ? body.planRoomIds.filter((id) => typeof id === 'string') : undefined;
     const version = body.version === 'R2000' ? 'R2000' : 'R2007'; // R2000/GBK 只作兼容备用
     try {
-      const { buffer, filename: base, info } = await exportDxf(project, { which, version, modelVersion: `v${snapshot.projectSnapshotVersion}`, planRoomIds });
+      const sheetMode = ['room', 'cabinet', 'both'].includes(body.sheetMode) ? body.sheetMode : undefined;
+      const { buffer, filename: base, info } = await exportDxf(project, { which, version, modelVersion: `v${snapshot.projectSnapshotVersion}`, planRoomIds, sheetMode });
       res.writeHead(200, {
         'Content-Type': 'application/dxf',
         ...exportSnapshotHeaders(snapshot),
@@ -2622,7 +2843,8 @@ async function handleApi(req, res, pathname) {
     if (!confirmed.ok) return exportSnapshotConflict(res, confirmed);
     const { project, ...snapshot } = confirmed.snapshot;
     try {
-      const { html, filename: base } = await exportRoombook(project, { modelVersion: `v${snapshot.projectSnapshotVersion}` });
+      const sheetMode = ['room', 'cabinet', 'both'].includes(body.sheetMode) ? body.sheetMode : undefined;
+      const { html, filename: base } = await exportRoombook(project, { modelVersion: `v${snapshot.projectSnapshotVersion}`, sheetMode });
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         ...exportSnapshotHeaders(snapshot),
@@ -2645,7 +2867,8 @@ async function handleApi(req, res, pathname) {
     const { project, ...snapshot } = confirmed.snapshot;
     try {
       const layoutRoomIds = Array.isArray(body.layoutRoomIds) ? body.layoutRoomIds.filter((id) => typeof id === 'string') : [];
-      const { pdf, pageCount, filename: base } = await exportPdf(project, { modelVersion: `v${snapshot.projectSnapshotVersion}`, layoutRoomIds });
+      const sheetMode = ['room', 'cabinet', 'both'].includes(body.sheetMode) ? body.sheetMode : undefined;
+      const { pdf, pageCount, filename: base } = await exportPdf(project, { modelVersion: `v${snapshot.projectSnapshotVersion}`, layoutRoomIds, sheetMode });
       res.writeHead(200, {
         'Content-Type': 'application/pdf',
         ...exportSnapshotHeaders(snapshot),

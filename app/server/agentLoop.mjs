@@ -198,77 +198,86 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
       return { ok: true, steps, summary, draftId: currentDraftId, rounds: round };
     }
 
-    // 执行工具调用（目前只处理第一个，简单起见）
-    const tc = aiMsg.tool_calls[0];
-    const toolName = tc.function.name;
-    let toolArgs;
-    try {
-      toolArgs = JSON.parse(tc.function.arguments);
-    } catch {
-      toolArgs = {};
-    }
-    // Agent 模型有时会省略房间字段；没有明确房间目标时，将前端当前房间设为工具参数，
-    // 避免 cad.create_cabinet 的通用 MCP 默认值把柜体放到项目第一个房间。
-    if (toolName === 'cad.create_cabinet' && roomId && !toolArgs.roomId && !toolArgs.roomName) {
-      toolArgs.roomId = roomId;
-      if (roomName) toolArgs.roomName = roomName;
-    }
-    // 透传 draftId
-    if (currentDraftId && !toolArgs.draftId &&
-        ['cad.create_cabinet', 'cad.place_cabinet', 'cad.update_object',
-         'cad.delete_object', 'cad.create_assembly', 'cad.validate'].includes(toolName)) {
-      toolArgs.draftId = currentDraftId;
-    }
-
-    const step = { round, tool: toolName, args: toolArgs, ok: false };
-    const result = await callMcpTool(mcpBaseUrl, token, toolName, toolArgs);
-
-    if (result.ok) {
-      step.ok = true;
-      step.result = result.data;
-      // 记录 draftId
-      if (result.data?.draftId) currentDraftId = result.data.draftId;
-      consecutiveFailures = 0; // 成功清零
-    } else {
-      step.ok = false;
-      step.error = result.error;
-      step.code = result.code;
-      consecutiveFailures++;
-    }
-    steps.push(step);
-    if (onStep) onStep(step);
-
-    // 把工具结果喂回 AI
+    // 支持单轮单次或多次 tool_calls，顺序执行并自动串联 currentDraftId
+    const toolCalls = aiMsg.tool_calls;
     messages.push({
       role: 'assistant',
-      content: null,
-      tool_calls: [tc],
+      content: aiMsg.content ?? null,
+      tool_calls: toolCalls,
     });
-    messages.push({
-      role: 'tool',
-      tool_call_id: tc.id,
-      content: JSON.stringify(result.ok ? result.data : { error: result.error, code: result.code }),
-    });
-
-    // 连续 3 次失败 → 停下，尝试清理 draft（回滚半截变更）
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      // 回滚：删除本轮创建的 draft，避免脏数据残留
-      if (currentDraftId) {
-        try {
-          await callMcpTool(mcpBaseUrl, token, 'cad.discard_draft', { draftId: currentDraftId });
-          steps.push({ round, tool: 'cad.discard_draft', args: { draftId: currentDraftId }, ok: true, result: { note: '已回滚半截变更' } });
-        } catch {
-          /* 回滚失败不掩盖主错误 */
-        }
-        currentDraftId = null;
+    let lastError = '';
+    for (const tc of toolCalls) {
+      const toolName = tc.function.name;
+      let toolArgs;
+      try {
+        toolArgs = JSON.parse(tc.function.arguments);
+      } catch {
+        toolArgs = {};
       }
-      return {
-        ok: false,
-        steps,
-        summary: `连续 3 次失败，已回滚。最后错误：${result.error}。请检查参数或换个说法。`,
-        draftId: null,
-        rounds: round,
-      };
+      // Agent 模型有时会省略房间字段；没有明确房间目标时，将前端当前房间设为工具参数，
+      // 避免 cad.create_cabinet 的通用 MCP 默认值把柜体放到项目第一个房间。
+      if (toolName === 'cad.create_cabinet' && roomId && !toolArgs.roomId && !toolArgs.roomName) {
+        toolArgs.roomId = roomId;
+        if (roomName) toolArgs.roomName = roomName;
+      }
+      // 透传 draftId
+      if (currentDraftId && !toolArgs.draftId &&
+          ['cad.create_cabinet', 'cad.place_cabinet', 'cad.update_object',
+           'cad.delete_object', 'cad.create_assembly', 'cad.duplicate_object',
+           'cad.submit_proposal', 'cad.create_room', 'cad.draw_wall', 'cad.validate'].includes(toolName)) {
+        toolArgs.draftId = currentDraftId;
+      }
+
+      const step = { round, tool: toolName, args: toolArgs, ok: false };
+      const result = await callMcpTool(mcpBaseUrl, token, toolName, toolArgs);
+
+      if (result.ok) {
+        step.ok = true;
+        step.result = result.data;
+        if (result.data?.draftId) currentDraftId = result.data.draftId;
+        step.draftId = currentDraftId;
+        consecutiveFailures = 0;
+      } else {
+        step.ok = false;
+        step.error = result.error;
+        step.code = result.code;
+        step.draftId = currentDraftId;
+        lastError = result.error;
+        consecutiveFailures++;
+      }
+      steps.push(step);
+      if (onStep) {
+        try {
+          await onStep(step, currentDraftId);
+        } catch {
+          /* 回调失败不影响主流程 */
+        }
+      }
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        content: JSON.stringify(result.ok ? result.data : { error: result.error, code: result.code }),
+      });
+
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        if (currentDraftId) {
+          try {
+            await callMcpTool(mcpBaseUrl, token, 'cad.discard_draft', { draftId: currentDraftId });
+            steps.push({ round, tool: 'cad.discard_draft', args: { draftId: currentDraftId }, ok: true, result: { note: '已回滚半截变更' } });
+          } catch {
+            /* 回滚失败不掩盖主错误 */
+          }
+          currentDraftId = null;
+        }
+        return {
+          ok: false,
+          steps,
+          summary: `连续 3 次失败，已回滚。最后错误：${lastError}。请检查参数或换个说法。`,
+          draftId: null,
+          rounds: round,
+        };
+      }
     }
   }
 

@@ -22,7 +22,7 @@ async function readStdin(): Promise<string> {
 
 async function main(): Promise<void> {
   const raw = await readStdin();
-  let input: { project?: Project; modelVersion?: string; rulesPath?: string; layoutRoomIds?: string[] };
+  let input: { project?: Project; modelVersion?: string; rulesPath?: string; layoutRoomIds?: string[]; sheetMode?: 'room' | 'cabinet' | 'both' };
   try {
     input = JSON.parse(raw);
   } catch {
@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   }
   const rules = JSON.parse(readFileSync(input.rulesPath ?? RULES_PATH, 'utf8')) as RuleSet;
   const book = buildRoomBook(input.project, rules, input.modelVersion ?? 'unknown');
-  process.stdout.write(roomBookHtml(book, { layoutRoomIds: input.layoutRoomIds }));
+  process.stdout.write(roomBookHtml(book, { layoutRoomIds: input.layoutRoomIds, sheetMode: input.sheetMode }));
 }
 
 main().catch((e: unknown) => {

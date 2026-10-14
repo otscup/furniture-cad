@@ -681,6 +681,130 @@ export class WorkspaceStore {
     });
   }
 
+
+  /**
+   * 同步浏览器端本地 Project 到服务端 Workspace（P10.2 双向同步 + 空本地防覆盖水位线保护）。
+   *
+   * 保护纪律：
+   *  1. 若 clientHasLocalEdits === false 且服务端 liveModelVersion > 0（说明云端已有 MCP/Agent 成果，
+   *     而本地浏览器刚打开、尚无本地编辑），绝不允许用本地默认示例覆盖云端，直接返回云端快照供前端注水；
+   *  2. 若传入 expectedLiveVersion 且小于当前 liveModelVersion，同时未声明 force=true，
+   *     拒绝静默覆盖并返回 WORKSPACE_VERSION_CONFLICT；
+   *  3. 若项目内容 hash 完全一致，不虚增 liveModelVersion，幂等返回当前快照；
+   *  4. 其余合法本地修改统一经 CommandBus.prepareProjectReplacement 校验并原子落盘、liveModelVersion + 1。
+   */
+  async syncClientProject(
+    project: Project,
+    opts?: {
+      expectedLiveVersion?: number;
+      clientHasLocalEdits?: boolean;
+      force?: boolean;
+      reason?: string;
+    },
+  ): Promise<
+    | {
+        ok: true;
+        unchanged: boolean;
+        hydratedFromServer: boolean;
+        liveModelVersion: number;
+        project: Project;
+      }
+    | {
+        ok: false;
+        code: typeof WORKSPACE_UNIT_ID_CONFLICT | "WORKSPACE_VERSION_CONFLICT" | "PROJECT_INVALID";
+        message: string;
+        liveModelVersion: number;
+        project: Project;
+      }
+  > {
+    return this.serializeLiveWrite(async () => {
+      const identityConflict = this.getUnitIdentityConflict();
+      if (identityConflict) {
+        return {
+          ok: false,
+          code: WORKSPACE_UNIT_ID_CONFLICT,
+          message: identityConflict,
+          liveModelVersion: this.liveModelVersion,
+          project: this.getProjectSnapshot(),
+        };
+      }
+      if (!project || typeof project !== "object" || Array.isArray(project) || !Array.isArray(project.cabinets) || !Array.isArray(project.rooms)) {
+        return {
+          ok: false,
+          code: "PROJECT_INVALID",
+          message: "提交的 project 格式不合法（缺少 rooms 或 cabinets 数组）。",
+          liveModelVersion: this.liveModelVersion,
+          project: this.getProjectSnapshot(),
+        };
+      }
+      const incomingDuplicates = findDuplicateUnitIds(project);
+      if (incomingDuplicates.length > 0) {
+        return {
+          ok: false,
+          code: WORKSPACE_UNIT_ID_CONFLICT,
+          message: unitIdentityConflictMessage("client project", incomingDuplicates),
+          liveModelVersion: this.liveModelVersion,
+          project: this.getProjectSnapshot(),
+        };
+      }
+
+      // 防空覆盖核心保护：当本地声明没有本地未保存编辑（或本地是空柜体）而云端已经有版本演进时，直接把云端真源回传给浏览器注水
+      const currentSnap = this.getProjectSnapshot();
+      const incomingIsEmpty = project.cabinets.length === 0 && currentSnap.cabinets.length > 0;
+      if ((opts?.clientHasLocalEdits === false || (incomingIsEmpty && !opts?.force)) && this.liveModelVersion > 0) {
+        return {
+          ok: true,
+          unchanged: true,
+          hydratedFromServer: true,
+          liveModelVersion: this.liveModelVersion,
+          project: currentSnap,
+        };
+      }
+
+      if (
+        typeof opts?.expectedLiveVersion === "number" &&
+        Number.isInteger(opts.expectedLiveVersion) &&
+        opts.expectedLiveVersion < this.liveModelVersion &&
+        !opts?.force
+      ) {
+        return {
+          ok: false,
+          code: "WORKSPACE_VERSION_CONFLICT",
+          message: `本地基线版本 v${opts.expectedLiveVersion} 落后于服务端当前版本 v${this.liveModelVersion}，已阻止覆盖云端数据。`,
+          liveModelVersion: this.liveModelVersion,
+          project: currentSnap,
+        };
+      }
+
+      const preparedProject = this.bus.prepareProjectReplacement(project);
+      const nextProject = preparedProject.project;
+      const currentHash = this.projectHash(this.bus.getState());
+      const nextHash = this.projectHash(nextProject);
+      if (currentHash === nextHash) {
+        return {
+          ok: true,
+          unchanged: true,
+          hydratedFromServer: false,
+          liveModelVersion: this.liveModelVersion,
+          project: this.getProjectSnapshot(),
+        };
+      }
+
+      const nextVersion = this.liveModelVersion + 1;
+      const savedAt = await this.persistSnapshot(nextProject, nextVersion, this.syncReceipts);
+      this.bus.replacePreparedProject(preparedProject, opts?.reason ?? "sync client project");
+      this.liveModelVersion = nextVersion;
+      this.updatedAt = savedAt;
+      return {
+        ok: true,
+        unchanged: false,
+        hydratedFromServer: false,
+        liveModelVersion: this.liveModelVersion,
+        project: this.getProjectSnapshot(),
+      };
+    });
+  }
+
   /** 创建草稿：从当前 live 快照 fork，并同时记录基线 version + SHA-256 项目 hash。 */
   async createDraft(owner: string): Promise<DraftHandle> {
     return this.serializeLiveWrite(async () => {

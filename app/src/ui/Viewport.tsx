@@ -590,7 +590,7 @@ export function Viewport(props: ViewportProps) {
           const semantic = hitPart(derived.geom.views.pickLines, raw, tol);
           if (semantic) {
             props.onPickPart?.(semantic);
-            const plan = dragPlanOf(semantic);
+            const plan = dragPlanOf(semantic, { allowAnchorDrag: e.shiftKey });
             if (!plan.ok) {
               // 语义识别成功但该边不可拖（例如尺寸基准端）时，必须遵守
               // sheetDrag 的 NoDrag 契约；不能把它当普通生成图元继续建覆盖。

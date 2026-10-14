@@ -190,3 +190,9 @@ export function sourceOverride(sourceKey: string, prim: Prim, space: DrawingSpac
     ...(prim.k === 'text' ? { align: prim.align } : {}), ...meta,
   };
 }
+
+/** 过滤掉已失效或歧义的二维图元覆盖，供界面在用户修改柜体尺寸后一键清理残留覆盖。 */
+export function filterValidDrawingEdits(project: Project, planKeys: string[], sheetKeys: string[]): DrawingEntity[] {
+  const badIds = new Set(drawingSourceProblems(project, planKeys, sheetKeys).map((p) => p.entity.id));
+  return (project.drawingEdits ?? []).filter((e) => !badIds.has(e.id));
+}

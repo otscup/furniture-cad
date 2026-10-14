@@ -22,6 +22,7 @@ const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
 const VALIDATE_EXPORT_TS = join(ROOT, 'scripts', 'validate-export.ts');
 const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
+const TS_NODE_ARGS = Number(process.versions.node.split(".")[0]) >= 22 ? ["--experimental-strip-types", "--no-warnings"] : ["--no-warnings"];
 
 /** 正式导出遇到 ERROR 时返回给 HTTP/MCP 的可识别阻断错误。 */
 export class ExportBlockedError extends Error {
@@ -61,7 +62,7 @@ async function assertExportable(project) {
       fixHint: '将该覆盖恢复到存在的柜体及 top/front/internal 视图，或先删除该覆盖后再导出。',
     }));
   if (unsupportedDrawingIssues.length > 0) throw new ExportBlockedError(unsupportedDrawingIssues);
-  const result = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', VALIDATE_EXPORT_TS], {
+  const result = await run(process.execPath, [...TS_NODE_ARGS, VALIDATE_EXPORT_TS], {
     input: JSON.stringify({ project }),
   });
   let validation;
@@ -130,6 +131,7 @@ function pythonExe() {
     join(ROOT, '.venv', 'Scripts', 'python.exe'),
     join(ROOT, '..', '.venv', 'Scripts', 'python.exe'),
     join(ROOT, '..', '.venv', 'bin', 'python'),
+    'python3',
     'python',
   ]
     .filter(Boolean)
@@ -141,7 +143,7 @@ function pythonExe() {
  * DXF 导出：返回 { buffer, filename, info }。
  * which: ['plan','sheet'] 子集；version: 'R2007' | 'R2000'
  */
-export async function exportDxf(project, { which = ['plan', 'sheet'], version = 'R2007', modelVersion = 'unknown', planRoomIds } = {}) {
+export async function exportDxf(project, { which = ['plan', 'sheet'], version = 'R2007', modelVersion = 'unknown', planRoomIds, sheetMode } = {}) {
   await assertExportable(project);
   const dir = mkdtempSync(join(tmpdir(), 'furniture-dxf-'));
   const neutralPath = join(dir, 'neutral.json');
@@ -154,8 +156,8 @@ export async function exportDxf(project, { which = ['plan', 'sheet'], version = 
     }
   };
   try {
-    const neutralOut = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
-      input: JSON.stringify({ project, which, modelVersion: String(modelVersion), planRoomIds }),
+    const neutralOut = await run(process.execPath, [...TS_NODE_ARGS, EMIT_NEUTRAL_TS], {
+      input: JSON.stringify({ project, which, modelVersion: String(modelVersion), planRoomIds, ...(sheetMode ? { sheetMode } : {}) }),
     });
     writeFileSync(neutralPath, neutralOut.out, 'utf8');
     const infoRaw = await run(pythonExe(), [EXPORT_DXF_PY, neutralPath, dxfPath, version]);
@@ -175,7 +177,7 @@ export async function exportDxf(project, { which = ['plan', 'sheet'], version = 
  */
 export async function exportCutlist(project, { modelVersion = 'unknown' } = {}) {
   await assertExportable(project);
-  const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_NEUTRAL_TS], {
+  const r = await run(process.execPath, [...TS_NODE_ARGS, EMIT_NEUTRAL_TS], {
     input: JSON.stringify({ project, which: [], modelVersion: String(modelVersion) }),
   });
   const n = JSON.parse(r.out);
@@ -215,10 +217,10 @@ export async function exportCutlist(project, { modelVersion = 'unknown' } = {}) 
  * 图纸册 HTML 导出：返回 { html, filename }。
  * 浏览器打开后「打印 → 另存为 PDF」。
  */
-export async function exportRoombook(project, { modelVersion = 'unknown', layoutRoomIds } = {}) {
+export async function exportRoombook(project, { modelVersion = 'unknown', layoutRoomIds, sheetMode } = {}) {
   await assertExportable(project);
-  const r = await run(process.execPath, ['--experimental-strip-types', '--no-warnings', EMIT_ROOMBOOK_TS], {
-    input: JSON.stringify({ project, modelVersion: String(modelVersion), ...(Array.isArray(layoutRoomIds) ? { layoutRoomIds } : {}) }),
+  const r = await run(process.execPath, [...TS_NODE_ARGS, EMIT_ROOMBOOK_TS], {
+    input: JSON.stringify({ project, modelVersion: String(modelVersion), ...(Array.isArray(layoutRoomIds) ? { layoutRoomIds } : {}), ...(sheetMode ? { sheetMode } : {}) }),
   });
   const html = r.out || '';
   if (!html.trim()) throw new Error(r.err || '生成器无输出');
@@ -230,11 +232,11 @@ export async function exportRoombook(project, { modelVersion = 'unknown', layout
  * 服务端真实 PDF 导出：复用 roomBook HTML 的 A3 横向页面和单柜 SVG，
  * 不依赖用户本机浏览器、打印缩放或「打印背景」设置。
  */
-export async function exportPdf(project, { modelVersion = 'unknown', layoutRoomIds = [] } = {}) {
+export async function exportPdf(project, { modelVersion = 'unknown', layoutRoomIds = [], sheetMode } = {}) {
   const selectedLayoutRoomIds = Array.isArray(layoutRoomIds)
     ? layoutRoomIds.filter((id) => typeof id === 'string' && (project?.rooms ?? []).some((room) => room.id === id))
     : [];
-  const { html, filename: htmlFilename } = await exportRoombook(project, { modelVersion, layoutRoomIds: selectedLayoutRoomIds });
+  const { html, filename: htmlFilename } = await exportRoombook(project, { modelVersion, layoutRoomIds: selectedLayoutRoomIds, sheetMode });
   const renderScript = [
     'import sys',
     'from weasyprint import HTML',

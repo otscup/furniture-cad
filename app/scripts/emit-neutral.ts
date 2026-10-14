@@ -31,7 +31,7 @@ async function readStdin(): Promise<string> {
 
 async function main(): Promise<void> {
   const raw = await readStdin();
-  let input: { project?: Project; which?: Array<'plan' | 'sheet'>; modelVersion?: string; rulesPath?: string; planRoomIds?: string[] };
+  let input: { project?: Project; which?: Array<'plan' | 'sheet'>; modelVersion?: string; rulesPath?: string; planRoomIds?: string[]; sheetMode?: 'room' | 'cabinet' | 'both' };
   try {
     input = JSON.parse(raw);
   } catch {
@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   }
   const rules = JSON.parse(readFileSync(input.rulesPath ?? RULES_PATH, 'utf8')) as RuleSet;
   const which = input.which && input.which.length > 0 ? input.which : ['plan', 'sheet'];
-  const out = manufacturingToNeutralExportDefault(input.project, rules, which, input.modelVersion ?? 'unknown', input.planRoomIds);
+  const out = manufacturingToNeutralExportDefault(input.project, rules, which, input.modelVersion ?? 'unknown', input.planRoomIds, input.sheetMode ?? 'cabinet');
   process.stdout.write(JSON.stringify(out));
 }
 

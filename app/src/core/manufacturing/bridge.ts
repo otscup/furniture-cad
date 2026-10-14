@@ -104,10 +104,11 @@ export function manufacturingToNeutralExport(
   which: Array<'plan' | 'sheet'>,
   modelVersion: string,
   selectedRoomIds?: string[],
+  sheetMode: 'room' | 'cabinet' | 'both' = 'cabinet',
 ): NeutralExport {
   const geom = generateProject(project, rules);
   const mfg = deriveManufacturing(project, geom, rules, mfgRules);
-  return toNeutralExport(project, rules, which, modelVersion, manufacturingToPanels(mfg.parts), selectedRoomIds);
+  return toNeutralExport(project, rules, which, modelVersion, manufacturingToPanels(mfg.parts), selectedRoomIds, sheetMode);
 }
 
 /** 便捷：用默认制造规则 */
@@ -117,6 +118,7 @@ export function manufacturingToNeutralExportDefault(
   which: Array<'plan' | 'sheet'>,
   modelVersion: string,
   selectedRoomIds?: string[],
+  sheetMode: 'room' | 'cabinet' | 'both' = 'cabinet',
 ): NeutralExport {
-  return manufacturingToNeutralExport(project, rules, DEFAULT_MANUFACTURING_RULES, which, modelVersion, selectedRoomIds);
+  return manufacturingToNeutralExport(project, rules, DEFAULT_MANUFACTURING_RULES, which, modelVersion, selectedRoomIds, sheetMode);
 }

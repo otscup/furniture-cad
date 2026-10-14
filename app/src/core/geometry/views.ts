@@ -265,8 +265,12 @@ export class DimLayout {
       const levelEnds: number[] = [];
 
       for (const intent of sorted) {
-        const start = axial(intent) - textHalf(intent);
-        const end = axialEnd(intent) + textHalf(intent);
+        const a0 = axial(intent);
+        const a1 = axialEnd(intent);
+        const mid = (a0 + a1) / 2;
+        const th = textHalf(intent) + 25;
+        const start = Math.min(a0 + 1, mid - th);
+        const end = Math.max(a1 - 1, mid + th);
         let level = 0;
         while (level < levelEnds.length && start < levelEnds[level]!) level++;
         if (level >= levelEnds.length) levelEnds.push(end);
@@ -305,8 +309,12 @@ export class DimLayout {
       const levels: number[] = [];
 
       for (const it of sorted) {
-        const s = axial(it) - textHalf(it);
-        const e = axialEnd(it) + textHalf(it);
+        const a0 = axial(it);
+        const a1 = axialEnd(it);
+        const mid = (a0 + a1) / 2;
+        const th = textHalf(it) + 25;
+        const s = Math.min(a0 + 1, mid - th);
+        const e = Math.max(a1 - 1, mid + th);
         let lv = 0;
         while (lv < levelEnds.length && s < levelEnds[lv]!) lv++;
         levels.push(lv);

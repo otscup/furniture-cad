@@ -2,7 +2,8 @@ import { lazy, Suspense, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { CommandBus } from '../core/commandBus.ts';
 import { assemblyConfirmationStatus } from '../core/assemblyConfirmation.ts';
-import { confirmAssembly } from '../core/commands.ts';
+import { confirmAssembly, resizeCabinet, setCabinetParam } from '../core/commands.ts';
+import { buildFurnitureSheet } from '../export/furnitureSheet.ts';
 import { buildCabinetViews } from '../core/geometry/views.ts';
 import { allUnits } from '../core/layoutModel.ts';
 import { displayGroupsForRoom, indexProjectRooms } from '../core/roomIndex.ts';
@@ -93,6 +94,18 @@ export function RoomWorkspace(props: {
   readOnly?: boolean;
   accountConnected: boolean;
   onAccountOpen: () => void;
+  liveDraftPreview?: {
+    draftId: string;
+    project: Project;
+    liveModelVersion: number;
+    baseModelVersion: number;
+    blockingErrors: number;
+    stepText?: string;
+  } | null;
+  onApplyLiveDraft?: (draftId: string) => void;
+  onOpenRemoteDrafts?: () => void;
+  onSyncLocalToServer?: () => void;
+  remoteDiffers?: boolean;
   children?: ReactNode;
 }): ReactNode {
   const groups = useMemo(() => indexProjectRooms(props.project), [props.project]);
@@ -136,6 +149,41 @@ export function RoomWorkspace(props: {
     setPendingAssemblyId(null);
     setAssemblyConfirmationMessage(`已明确确认「${pendingAssembly.name}」；只影响连续浏览，不改变逐柜生产图。`);
   };
+
+  const [wholeSheetOpen, setWholeSheetOpen] = useState(true);
+  const wholeRoomSheetSvg = useMemo(() => {
+    if (!activeRoom || activeRoom.cabinets.length === 0) return null;
+    try {
+      const sheet = buildFurnitureSheet(activeRoom.room, activeRoom.cabinets, props.project, props.rules, {
+        furnitureName: `${activeRoom.room.name}整体柜`,
+      });
+      return primsToSvg(sheet.prims, 'workspace-whole-room-sheet-svg');
+    } catch {
+      return null;
+    }
+  }, [activeRoom, props.project, props.rules, props.version]);
+
+  const liveDraftSheetSvg = useMemo(() => {
+    const dp = props.liveDraftPreview?.project;
+    if (!dp) return null;
+    const dGroups = indexProjectRooms(dp);
+    const targetGroup = (activeRoom ? dGroups.find((g) => g.room.id === activeRoom.room.id || g.room.name === activeRoom.room.name) : null)
+      ?? dGroups.find((g) => g.cabinets.length > 0)
+      ?? dGroups[0];
+    if (!targetGroup || targetGroup.cabinets.length === 0) return null;
+    try {
+      const sheet = buildFurnitureSheet(targetGroup.room, targetGroup.cabinets, dp, props.rules, {
+        furnitureName: `${targetGroup.room.name}·MCP实时草稿`,
+      });
+      return {
+        svg: primsToSvg(sheet.prims, 'workspace-live-draft-sheet-svg'),
+        roomName: targetGroup.room.name,
+        cabinetCount: targetGroup.cabinets.length,
+      };
+    } catch {
+      return null;
+    }
+  }, [props.liveDraftPreview, activeRoom, props.rules]);
 
   const cabinetViews = useMemo(() => {
     const output = new Map<string, { front: string; internal: string; top: string; error?: string }>();
@@ -242,11 +290,79 @@ export function RoomWorkspace(props: {
                       ＋ 添加柜体
                     </button>
                   ) : null}
+                  {props.remoteDiffers && props.onSyncLocalToServer ? (
+                    <button type="button" className="workspace-button workspace-button-warning" onClick={props.onSyncLocalToServer} disabled={props.readOnly} data-testid="workspace-sync-to-server-button" title="将当前浏览器修改同步到服务端工作区，解锁 PDF/DXF 导出">
+                      ⚡ 同步修改到云端
+                    </button>
+                  ) : null}
                   <button type="button" className="workspace-button workspace-button-quiet" onClick={() => props.onOpenCad(undefined, activeRoom.room.id)} disabled={props.readOnly} title={props.readOnly ? '历史重复 Unit ID 项目只读；须显式修复/迁移后才能编辑' : '旧版 CAD 高级编辑入口继续保留'}>
                     高级 CAD
                   </button>
                 </div>
               </div>
+
+              {props.liveDraftPreview && liveDraftSheetSvg ? (
+                <section className="workspace-live-draft-stage" aria-label="MCP 与 Agent 实时绘制同步预览" data-testid="workspace-live-draft-stage">
+                  <header className="workspace-whole-room-head">
+                    <div>
+                      <strong>⚡ MCP / Agent 正在实时绘图（草稿 {props.liveDraftPreview.draftId}）</strong>
+                      <span>
+                        {liveDraftSheetSvg.roomName} · 已绘制 {liveDraftSheetSvg.cabinetCount} 台柜体
+                        {props.liveDraftPreview.stepText ? ` · 最新动作：${props.liveDraftPreview.stepText}` : ''}
+                        {props.liveDraftPreview.blockingErrors > 0 ? ` · ${props.liveDraftPreview.blockingErrors} 项待修正` : ' · 校验 0 错误'}
+                      </span>
+                    </div>
+                    <div className="workspace-room-actions">
+                      {props.onApplyLiveDraft ? (
+                        <button
+                          type="button"
+                          className="workspace-button workspace-button-primary"
+                          data-testid="workspace-apply-live-draft"
+                          disabled={props.readOnly}
+                          onClick={() => props.onApplyLiveDraft?.(props.liveDraftPreview!.draftId)}
+                        >
+                          ✅ 一键采纳并同步到画布
+                        </button>
+                      ) : null}
+                      {props.onOpenRemoteDrafts ? (
+                        <button type="button" className="workspace-button workspace-button-quiet" onClick={props.onOpenRemoteDrafts}>
+                          草稿详情
+                        </button>
+                      ) : null}
+                    </div>
+                  </header>
+                  <div
+                    className="workspace-whole-room-canvas"
+                    role="img"
+                    aria-label="MCP 实时草稿整墙四视图预览"
+                    dangerouslySetInnerHTML={{ __html: liveDraftSheetSvg.svg }}
+                  />
+                </section>
+              ) : null}
+
+              {wholeRoomSheetSvg ? (
+                <section className="workspace-whole-room-sheet" aria-label={`${activeRoom.room.name}整墙一体化四视图`} data-testid="workspace-whole-room-sheet">
+                  <header className="workspace-whole-room-head">
+                    <div>
+                      <strong>📐 {activeRoom.room.name} · 整房/整墙一体化生产四视图（对标工厂 A3 标准图幅）</strong>
+                      <span>同时展示本房间全部地柜俯视、吊柜俯视、正面外观与内部结构（共 {activeRoom.cabinets.length} 台柜体，自动防遮挡展开，与导出 PDF/DXF 完全同源）</span>
+                    </div>
+                    <div className="workspace-room-actions">
+                      <button type="button" className="workspace-button workspace-button-quiet" onClick={() => setWholeSheetOpen((v) => !v)}>
+                        {wholeSheetOpen ? '收起整墙总图' : '展开整墙总图'}
+                      </button>
+                    </div>
+                  </header>
+                  {wholeSheetOpen ? (
+                    <div
+                      className="workspace-whole-room-canvas"
+                      role="img"
+                      aria-label={`${activeRoom.room.name}整体四视图`}
+                      dangerouslySetInnerHTML={{ __html: wholeRoomSheetSvg }}
+                    />
+                  ) : null}
+                </section>
+              ) : null}
               {!activeRoom.unassigned ? (
                 <SharedPanelsPanel
                   project={props.project}
@@ -380,6 +496,93 @@ export function RoomWorkspace(props: {
                             </button>
                           </div>
                         </div>
+                        {!props.readOnly ? (
+                          <div className="workspace-quick-dims" aria-label={`${cabinet.name}快速改尺寸`}>
+                            <label>
+                              宽
+                              <input
+                                className="input"
+                                type="number"
+                                min={150}
+                                max={6000}
+                                defaultValue={cabinet.params.width}
+                                key={`w-${cabinet.id}-${cabinet.params.width}`}
+                                onBlur={(e) => {
+                                  const val = Math.round(Number(e.target.value));
+                                  if (Number.isFinite(val) && val >= 150 && val !== cabinet.params.width) {
+                                    props.bus.execute(resizeCabinet(cabinet, { width: val }));
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                }}
+                              />
+                            </label>
+                            <label>
+                              高
+                              <input
+                                className="input"
+                                type="number"
+                                min={200}
+                                max={3000}
+                                defaultValue={cabinet.params.height}
+                                key={`h-${cabinet.id}-${cabinet.params.height}`}
+                                onBlur={(e) => {
+                                  const val = Math.round(Number(e.target.value));
+                                  if (Number.isFinite(val) && val >= 200 && val !== cabinet.params.height) {
+                                    props.bus.execute(resizeCabinet(cabinet, { height: val }));
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                }}
+                              />
+                            </label>
+                            <label>
+                              深
+                              <input
+                                className="input"
+                                type="number"
+                                min={150}
+                                max={1200}
+                                defaultValue={cabinet.params.depth}
+                                key={`d-${cabinet.id}-${cabinet.params.depth}`}
+                                onBlur={(e) => {
+                                  const val = Math.round(Number(e.target.value));
+                                  if (Number.isFinite(val) && val >= 150 && val !== cabinet.params.depth) {
+                                    props.bus.execute(resizeCabinet(cabinet, { depth: val }));
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                }}
+                              />
+                            </label>
+                            {(cabinet.params.cabinetType === 'wall' || (cabinet.params.mountHeight ?? 0) > 0) ? (
+                              <label>
+                                离地
+                                <input
+                                  className="input"
+                                  type="number"
+                                  min={100}
+                                  max={2600}
+                                  defaultValue={cabinet.params.mountHeight ?? 1450}
+                                  key={`m-${cabinet.id}-${cabinet.params.mountHeight ?? 0}`}
+                                  onBlur={(e) => {
+                                    const val = Math.round(Number(e.target.value));
+                                    if (Number.isFinite(val) && val > 0 && val !== (cabinet.params.mountHeight ?? 0)) {
+                                      props.bus.execute(setCabinetParam(cabinet, 'mountHeight', val, `离地高 → ${val}mm`));
+                                    }
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+                                  }}
+                                />
+                              </label>
+                            ) : null}
+                            <span style={{ color: 'var(--muted)', fontSize: 10 }}>回车或失焦直接生效</span>
+                          </div>
+                        ) : null}
                         {referenceNotes.length > 0 ? (
                           <div role="note" style={{ marginTop: 10, padding: '8px 10px', border: '1px solid #c94e42', background: '#fff1ef', color: '#751c15', fontSize: 13, lineHeight: 1.45 }}>
                             <strong>参考预留｜非 CNC 开孔｜待拆单确认</strong>

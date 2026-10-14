@@ -86,9 +86,13 @@ export function visionResultToNormalized(result: VisionResult, opts: VisionToNor
   const cabinets: NormalizedCabinet[] = result.cabinets.map((c: VisionCabinet, i: number) => {
     const ref = c.ref || `vis_${i + 1}`;
     const name = c.name || ref;
-    const w = c.width?.value ?? null;
-    const h = c.height?.value ?? null;
-    const d = c.depth?.value ?? null;
+    const rawW = c.width?.value ?? null;
+    const rawH = c.height?.value ?? null;
+    const rawD = c.depth?.value ?? null;
+    // 若识别出了柜体但缺失宽高深，自动赋予常见标准默认尺寸（宽900×高2100×深600）并记入 caveats，先生成 CAD 供页面直接人工调整
+    const w = rawW ?? 900;
+    const h = rawH ?? 2100;
+    const d = rawD ?? 600;
     const cabConf: Confidence = c.confidence;
 
     // 可见结构（有才翻译，绝不脑补）
@@ -165,15 +169,24 @@ export function visionResultToNormalized(result: VisionResult, opts: VisionToNor
     connections: null,
   }));
 
-  // 真正说不清的 → questions（硬阻断）
+  // 当完全没识别出任何柜体（cabinets 为空）时，ambiguous 进入 questions 硬阻断（保持模糊图验收契约）；
+  // 当已识别出至少 1 个柜体时，将 ambiguous 与缺失尺寸降级为顶层 caveats 非阻断提示，让 CAD 先画出来供页面人工修改！
   const questions: string[] = [];
-  for (const a of result.ambiguous ?? []) {
-    if (typeof a === 'string' && a.trim()) questions.push(a);
-  }
-  // 识别不到任何尺寸的柜体 → 必须问
-  for (const c of result.cabinets) {
-    if (c.width == null && c.height == null) {
-      questions.push(`柜体「${c.name || c.ref}」识别不到任何尺寸，请告诉它的真实宽/高后再导入`);
+  const topCaveats: string[] = [];
+  if (result.cabinets.length === 0) {
+    for (const a of result.ambiguous ?? []) {
+      if (typeof a === 'string' && a.trim()) questions.push(a);
+    }
+  } else {
+    for (const a of result.ambiguous ?? []) {
+      if (typeof a === 'string' && a.trim()) {
+        topCaveats.push(`识图待复核项：${a}（已按默认/估计值先行生成图纸，可直接在页面修改）`);
+      }
+    }
+    for (const c of result.cabinets) {
+      if (c.width == null && c.height == null) {
+        topCaveats.push(`柜体「${c.name || c.ref}」原图未标注宽高，已按默认 900×2100×600mm 暂填，请在工作台直接修改`);
+      }
     }
   }
 
@@ -188,8 +201,87 @@ export function visionResultToNormalized(result: VisionResult, opts: VisionToNor
     assemblies: assemblies.length ? assemblies : null,
     assumptions: null,
     questions: questions.length ? questions : null,
+    caveats: topCaveats.length ? topCaveats : undefined,
     // P5 真实视觉识别是已验证能力；但具体生产结构仍靠 caveats 暴露，不在此标未验证
     unverifiedCapabilities: null,
+  };
+}
+
+/**
+ * 双图/多图识别结果融合（效果图 + 尺寸图联合建模）：
+ *  - 以效果图（render）提供丰富的分格（rows/units/components/门抽数量）；
+ *  - 以尺寸图（dimension）提供精确的宽高深标注（source="annotation"）与 scale.known=true；
+ *  - 按柜体序号或名称智能配对合并，若尺寸图多出独立柜体则一并保留。
+ */
+export function mergeVisionResults(
+  items: Array<{ result: VisionResult; mode: 'render' | 'dimension'; name?: string }>,
+): VisionResult {
+  if (items.length === 0) {
+    return { cabinets: [], overallConfidence: 'low' };
+  }
+  if (items.length === 1) return items[0]!.result;
+
+  const renderItems = items.filter((i) => i.mode === 'render');
+  const dimItems = items.filter((i) => i.mode === 'dimension');
+  const baseResult = (renderItems[0] ?? items[0])!.result;
+  const dimResult = dimItems[0]?.result ?? null;
+  if (!dimResult) return baseResult;
+
+  const mergedCabinets: VisionCabinet[] = baseResult.cabinets.map((rc, idx) => {
+    const dc =
+      dimResult.cabinets.find((d) => d.name && rc.name && d.name === rc.name) ??
+      dimResult.cabinets[idx] ??
+      null;
+    if (!dc) return rc;
+    const pickDim = (
+      rDim: VisionCabinet['width'],
+      dDim: VisionCabinet['width'],
+    ): VisionCabinet['width'] => {
+      if (dDim && (dDim.source === 'annotation' || dDim.source === 'reference' || !rDim)) return dDim;
+      return rDim ?? dDim;
+    };
+    const notVis = new Set(rc.notVisible ?? []);
+    if (dc.width?.source === 'annotation' || dc.height?.source === 'annotation') {
+      notVis.delete('real-size');
+    }
+    if (dc.depth?.source === 'annotation') {
+      notVis.delete('depth');
+    }
+    return {
+      ...rc,
+      name: rc.name || dc.name,
+      width: pickDim(rc.width, dc.width),
+      height: pickDim(rc.height, dc.height),
+      depth: pickDim(rc.depth, dc.depth),
+      rows: rc.rows?.length ? rc.rows : dc.rows,
+      units: rc.units?.length ? rc.units : dc.units,
+      components: rc.components?.length ? rc.components : dc.components,
+      confidence: dc.confidence === 'high' || rc.confidence === 'high' ? 'high' : 'medium',
+      notVisible: [...notVis],
+    };
+  });
+
+  // 若尺寸图识别出的柜体数量多于效果图，补齐剩余柜体
+  if (dimResult.cabinets.length > mergedCabinets.length) {
+    for (let i = mergedCabinets.length; i < dimResult.cabinets.length; i++) {
+      mergedCabinets.push(dimResult.cabinets[i]!);
+    }
+  }
+
+  const notes = [
+    ...(baseResult.notes ?? []),
+    ...(dimResult.notes ?? []),
+    `已融合 ${renderItems.length} 张效果图（外观分格）与 ${dimItems.length} 张尺寸图（精确标注尺寸）`,
+  ];
+  const ambiguous = [...(baseResult.ambiguous ?? []), ...(dimResult.ambiguous ?? [])];
+
+  return {
+    cabinets: mergedCabinets,
+    relations: baseResult.relations?.length ? baseResult.relations : dimResult.relations,
+    scale: dimResult.scale?.known ? dimResult.scale : (baseResult.scale ?? dimResult.scale),
+    overallConfidence: dimResult.scale?.known ? 'high' : baseResult.overallConfidence,
+    notes,
+    ambiguous: ambiguous.length ? ambiguous : undefined,
   };
 }
 

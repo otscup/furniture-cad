@@ -755,13 +755,6 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       /** 系统替它改了落位时要写在 summary 里 —— "界面读数必须是最终会被用到的那个值" */
       let note = '';
       const base = defaultCabinetParams(rules);
-      const place = { x: mm(Number(p.atX ?? 0)), y: mm(Number(p.atY ?? 0)) };
-      if (p.atX === undefined && p.atY === undefined) {
-        // 没给落位：放在房间内已有柜体的右侧，避免新柜与旧柜必然重叠（重叠会立刻产生干涉 ERROR）
-        const same = project.cabinets.filter((c) => c.roomId === room.id);
-        place.x = same.reduce((m, c) => Math.max(m, c.placement.x + c.params.width), 0);
-        place.y = same.length ? same[0].placement.y : 0;
-      }
       const width = p.width === undefined ? base.width : mm(Number(p.width));
       const height = p.height === undefined ? base.height : mm(Number(p.height));
       const depth = p.depth === undefined ? base.depth : mm(Number(p.depth));
@@ -770,6 +763,21 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       const mountHeight = p.mountHeight === undefined ? 0 : Number(p.mountHeight);
       if (!Number.isInteger(mountHeight) || mountHeight < 0 || mountHeight > 3000) return { ok: false, error: 'mountHeight 必须是 0~3000mm 整数' };
       if ((cabinetType === 'wall' && mountHeight <= 0) || (cabinetType !== 'wall' && mountHeight > 0)) return { ok: false, error: '吊柜必须给正数 mountHeight；地柜/高柜/岛台的 mountHeight 必须为 0' };
+      const place = { x: mm(Number(p.atX ?? 0)), y: mm(Number(p.atY ?? 0)) };
+      if (p.atX === undefined && p.atY === undefined) {
+        // 没给落位：只对同一房间内在垂直标高范围 [mountHeight, mountHeight+height] 发生重叠的柜体做横向避让。
+        // 这样吊柜（mountHeight > 0）会自动从 X=0（或通顶高柜右侧）排在地柜正上方，实现上下对齐，不再被地柜挤到右侧墙外。
+        const sameRoom = project.cabinets.filter((c) => c.roomId === room.id);
+        const z0 = mountHeight;
+        const z1 = mountHeight + height;
+        const verticallyOverlapping = sameRoom.filter((c) => {
+          const cz0 = c.params.mountHeight ?? 0;
+          const cz1 = cz0 + c.params.height;
+          return cz0 < z1 && cz1 > z0;
+        });
+        place.x = verticallyOverlapping.reduce((m, c) => Math.max(m, c.placement.x + c.params.width), 0);
+        place.y = sameRoom.length ? sameRoom[0].placement.y : 0;
+      }
       const bodyLift = p.bodyLift === undefined ? (cabinetType === 'wall' ? 0 : base.bodyLift) : Number(p.bodyLift);
       if (!Number.isInteger(bodyLift) || bodyLift < 0 || bodyLift > 300) return { ok: false, error: 'bodyLift 必须是 0~300mm 整数' };
       let counterCutouts: Cabinet['params']['counterCutouts'];

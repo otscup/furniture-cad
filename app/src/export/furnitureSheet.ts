@@ -127,12 +127,96 @@ function linePrim(x1: number, y1: number, x2: number, y2: number, layer: string,
 
 // ─────────────────────────── 柜体分类 ───────────────────────────
 
-function classifyCabinet(cab: Cabinet): 'base' | 'wall' | 'tall' {
+export function classifyCabinet(cab: Cabinet): 'base' | 'wall' | 'tall' {
   const h = cab.params.height;
   const mountH = cab.params.mountHeight ?? 0;
-  if (mountH > 500) return 'wall';
-  if (h > 1800) return 'tall';
+  if (cab.params.cabinetType === 'wall' || mountH > 300) return 'wall';
+  if (cab.params.cabinetType === 'tall' || h > 1800) return 'tall';
   return 'base';
+}
+
+/**
+ * 计算整墙/整房多柜体展开 X 坐标（防遮挡 + L/U 型转角墙展开）：
+ *  1. 同一墙面方向（rotation 0°/180° 按 X，90°/270° 按 Y）保持真实相对间距；
+ *  2. 不同墙面方向（L 型/U 型转角）按墙分组依次展开，组间留 260mm 转角分隔，不再跳过旋转柜；
+ *  3. 若同墙内两只柜体在水平 [x0, x1] 与垂直 [mountHeight, mountHeight+height] 同时发生重叠
+ *     （例如未落位的新建柜、前后排岛台遮挡），自动将后一柜向右顺延避让，彻底消除柜体互相遮挡；
+ *     而地柜（mountHeight=0）与正上方吊柜（mountHeight>0）因垂直标高不重叠，保持相同 X 上下对齐！
+ */
+export function computeUnfoldedWallX(cabinets: Cabinet[]): Map<string, number> {
+  const result = new Map<string, number>();
+  if (cabinets.length === 0) return result;
+  if (cabinets.length === 1) {
+    result.set(cabinets[0]!.id, cabinets[0]!.placement.x);
+    return result;
+  }
+
+  const rotNorm = (rot: number): number => {
+    const r = ((Math.round(rot / 90) * 90) % 360 + 360) % 360;
+    return r;
+  };
+  const alongWallCoord = (cab: Cabinet): number => {
+    const r = rotNorm(cab.placement.rotation);
+    return r === 90 || r === 270 ? cab.placement.y : cab.placement.x;
+  };
+  const depthCoord = (cab: Cabinet): number => {
+    const r = rotNorm(cab.placement.rotation);
+    return r === 90 || r === 270 ? cab.placement.x : cab.placement.y;
+  };
+
+  // 按墙面朝向分组（0 -> 90 -> 180 -> 270）
+  const wallOrder = [0, 90, 180, 270];
+  const groups = new Map<number, Cabinet[]>();
+  for (const cab of cabinets) {
+    const g = rotNorm(cab.placement.rotation);
+    const list = groups.get(g) ?? [];
+    list.push(cab);
+    groups.set(g, list);
+  }
+
+  const singleWallOnly = groups.size === 1 && groups.has(0);
+  let wallCursorX = singleWallOnly ? Math.min(...cabinets.map((c) => c.placement.x)) : 0;
+
+  for (const gKey of wallOrder) {
+    const list = groups.get(gKey);
+    if (!list || list.length === 0) continue;
+    const sorted = [...list].sort((a, b) => {
+      const da = alongWallCoord(a) - alongWallCoord(b);
+      if (Math.abs(da) > 1) return da;
+      const dd = depthCoord(a) - depthCoord(b);
+      if (Math.abs(dd) > 1) return dd;
+      return (a.params.mountHeight ?? 0) - (b.params.mountHeight ?? 0);
+    });
+    const minAlong = Math.min(...sorted.map(alongWallCoord));
+    const placedSpans: Array<{ x0: number; x1: number; z0: number; z1: number; depth: number }> = [];
+    let groupMaxX = wallCursorX;
+
+    for (const cab of sorted) {
+      let desiredX = wallCursorX + (alongWallCoord(cab) - minAlong);
+      const w = cab.params.width;
+      const z0 = cab.params.mountHeight ?? 0;
+      const z1 = z0 + cab.params.height;
+      const d = depthCoord(cab);
+
+      // 若与已放置的同标高段柜体在水平方向重叠，向右顺延防遮挡
+      let conflict = placedSpans.find(
+        (s) => desiredX < s.x1 - 1 && desiredX + w > s.x0 + 1 && z0 < s.z1 - 1 && z1 > s.z0 + 1,
+      );
+      while (conflict) {
+        const gap = Math.abs(d - conflict.depth) > 80 ? 160 : 0;
+        desiredX = conflict.x1 + gap;
+        conflict = placedSpans.find(
+          (s) => desiredX < s.x1 - 1 && desiredX + w > s.x0 + 1 && z0 < s.z1 - 1 && z1 > s.z0 + 1,
+        );
+      }
+
+      result.set(cab.id, desiredX);
+      placedSpans.push({ x0: desiredX, x1: desiredX + w, z0, z1, depth: d });
+      groupMaxX = Math.max(groupMaxX, desiredX + w);
+    }
+    wallCursorX = groupMaxX + 260;
+  }
+  return result;
 }
 
 // ─────────────────────────── 视图生成（1:1 mm） ───────────────────────────
@@ -151,12 +235,14 @@ function buildRawView(
   yOffset: (cab: Cabinet) => number = () => 0,
   drawingEdits: DrawingEntity[] = [],
   viewPlacements: Record<string, Vec2> = {},
+  unfoldedX?: Map<string, number>,
 ): RawView {
   const prims: Prim[] = [];
   if (cabinets.length === 0) return { prims, w: 0, h: 0 };
 
-  const sorted = [...cabinets].sort((a, b) => a.placement.x - b.placement.x);
-  const x0 = sorted[0]!.placement.x;
+  const xOf = (c: Cabinet): number => unfoldedX?.get(c.id) ?? c.placement.x;
+  const sorted = [...cabinets].sort((a, b) => xOf(a) - xOf(b));
+  const x0 = xOf(sorted[0]!);
   let maxX = 0;
   let maxH = 0;
 
@@ -219,7 +305,7 @@ function buildRawView(
     }
     const origin = vs.meta[viewKind].origin;
     const dy = yOffset(cab);
-    const px = cab.placement.x - x0;
+    const px = xOf(cab) - x0;
     let placed = translatePrims(viewPrims, px - origin.x, dy - origin.y);
     if (viewKind === 'top' && placed.length > 0) {
       // 俯视图的外置预留标签落在原始视图 bbox 下方；整体归一到 y=0，
@@ -401,23 +487,33 @@ function addFrontPartitionAndDoorDims(
   dimensions: ReturnType<typeof deriveDoorDimensions>,
   scale: number,
   cabinetX0: number,
+  unfoldedX?: Map<string, number>,
 ): void {
   const topY = box.y + box.h;
+  const xOf = (c: Cabinet): number => unfoldedX?.get(c.id) ?? c.placement.x;
   const mapX = (cabinet: Cabinet, modelX: number): number =>
-    box.x + (cabinet.placement.x - cabinetX0 + modelX - rawBounds.minX) * scale;
+    box.x + (xOf(cabinet) - cabinetX0 + modelX - rawBounds.minX) * scale;
 
-  const partitionGroups = new Map<string, { partition: CabinetPartitionDimension; rows: Set<number> }>();
+  const partitionGroups = new Map<string, { partition: CabinetPartitionDimension; rows: Set<number>; kinds: Set<string> }>();
   for (const partition of dimensions.partitions) {
     if (partition.face !== 'front' || !cabinets.includes(partition.cabinet)) continue;
-    const key = `${partition.cabinet.id}|${Math.round(partition.x0)}|${Math.round(partition.x1)}|${partition.partitionKind}`;
-    const group = partitionGroups.get(key) ?? { partition, rows: new Set<number>() };
+    const mx0 = Math.round(mapX(partition.cabinet, partition.x0));
+    const mx1 = Math.round(mapX(partition.cabinet, partition.x1));
+    const key = cabinets.length > 1
+      ? `${mx0}|${mx1}`
+      : `${partition.cabinet.id}|${Math.round(partition.x0)}|${Math.round(partition.x1)}|${partition.partitionKind}`;
+    const group = partitionGroups.get(key) ?? { partition, rows: new Set<number>(), kinds: new Set<string>() };
     group.rows.add(partition.rowIndex);
+    group.kinds.add(partition.partitionKind);
     partitionGroups.set(key, group);
   }
-  for (const { partition, rows } of partitionGroups.values()) {
-    const label = rows.size > 1
-      ? `正${[...rows].sort((a, b) => a - b).map((row) => `R${row + 1}`).join('+')}·${partition.partitionKind}/${Math.round(partition.x1 - partition.x0)}`
-      : partition.label;
+  for (const { partition, rows, kinds } of partitionGroups.values()) {
+    const kindStr = [...kinds].join('+');
+    const label = cabinets.length > 1 && kinds.size > 1
+      ? `正${kindStr}/${Math.round(partition.x1 - partition.x0)}`
+      : rows.size > 1
+        ? `正${[...rows].sort((a, b) => a - b).map((row) => `R${row + 1}`).join('+')}·${partition.partitionKind}/${Math.round(partition.x1 - partition.x0)}`
+        : partition.label;
     dims.add({
       p0: { x: mapX(partition.cabinet, partition.x0), y: topY },
       p1: { x: mapX(partition.cabinet, partition.x1), y: topY },
@@ -430,7 +526,11 @@ function addFrontPartitionAndDoorDims(
   const leafGroups = new Map<string, DoorLeafDimension>();
   for (const leaf of dimensions.leaves) {
     if (leaf.face !== 'front' || !cabinets.includes(leaf.cabinet)) continue;
-    const key = `${leaf.cabinet.id}|${Math.round(leaf.x0)}|${Math.round(leaf.x1)}|${Math.round(leaf.width)}`;
+    const mx0 = Math.round(mapX(leaf.cabinet, leaf.x0));
+    const mx1 = Math.round(mapX(leaf.cabinet, leaf.x1));
+    const key = cabinets.length > 1
+      ? `${mx0}|${mx1}|${Math.round(leaf.width)}`
+      : `${leaf.cabinet.id}|${Math.round(leaf.x0)}|${Math.round(leaf.x1)}|${Math.round(leaf.width)}`;
     if (!leafGroups.has(key)) leafGroups.set(key, leaf);
   }
   for (const leaf of leafGroups.values()) {
@@ -455,6 +555,8 @@ export function buildFurnitureSheet(
   const furnitureName = opts.furnitureName ?? room.name;
   const prims: Prim[] = [];
 
+  const unfoldedX = computeUnfoldedWallX(cabinets);
+  const xOf = (c: Cabinet): number => unfoldedX.get(c.id) ?? c.placement.x;
   const baseCabs = cabinets.filter((c) => classifyCabinet(c) === 'base');
   const wallCabs = cabinets.filter((c) => classifyCabinet(c) === 'wall');
   const tallCabs = cabinets.filter((c) => classifyCabinet(c) === 'tall');
@@ -462,13 +564,14 @@ export function buildFurnitureSheet(
   const projectViews = buildProjectViews(project, rules);
   const drawings = project.drawingEdits ?? [];
 
-  const planBase = buildRawView(planCabs, 'top', rules, () => 0, drawings, projectViews.placements);
-  const planWall = buildRawView(wallCabs, 'top', rules, () => 0, drawings, projectViews.placements);
-  // 单柜交付只需要一个俯视图：将它居中置于上排，避免衣柜/书柜右上角空出整块视图槽。
-  const planSingle = cabinets.length === 1 ? buildRawView(cabinets, 'top', rules, () => 0, drawings, projectViews.placements) : null;
+  const planBase = buildRawView(planCabs, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);
+  const planWall = buildRawView(wallCabs, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);
+  // 只有同时存在地柜/高柜与吊柜时才分左右双俯视图（地柜平面结构图 + 吊柜平面结构图）；否则将整体俯视图居中置于上排
+  const hasDualPlan = planCabs.length > 0 && wallCabs.length > 0;
+  const planSingle = !hasDualPlan ? buildRawView(cabinets, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX) : null;
   const mountY = (cab: Cabinet) => cab.params.mountHeight ?? 0;
-  const elevFront = buildRawView(cabinets, 'front', rules, mountY, drawings, projectViews.placements);
-  const elevInternal = buildRawView(cabinets, 'internal', rules, mountY, drawings, projectViews.placements);
+  const elevFront = buildRawView(cabinets, 'front', rules, mountY, drawings, projectViews.placements, unfoldedX);
+  const elevInternal = buildRawView(cabinets, 'internal', rules, mountY, drawings, projectViews.placements, unfoldedX);
 
   // ── 缩放：四视图统一缩放，确保占满 70%+ 页面 ──
   const availViewW = (DRAW_W - VIEW_GAP_X) / 2;
@@ -482,7 +585,7 @@ export function buildFurnitureSheet(
   let s = Math.max(Math.min(sW, sPlanH, sElevH, 2.0), 0.1);
   const doorDimensions = deriveDoorDimensions(cabinets, rules);
   const elevFrontRawBounds = primsBBox(elevFront.prims);
-  const frontCabinetX0 = cabinets.length > 0 ? Math.min(...cabinets.map((cabinet) => cabinet.placement.x)) : 0;
+  const frontCabinetX0 = cabinets.length > 0 ? Math.min(...cabinets.map((cabinet) => xOf(cabinet))) : 0;
   const buildFrontDimensionProbe = (candidateScale: number): DimLayout => {
     const probe = new DimLayout();
     if (elevFront.w <= 0) return probe;
@@ -497,21 +600,22 @@ export function buildFurnitureSheet(
       p0: { x: probeBox.x, y: topY }, p1: { x: probeBox.x + probeBox.w, y: topY },
       txt: `${Math.round(probeBox.w / candidateScale)}`, orientation: 'h', side: 'top', chain: 'ef-total', baseOffset: 350, textOffset: 150,
     });
-    addFrontPartitionAndDoorDims(probe, probeBox, elevFrontRawBounds, cabinets, doorDimensions, candidateScale, frontCabinetX0);
+    addFrontPartitionAndDoorDims(probe, probeBox, elevFrontRawBounds, cabinets, doorDimensions, candidateScale, frontCabinetX0, unfoldedX);
     return probe;
   };
 
   const BASE_FRONT_DIM_BAND = 250 + 350 + 500 + ROW_GAP_Y;
+  const PLAN_BOTTOM_RESERVE = 1180; // 俯视图底部尺寸线(350) + 俯视图标题(820) + 安全间距(360)
   const PLAN_TOP_RESERVE = 700; // 350mm 尺寸线 + 延伸线/文字/外边距的安全空间
   let frontDimensionProbe = buildFrontDimensionProbe(s);
-  let frontDimBand = Math.max(BASE_FRONT_DIM_BAND, frontDimensionProbe.outermostOffset('top') + 350);
+  let frontDimBand = Math.max(BASE_FRONT_DIM_BAND, frontDimensionProbe.outermostOffset('top') + PLAN_BOTTOM_RESERVE);
   // 门数越多，文字避让可能增加若干层尺寸链；把这些层级计入缩放上限，保证俯视图仍落在 A3 内。
   for (let pass = 0; pass < 12; pass++) {
     const pageScaleLimit = (SHEET_H - MARGIN - DRAW_Y - frontDimBand - PLAN_TOP_RESERVE) / (contentElevH + contentPlanH);
     if (pageScaleLimit >= s - 1e-6) break;
     s = Math.max(0.1, Math.min(s, pageScaleLimit));
     frontDimensionProbe = buildFrontDimensionProbe(s);
-    frontDimBand = Math.max(BASE_FRONT_DIM_BAND, frontDimensionProbe.outermostOffset('top') + 350);
+    frontDimBand = Math.max(BASE_FRONT_DIM_BAND, frontDimensionProbe.outermostOffset('top') + PLAN_BOTTOM_RESERVE);
   }
 
   // 2x2 布局：
@@ -561,22 +665,27 @@ export function buildFurnitureSheet(
   const dims = new DimLayout();
   const DIM_OFF = 350;  // 尺寸线与视图的间距
 
-  // 水平尺寸链：顶部总宽 + 底部各段
+  // 水平尺寸链：顶部总宽 + 底部各段（上下对齐的地柜+吊柜共享同一 X 段时自动去重，避免重复叠字）
   const addHDims = (
     cabs: Cabinet[], box: { x: number; y: number; w: number; h: number }, prefix: string
   ): void => {
     if (cabs.length === 0 || box.w <= 0) return;
-    const sorted = [...cabs].sort((a, b) => a.placement.x - b.placement.x);
-    const x0 = sorted[0]!.placement.x;
+    const sorted = [...cabs].sort((a, b) => xOf(a) - xOf(b));
+    const x0 = xOf(sorted[0]!);
     // 顶部：总宽
     dims.add({
       p0: { x: box.x, y: box.y + box.h }, p1: { x: box.x + box.w, y: box.y + box.h },
       txt: `${Math.round(box.w / s)}`, orientation: 'h', side: 'top',
       chain: `${prefix}-total`, baseOffset: DIM_OFF, textOffset: 150,
     });
-    // 底部：各段
+    // 底部：各段（按水平区间去重）
+    const seenSegs = new Set<string>();
     for (const cab of sorted) {
-      const cx = box.x + (cab.placement.x - x0) * s;
+      const rawX = xOf(cab) - x0;
+      const segKey = `${Math.round(rawX)}:${Math.round(rawX + cab.params.width)}`;
+      if (seenSegs.has(segKey)) continue;
+      seenSegs.add(segKey);
+      const cx = box.x + rawX * s;
       const cw = cab.params.width * s;
       dims.add({
         p0: { x: cx, y: box.y }, p1: { x: cx + cw, y: box.y },
@@ -610,7 +719,7 @@ export function buildFurnitureSheet(
     addVDims(pwBox, `${maxD}`, 'pw');
   }
   addHDims(cabinets, efBox, 'ef');
-  addFrontPartitionAndDoorDims(dims, efBox, elevFrontRawBounds, cabinets, doorDimensions, s, frontCabinetX0);
+  addFrontPartitionAndDoorDims(dims, efBox, elevFrontRawBounds, cabinets, doorDimensions, s, frontCabinetX0, unfoldedX);
   {
     const maxH = Math.max(...cabinets.map((c) => c.params.height + (c.params.mountHeight ?? 0)));
     addVDims(efBox, `${maxH}`, 'ef');
@@ -646,14 +755,14 @@ export function buildFurnitureSheet(
     return m;
   };
   // 俯视图标题固定在该视图自身尺寸链下方；不能把较低的立面底部尺寸算进来。
-  const planTitleY = planY - 1100;
+  const planTitleY = planY - 820;
   if (pbBox.w > 0) {
-    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, planSingle ? '俯视图' : '地柜平面俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
   if (pwBox.w > 0) {
-    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
-  const elevTitleY = minDimYBelow(elevY) - 450;
+  const elevTitleY = Math.max(BOT_H + 180, minDimYBelow(elevY) - 400);
   prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '外观正面图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   prims.push(textPrim(eiBox.x + eiBox.w / 2, elevTitleY, '内部结构图', SZ_VIEW_TITLE, L_TEXT, 'c'));
 
@@ -756,7 +865,8 @@ function drawFrame(
   const sy = H - 100;
   // 侧边栏左侧竖线（与主区隔开），从顶部到底部客户栏
   prims.push(linePrim(sx, 100, sx, H - 100, L_BORDER, 1));
-  prims.push(textPrim(sx + (SIDE_R - sx) / 2, sy - 300, furnitureName, SZ_TITLE, L_TEXT, 'c'));
+  const titleSize = furnitureName.length > 6 ? Math.max(190, Math.floor(2000 / furnitureName.length)) : SZ_TITLE;
+  prims.push(textPrim(sx + (SIDE_R - sx) / 2, sy - 300, furnitureName, titleSize, L_TEXT, 'c'));
   prims.push(linePrim(sx, sy - 550, SIDE_R, sy - 550, L_BORDER, 1));
 
   let ty = sy - 700;

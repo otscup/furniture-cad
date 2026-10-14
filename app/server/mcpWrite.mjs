@@ -802,18 +802,24 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       // docFactory 走动态 import（与 commands 同一批 .ts）
       const { createRoom, rectRoom } = await import('../src/core/docFactory.ts');
       const hasRect = args.x !== undefined || args.y !== undefined || args.w !== undefined || args.h !== undefined;
-      // Bug 3 修：透传 draft 里已有房间 id 作 takenIds，否则永远生成 room_001 撞号
+      // 透传 draft 里已有房间 id 与全部墙 id 作 takenIds，防止 room_001 或 wall_001 撞号
       const proj = ws.draftState(d.draftId);
-      const takenRoomIds = (proj?.rooms ?? []).map((rm) => rm.id);
+      const takenRoomIds = new Set();
+      for (const rm of proj?.rooms ?? []) {
+        takenRoomIds.add(rm.id);
+        for (const wl of rm.walls ?? []) takenRoomIds.add(wl.id);
+      }
       let room;
       try {
         if (hasRect) {
-          if (args.x === undefined || args.y === undefined || args.w === undefined || args.h === undefined) {
-            return fail('矩形房间须同时给 x/y/w/h（只想占位就四个都不给，建空房间）');
+          if (args.w === undefined || args.h === undefined) {
+            return fail('矩形房间须同时给 w 和 h（mm，>0；x/y 缺省自动排在现有房间右侧不重叠）');
           }
           if (!(args.w > 0 && args.h > 0)) return fail('w/h 必须是 >0 的数字（mm）');
+          const rx = args.x ?? 0;
+          const ry = args.y ?? 0;
           room = rectRoom({
-            name: args.name, x: args.x, y: args.y, w: args.w, h: args.h,
+            name: args.name, x: rx, y: ry, w: args.w, h: args.h,
             ...(args.thickness !== undefined ? { thickness: args.thickness } : {}),
             ...(args.height !== undefined ? { height: args.height } : {}),
             takenIds: takenRoomIds,

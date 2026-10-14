@@ -125,8 +125,34 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * @param opts.aiConfig { baseUrl, apiKey, model, timeoutMs }
  * @param opts.onStep 步骤回调（流式推送给前端，可选）
  */
+function summarizeProjectContext(project, activeRoomId) {
+  if (!project || typeof project !== 'object') return '';
+  const rooms = Array.isArray(project.rooms) ? project.rooms : [];
+  const cabinets = Array.isArray(project.cabinets) ? project.cabinets : [];
+  const lines = ['当前工作区空间与柜体摘要（可直接引用，无需额外调 get_state）：'];
+  for (const r of rooms) {
+    let dimStr = '无墙体';
+    if (Array.isArray(r.walls) && r.walls.length > 0) {
+      const xs = r.walls.flatMap((w) => [w.start?.x ?? 0, w.end?.x ?? 0]);
+      const ys = r.walls.flatMap((w) => [w.start?.y ?? 0, w.end?.y ?? 0]);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      dimStr = `${Math.round(maxX - minX)}×${Math.round(maxY - minY)}mm (世界坐标 X:${Math.round(minX)}..${Math.round(maxX)}, Y:${Math.round(minY)}..${Math.round(maxY)})`;
+    }
+    const rCabs = cabinets.filter((c) => c.roomId === r.id);
+    lines.push(`- 房间「${r.name}」(roomId=${r.id}${r.id === activeRoomId ? '，当前选中房间' : ''})：${dimStr}，现有 ${rCabs.length} 台柜体`);
+    if (r.id === activeRoomId && rCabs.length > 0) {
+      for (const c of rCabs) {
+        const p = c.params || {};
+        lines.push(`  · 柜体「${c.name}」(cabinetId=${c.id})：${p.cabinetType || 'base'}，${p.width}×${p.height}×${p.depth}mm，离地=${p.mountHeight ?? 0}mm，位置=(${c.placement?.x ?? 0},${c.placement?.y ?? 0})`);
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
 export async function runAgentLoop(opts) {
-  const { intent, images, visionResult, draftId, roomId, roomName, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
+  const { intent, images, visionResult, draftId, roomId, roomName, workspaceProject, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
   const steps = [];
   let currentDraftId = draftId || null;
   let round = 0;
@@ -142,17 +168,20 @@ export async function runAgentLoop(opts) {
   );
 
   // 2. 构建系统提示
+  const projectContextText = summarizeProjectContext(workspaceProject, roomId);
   const systemPrompt = `你是家具 CAD 的 AI 装配 Agent。用户说出意图后，你调用 MCP 工具在 draft 草稿里搭建柜体。
 
 规则：
 - 所有写操作只进 draft，不碰 live。${currentDraftId ? `继续使用 draft ${currentDraftId}。` : '没有 draft 时工具会自动创建。'}
-- 先理解意图，拆成工具调用。每步只调一个工具，看结果再决定下一步。
+- 先理解意图，拆成工具调用。支持按顺序创建柜体、调整参数、建立组合。
+- 新建房间（cad.create_room）只需传 name 与 w、h（x、y 可省略或传 0，系统会自动将新房间排布在已有房间右侧，绝不重叠）。
+- 新建柜体（cad.create_cabinet）默认放在当前房间「${roomName || roomId}」（roomId=${roomId}）；若不传 x、y，系统会自动在当前房间内寻找不撞墙、不重叠的贴墙位置（且吊柜 mountHeight>0 会自动对齐在地柜正上方）。
 - 一排连续的厨房地柜、吊柜，先分别创建独立柜体模块，再按地柜排、吊柜排分别调用 cad.create_assembly 组成柜组；连接只描述相邻模块关系。
 - 组合只用于整体展示/操作，不代表把多个柜箱合成一只柜，也不自动生成连续台面、共享顶板或 CNC 开孔；不要合并柜体模块尺寸或板件。
+- 当用户同时提供两张图（效果图 + 尺寸图）时：以【效果图】确定柜体外观布局（地柜/吊柜排布、门扇、抽屉、开放格、电器位），以【尺寸图】上的毫米标注数值作为精确宽/高/深尺寸！
 - 工具报错时读错误信息，调整参数重试。同一问题最多重试 3 轮，修不好就停下说明原因。
 - 完成后调用 cad.validate 确认 0 错误。
-- 不要编造数据：尺寸不确定就问用户，不要猜。
-${roomId ? `- 当前工作区房间为「${roomName || roomId}」（roomId=${roomId}）；新建柜体默认放在此房间，除非用户明确指定其他房间。\n` : ''}
+${roomId ? `- 当前工作区房间为「${roomName || roomId}」（roomId=${roomId}）；新建柜体默认放在此房间，除非用户明确指定其他房间。\n` : ''}${projectContextText ? `${projectContextText}\n` : ''}
 
 ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}\n` : ''}${images && images.length > 0 ? `用户附了 ${images.length} 张图（${images.map(i => `${i.name || '图片'}:${i.mode === 'dimension' ? '尺寸图' : '效果图'}`).join('、')}），请结合图片理解意图。尺寸图上的标注数字优先采用。\n` : ''}
 当前 draft：${currentDraftId ?? '无（工具会自动创建）'}`;

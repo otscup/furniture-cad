@@ -26,8 +26,8 @@ import { CommandBus } from '../core/commandBus.ts';
 import type { Command, DerivedSummary, ExecResult } from '../core/commandBus.ts';
 import { serializeProjectFile, parseProjectFile } from '../core/projectFile.ts';
 import { sampleProject } from '../core/docFactory.ts';
-import { findDuplicateUnitIds, unitIdentityConflictError, unitIdentityConflictMessage, WORKSPACE_UNIT_ID_CONFLICT } from '../core/unitIdentity.mjs';
-export { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT } from '../core/unitIdentity.mjs';
+import { findDuplicateUnitIds, unitIdentityConflictError, unitIdentityConflictMessage, WORKSPACE_UNIT_ID_CONFLICT, repairDuplicateUnitIdsInProject, deoverlapProjectRooms } from '../core/unitIdentity.mjs';
+export { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT, repairDuplicateUnitIdsInProject, deoverlapProjectRooms } from '../core/unitIdentity.mjs';
 
 /** 落盘函数：调用方把「内存真相」序列化成字符串传入，队列只负责原子有序写。 */
 export type PersistFn = (content: string) => Promise<void>;
@@ -799,6 +799,70 @@ export class WorkspaceStore {
         ok: true,
         unchanged: false,
         hydratedFromServer: false,
+        liveModelVersion: this.liveModelVersion,
+        project: this.getProjectSnapshot(),
+      };
+    });
+  }
+
+
+  /**
+   * 显式一键修复工作区（含 live project、全部 syncReceipts 与全部 drafts）中的历史重复 Unit/backUnit ID，
+   * 并自动错开坐标重叠的房间，解除 WORKSPACE_UNIT_ID_CONFLICT 只读锁定。
+   */
+  async repairUnitIdentityConflicts(): Promise<{
+    ok: true;
+    repairedLive: number;
+    repairedDrafts: number;
+    repairedReceipts: number;
+    deoverlappedRooms: number;
+    liveModelVersion: number;
+    project: Project;
+  }> {
+    return this.serializeLiveWrite(async () => {
+      this.loadedIdentityConflict = null;
+      const rawLive = this.bus.getState();
+      const { project: dedupedLive, repairedCount: repairedLive } = repairDuplicateUnitIdsInProject(rawLive);
+      const { project: cleanLive, movedRooms } = deoverlapProjectRooms(dedupedLive);
+
+      let repairedReceipts = 0;
+      const nextReceipts = new Map<string, DraftSyncReceipt>();
+      for (const [syncId, receipt] of this.syncReceipts.entries()) {
+        const { project: fixedProj, repairedCount } = repairDuplicateUnitIdsInProject(receipt.project);
+        if (repairedCount > 0) repairedReceipts += repairedCount;
+        nextReceipts.set(syncId, { ...structuredClone(receipt), project: fixedProj });
+      }
+
+      let repairedDrafts = 0;
+      for (const [draftId, draft] of [...this.drafts.entries()]) {
+        const { project: fixedDraftProj, repairedCount } = repairDuplicateUnitIdsInProject(draft.getState());
+        const { project: cleanDraftProj, movedRooms: draftMoved } = deoverlapProjectRooms(fixedDraftProj);
+        if (repairedCount > 0 || draftMoved.length > 0) {
+          repairedDrafts += repairedCount;
+          const nextJson = { ...draft.toJSON(), project: cleanDraftProj };
+          const rebuilt = ServerDraft.fromJSON(nextJson, this.rules);
+          if (this.persistDraft) {
+            await this.persistDraft(draftId, JSON.stringify(rebuilt.toJSON(), null, 2));
+          }
+          this.drafts.set(draftId, rebuilt);
+        }
+      }
+
+      const nextVersion = this.liveModelVersion + 1;
+      const savedAt = new Date().toISOString();
+      await this.persist(this.serializeWorkspace(cleanLive, nextVersion, savedAt, nextReceipts));
+      this.bus.switchToValidatedHealthyProject(cleanLive, '显式修复重复 Unit ID 并解除只读锁', true);
+      this.liveModelVersion = nextVersion;
+      this.updatedAt = savedAt;
+      this.syncReceipts.clear();
+      for (const [k, v] of nextReceipts) this.syncReceipts.set(k, v);
+
+      return {
+        ok: true,
+        repairedLive,
+        repairedDrafts,
+        repairedReceipts,
+        deoverlappedRooms: movedRooms.length,
         liveModelVersion: this.liveModelVersion,
         project: this.getProjectSnapshot(),
       };

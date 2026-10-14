@@ -690,7 +690,8 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       }
       // 分区 id 的唯一性必须**跨行**成立：板件 id 由 unit.id 拼出（`P_cab_unit_001_SHELF1`），
       // 两行各有一个 `unit_001` 会让两份板件在清单里合成一条 —— 静默少件。
-      const taken = new Set(allUnits(cab.layout).map((u) => u.id));
+      const taken = collectUnitIds();
+      for (const u of allUnits(cab.layout)) taken.add(u.id);
       if (cab.layout.backUnits) for (const u of cab.layout.backUnits) taken.add(u.id);
       const unit = makeUnit({
         id: nextId('unit', taken),
@@ -763,10 +764,22 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       const mountHeight = p.mountHeight === undefined ? 0 : Number(p.mountHeight);
       if (!Number.isInteger(mountHeight) || mountHeight < 0 || mountHeight > 3000) return { ok: false, error: 'mountHeight 必须是 0~3000mm 整数' };
       if ((cabinetType === 'wall' && mountHeight <= 0) || (cabinetType !== 'wall' && mountHeight > 0)) return { ok: false, error: '吊柜必须给正数 mountHeight；地柜/高柜/岛台的 mountHeight 必须为 0' };
-      const place = { x: mm(Number(p.atX ?? 0)), y: mm(Number(p.atY ?? 0)) };
+      const roomObj = project.rooms.find((r) => r.id === room.id);
+      let roomMinX = 0;
+      let roomMinY = 0;
+      if (roomObj && roomObj.walls.length > 0) {
+        roomMinX = Math.min(...roomObj.walls.flatMap((w) => [w.start.x, w.end.x]));
+        roomMinY = Math.min(...roomObj.walls.flatMap((w) => [w.start.y, w.end.y]));
+      }
+      const place = { x: mm(Number(p.atX ?? roomMinX)), y: mm(Number(p.atY ?? roomMinY)) };
+      if (p.atX !== undefined && p.atY !== undefined && roomMinX >= 1000 && place.x < roomMinX - 200) {
+        // AI / MCP 传的是房间局部坐标（如 x=60, y=60），自动加上当前房间的世界坐标起点偏移，防止落入左侧第一个房间导致重叠
+        place.x = mm(place.x + roomMinX);
+        place.y = mm(place.y + roomMinY);
+      }
       if (p.atX === undefined && p.atY === undefined) {
         // 没给落位：只对同一房间内在垂直标高范围 [mountHeight, mountHeight+height] 发生重叠的柜体做横向避让。
-        // 这样吊柜（mountHeight > 0）会自动从 X=0（或通顶高柜右侧）排在地柜正上方，实现上下对齐，不再被地柜挤到右侧墙外。
+        // 这样吊柜（mountHeight > 0）会自动从房间起点 X（或通顶高柜右侧）排在地柜正上方，实现上下对齐，不再被地柜挤到右侧墙外。
         const sameRoom = project.cabinets.filter((c) => c.roomId === room.id);
         const z0 = mountHeight;
         const z1 = mountHeight + height;
@@ -775,8 +788,8 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
           const cz1 = cz0 + c.params.height;
           return cz0 < z1 && cz1 > z0;
         });
-        place.x = verticallyOverlapping.reduce((m, c) => Math.max(m, c.placement.x + c.params.width), 0);
-        place.y = sameRoom.length ? sameRoom[0].placement.y : 0;
+        place.x = verticallyOverlapping.reduce((m, c) => Math.max(m, c.placement.x + c.params.width), roomMinX);
+        place.y = sameRoom.length ? sameRoom[0].placement.y : roomMinY;
       }
       const bodyLift = p.bodyLift === undefined ? (cabinetType === 'wall' ? 0 : base.bodyLift) : Number(p.bodyLift);
       if (!Number.isInteger(bodyLift) || bodyLift < 0 || bodyLift > 300) return { ok: false, error: 'bodyLift 必须是 0~300mm 整数' };
@@ -855,6 +868,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         backUnits,
         rows,
         takenIds: project.cabinets.map((c) => c.id),
+        takenUnitIds: unitTaken,
       });
 
       // 没给落位时，替它在房间里找一个**放得下**的位置。

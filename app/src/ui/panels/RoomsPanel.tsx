@@ -3,14 +3,15 @@ import type { CommandBus } from '../../core/commandBus.ts';
 import type { Room, Vec2 } from '../../core/types.ts';
 import * as CMD from '../../core/commands.ts';
 import { rectRoom } from '../../core/docFactory.ts';
+import { deoverlapProjectRooms } from '../../core/unitIdentity.mjs';
 import { NumField, Pill, Row, Section, Text, TextField } from './common.tsx';
 
 /** 房间页有两种状态：列表 / 新建。新建是**独立一页**，不在列表里凭空多出一张卡片 */
 export type RoomsView = 'list' | 'new';
 
 /** 房间尺寸来自四面墙端点，取包围盒的宽/高（mm） */
-function roomDims(room: Room): { w: number; h: number } {
-  if (room.walls.length === 0) return { w: 0, h: 0 };
+function roomDims(room: Room): { w: number; h: number; minX: number; minY: number; maxX: number; maxY: number } {
+  if (room.walls.length === 0) return { w: 0, h: 0, minX: 0, minY: 0, maxX: 0, maxY: 0 };
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -23,24 +24,57 @@ function roomDims(room: Room): { w: number; h: number } {
       if (p.y > maxY) maxY = p.y;
     }
   }
-  return { w: Math.round(maxX - minX), h: Math.round(maxY - minY) };
+  return {
+    w: Math.round(maxX - minX),
+    h: Math.round(maxY - minY),
+    minX: Math.round(minX),
+    minY: Math.round(minY),
+    maxX: Math.round(maxX),
+    maxY: Math.round(maxY),
+  };
 }
 
 export function RoomsPanel(props: {
   bus: CommandBus;
   version: number;
   run: (cmd: import('../../core/commandBus.ts').Command) => boolean;
-  onToast: (kind: 'ok' | 'info' | 'error', msg: string) => void;
+  onToast: (kind: 'ok' | 'info' | 'warn' | 'error', msg: string) => void;
   onFocusRoom: (id: string) => void;
   view: RoomsView;
   onViewChange: (v: RoomsView) => void;
   onCreated: (roomId: string) => void;
+  onSyncToServer?: () => Promise<boolean> | void;
+  remoteDiffers?: boolean;
   readOnly?: boolean;
 }): ReactNode {
   const { bus, run, onToast, onFocusRoom, view, onViewChange, onCreated } = props;
   const project = bus.getState();
+  const [confirmCascadeId, setConfirmCascadeId] = useState<string | null>(null);
 
   const cabCountOf = (roomId: string): number => project.cabinets.filter((c) => c.roomId === roomId).length;
+
+  const hasOverlappingRooms = (() => {
+    const boxes = project.rooms.map(roomDims).filter((b) => b.w > 0 && b.h > 0);
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i]!;
+        const b = boxes[j]!;
+        if (a.minX < b.maxX && a.maxX > b.minX && a.minY < b.maxY && a.maxY > b.minY) return true;
+      }
+    }
+    return false;
+  })();
+
+  const onDeoverlapRooms = (): void => {
+    if (props.readOnly) return;
+    const { project: nextProj, movedRooms } = deoverlapProjectRooms(project);
+    if (movedRooms.length === 0) {
+      onToast('info', '当前没有坐标重叠的房间');
+      return;
+    }
+    bus.replaceProject(nextProj, `自动错开重叠房间（${movedRooms.map((r: { roomName: string }) => r.roomName).join('、')}）`);
+    onToast('ok', `已自动错开 ${movedRooms.length} 个重叠房间（连同房内柜体一并平移）`);
+  };
 
   const onRename = (room: Room, index: number, toName: string): void => {
     if (!toName || toName === room.name) return;
@@ -59,13 +93,20 @@ export function RoomsPanel(props: {
     }
   };
 
-  const onDelete = (room: Room): void => {
-    const n = cabCountOf(room.id);
-    if (n > 0) {
-      onToast('error', `房间内有 ${n} 个柜体，无法删除（请先移走或删除这些柜体）`);
+  const onDelete = (room: Room, cascade = false): void => {
+    if (props.readOnly) {
+      onToast('warn', '当前工作区处于只读锁状态，请先点击顶部横幅「一键自动修复重复 Unit ID」解锁后再删除房间');
       return;
     }
-    if (run(CMD.deleteRoomCommand(room.id, room.name))) onToast('ok', `已删除房间「${room.name}」`);
+    const n = cabCountOf(room.id);
+    if (n > 0 && !cascade) {
+      setConfirmCascadeId(room.id);
+      return;
+    }
+    if (run(CMD.deleteRoomCommand(room.id, room.name, 'ui', cascade && n > 0))) {
+      setConfirmCascadeId(null);
+      onToast('ok', cascade && n > 0 ? `已删除房间「${room.name}」及其 ${n} 台柜体（可撤销）` : `已删除房间「${room.name}」`);
+    }
   };
 
   /** 新建房间是独立一页 —— 点「+ 新建房间」只**切到那一页**，不立刻造一个出来 */
@@ -86,14 +127,35 @@ export function RoomsPanel(props: {
   return (
     <div className="panel-scroll">
       <Section title={`房间管理（${project.rooms.length}）`}>
-        <div className="btn-row">
+        <div className="btn-row" style={{ flexWrap: 'wrap', gap: 6 }}>
           <button type="button" className="tb-btn primary" disabled={props.readOnly} onClick={() => onViewChange('new')}>
             + 新建房间
           </button>
+          {props.onSyncToServer ? (
+            <button
+              type="button"
+              className="tb-btn"
+              disabled={props.readOnly}
+              onClick={() => void props.onSyncToServer?.()}
+              title="将本地房间与柜体修改同步写入服务端工作区"
+            >
+              {props.remoteDiffers ? '⚡ 同步修改到服务端' : '☁️ 同步到服务端'}
+            </button>
+          ) : null}
+          {hasOverlappingRooms ? (
+            <button
+              type="button"
+              className="tb-btn"
+              disabled={props.readOnly}
+              onClick={onDeoverlapRooms}
+              title="将坐标重叠在 (0,0) 的多个房间及柜体自动横向错开排布"
+            >
+              📐 一键错开重叠房间
+            </button>
+          ) : null}
         </div>
         <div className="hint-line">
-          每个房间是独立、可命名、可单独查看的实体。点「聚焦」会把平面图缩放到该房间，
-          多个房间时一眼就能分清哪个是哪个。删除带柜体的房间会被拦下，避免留下悬空柜体。
+          每个房间是独立、可命名、可单独查看的实体。点「聚焦」会把平面图缩放到该房间；空房间可直接删除，含柜体的房间点击「删除」后确认即可连同房内柜体一并删除（支持 Ctrl+Z 一步撤销）。
         </div>
 
         {project.rooms.length === 0 ? (
@@ -105,6 +167,7 @@ export function RoomsPanel(props: {
             const dims = roomDims(room);
             const cabs = cabCountOf(room.id);
             const hasWalls = room.walls.length > 0;
+            const confirmingCascade = confirmCascadeId === room.id;
             return (
               <div key={room.id} className="room-card">
                 <div className="room-card-head">
@@ -140,22 +203,42 @@ export function RoomsPanel(props: {
                 </Row>
 
                 <Row label="墙体">
-                  <Text mono>{room.walls.length} 面</Text>
+                  <Text mono>{room.walls.length} 面{hasWalls ? ` · 起点 (${dims.minX}, ${dims.minY})` : ''}</Text>
                 </Row>
 
-                <div className="room-actions">
+                <div className="room-actions" style={{ flexWrap: 'wrap', gap: 6 }}>
                   <button type="button" className="tb-btn" onClick={() => onFocusRoom(room.id)} title="平面图缩放到该房间">
                     聚焦
                   </button>
-                  <button
-                    type="button"
-                    className="tb-btn danger"
-                    disabled={cabs > 0}
-                    title={cabs > 0 ? `房间内有 ${cabs} 个柜体，先移走或删除` : '删除该房间'}
-                    onClick={() => onDelete(room)}
-                  >
-                    删除
-                  </button>
+                  {!confirmingCascade ? (
+                    <button
+                      type="button"
+                      className="tb-btn danger"
+                      disabled={props.readOnly}
+                      title={cabs > 0 ? `删除该房间（含房内 ${cabs} 台柜体，点击后二次确认）` : '删除该房间'}
+                      onClick={() => onDelete(room, false)}
+                    >
+                      {cabs > 0 ? `删除（含${cabs}柜）` : '删除'}
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="tb-btn danger"
+                        disabled={props.readOnly}
+                        onClick={() => onDelete(room, true)}
+                      >
+                        确认连同 {cabs} 台柜体删除
+                      </button>
+                      <button
+                        type="button"
+                        className="tb-btn"
+                        onClick={() => setConfirmCascadeId(null)}
+                      >
+                        取消
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             );
@@ -168,21 +251,11 @@ export function RoomsPanel(props: {
 
 /**
  * 新建房间 —— **独立一页**。
- *
- * ── 为什么不再"点了就立刻多一张卡片" ──
- *   旧做法是点「+ 新建房间」就地 append 一个默认 3200×2600 的房间：
- *   用户还没填名字，列表里就并排多出一个「房间3」，跟已有房间混在一起，
- *   既分不清哪个是新加的，也没机会先想好尺寸。
- *   这里改成：先给一页表单（名称 / 宽 / 高 / 落位），确认后才真的建。
- *
- * ── 尺寸为什么是"填数字"而不是"拖四个角" ──
- *   房间尺寸本来就由四面墙端点决定（room.resize 也是这么做的）；
- *   矩形房间是最常见的情况，给它一条最快的路；异形房间仍然去平面图「画墙」。
  */
 function NewRoomPage(props: {
   bus: CommandBus;
   run: (cmd: import('../../core/commandBus.ts').Command) => boolean;
-  onToast: (kind: 'ok' | 'info' | 'error', msg: string) => void;
+  onToast: (kind: 'ok' | 'info' | 'warn' | 'error', msg: string) => void;
   onCancel: () => void;
   onCreated: (roomId: string) => void;
   onDone: () => void;
@@ -209,10 +282,6 @@ function NewRoomPage(props: {
       onToast('error', bad);
       return;
     }
-    /**
-     * 房间 id 与墙 id 必须避开**全项目**已用的（不能只按"第几个房间"编）。
-     * 少了这几行，第二个房间拿到的还是 room_001 → 结构性命令被拒 → 永远建不出第二个。
-     */
     const takenIds = new Set<string>();
     for (const r of project.rooms) {
       takenIds.add(r.id);
@@ -220,7 +289,7 @@ function NewRoomPage(props: {
     }
     let maxX = 0;
     for (const r of project.rooms) for (const wl of r.walls) maxX = Math.max(maxX, wl.start.x, wl.end.x);
-    const x = project.rooms.length === 0 ? 0 : Math.round(maxX) + 200;
+    const x = project.rooms.length === 0 ? 0 : Math.round(maxX) + 800;
     const room = rectRoom({ name: name.trim(), note, x, y: 0, w: 3200, h: 2600, takenIds });
     if (!run(CMD.createRoomCommand(room))) {
       onToast('error', '新建房间被总线拒绝');
@@ -242,7 +311,7 @@ function NewRoomPage(props: {
           </button>
         </div>
         <div className="hint-line">
-          填写名称即可创建；默认矩形为 3200×2600mm，之后可在房间面板调整尺寸。异形房间请用平面图里的「画墙」工具。
+          填写名称即可创建；默认矩形为 3200×2600mm（自动排布在现有房间右侧，绝不重叠），之后可在房间面板调整尺寸。
         </div>
 
         <Row label="名称">

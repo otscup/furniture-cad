@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { hashProjectSnapshot } from './projectHash.mjs';
-import { findDuplicateUnitIds, unitIdentityConflictMessage, WORKSPACE_UNIT_ID_CONFLICT } from '../src/core/unitIdentity.mjs';
+import { findDuplicateUnitIds, unitIdentityConflictMessage, WORKSPACE_UNIT_ID_CONFLICT, repairDuplicateUnitIdsInProject, deoverlapProjectRooms } from '../src/core/unitIdentity.mjs';
 import { AuthStore, PLANS, ROLES, securityPolicy } from './auth.mjs';
 import { auditCsv } from './auditCsv.mjs';
 import { csvCell } from './csvCell.mjs';
@@ -1739,6 +1739,86 @@ async function handleApi(req, res, pathname) {
    * 服务端工作区与 MCP/Agent 草稿实时流（GET /api/workspace/stream，SSE）。
    * 浏览器打开后保持长连接，MCP 或内置 Agent 每画一步立即推送到浏览器主视口预览。
    */
+
+  /**
+   * 显式一键修复工作区（含 live project、草稿、syncReceipts 与历史项目文件）的重复 Unit/backUnit ID
+   * 并自动错开重叠房间，解除 WORKSPACE_UNIT_ID_CONFLICT 只读锁定（POST /api/workspace/repair-unit-ids）。
+   */
+  if (pathname === '/api/workspace/repair-unit-ids' && req.method === 'POST') {
+    const aid = gate.account?.id || 'local-open';
+    const ws = await getWorkspaceState(aid);
+    if (!ws.ok) return workspaceUnavailable(res, ws);
+    const repairRes = await ws.workspace.repairUnitIdentityConflicts();
+    // 同步检查并修复该账号下多项目目录里的历史项目文件（若有）
+    try {
+      const dataDir = accountWorkspaceDir(aid);
+      const projectsDir = join(dataDir, 'projects');
+      if (existsSync(projectsDir)) {
+        const { readdirSync: rdSync } = await import('node:fs');
+        for (const f of rdSync(projectsDir)) {
+          if (!f.endsWith('.json')) continue;
+          const fp = join(projectsDir, f);
+          try {
+            const rawEnv = JSON.parse(readFileSync(fp, 'utf8'));
+            const targetProj = rawEnv?.project ?? rawEnv;
+            if (targetProj && typeof targetProj === 'object' && Array.isArray(targetProj.cabinets)) {
+              const { project: fixedProj, repairedCount } = repairDuplicateUnitIdsInProject(targetProj);
+              const { project: cleanProj, movedRooms } = deoverlapProjectRooms(fixedProj);
+              if (repairedCount > 0 || movedRooms.length > 0) {
+                if (rawEnv?.project) rawEnv.project = cleanProj;
+                else Object.assign(rawEnv, cleanProj);
+                writeFileSync(fp, JSON.stringify(rawEnv, null, 2) + '\n', 'utf8');
+              }
+            }
+          } catch {
+            /* ignore malformed auxiliary project file */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    const snapshot = captureLiveProjectSnapshot(ws.workspace);
+    const identityDiagnostics = ws.workspace.getUnitIdentityDiagnostics?.() ?? {
+      readOnly: false,
+      code: null,
+      message: null,
+      duplicateUnitIds: [],
+    };
+    auth.audit({
+      actor: aid,
+      action: 'workspace.repair_unit_ids',
+      result: 'ok',
+      repairedLive: repairRes.repairedLive,
+      repairedDrafts: repairRes.repairedDrafts,
+      repairedReceipts: repairRes.repairedReceipts,
+      deoverlappedRooms: repairRes.deoverlappedRooms,
+      liveModelVersion: snapshot.projectSnapshotVersion,
+    });
+    broadcastWorkspaceEvent(aid, {
+      type: 'workspace.updated',
+      liveModelVersion: snapshot.projectSnapshotVersion,
+      projectSnapshotId: snapshot.projectSnapshotId,
+      projectSnapshotHash: snapshot.projectSnapshotHash,
+      projectSnapshotVersion: snapshot.projectSnapshotVersion,
+      project: snapshot.project,
+    });
+    return json(res, 200, {
+      ok: true,
+      repairedLive: repairRes.repairedLive,
+      repairedDrafts: repairRes.repairedDrafts,
+      repairedReceipts: repairRes.repairedReceipts,
+      deoverlappedRooms: repairRes.deoverlappedRooms,
+      project: snapshot.project,
+      identityDiagnostics,
+      liveModelVersion: snapshot.projectSnapshotVersion,
+      workspaceId: ws.workspace.workspaceId,
+      projectSnapshotId: snapshot.projectSnapshotId,
+      projectSnapshotHash: snapshot.projectSnapshotHash,
+      projectSnapshotVersion: snapshot.projectSnapshotVersion,
+    });
+  }
+
   if (pathname === '/api/workspace/stream' && req.method === 'GET') {
     const aid = gate.account?.id || 'local-open';
     const ws = await getWorkspaceState(aid);
@@ -2060,6 +2140,7 @@ async function handleApi(req, res, pathname) {
         roomId: serverRoom.id,
         // 服务端 workspace 的房间名是真源，避免前端传入 stale/mismatched name。
         roomName: serverRoom.name,
+        workspaceProject: agentProject,
         token: userToken,
         mcpBaseUrl,
         aiConfig: {

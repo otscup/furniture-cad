@@ -51,7 +51,7 @@ import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
 import { newCommandId } from '../core/ids.ts';
 import { editIdFromSelection, editSelectionId, filterValidDrawingEdits, replaceDrawingEdits, sourceKeyFromSelection, sourceOverride, translateDrawingEntity } from '../core/drawingEdits.ts';
-import { findDuplicateUnitIds, unitIdentityConflictMessage } from '../core/unitIdentity.mjs';
+import { findDuplicateUnitIds, unitIdentityConflictMessage, repairDuplicateUnitIdsInProject, deoverlapProjectRooms } from '../core/unitIdentity.mjs';
 import type { Toast, ToastKind, Tool } from './types.ts';
 
 const WORKSPACE_CONTEXT_STORAGE_KEY = 'furniture-cad.workspace-context';
@@ -1526,6 +1526,55 @@ export function App() {
     return true;
   }, [token, unitIdentityReadOnly]);
 
+  const repairWorkspaceUnitIds = useCallback(async (): Promise<void> => {
+    preserveDuplicateDraftBeforeHealthySwitch();
+    const res = await api<{
+      ok?: boolean;
+      repairedLive?: number;
+      repairedDrafts?: number;
+      repairedReceipts?: number;
+      deoverlappedRooms?: number;
+      project?: Project;
+      liveModelVersion?: number;
+      projectSnapshotId?: string;
+      projectSnapshotHash?: string;
+      projectSnapshotVersion?: number;
+      identityDiagnostics?: IdentityDiagnostics;
+    }>('/api/workspace/repair-unit-ids', {
+      method: 'POST',
+      token,
+      body: {},
+    });
+
+    const localFixed = deoverlapProjectRooms(repairDuplicateUnitIdsInProject(bus.getState()).project).project;
+    const targetProject = (res.ok && res.data?.project && findDuplicateUnitIds(res.data.project).length === 0)
+      ? res.data.project
+      : localFixed;
+
+    try {
+      validatedHealthyProjectFingerprintRef.current = stableProjectJson(targetProject);
+      bus.switchToValidatedHealthyProject(targetProject, '一键自动修复重复 Unit ID 并解除只读锁定', true);
+      clearPersistedIdentityLockAfterHealthySwitch();
+      setStickyIdentityDiagnostics(null);
+      setProjectStorageReadOnly(false);
+      saveDraft(bus.toFileSnapshot());
+      const snapVer = res.data?.projectSnapshotVersion ?? res.data?.liveModelVersion ?? remoteWorkspaceStatus?.liveModelVersion ?? 1;
+      setRemoteWorkspaceStatus((prev) => prev ? {
+        ...prev,
+        differs: false,
+        liveModelVersion: snapVer,
+        confirmedProject: structuredClone(targetProject),
+        projectSnapshotId: res.data?.projectSnapshotId ?? prev.projectSnapshotId,
+        projectSnapshotHash: res.data?.projectSnapshotHash ?? prev.projectSnapshotHash,
+        projectSnapshotVersion: snapVer,
+        identityDiagnostics: { readOnly: false, code: null, message: null, duplicateUnitIds: [] },
+      } : prev);
+      toast('ok', '已自动重编号修复重复 Unit ID 并解除只读锁定，现在可正常编辑、删除房间与导出图纸！');
+    } catch (error) {
+      toast('error', `修复失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [token, remoteWorkspaceStatus?.liveModelVersion, toast]);
+
   const applyLiveDraftQuick = useCallback(async (draftId: string): Promise<void> => {
     if (unitIdentityReadOnly) return;
     const detail = await api<{
@@ -1640,8 +1689,17 @@ export function App() {
           </span>
           <button
             type="button"
+            data-testid="unit-identity-auto-repair"
+            style={{ marginLeft: 12, border: '1px solid #1d4ed8', borderRadius: 4, padding: '4px 10px', background: '#2563eb', color: '#ffffff', fontWeight: 600, cursor: 'pointer' }}
+            title="自动为所有重复的分区/背板分区分配全局唯一 ID（含服务端草稿与历史收据），立即解除只读锁定"
+            onClick={() => void repairWorkspaceUnitIds()}
+          >
+            🔧 一键自动修复重复 Unit ID 并解除只读锁定
+          </button>
+          <button
+            type="button"
             data-testid="unit-identity-switch-healthy-project"
-            style={{ marginLeft: 12, border: '1px solid currentColor', borderRadius: 4, padding: '3px 8px', background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+            style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 4, padding: '3px 8px', background: 'transparent', color: 'inherit', cursor: 'pointer' }}
             title="跳转到 ProjectsPanel；确认载入后会验证重复 Unit ID，仅健康项目可解除只读锁"
             onClick={() => { setWorkspaceMode(false); setRightTab('projects'); setSelection([]); }}
           >
@@ -1737,6 +1795,7 @@ export function App() {
               workspaceRoomId={workspaceRoomId}
               onWorkspaceRoomChange={changeWorkspaceRoom}
               onOpenRemoteDrafts={openRemoteDrafts}
+              onQuickApplyDraft={(dId) => void applyLiveDraftQuick(dId)}
               onLiveDraftChange={setLiveDraftPreview}
               readOnly={unitIdentityReadOnly}
               workspaceContext
@@ -1880,6 +1939,8 @@ export function App() {
               view={roomsView}
               onViewChange={setRoomsView}
               onCreated={onRoomCreated}
+              onSyncToServer={syncLocalToServer}
+              remoteDiffers={remoteWorkspaceStatus?.differs ?? false}
               readOnly={unitIdentityReadOnly}
             />
           ) : null}

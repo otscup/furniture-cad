@@ -41,9 +41,11 @@ interface Props {
   setSelection: (ids: string[]) => void;
   /** 工作区逐柜预览时只显示这一柜；传统 CAD 3D 视图留空表示全项目。 */
   cabinetFilterId?: string;
+  /** 工作区全房 3D 预览时只显示当前房间内的柜体（避免跨房间干扰）。 */
+  roomFilterId?: string;
 }
 
-export function ThreeViewport({ bus, version, selection, setSelection, cabinetFilterId }: Props) {
+export function ThreeViewport({ bus, version, selection, setSelection, cabinetFilterId, roomFilterId }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasHostRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -56,11 +58,18 @@ export function ThreeViewport({ bus, version, selection, setSelection, cabinetFi
   const bodies = useMemo<Box3D[]>(() => {
     try {
       const all = bus.derive().geom.bodies3d;
-      return cabinetFilterId ? all.filter((body) => body.cabId === cabinetFilterId) : all;
+      if (cabinetFilterId) return all.filter((body) => body.cabId === cabinetFilterId);
+      if (roomFilterId) {
+        const roomCabIds = new Set(
+          bus.getState().cabinets.filter((c) => c.roomId === roomFilterId).map((c) => c.id)
+        );
+        return all.filter((body) => roomCabIds.has(body.cabId));
+      }
+      return all;
     } catch {
       return [];
     }
-  }, [bus, version, cabinetFilterId]);
+  }, [bus, version, cabinetFilterId, roomFilterId]);
 
   // ── 初始化场景（一次）──
   useEffect(() => {

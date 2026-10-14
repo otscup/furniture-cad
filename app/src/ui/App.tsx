@@ -50,7 +50,7 @@ import type { PickLine } from '../core/geometry/pickLines.ts';
 import { noteHit, useCorrections } from '../state/memoryStore.ts';
 import { nextToastId } from './types.ts';
 import { newCommandId } from '../core/ids.ts';
-import { editIdFromSelection, editSelectionId, replaceDrawingEdits, sourceKeyFromSelection, sourceOverride, translateDrawingEntity } from '../core/drawingEdits.ts';
+import { editIdFromSelection, editSelectionId, filterValidDrawingEdits, replaceDrawingEdits, sourceKeyFromSelection, sourceOverride, translateDrawingEntity } from '../core/drawingEdits.ts';
 import { findDuplicateUnitIds, unitIdentityConflictMessage } from '../core/unitIdentity.mjs';
 import type { Toast, ToastKind, Tool } from './types.ts';
 
@@ -242,6 +242,16 @@ export function App() {
    */
   const [token, setTokenRaw] = useState<string | null>(() => loadToken());
   const [remoteWorkspaceStatus, setRemoteWorkspaceStatus] = useState<RemoteWorkspaceStatus | null>(null);
+  const [liveDraftPreview, setLiveDraftPreview] = useState<{
+    draftId: string;
+    project: Project;
+    liveModelVersion: number;
+    baseModelVersion: number;
+    blockingErrors: number;
+    stepText?: string;
+  } | null>(null);
+  const hasLocalDraftRef = useRef<boolean>(false);
+  const hydratedFromCloudRef = useRef<boolean>(false);
   const validatedHealthyProjectFingerprintRef = useRef<string | null>(null);
   const [stickyIdentityDiagnostics, setStickyIdentityDiagnostics] = useState<IdentityDiagnostics | null>(persistedIdentityLock?.diagnostics ?? null);
   const currentProjectFingerprint = stableProjectJson(bus.getState());
@@ -307,6 +317,28 @@ export function App() {
         && typeof snapshotHash === 'string' && /^[a-f0-9]{64}$/i.test(snapshotHash)
         && Number.isInteger(snapshotVersion) && (snapshotVersion ?? -1) >= 0
         && Number.isInteger(liveModelVersion) && snapshotVersion === liveModelVersion;
+
+      // 云端防空覆盖自动注水：若本地浏览器没有任何已保存草稿（!hasLocalDraftRef.current）、
+      // 本地模型仍处于初始未编辑状态（bus.getVersion() === 0），且服务端已有 MCP/Agent 提交的模型（liveModelVersion > 0），
+      // 自动用服务端模型注水到本地画布，绝不用空本地状态冲掉云端成果！
+      if (
+        !hydratedFromCloudRef.current &&
+        !hasLocalDraftRef.current &&
+        bus.getVersion() === 0 &&
+        !(window as any).__syncOnlyBus &&
+        !unitIdentityReadOnlyRef.current &&
+        !workspaceResult.data.identityDiagnostics?.readOnly &&
+        (liveModelVersion ?? 0) > 0 &&
+        stableProjectJson(workspaceResult.data.project) !== stableProjectJson(bus.getState())
+      ) {
+        hydratedFromCloudRef.current = true;
+        try {
+          bus.replaceProject(workspaceResult.data.project, `从云端工作区 v${liveModelVersion} 自动同步恢复`);
+        } catch {
+          /* ignore */
+        }
+      }
+
       setRemoteWorkspaceStatus({
         draftCount: draftsResult.data.drafts?.length ?? 0,
         differs: stableProjectJson(workspaceResult.data.project) !== stableProjectJson(bus.getState()),
@@ -321,8 +353,56 @@ export function App() {
       });
     };
     void refresh();
+    let es: EventSource | null = null;
+    if (typeof EventSource !== 'undefined') {
+      try {
+        const streamUrl = token
+          ? `/api/workspace/stream?token=${encodeURIComponent(token)}`
+          : '/api/workspace/stream';
+        es = new EventSource(streamUrl);
+        es.onmessage = (evt) => {
+          if (cancelled) return;
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload.type === 'init' && payload.latestDraft?.project) {
+              setLiveDraftPreview({
+                draftId: payload.latestDraft.draftId,
+                project: payload.latestDraft.project,
+                liveModelVersion: payload.liveModelVersion ?? 0,
+                baseModelVersion: payload.latestDraft.baseModelVersion ?? 0,
+                blockingErrors: 0,
+              });
+            } else if ((payload.type === 'draft.updated' || payload.type === 'agent.step') && (payload.project || payload.draftProject)) {
+              const proj = payload.project ?? payload.draftProject;
+              setLiveDraftPreview({
+                draftId: payload.draftId,
+                project: proj,
+                liveModelVersion: payload.liveModelVersion ?? payload.freshness?.liveModelVersion ?? 0,
+                baseModelVersion: payload.baseModelVersion ?? payload.freshness?.baseModelVersion ?? 0,
+                blockingErrors: payload.validation?.blockingErrors ?? 0,
+                stepText: payload.step ? `${payload.step.tool}${payload.step.ok ? ' ✓' : ' ✗'}` : undefined,
+              });
+              void refresh();
+            } else if (payload.type === 'draft.deleted') {
+              setLiveDraftPreview(null);
+              void refresh();
+            } else if (payload.type === 'workspace.updated') {
+              void refresh();
+            }
+          } catch {
+            /* ignore */
+          }
+        };
+      } catch {
+        /* fallback to timer */
+      }
+    }
     const timer = window.setInterval(() => { void refresh(); }, 4000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      if (es) es.close();
+    };
   }, [token, version]);
 
   /**
@@ -359,6 +439,7 @@ export function App() {
   useEffect(() => {
     const d = loadDraft();
     if (!d) return;
+    hasLocalDraftRef.current = true;
     const activeIdentityLock = bus.getUnitIdentityConflict();
     if (d.identityConflict || activeIdentityLock) {
       bus.loadProjectReadOnly(d.project);
@@ -1402,6 +1483,104 @@ export function App() {
     setRightTab('ai');
     setWorkspaceMode(true);
   };
+  const syncLocalToServer = useCallback(async (): Promise<boolean> => {
+    if (unitIdentityReadOnly) return false;
+    const res = await api<{
+      ok?: boolean;
+      project?: Project;
+      liveModelVersion?: number;
+      projectSnapshotId?: string;
+      projectSnapshotHash?: string;
+      projectSnapshotVersion?: number;
+      identityDiagnostics?: IdentityDiagnostics;
+    }>('/api/workspace', {
+      method: 'PUT',
+      token,
+      body: {
+        project: bus.getState(),
+        clientHasLocalEdits: true,
+        force: true,
+        reason: '网页端手动修改同步到服务器',
+      },
+    });
+    if (!res.ok || !res.data.project) {
+      toast('error', `同步到服务器失败：${res.error ?? '未知错误'}`);
+      return false;
+    }
+    const snapId = res.data.projectSnapshotId ?? null;
+    const snapHash = res.data.projectSnapshotHash ?? null;
+    const snapVer = res.data.projectSnapshotVersion ?? res.data.liveModelVersion ?? 0;
+    setRemoteWorkspaceStatus((prev) => ({
+      draftCount: prev?.draftCount ?? 0,
+      differs: false,
+      liveModelVersion: snapVer,
+      stale: false,
+      snapshotReady: Boolean(snapId && snapHash),
+      confirmedProject: res.data.project!,
+      projectSnapshotId: snapId,
+      projectSnapshotHash: snapHash,
+      projectSnapshotVersion: snapVer,
+      identityDiagnostics: res.data.identityDiagnostics,
+    }));
+    toast('ok', `已将当前网页修改同步到服务器（v${snapVer}），现在可直接导出 PDF / DXF`);
+    return true;
+  }, [token, unitIdentityReadOnly]);
+
+  const applyLiveDraftQuick = useCallback(async (draftId: string): Promise<void> => {
+    if (unitIdentityReadOnly) return;
+    const detail = await api<{
+      draftId: string;
+      runId: string;
+      revision: number;
+      draftHash: string;
+      liveModelVersion: number;
+      baseModelVersion: number;
+      baseProjectHash: string;
+      project: Project;
+    }>(`/api/drafts/${encodeURIComponent(draftId)}`, { token });
+    if (!detail.ok || !detail.data?.project) {
+      toast('error', `读取草稿失败：${detail.error ?? '草稿不存在'}`);
+      return;
+    }
+    const d = detail.data;
+    const syncId = `quick:${d.draftId}:${d.runId}:r${d.revision}:l${bus.getVersion()}`;
+    const applied = await api<{
+      project: Project;
+      liveModelVersion: number;
+    }>(`/api/drafts/${encodeURIComponent(draftId)}/apply`, {
+      method: 'POST',
+      token,
+      body: {
+        syncId,
+        runId: d.runId,
+        draftId: d.draftId,
+        revision: d.revision,
+        draftHash: d.draftHash,
+        localVersion: bus.getVersion(),
+        remoteVersion: d.liveModelVersion,
+        baseModelVersion: d.baseModelVersion,
+        baseProjectHash: d.baseProjectHash,
+      },
+    });
+    if (!applied.ok || !applied.data?.project) {
+      toast('error', `应用草稿失败：${applied.error ?? '请打开草稿页查看详情'}`);
+      return;
+    }
+    bus.replaceProject(applied.data.project, `应用 MCP/Agent 草稿 ${draftId}`);
+    setLiveDraftPreview(null);
+    toast('ok', `已采纳草稿 ${draftId} 并同步到当前画布（live v${applied.data.liveModelVersion}）`);
+  }, [token, unitIdentityReadOnly]);
+
+  const cleanStaleOverrides = useCallback((): void => {
+    if (unitIdentityReadOnly) return;
+    const derived = bus.derive();
+    const planKeys = Object.values(derived.geom.roomPlanSourceKeys ?? {}).flat();
+    const sheetKeys = derived.geom.views.sourceKeys ?? [];
+    const cleaned = filterValidDrawingEdits(bus.getState(), planKeys, sheetKeys);
+    bus.execute(replaceDrawingEdits(bus.getState(), cleaned, '清理已失效的二维图元覆盖'));
+    toast('ok', '已清理失效的二维图元覆盖');
+  }, [unitIdentityReadOnly]);
+
   const openRemoteDrafts = (): void => {
     setSelection([]);
     selectionOnModeChange.current = null;
@@ -1543,6 +1722,11 @@ export function App() {
             onSharedPanelDraftChange={setSharedPanelDraftOpen}
             accountConnected={Boolean(token)}
             onAccountOpen={() => setAccountOpen(true)}
+            liveDraftPreview={liveDraftPreview}
+            onApplyLiveDraft={(dId) => void applyLiveDraftQuick(dId)}
+            onOpenRemoteDrafts={openRemoteDrafts}
+            onSyncLocalToServer={() => void syncLocalToServer()}
+            remoteDiffers={remoteWorkspaceStatus?.differs ?? false}
           >
             <AIPanel
               bus={bus}
@@ -1553,6 +1737,7 @@ export function App() {
               workspaceRoomId={workspaceRoomId}
               onWorkspaceRoomChange={changeWorkspaceRoom}
               onOpenRemoteDrafts={openRemoteDrafts}
+              onLiveDraftChange={setLiveDraftPreview}
               readOnly={unitIdentityReadOnly}
               workspaceContext
             />
@@ -1798,6 +1983,8 @@ export function App() {
               projectSnapshotVersion={remoteWorkspaceStatus?.projectSnapshotVersion ?? null}
               unconfirmedSharedPanelDraft={sharedPanelDraftOpen}
               onOpenRemoteDrafts={openRemoteDrafts}
+              onSyncLocalToServer={syncLocalToServer}
+              onCleanStaleOverrides={cleanStaleOverrides}
               onToast={toast}
               readOnly={unitIdentityReadOnly}
             />

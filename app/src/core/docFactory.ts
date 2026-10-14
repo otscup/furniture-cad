@@ -125,6 +125,7 @@ export function createCabinet(opts: {
   origin?: ImportOrigin;
   rules: RuleSet;
   takenIds?: Iterable<string>;
+  takenUnitIds?: Iterable<string>;
 }): Cabinet {
   const base = defaultCabinetParams(opts.rules);
   const params: CabinetParams = {
@@ -132,7 +133,24 @@ export function createCabinet(opts: {
     ...opts.params,
     backPanel: { ...base.backPanel, ...(opts.params?.backPanel ?? {}) },
   };
-  let units = opts.units && opts.units.length > 0 ? opts.units : defaultUnits(params.width, opts.rules, params.depth);
+  const takenUnits = new Set<string>(opts.takenUnitIds ?? []);
+  const dedupUnits = (list: UnitSpec[]): UnitSpec[] =>
+    list.map((u) => {
+      if (u.id && !takenUnits.has(u.id)) {
+        takenUnits.add(u.id);
+        return u;
+      }
+      const id = nextId('unit', takenUnits);
+      takenUnits.add(id);
+      return { ...u, id };
+    });
+  let units =
+    opts.units && opts.units.length > 0
+      ? dedupUnits(opts.units)
+      : !(opts.rows && opts.rows.length > 0)
+        ? defaultUnits(params.width, opts.rules, params.depth, takenUnits)
+        : [];
+  for (const u of units) takenUnits.add(u.id);
   /**
    * 背面分区的 id 兜底：板件 id 是 `P_{cab}_{unit.id}_…` 拼出来的，
    * 前后排撞 id = 两块不同的板共用一条清单记录（生产下错料）。
@@ -140,16 +158,7 @@ export function createCabinet(opts: {
    */
   let backUnits: UnitSpec[] | undefined;
   if (opts.backUnits && opts.backUnits.length > 0) {
-    const taken = new Set<string>(units.map((u) => u.id));
-    backUnits = opts.backUnits.map((u) => {
-      if (!taken.has(u.id)) {
-        taken.add(u.id);
-        return u;
-      }
-      const fixed = { ...u, id: nextId('unit', taken) };
-      taken.add(fixed.id);
-      return fixed;
-    });
+    backUnits = dedupUnits(opts.backUnits);
   }
   /**
    * 垂直行：只有真分了上下两层（≥2 行）才写 `rows`，1 行塌回 units ——
@@ -157,15 +166,15 @@ export function createCabinet(opts: {
    */
   let rows: CabinetRow[] | undefined;
   if (opts.rows && opts.rows.length > 0) {
-    const rowTaken = new Set<string>(units.map((u) => u.id));
+    const rowTaken = new Set<string>(takenUnits);
     rows = opts.rows.map((r) => {
       const id = nextId('row', rowTaken);
       rowTaken.add(id);
-      return { id, height: r.height ?? ROW_HEIGHT_FILL, units: r.units };
+      return { id, height: r.height ?? ROW_HEIGHT_FILL, units: dedupUnits(r.units) };
     });
     if (rows.length === 1) {
       // 单行：塌回，不留 rows（等价 v0.2 形状）
-      units = rows[0]!.units.length > 0 ? rows[0]!.units : units;
+      units = rows[0]!.units.length > 0 ? rows[0]!.units : defaultUnits(params.width, opts.rules, params.depth, takenUnits);
       rows = undefined;
     } else {
       // 多行：units 留第一行的镜像（字段必填，存盘时由 toFileLayout 省略），
@@ -440,17 +449,23 @@ export function defaultNickname(kind: UnitSpec['kind']): string {  switch (kind)
  * 默认分区：把柜宽按 2:4:2 拆成三个分区。
  * 每个分区都必须带完整的子规格 —— 否则生成器会静默跳过（比报错更危险）。
  */
-export function defaultUnits(width: number, rules: RuleSet, depth = 600): UnitSpec[] {
+export function defaultUnits(width: number, rules: RuleSet, depth = 600, takenUnitIds?: Iterable<string>): UnitSpec[] {
+  const used = new Set<string>(takenUnitIds ?? []);
+  const alloc = (): string => {
+    const id = nextId('unit', used);
+    used.add(id);
+    return id;
+  };
   if (width < 700) {
-    return [makeUnit({ id: 'unit_001', kind: 'shelves', requestedWidth: width, rules, count: 3 })];
+    return [makeUnit({ id: alloc(), kind: 'shelves', requestedWidth: width, rules, count: 3 })];
   }
   const a = Math.round(width * 0.25);
   const b = Math.round(width * 0.5);
   const c = width - a - b;
   return [
-    makeUnit({ id: 'unit_001', kind: 'drawerBank', requestedWidth: a, rules, count: 3, depth }),
-    makeUnit({ id: 'unit_002', kind: 'hanging', requestedWidth: b, rules, rodHeight: 1800 }),
-    makeUnit({ id: 'unit_003', kind: 'shelves', requestedWidth: c, rules, count: 4 }),
+    makeUnit({ id: alloc(), kind: 'drawerBank', requestedWidth: a, rules, count: 3, depth }),
+    makeUnit({ id: alloc(), kind: 'hanging', requestedWidth: b, rules, rodHeight: 1800 }),
+    makeUnit({ id: alloc(), kind: 'shelves', requestedWidth: c, rules, count: 4 }),
   ];
 }
 

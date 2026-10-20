@@ -113,10 +113,10 @@ for _ in $(seq 1 30); do
 done
 [ "$ok" = "1" ] || die "服务 60 秒没起来，看 docker logs"
 HEALTH="$(curl -s "http://127.0.0.1:$PORT/api/health")"
-echo "$HEALTH" | grep -q '"ok":true' || die "健康检查 ok≠true"
+echo "$HEALTH" | grep -qE '"ok":[[:space:]]*true' || die "健康检查 ok≠true"
 
 # 四之一的坑：data/ 变成 root 属主会导致"一切正常但写不进盘"
-if echo "$HEALTH" | grep -q '"dataWritable":true'; then
+if echo "$HEALTH" | grep -qE '"dataWritable":[[:space:]]*true'; then
   log "data/ 可写 ✅"
 else
   echo "⚠️ data/ 不可写！修完再走（deploy-nas.md「四之一」）："

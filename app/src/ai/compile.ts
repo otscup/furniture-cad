@@ -370,6 +370,28 @@ const FAMILY_ACTION: Record<string, string> = {
  * @param project **这一步开始时**的项目 —— 多步计划的每一步都要对着上一步的结果编译，
  *                否则"先加一个分区、再改第 4 个分区"这类计划会因为下标没跟上而改错对象。
  */
+/**
+ * AI 参数里的布尔：JSON 可能是 true，也可能是 "true" / 1。
+ *
+ * 为什么要容这三种 ──
+ *   模型输出的 JSON 里 boolean 字段偶尔会写成字符串（"true"），
+ *   也可能用 1/0 表示。契约层声明的是 boolean，但**校验层不查类型**
+ *   （checkParam 的 boolean 分支只看值本身），所以这里必须自己兜住。
+ *   漏掉一种 = 功能静默失效（用户说「加裤架」，图上什么也没有）。
+ *
+ * @param v 原始参数值
+ * @returns boolean
+ */
+function truthyFlag(v: unknown): boolean {
+  if (v === true) return true;
+  if (typeof v === 'number') return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    return s === 'true' || s === '1' || s === 'yes' || s === '是';
+  }
+  return false;
+}
+
 export function compileAction(action: AiAction, project: Project, rules: RuleSet): CompileResult {
   // ── A4：part 目标的语义校验（点选的部件必须存在、改的路径必须与部件一致）──
   if (action.target?.scope === 'selection') {
@@ -702,6 +724,9 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
         depth: cab.params.depth,
         count: p.count === undefined ? undefined : Number(p.count),
         rodHeight: p.rodHeight === undefined ? undefined : Number(p.rodHeight),
+        // 格子抽 / 裤架（2026-10-21）：显式透传，缺省不启用
+        drawerStyle: p.drawerStyle === undefined ? undefined : (String(p.drawerStyle) === 'grid' ? 'grid' : 'plain'),
+        trouserRack: truthyFlag(p.trouserRack) ? true : undefined,
         doors: doorIntentOf(p.doorCount, p.doorMaterial),
         appliance:
           kind === 'appliance'

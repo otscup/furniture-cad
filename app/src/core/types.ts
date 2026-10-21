@@ -328,6 +328,18 @@ export interface DrawerSpec {
   bottomGrooveDepth: number;
   gap: number;
   boxHeightDeduct: number;
+  /**
+   * 抽面表达方式（2026-10-21 补，对标参考图纸《世园润府》）：
+   *   'plain' = 普通抽面（一条横线）—— 默认；
+   *   'grid'  = **格子抽**：抽面被分成若干小格，
+   *             格内用连续折线（V 形）表示可抽拉的小格。
+   *
+   * 为什么要显式建模而不是靠 count 推断：
+   *   同样 3 个抽屉，'plain' 画三条横线，'grid' 画一排折线小格 ——
+   *   图上完全不同，客户和车间看的不是一回事。
+   *   靠 count 猜会把「三个普通大抽」误画成格子抽。
+   */
+  style?: 'plain' | 'grid';
 }
 
 /**
@@ -360,6 +372,16 @@ export interface UnitSpec {
   /** 仅 kind='appliance'：洞口与上下分体定义（缺省值由 docFactory.makeUnit 显式补齐） */
   appliance?: ApplianceSpec;
   drawers?: DrawerSpec;
+  /**
+   * 挂衣区里的**裤架**（2026-10-21 补，对标参考图纸）。
+   *
+   * 裤架 = 挂裤子用的横杆 + 一排倒 V 形挂钩。
+   * 参考图 p5 的画法：横杆下方挂一串 ∨ 形挂钩（顶点挂在杆上）。
+   *
+   * 显式建模的原因：裤架是**独立五金**，不是「多一个层板」——
+   * 它有自己的五金件、自己的示意画法。
+   */
+  trouserRack?: boolean;
   shelves?: {
     count: number;
     mode: 'equal';

@@ -24,6 +24,13 @@ export interface TemplateUnit {
   count?: number;
   /** 仅 hanging：挂衣杆离柜内底高度 */
   rodHeight?: number;
+  /**
+   * 抽面表达（仅 drawerBank）：'plain' = 普通抽面（缺省），
+   * 'grid' = 格子抽（图上画一排折线小格）。
+   */
+  drawerStyle?: 'plain' | 'grid';
+  /** 仅 hanging：是否带裤架（分区底部横杆 + 倒V挂钩） */
+  trouserRack?: boolean;
   /** 门板。缺省 = 无门；显式 null 也表示无门（跟"忘了填"区分开） */
   doors?: { count: number; hingeSide?: 'left' | 'right' } | null;
   /** 斜层板倾角（度，仅 shelves 分区；酒柜展示架常用 10~15）。缺省 = 0 平层板 */
@@ -85,6 +92,17 @@ export const CABINET_TEMPLATES: CabinetTemplate[] = [
     hint: '矮柜 700 高 · 挂墙无踢脚 · 对开门',
     params: { width: 1200, height: 700, depth: 350, bodyLift: 0, cabinetType: 'wall', mountHeight: 1450 },
     units: [{ kind: 'shelves', width: { ratio: 1 }, count: 1, doors: { count: 2 }, nickname: '吊柜格' }],
+  },
+  {
+    id: 'wardrobe_grid',
+    name: '衣柜（格子抽 + 裤架）',
+    hint: '衣柜 2400 高 · 格子抽 + 带裤架的挂衣区 + 顶部被褥格',
+    params: { width: 1800, height: 2400, depth: 600, bodyLift: 80, cabinetType: 'tall' },
+    units: [
+      { kind: 'shelves', width: { ratio: 0.28 }, count: 1, nickname: '被褥格' },
+      { kind: 'hanging', width: { ratio: 0.36 }, rodHeight: 1800, trouserRack: true, nickname: '挂衣+裤架' },
+      { kind: 'drawerBank', width: { ratio: 0.36 }, count: 3, drawerStyle: 'grid', nickname: '格子抽' },
+    ],
   },
   {
     id: 'tv_stand',

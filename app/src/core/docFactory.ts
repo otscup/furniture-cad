@@ -236,6 +236,9 @@ export function createCabinetFromTemplate(opts: {
             depth: tpl.params.depth,
             count: u.count,
             rodHeight: u.rodHeight,
+            // 格子抽 / 裤架（2026-10-21）：模板显式声明，缺省不启用
+            drawerStyle: u.drawerStyle,
+            trouserRack: u.trouserRack,
             tilt: u.tilt,
             doors: u.doors ? { count: u.doors.count, hingeSide: u.doors.hingeSide } : undefined,
             appliance: u.appliance,
@@ -322,6 +325,19 @@ export function makeUnit(opts: {
   /** 仅 hanging 有效：挂衣杆离柜内底高度 */
   rodHeight?: number;
   /**
+   * 抽面表达（仅 drawerBank 有效）：'plain' = 普通抽面（默认），
+   * 'grid' = 格子抽（图上画一排折线小格）。
+   *
+   * 显式建模而非靠 count 推断：同样 3 个抽屉，
+   * plain 画三条横线、grid 画一排折线 —— 图上完全不同。
+   */
+  drawerStyle?: 'plain' | 'grid';
+  /**
+   * 挂衣区是否带**裤架**（仅 hanging 有效）。
+   * 裤架 = 分区底部一根横杆 + 一排倒V挂钩。
+   */
+  trouserRack?: boolean;
+  /**
    * 斜层板倾角（度）。仅 shelves 分区使用；由模板/AI/UI 透传，
    * 缺省 0（平层板，显式默认）。不靠"字段缺失"表达倾斜状态。
    */
@@ -365,6 +381,8 @@ export function makeUnit(opts: {
     case 'drawerBank': {
       const d = defaultDrawerSpec(opts.rules, opts.depth ?? 600);
       unit = { ...base, nickname, drawers: { ...d, count: clampInt(opts.count ?? d.count, 1, 10) } };
+      // 格子抽：抽面画成折线小格（对标参考图纸）。显式建模，不靠 count 推断。
+      if (opts.drawerStyle === 'grid') unit.drawers!.style = 'grid';
       break;
     }
     case 'shelves':
@@ -382,6 +400,8 @@ export function makeUnit(opts: {
         rod: { count: 1, heightFromBottom: Math.round(opts.rodHeight ?? 1800), hardware: pickRod(opts.rules) },
         shelves: { count: 1, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       };
+      // 裤架：分区底部加裤架横杆 + 倒V挂钩（对标参考图纸）。
+      if (opts.trouserRack === true) unit.trouserRack = true;
       break;
     case 'appliance': {
       const a = opts.appliance ?? {};

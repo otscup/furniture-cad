@@ -688,10 +688,12 @@ export class WorkspaceStore {
    * 保护纪律：
    *  1. 若 clientHasLocalEdits === false 且服务端 liveModelVersion > 0（说明云端已有 MCP/Agent 成果，
    *     而本地浏览器刚打开、尚无本地编辑），绝不允许用本地默认示例覆盖云端，直接返回云端快照供前端注水；
-   *  2. 若传入 expectedLiveVersion 且小于当前 liveModelVersion，同时未声明 force=true，
+   *  2. **A1：clientHasLocalEdits === true 时不受"空柜体"推断影响** —— 用户主动删空是合法变更，
+   *     必须照常落库（见下面 shouldHydrateFromServer 的完整说明与风险）；
+   *  3. 若传入 expectedLiveVersion 且小于当前 liveModelVersion，同时未声明 force=true，
    *     拒绝静默覆盖并返回 WORKSPACE_VERSION_CONFLICT；
-   *  3. 若项目内容 hash 完全一致，不虚增 liveModelVersion，幂等返回当前快照；
-   *  4. 其余合法本地修改统一经 CommandBus.prepareProjectReplacement 校验并原子落盘、liveModelVersion + 1。
+   *  4. 若项目内容 hash 完全一致，不虚增 liveModelVersion，幂等返回当前快照；
+   *  5. 其余合法本地修改统一经 CommandBus.prepareProjectReplacement 校验并原子落盘、liveModelVersion + 1。
    */
   async syncClientProject(
     project: Project,
@@ -748,10 +750,38 @@ export class WorkspaceStore {
         };
       }
 
-      // 防空覆盖核心保护：当本地声明没有本地未保存编辑（或本地是空柜体）而云端已经有版本演进时，直接把云端真源回传给浏览器注水
+      // ── 防空覆盖水位线（A1 修复：区分「没加载完的空」与「用户真的删空了」）──
+      /**
+       * 这道闸的**本意**是防事故：浏览器刚打开、本地还是默认示例，一按同步就把云端
+       * MCP/Agent 的成果冲成空。这一点必须保住。
+       *
+       * 但它原来的判据只看"传进来 0 台柜体"（incomingIsEmpty），于是把**用户主动删空**
+       * 也当成了事故回滚 —— 删掉最后一台柜体时 PUT 返回 200、云端纹丝不动，
+       * 用户的删除被静默吞掉（真实复现过的数据不一致）。
+       *
+       * 现在按**客户端自己的声明**分流，"空"不再是"事故"的同义词：
+       *  · clientHasLocalEdits === true → 客户端明确说"我有本地编辑"，哪怕结果为空也
+       *    必须接受：删空是一次合法的模型变更，照常落库并让 liveModelVersion + 1。
+       *    **行为变更 / 风险**：删空从此真的会覆盖云端。若客户端谎报 true，云端就会被
+       *    真的清空 —— 但"有没有本地编辑"只有声明方知道，服务端不能靠猜代替它，
+       *    否则用户的正当删除永远写不进去（这正是本次要修的事故）。
+       *    缓解：撤销仍走 CommandBus 的 replaceProject 副作用（浏览器 Ctrl+Z 可恢复），
+       *    且并发覆盖仍由下面的 expectedLiveVersion 乐观锁拦住。
+       *  · clientHasLocalEdits === false → 明确的"我没有本地编辑"，照旧注水保护，一字不改。
+       *  · 未声明（老脚本 / 直接调用的外部代码）→ 沿用原来的保守判据（传进来 0 台
+       *    而云端有），宁可不写，也不让不声明的调用方删掉别人的成果。
+       *  · force === true → 用户在冲突界面明确选过"用本地覆盖云端"，**连空也算数**，
+       *    否则那个按钮在"本地恰好是空"时同样会静默失效（同一类 bug 的另一半）。
+       */
       const currentSnap = this.getProjectSnapshot();
+      const declaresLocalEdits = opts?.clientHasLocalEdits === true;
+      const declaresNoLocalEdits = opts?.clientHasLocalEdits === false;
       const incomingIsEmpty = project.cabinets.length === 0 && currentSnap.cabinets.length > 0;
-      if ((opts?.clientHasLocalEdits === false || (incomingIsEmpty && !opts?.force)) && this.liveModelVersion > 0) {
+      const shouldHydrateFromServer =
+        !opts?.force &&
+        this.liveModelVersion > 0 &&
+        (declaresNoLocalEdits || (!declaresLocalEdits && incomingIsEmpty));
+      if (shouldHydrateFromServer) {
         return {
           ok: true,
           unchanged: true,
@@ -1212,6 +1242,45 @@ export class WorkspaceStore {
     }
   }
 
+  /** 项目身份签名：用于判断一份草稿"是不是本项目的"。 */
+  private projectIdSignature(project: unknown): string | null {
+    if (!project || typeof project !== 'object') return null;
+    const id = (project as { id?: unknown }).id;
+    return typeof id === 'string' && id.length > 0 ? id : null;
+  }
+
+  /** 本项目 live 模型的项目 id（取自模型本体，不从文件名推）。 */
+  private liveProjectId(): string | null {
+    return this.projectIdSignature(this.bus.getState());
+  }
+
+  /**
+   * 判断一份从磁盘装载的草稿是否**属于本项目**。
+   *
+   * 判据：workspaceId 相同（同一次装载实例）+ project.id 相同（同一条项目文件；
+   * 项目切换/装载实例重建后 workspaceId 会变，但项目 id 不变）。
+   * 任一侧拿不到 id 时退回按 workspaceId 判定，与历史行为一致。
+   */
+  private draftBelongsToThisProject(draft: ServerDraft): boolean {
+    if (draft.workspaceId !== this.workspaceId) return false;
+    const own = this.liveProjectId();
+    const draftProjectId = this.projectIdSignature(draft.getState());
+    if (own === null || draftProjectId === null) return true;
+    return own === draftProjectId;
+  }
+
+  /**
+   * 隔离（**不删除**）一份不属于本项目的草稿。
+   *
+   * 没有隔离通道时返回 false，并把文件原样留在磁盘上：
+   * 别人的草稿宁可下次多读一次，也不能因为这条装载路径被物理抹掉。
+   */
+  private async isolateForeignDraftFile(draftId: string, reason: string): Promise<boolean> {
+    if (!this.quarantineDraft) return false;
+    await this.quarantineDraft(draftId, reason);
+    return true;
+  }
+
   private async quarantineDraftFile(draftId: string, reason: string): Promise<void> {
     if (this.quarantineDraft) {
       await this.quarantineDraft(draftId, reason);
@@ -1280,10 +1349,33 @@ export class WorkspaceStore {
         await this.quarantineDraftFile(f.draftId, `文件名 draftId 与内容不一致：${draft.draftId}`);
         continue;
       }
-      if (draft.workspaceId !== this.workspaceId || this.freshnessFor(draft).isStale) {
+      /**
+       * 不属于本项目的草稿：**隔离，绝不删除**（P0-3）。
+       *
+       * 历史事故：`projects/drafts/` 是所有项目共用的一层目录
+       * （workspaceHost.mjs 里 `join(dirname(filePath), 'drafts')`，而项目文件在
+       * `projects/{id}.json` ⇒ draftsDir 恒为 `projects/drafts/`）。于是切到项目 B 时
+       * 读到项目 A 的草稿 → workspaceId 不等 → 旧代码调 retireDraftFile() → **物理删除**。
+       * 用户切一下项目，别人的未提交成果就没了，而且没有回收站。
+       *
+       * 现在的分级（按"能不能证明它属于本项目"排序，宁可少删）：
+       *   ① 不是本项目（workspaceId 或 project.id 对不上）⇒ 隔离；没有隔离通道就原样
+       *      留在磁盘上，**绝不 delete**；
+       *   ② 是本项目 + 基线确实过期 ⇒ 才允许 retire（真正过期，恢复也无意义；
+       *      删除/隔离仍由 retireDraftFile 自己兜底）。
+       */
+      if (!this.draftBelongsToThisProject(draft)) {
         skipped.push(f.draftId);
         if (this.getUnitIdentityConflict()) continue;
-        await this.retireDraftFile(f.draftId, '工作区不匹配或草稿基线已过期');
+        const reason = `不属于本项目的草稿（live project=${this.liveProjectId() ?? '?'}，draft project=${this.projectIdSignature(draft.getState()) ?? '?'}）`;
+        // 隔离失败就保留文件：这里是数据安全侧，失败不能升级成删除。
+        await this.isolateForeignDraftFile(f.draftId, reason);
+        continue;
+      }
+      if (this.freshnessFor(draft).isStale) {
+        skipped.push(f.draftId);
+        if (this.getUnitIdentityConflict()) continue;
+        await this.retireDraftFile(f.draftId, '草稿基线已过期');
         continue;
       }
       this.drafts.set(draft.draftId, draft);

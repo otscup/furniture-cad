@@ -34,6 +34,27 @@ const SELECTED_COLOR = 0x4a90d9;
 /** 单位盒：模块级共享（scale 定尺寸），永不 dispose —— 每次重建 new 会漏 GPU 内存 */
 const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
 
+/**
+ * 摘掉一批 body mesh 并释放**它自己创建**的材质。
+ *
+ * 只 dispose 材质：几何是模块级共享的 UNIT_BOX，dispose 掉会让下一次 rebuild
+ * 拿到一个已释放的 geometry（WebGL 层报错、模型整块消失）。
+ * 场景增量（rebuild）与整体卸载（cleanup）走同一份实现，避免两处漂移。
+ */
+function disposeBodyGroup(group: THREE.Group | null): void {
+  if (!group) return;
+  // removeFromParent 同时断开 scene.children 与 mesh.parent 两条链：
+  // 只 scene.remove(mesh) 是无效的（mesh 的 parent 是 group，不是 scene）。
+  group.removeFromParent();
+  group.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) material?.dispose?.();
+  });
+  group.clear();
+}
+
 interface Props {
   bus: CommandBus;
   version: number;
@@ -53,6 +74,13 @@ export function ThreeViewport({ bus, version, selection, setSelection, cabinetFi
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshByCab = useRef<Map<string, { meshes: THREE.Mesh[]; roles: string[] }>>(new Map());
+  /**
+   * 当前这一批 mesh 所在的 Group。
+   * 必须记住它：mesh 的 parent 是 Group 而不是 Scene，`scene.remove(mesh)` 什么也不做，
+   * 于是每次 rebuild 都把上一批 Group 永久留在场景里（三个桶的 Cam 每次都渲染）。
+   * 重建前拿它整体摘下来，是这条泄漏的唯一治本点。
+   */
+  const groupRef = useRef<THREE.Group | null>(null);
   const [ready, setReady] = useState(false);
 
   const bodies = useMemo<Box3D[]>(() => {
@@ -124,6 +152,12 @@ export function ThreeViewport({ bus, version, selection, setSelection, cabinetFi
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      // 卸载时同样整组摘除并释放材质：StrictMode 双挂载 / 路由切走时，
+      // scene 本身没人再引用，但 groupRef 仍指着一批挂着 parent 的 mesh，
+      // 下次 rebuild 会操作一个已废弃的 scene —— 等于把泄漏换成脏引用。
+      disposeBodyGroup(groupRef.current);
+      groupRef.current = null;
+      meshByCab.current = new Map();
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentElement === host) host.removeChild(renderer.domElement);
@@ -141,13 +175,19 @@ export function ThreeViewport({ bus, version, selection, setSelection, cabinetFi
     const controls = controlsRef.current;
     if (!scene || !camera || !controls) return;
 
-    // 清旧
-    for (const entry of meshByCab.current.values()) {
-      for (const m of entry.meshes) {
-        scene.remove(m);
-        (m.material as THREE.Material).dispose();
-      }
-    }
+    /**
+     * 清旧 —— 按 **Group** 清，不能按 mesh 清。
+     *
+     * 历史 bug：这里原本是 `scene.remove(m)`。mesh 的 parent 是下面那个
+     * `new THREE.Group()`，不是 scene，所以 remove 一次也没生效：旧 Group 连同
+     * 它的全部 mesh 永远挂在场景上，每次模型变更（拖一下松手）泄漏一批对象，
+     * 长会话越拖越卡，而且射线拾取还会打到已经不该存在的旧 mesh。
+     *
+     * 正确顺序：整组摘下来（removeFromParent 会同时断开 scene.children 与
+     * mesh.parent 两条链）→ 逐 mesh 释放**本批新建**的材质 → 断开内部引用。
+     */
+    disposeBodyGroup(groupRef.current);
+    groupRef.current = null;
     meshByCab.current = new Map();
 
     const group = new THREE.Group();
@@ -175,6 +215,7 @@ export function ThreeViewport({ bus, version, selection, setSelection, cabinetFi
       min.z = Math.min(min.z, b.cy); max.z = Math.max(max.z, b.cy);
     }
     scene.add(group);
+    groupRef.current = group;
 
     // 取景：包围盒中心，斜视角俯视（3D 自己的取景，与 2D 相机无关）
     if (bodies.length > 0 && Number.isFinite(min.x)) {

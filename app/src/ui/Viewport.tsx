@@ -838,81 +838,19 @@ export function Viewport(props: ViewportProps) {
     }
   };
 
-  const onPointerUp = (e: RPointerEvent<HTMLDivElement>): void => {
-    const el = wrapRef.current;
-    if (el?.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
-    if (!drag) return;
-
-    const sp = toCanvas(e);
-    const raw = toWorld(sp);
-
-    if (drag.kind === 'marquee') {
-      const project = bus.getState();
-      const ids = sheet ? [] : boxSelect(project, drag.a, drag.b);
-      const minX = Math.min(drag.a.x, drag.b.x), maxX = Math.max(drag.a.x, drag.b.x);
-      const minY = Math.min(drag.a.y, drag.b.y), maxY = Math.max(drag.a.y, drag.b.y);
-      for (const entity of project.drawingEdits ?? []) {
-        if (entity.space !== (sheet ? 'sheet' : 'plan') || !entity.points.length) continue;
-        if (entity.points.every(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY)) ids.push(editSelectionId(entity.id));
-      }
-      const derived = bus.derive().geom;
-      const space: DrawingSpace = sheet ? 'sheet' : 'plan';
-      const prims = sheet ? derived.views.prims : derived.plan;
-      const keys = sheet ? derived.views.sourceKeys : derived.planSourceKeys;
-      const hidden = new Set((project.drawingEdits ?? []).filter(x => x.space === space && x.replacesSource).map(x => x.replacesSource!));
-      ids.push(...sourceKeysInRect(prims, keys, { minX, minY, maxX, maxY }, hidden).map(sourceSelectionId));
-      setSelection(ids);
-    } else if (drag.kind === 'sheetDim') {
-      // 松手时的最终值：与刚才预览用的是同一个算法、同一个模型，
-      // 所以"预览 === 提交"是结构性保证，不是巧合。
-      const value = dragValueOf(drag.spec, drag.cab, drag.startWorld, raw);
-      const before = drag.spec.read(drag.cab);
-      if (value !== before) {
-        if (props.readOnly) {
-          props.onToast('warn', '历史重复 Unit ID 项目只读；图纸尺寸编辑已禁用。');
-          return;
-        }
-        const r = bus.execute(drag.spec.build(drag.cab, drag.pl.unitIndex, value), { commitLabel: `${drag.spec.labelZh} 拖动` });
-        if (!r.ok) props.onToast('error', `改${drag.spec.labelZh}失败：${r.error ?? '被规则拒绝'}`);
-        else if (dragClamped(drag.spec, value)) props.onToast('info', `${drag.spec.labelZh}已到上下限（${drag.spec.min}~${drag.spec.max}mm）：这是规则允许的边界`);
-      }
-    } else if (drag.kind === 'grip') {
-      const s = resolveAt(raw, drag.startPointer);
-      const plan = drag.cab
-        ? planCabinetGripDrag(drag.cab, drag.grip.role, s.p, drag.startPointer)
-        : drag.wall
-          ? planWallGripDrag(drag.wall, drag.grip.role, s.p)
-          : null;
-      if (plan) runCommand(plan.command);
-    } else if (drag.kind === 'body') {
-      const s = resolveAt(raw, drag.startPointer);
-      const dx = s.p.x - drag.startPointer.x;
-      const dy = s.p.y - drag.startPointer.y;
-      if (dx !== 0 || dy !== 0) {
-        runCommand(CMD.moveCabinetBatch(drag.cabs, bus.getState().cabinets, dx, dy));
-      }
-      } else if (drag.kind === 'drawing') {
-        const dx = Math.round(raw.x - drag.startWorld.x), dy = Math.round(raw.y - drag.startWorld.y);
-        if (Math.abs(dx) + Math.abs(dy) >= 2) {
-          const next = drag.edits.filter(e => !drag.selectedIds.includes(e.id));
-          if (drag.source) {
-            const entity = sourceOverride(drag.source.key, drag.source.prim, sheet ? 'sheet' : 'plan', drag.source.id, drag.source.meta);
-            if (!entity) { setEditPreview(null); return; }
-            next.push(translateDrawingEntity(entity, dx, dy));
-          setSelection([editSelectionId(entity.id)]);
-          props.onToast('info', '已创建当前视图覆盖；柜体生产参数未更改');
-        } else {
-          const moved: string[] = [];
-          for (const id of drag.selectedIds) {
-            const original = drag.edits.find(e => e.id === id);
-            if (original) { next.push(translateDrawingEntity(original, dx, dy)); moved.push(editSelectionId(id)); }
-          }
-          setSelection(moved);
-        }
-        persistDrawing(next, drag.source ? '覆盖并移动生成线' : '移动二维图元');
-      }
-    }
-
+  /**
+   * 一次指针交互的**唯一收尾**。
+   *
+   * 抽成函数的原因是一个真踩到的 bug：`drag.kind === 'drawing'` 里
+   * `sourceOverride()` 返回 null（拖的是填充图元 —— 它不能整体平移）时，
+   * 原代码写的是 `setEditPreview(null); return;`，于是**跳过了**函数末尾的统一清理，
+   * 松手之后**仍然**处于 drag 状态：橡皮筋、捕捉标记、预览徽标全都留在屏幕上，
+   * 而且下一次 pointermove 还会继续按"正在拖动"处理，用户只能按 Esc 或切工具才能恢复。
+   *
+   * 收尾只有这一份实现，且它由 onPointerUp 的 finally 无条件调用 ——
+   * 也就是"松手必须收干净"不再依赖每个 return 分支的自觉，而是语法保证。
+   */
+  const finishDrag = (): void => {
     setDrag(null);
     setPreview(null);
     setEditPreview(null);
@@ -922,6 +860,90 @@ export function Viewport(props: ViewportProps) {
     // 不清的话松手后屏幕上会留下一条指向虚空的橡皮筋和一个失效的捕捉标记，
     // 直到用户再次移动鼠标才消失。真实 CAD 在命令结束时会立刻收掉追踪线。
     setSnap(null);
+  };
+
+  const onPointerUp = (e: RPointerEvent<HTMLDivElement>): void => {
+    const el = wrapRef.current;
+    if (el?.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    if (!drag) return;
+
+    try {
+      const sp = toCanvas(e);
+      const raw = toWorld(sp);
+
+      if (drag.kind === 'marquee') {
+        const project = bus.getState();
+        const ids = sheet ? [] : boxSelect(project, drag.a, drag.b);
+        const minX = Math.min(drag.a.x, drag.b.x), maxX = Math.max(drag.a.x, drag.b.x);
+        const minY = Math.min(drag.a.y, drag.b.y), maxY = Math.max(drag.a.y, drag.b.y);
+        for (const entity of project.drawingEdits ?? []) {
+          if (entity.space !== (sheet ? 'sheet' : 'plan') || !entity.points.length) continue;
+          if (entity.points.every(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY)) ids.push(editSelectionId(entity.id));
+        }
+        const derived = bus.derive().geom;
+        const space: DrawingSpace = sheet ? 'sheet' : 'plan';
+        const prims = sheet ? derived.views.prims : derived.plan;
+        const keys = sheet ? derived.views.sourceKeys : derived.planSourceKeys;
+        const hidden = new Set((project.drawingEdits ?? []).filter(x => x.space === space && x.replacesSource).map(x => x.replacesSource!));
+        ids.push(...sourceKeysInRect(prims, keys, { minX, minY, maxX, maxY }, hidden).map(sourceSelectionId));
+        setSelection(ids);
+      } else if (drag.kind === 'sheetDim') {
+        // 松手时的最终值：与刚才预览用的是同一个算法、同一个模型，
+        // 所以"预览 === 提交"是结构性保证，不是巧合。
+        const value = dragValueOf(drag.spec, drag.cab, drag.startWorld, raw);
+        const before = drag.spec.read(drag.cab);
+        if (value !== before) {
+          if (props.readOnly) {
+            props.onToast('warn', '历史重复 Unit ID 项目只读；图纸尺寸编辑已禁用。');
+            return; // 收尾由 finally 负责
+          }
+          const r = bus.execute(drag.spec.build(drag.cab, drag.pl.unitIndex, value), { commitLabel: `${drag.spec.labelZh} 拖动` });
+          if (!r.ok) props.onToast('error', `改${drag.spec.labelZh}失败：${r.error ?? '被规则拒绝'}`);
+          else if (dragClamped(drag.spec, value)) props.onToast('info', `${drag.spec.labelZh}已到上下限（${drag.spec.min}~${drag.spec.max}mm）：这是规则允许的边界`);
+        }
+      } else if (drag.kind === 'grip') {
+        const s = resolveAt(raw, drag.startPointer);
+        const plan = drag.cab
+          ? planCabinetGripDrag(drag.cab, drag.grip.role, s.p, drag.startPointer)
+          : drag.wall
+            ? planWallGripDrag(drag.wall, drag.grip.role, s.p)
+            : null;
+        if (plan) runCommand(plan.command);
+      } else if (drag.kind === 'body') {
+        const s = resolveAt(raw, drag.startPointer);
+        const dx = s.p.x - drag.startPointer.x;
+        const dy = s.p.y - drag.startPointer.y;
+        if (dx !== 0 || dy !== 0) {
+          runCommand(CMD.moveCabinetBatch(drag.cabs, bus.getState().cabinets, dx, dy));
+        }
+      } else if (drag.kind === 'drawing') {
+        const dx = Math.round(raw.x - drag.startWorld.x), dy = Math.round(raw.y - drag.startWorld.y);
+        if (Math.abs(dx) + Math.abs(dy) >= 2) {
+          const next = drag.edits.filter(e => !drag.selectedIds.includes(e.id));
+          if (drag.source) {
+            const entity = sourceOverride(drag.source.key, drag.source.prim, sheet ? 'sheet' : 'plan', drag.source.id, drag.source.meta);
+            // 填充图元不能整体平移：sourceOverride 返回 null 时直接放弃本次移动。
+            // 收尾由 finally 统一保证 —— 这里 early return 不会再把拖动状态留在界面上。
+            if (!entity) return;
+            next.push(translateDrawingEntity(entity, dx, dy));
+            setSelection([editSelectionId(entity.id)]);
+            props.onToast('info', '已创建当前视图覆盖；柜体生产参数未更改');
+          } else {
+            const moved: string[] = [];
+            for (const id of drag.selectedIds) {
+              const original = drag.edits.find(e => e.id === id);
+              if (original) { next.push(translateDrawingEntity(original, dx, dy)); moved.push(editSelectionId(id)); }
+            }
+            setSelection(moved);
+          }
+          persistDrawing(next, drag.source ? '覆盖并移动生成线' : '移动二维图元');
+        }
+      }
+    } finally {
+      // 收尾放 finally：任何 return 路径（包括将来新增的早退）都不可能跳过它。
+      // 这不是防御性编程，而是把「松手必须收干净」从纪律变成语言保证。
+      finishDrag();
+    }
   };
 
   const onPointerLeave = (): void => {

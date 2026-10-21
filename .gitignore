@@ -29,3 +29,6 @@ app/verify/out/*.log
 # 其余是工具自己的运行时数据，不进版本控制。
 .workbuddy/*
 !.workbuddy/memory/
+
+# demo export artifacts (regenerable)
+demo-out/

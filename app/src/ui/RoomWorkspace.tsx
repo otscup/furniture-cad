@@ -12,6 +12,9 @@ import { CABINET_TEMPLATES } from '../core/templates.ts';
 import type { Project, RuleSet } from '../core/types.ts';
 import { primsToSvg } from '../export/roomBook.ts';
 import { SharedPanelsPanel } from './SharedPanelsPanel.tsx';
+import { liveDraftStageMode } from './liveAgentLog.ts';
+import type { AgentStreamEvent } from './liveAgentLog.ts';
+import { LiveAgentLog } from './panels/LiveAgentLog.tsx';
 
 const ThreeViewport = lazy(() => import('./ThreeViewport.tsx').then((module) => ({ default: module.ThreeViewport })));
 
@@ -107,6 +110,8 @@ export function RoomWorkspace(props: {
   onOpenRemoteDrafts?: () => void;
   onSyncLocalToServer?: () => void;
   remoteDiffers?: boolean;
+  /** A3：MCP / Agent 实时事件流（最新在前，最多 AGENT_EVENT_LIMIT 条）。 */
+  agentEvents?: AgentStreamEvent[];
   children?: ReactNode;
 }): ReactNode {
   const groups = useMemo(() => indexProjectRooms(props.project), [props.project]);
@@ -227,6 +232,18 @@ export function RoomWorkspace(props: {
       return null;
     }
   }, [props.liveDraftPreview, activeRoom, props.rules]);
+
+  /**
+   * A2：草稿预览在当前视图下的呈现方式。
+   * 原先这块只在"整墙四视图"下方出现（整房视图专有），切到 3D / 平面视图就看不见了，
+   * 而 3D / 平面恰恰是用户"正在看这个房间"的主画布。现在三视图都钉同一条草稿带。
+   */
+  const draftStage = useMemo(() => liveDraftStageMode(centerViewMode), [centerViewMode]);
+  /**
+   * 草稿带的显示条件 = 钉住（视图无关，来自 liveDraftStageMode）+ 真的存在草稿内容。
+   * **故意不含 centerViewMode 比较**：一旦写成"只有某视图才显示"，就退回本次要修的缺陷。
+   */
+  const showLiveDraftBand = Boolean(draftStage.pinned && props.liveDraftPreview && liveDraftSheetSvg);
 
   const cabinetViews = useMemo(() => {
     const output = new Map<string, { front: string; internal: string; top: string; error?: string }>();
@@ -436,6 +453,65 @@ export function RoomWorkspace(props: {
                 ) : null}
               </div>
 
+              {/*
+                A2：实时草稿带 —— 钉在主画布顶部，**三种视图都显示**。
+                原先草稿预览只渲染在"整墙四视图"下方的长内容里（即 sheet 视图专属），
+                用户切到 3D 或平面视图就完全看不到 Agent 在干什么 —— 而那两个才是
+                正在画的那个房间的主视图。虚线边框 + 顶部条是刻意的：一眼能看出
+                这是正在画的草稿，不是已入库的正式图；它只读，不碰 bus 里的正式模型。
+              */}
+              {showLiveDraftBand && props.liveDraftPreview && liveDraftSheetSvg ? (
+                <section
+                  className="workspace-live-draft-band"
+                  aria-label="MCP 与 Agent 实时草稿带（旁路预览，尚未入库）"
+                  data-testid="workspace-live-draft-band"
+                  data-live-draft-view={centerViewMode}
+                >
+                  <header className="workspace-live-draft-band-head">
+                    <span className="workspace-live-draft-band-tag">⚡ {draftStage.bandLabel}</span>
+                    <span className="workspace-live-draft-band-meta">
+                      草稿 {props.liveDraftPreview.draftId} · {liveDraftSheetSvg.roomName} · 已绘制 {liveDraftSheetSvg.cabinetCount} 台柜体
+                      {props.liveDraftPreview.stepText ? ` · 最新动作 ${props.liveDraftPreview.stepText}` : ''}
+                      {props.liveDraftPreview.blockingErrors > 0 ? ` · ${props.liveDraftPreview.blockingErrors} 项待修正` : ' · 校验 0 错误'}
+                    </span>
+                    <span className="workspace-live-draft-band-hint">{draftStage.hint}</span>
+                    <div className="workspace-live-draft-band-actions">
+                      {props.onApplyLiveDraft ? (
+                        <button
+                          type="button"
+                          className="workspace-button workspace-button-primary"
+                          data-testid="workspace-live-draft-band-apply"
+                          disabled={props.readOnly}
+                          title="把这份草稿采纳进你的正式模型（走 CommandBus，可撤销）"
+                          onClick={() => props.onApplyLiveDraft?.(props.liveDraftPreview!.draftId)}
+                        >
+                          ✅ 采纳这份草稿
+                        </button>
+                      ) : null}
+                      {props.onOpenRemoteDrafts ? (
+                        <button type="button" className="workspace-button workspace-button-quiet" onClick={props.onOpenRemoteDrafts}>
+                          草稿详情
+                        </button>
+                      ) : null}
+                    </div>
+                  </header>
+                  <div className="workspace-live-draft-band-body">
+                    <LiveAgentLog events={props.agentEvents} draftId={props.liveDraftPreview.draftId} />
+                  </div>
+                </section>
+              ) : props.agentEvents && props.agentEvents.length > 0 ? (
+                /* 没有草稿内容（例如只有 agent.step 而服务端降级没带 project）时，
+                   事件流本身仍然是"Agent 在动"的唯一证据，不能一起消失。 */
+                <section
+                  className="workspace-live-draft-band workspace-live-draft-band-log-only"
+                  aria-label="MCP 与 Agent 实时事件流（本轮没有可渲染的草稿图元）"
+                  data-testid="workspace-agent-log-band"
+                  data-live-draft-view={centerViewMode}
+                >
+                  <LiveAgentLog events={props.agentEvents} />
+                </section>
+              ) : null}
+
               {centerViewMode === '3d' ? (
                 <section className="workspace-whole-room-sheet" aria-label={`${activeRoom.room.name} 3D 空间预览`} data-testid="workspace-inline-3d-stage">
                   <header className="workspace-whole-room-head">
@@ -533,7 +609,12 @@ export function RoomWorkspace(props: {
                 </section>
               ) : null}
 
-              {props.liveDraftPreview && liveDraftSheetSvg ? (
+              {/*
+                A2：草稿的**整张四视图**只在 sheet 视图展开 —— 3D / 平面视图里它挂在
+                顶部草稿带里（上面那块），不会在这里再出现一遍。判据来自
+                liveDraftStageMode().inlineSheet，不是硬编码的视图名。
+              */}
+              {props.liveDraftPreview && liveDraftSheetSvg && draftStage.inlineSheet ? (
                 <section className="workspace-live-draft-stage" aria-label="MCP 与 Agent 实时绘制同步预览" data-testid="workspace-live-draft-stage">
                   <header className="workspace-whole-room-head">
                     <div>

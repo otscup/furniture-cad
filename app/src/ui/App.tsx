@@ -44,6 +44,8 @@ import { AccountPanel } from './panels/AccountPanel.tsx';
 import { VariantPanel } from './panels/VariantPanel.tsx';
 import { ExportPanel } from './panels/ExportPanel.tsx';
 import { RoomWorkspace, WorkspaceTopBar } from './RoomWorkspace.tsx';
+import { agentEventFromSsePayload, appendAgentEvent } from './liveAgentLog.ts';
+import type { AgentStreamEvent, AgentStreamEventInput } from './liveAgentLog.ts';
 import { api, loadToken, saveToken } from '../ai/aiClient.ts';
 import { loadDraft, saveDraft, clearDraft, fmtSavedAt, hasStoredDuplicateUnitIds, setProjectStorageReadOnly } from '../state/draftStore.ts';
 import type { PickLine } from '../core/geometry/pickLines.ts';
@@ -242,6 +244,16 @@ export function App() {
    */
   const [token, setTokenRaw] = useState<string | null>(() => loadToken());
   const [remoteWorkspaceStatus, setRemoteWorkspaceStatus] = useState<RemoteWorkspaceStatus | null>(null);
+  /**
+   * P1-5：PUT 被服务端以 WORKSPACE_VERSION_CONFLICT 拒绝时，把**云端项目原样**存下来，
+   * 让用户显式二选一（用云端覆盖本地 / 保留本地强制覆盖云端）。
+   * 绝不在这里自动决定 —— 静默覆盖正是这次要修掉的缺陷。
+   */
+  const [workspaceVersionConflict, setWorkspaceVersionConflict] = useState<{
+    project: Project;
+    liveModelVersion: number | null;
+    message: string;
+  } | null>(null);
   const [liveDraftPreview, setLiveDraftPreview] = useState<{
     draftId: string;
     project: Project;
@@ -250,9 +262,41 @@ export function App() {
     blockingErrors: number;
     stepText?: string;
   } | null>(null);
+  /**
+   * A3：MCP / Agent 实时事件流（最新在前，最多 50 条）。
+   *
+   * 纪律：这里只记录**看见**了什么（SSE 推过来的 step / draft / workspace 事件），
+   * 绝不回写 bus —— 事件流是旁路观测，草稿与正式模型都只由各自的既有写入口变更。
+   * 用户正在拖动、正在改尺寸时，多一条日志不会打断任何编辑操作。
+   */
+  const [agentEvents, setAgentEvents] = useState<AgentStreamEvent[]>([]);
+  /** 去重指纹：EventSource 断线重连会重推同一步，同一条事件不能记两遍。 */
+  const agentEventKeysRef = useRef<Set<string>>(new Set());
+  /**
+   * 归约本身是纯函数（ui/liveAgentLog.ts 的 appendAgentEvent）：倒序、去重、
+   * 上限 50 条三条语义都在那里被 verify 脚本直接断言，这里只负责把 state 换掉。
+   */
+  const pushAgentEvent = useCallback((input: AgentStreamEventInput): void => {
+    const seen = agentEventKeysRef.current;
+    const now = Date.now();
+    setAgentEvents((previous) => appendAgentEvent(previous, input, seen, now).events);
+  }, []);
   const hasLocalDraftRef = useRef<boolean>(false);
   const hydratedFromCloudRef = useRef<boolean>(false);
   const validatedHealthyProjectFingerprintRef = useRef<string | null>(null);
+  /**
+   * P1-5 乐观锁基线：最近一次 GET/PUT /api/workspace 成功返回的 liveModelVersion。
+   * PUT 时作为 expectedLiveVersion 发出，服务端据此拒绝"用旧基线覆盖新云端"。
+   * null = 首屏 GET 还没回来，此时不发该字段（服务端视作无从比较），
+   * 而不是发 0 —— 发 0 会把一次正常的首次同步误判成版本冲突。
+   */
+  const lastLiveVersionRef = useRef<number | null>(null);
+  /**
+   * P1-5：最近一次确认的**服务端侧**项目指纹。clientHasLocalEdits 由
+   * "本地模型 vs 这份指纹"比较得出，不再恒为 true —— 恒 true 等于把
+   * 服务端的空/无编辑防覆盖水位线保护也一并废掉。
+   */
+  const lastServerProjectFingerprintRef = useRef<string | null>(null);
   const [stickyIdentityDiagnostics, setStickyIdentityDiagnostics] = useState<IdentityDiagnostics | null>(persistedIdentityLock?.diagnostics ?? null);
   const currentProjectFingerprint = stableProjectJson(bus.getState());
   const remoteIdentityReadOnly = Boolean(remoteWorkspaceStatus?.identityDiagnostics?.readOnly
@@ -290,9 +334,25 @@ export function App() {
     saveToken(t);
   }, []);
 
+  /**
+   * P1-5 第二部分：SSE 订阅 + 兜底轮询。
+   *
+   * 依赖数组里**不能有 version**。原先写的是 [token, version]，而 version 每次
+   * 命令提交（拖动松手、改一个尺寸）都会 +1 —— 于是每改一次就：销毁 EventSource
+   * → 新建 EventSource → 服务端重跑一次 captureLiveProjectSnapshot 全量快照并 push init。
+   * 这是纯粹的浪费，而且会造成"正在推的草稿预览被刚建的连接打断"这类竞态。
+   * 现在 effect 只在 token 变化时重建；version 通过 versionRef 在回调里按需读最新值。
+   */
   useEffect(() => {
     let cancelled = false;
-    const refresh = async (): Promise<void> => {
+    /**
+     * in-flight 去重：SSE 事件连发时（draft.updated 与 workspace.updated 常前后脚到）
+     * 以及"SSE 刚推完，兜底定时器又到点"时，只允许一次 GET 在飞。
+     * 参考 AIPanel.tsx 里同一套写法。
+     */
+    let refreshInFlight = false;
+    let refreshAgain = false;
+    const refreshOnce = async (): Promise<void> => {
       const [workspaceResult, draftsResult] = await Promise.all([
         api<{
           project?: Project;
@@ -339,6 +399,10 @@ export function App() {
         }
       }
 
+      // P1-5：把这次确认到的服务端基线记下来，供 PUT 的 expectedLiveVersion 与
+      // clientHasLocalEdits 使用。只认"服务端亲口说的"版本号与指纹。
+      lastLiveVersionRef.current = Number.isInteger(liveModelVersion) ? liveModelVersion! : null;
+      lastServerProjectFingerprintRef.current = stableProjectJson(workspaceResult.data.project);
       setRemoteWorkspaceStatus({
         draftCount: draftsResult.data.drafts?.length ?? 0,
         differs: stableProjectJson(workspaceResult.data.project) !== stableProjectJson(bus.getState()),
@@ -352,18 +416,66 @@ export function App() {
         identityDiagnostics: workspaceResult.data.identityDiagnostics,
       });
     };
+    /**
+     * 统一的 refresh 入口：同一时刻最多一个 GET 在飞。
+     * 期间又来一次请求就记一个 refreshAgain，等这次回来再补一次 ——
+     * 既不会把请求打爆，也不会漏掉最后一次状态变化。
+     */
+    const refresh = async (): Promise<void> => {
+      if (cancelled) return;
+      if (refreshInFlight) { refreshAgain = true; return; }
+      refreshInFlight = true;
+      try {
+        await refreshOnce();
+      } finally {
+        refreshInFlight = false;
+      }
+      if (refreshAgain && !cancelled) {
+        refreshAgain = false;
+        void refresh();
+      }
+    };
     void refresh();
     let es: EventSource | null = null;
+    /** SSE 是否已连上；连上时 4s 定时器降级为 30s 兜底，断开时立刻恢复 4s。 */
+    let streamConnected = false;
+    let pollTimer: number | null = null;
+    const setFallbackInterval = (ms: number): void => {
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      pollTimer = window.setInterval(() => { void refresh(); }, ms);
+    };
     if (typeof EventSource !== 'undefined') {
       try {
         const streamUrl = token
           ? `/api/workspace/stream?token=${encodeURIComponent(token)}`
           : '/api/workspace/stream';
         es = new EventSource(streamUrl);
+        // 连接建立即说明推送通道活着，轮询能从 4s 退到 30s；onerror 时退回 4s 兜底。
+        es.onopen = () => {
+          if (cancelled) return;
+          streamConnected = true;
+          setFallbackInterval(30000);
+        };
+        es.onerror = () => {
+          if (cancelled) return;
+          // EventSource 自带重连，这里只负责把兜底轮询提回 4s，别让用户盯着旧状态。
+          if (streamConnected) {
+            streamConnected = false;
+            setFallbackInterval(4000);
+          }
+        };
         es.onmessage = (evt) => {
           if (cancelled) return;
           try {
             const payload = JSON.parse(evt.data);
+            /**
+             * A3：**所有**事件都先过一遍这条纯函数翻译，再决定要不要动 UI。
+             * 翻译规则（哪种事件算一条、键怎么拼、文本怎么写）全在
+             * ui/liveAgentLog.ts 的 agentEventFromSsePayload 里，被 verify 脚本逐条断言；
+             * 这里不重复拼字符串，避免"面板说的"和"预览说的"两套口径。
+             */
+            const agentEvent = agentEventFromSsePayload(payload);
+            if (agentEvent) pushAgentEvent(agentEvent);
             if (payload.type === 'init' && payload.latestDraft?.project) {
               setLiveDraftPreview({
                 draftId: payload.latestDraft.draftId,
@@ -388,6 +500,8 @@ export function App() {
               void refresh();
             } else if (payload.type === 'workspace.updated') {
               void refresh();
+              // push 里已经带了版本号时直接用，省掉一次往返。
+              if (Number.isInteger(payload.liveModelVersion)) lastLiveVersionRef.current = payload.liveModelVersion;
             }
           } catch {
             /* ignore */
@@ -397,13 +511,40 @@ export function App() {
         /* fallback to timer */
       }
     }
-    const timer = window.setInterval(() => { void refresh(); }, 4000);
+    setFallbackInterval(4000);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (pollTimer !== null) window.clearInterval(pollTimer);
       if (es) es.close();
     };
-  }, [token, version]);
+    // 故意**不含 version**：version 每提交一条命令就 +1，放进依赖会让 EventSource
+    // 每次编辑都重建并让服务端重跑全量快照。version 的读取需求见 versionRef。
+    // pushAgentEvent 是 useCallback([]) 的稳定引用，放进来不会引起重建。
+  }, [token, pushAgentEvent]);
+
+  /**
+   * 最新 version 的 ref。SSE 的 effect 不能依赖 version（见上），
+   * 但回调里偶发需要读到"此刻"的总线版本时从这里取，而不是靠闭包快照。
+   */
+  const versionRef = useRef(version);
+  versionRef.current = version;
+
+  /**
+   * 本地模型一变只重算 `differs`（"网页/服务器不同步"角标与同步按钮的开关）。
+   * **纯本地计算，不打 API** —— 这一点很关键：
+   * 原先这个角标靠 SSE effect 依赖 version 顺带刷新，去掉依赖后如果什么都不做，
+   * 用户改完模型最多要等 30s 兜底轮询才看得到同步按钮，那是明显的体感退化。
+   */
+  useEffect(() => {
+    const serverFingerprint = lastServerProjectFingerprintRef.current;
+    if (serverFingerprint === null) return;
+    const nextDiffers = stableProjectJson(bus.getState()) !== serverFingerprint;
+    setRemoteWorkspaceStatus((previous) => {
+      if (!previous || previous.differs === nextDiffers) return previous;
+      return { ...previous, differs: nextDiffers };
+    });
+    // versionRef 只是为了让这条依赖显式化：真正变化的是 version。
+  }, [version]);
 
   /**
    * 退出登录只有这一份实现（顶栏按钮与账号面板那个共用）。
@@ -1483,10 +1624,39 @@ export function App() {
     setRightTab('ai');
     setWorkspaceMode(true);
   };
-  const syncLocalToServer = useCallback(async (): Promise<boolean> => {
+  /**
+   * 本地 → 服务端同步（PUT /api/workspace）。
+   *
+   * P1-5 修复点（这次的重点）：原先写死 `clientHasLocalEdits: true, force: true`，
+   * 结果 server 端 workspace.ts:764-777 的版本冲突闸被 force 完全绕过，
+   * 文档里明令禁止的 last-write-wins 反而成了默认路径 ——
+   * A 端改了模型，B 端一点"同步"就能把它静默冲掉。
+   *
+   * 现在：
+   *  · expectedLiveVersion 发的是最近一次确认到的服务端基线（ref，非闭包旧值）；
+   *  · 不带 force —— 基线落后时服务端会真的拒绝，这才是我们要的；
+   *  · clientHasLocalEdits 反映真实情况（本地模型与最后一次确认的服务端项目是否不同），
+   *    恒 true 会把服务端"空本地不覆盖云端"那道水位线保护也一起废掉；
+   *  · WORKSPACE_VERSION_CONFLICT 不当异常吞掉，转成显式冲突态交给用户二选一。
+   */
+  const syncLocalToServer = useCallback(async (force = false): Promise<boolean> => {
     if (unitIdentityReadOnly) return false;
+    const localProject = bus.getState();
+    const serverFingerprint = lastServerProjectFingerprintRef.current;
+    /**
+     * 只有"确实和最后确认过的服务端项目不同"才声明本地有编辑。
+     * 还没有任何服务端基线（serverFingerprint 为 null，首屏 GET 未回）时按 true 处理：
+     * 宁可让服务端走冲突判定，也不要谎称"无本地编辑"导致自己的修改被云端静默注水覆盖。
+     */
+    const clientHasLocalEdits = serverFingerprint === null || stableProjectJson(localProject) !== serverFingerprint;
+    /** 基线版本；null = 首屏 GET 还没回来，此时不带该字段。 */
+    const expectedLiveVersion = lastLiveVersionRef.current;
+    /** PUT 在飞期间用户可能继续编辑；回来时用它判断本地是否又变了。 */
+    const modelVersionAtRequest = versionRef.current;
     const res = await api<{
       ok?: boolean;
+      code?: string;
+      error?: string;
       project?: Project;
       liveModelVersion?: number;
       projectSnapshotId?: string;
@@ -1497,22 +1667,62 @@ export function App() {
       method: 'PUT',
       token,
       body: {
-        project: bus.getState(),
-        clientHasLocalEdits: true,
-        force: true,
-        reason: '网页端手动修改同步到服务器',
+        project: localProject,
+        clientHasLocalEdits,
+        ...(force ? { force: true } : {}),
+        /**
+         * null 时**不发**该字段：发 0 会让一次正常的首次同步被误判为"基线落后"。
+         */
+        ...(expectedLiveVersion === null ? {} : { expectedLiveVersion }),
+        reason: force ? '网页端确认强制覆盖云端（用户显式选择）' : '网页端手动修改同步到服务器',
       },
     });
+    /**
+     * 版本冲突**必须**单独处理，且绝不能静默覆盖：
+     * 服务端返回 409 + code='WORKSPACE_VERSION_CONFLICT' + 整份云端 project。
+     * 把它存进 workspaceVersionConflict 让用户在界面上明确二选一；
+     * 同时把基线版本更新成服务端当前版本，避免用户下一次点同步还是同一份旧基线。
+     */
+    if (res.data?.code === 'WORKSPACE_VERSION_CONFLICT' || (res.status === 409 && res.data?.project)) {
+      const serverProject = res.data?.project ?? null;
+      const serverVersion = typeof res.data?.liveModelVersion === 'number'
+        ? res.data.liveModelVersion
+        : (typeof res.data?.projectSnapshotVersion === 'number' ? res.data.projectSnapshotVersion : null);
+      if (serverVersion !== null) lastLiveVersionRef.current = serverVersion;
+      if (serverProject) {
+        lastServerProjectFingerprintRef.current = stableProjectJson(serverProject);
+        setWorkspaceVersionConflict({
+          project: serverProject,
+          liveModelVersion: serverVersion,
+          message: res.data?.error ?? res.error ?? '云端已被其他端修改，本地未覆盖。',
+        });
+        toast('warn', `云端已被其他端修改（v${serverVersion ?? '?'}），本地未覆盖；请选择要保留的版本。`);
+      } else {
+        toast('error', `同步被服务端拒绝：${res.data?.error ?? res.error ?? '版本冲突'}`);
+      }
+      return false;
+    }
     if (!res.ok || !res.data.project) {
       toast('error', `同步到服务器失败：${res.error ?? '未知错误'}`);
       return false;
     }
+    // 成功后用服务端确认的版本与项目指纹更新基线 —— 下一次 PUT 才算"对得上号"。
+    const confirmedVersion = typeof res.data.liveModelVersion === 'number'
+      ? res.data.liveModelVersion
+      : (typeof res.data.projectSnapshotVersion === 'number' ? res.data.projectSnapshotVersion : null);
+    if (confirmedVersion !== null) lastLiveVersionRef.current = confirmedVersion;
+    lastServerProjectFingerprintRef.current = stableProjectJson(res.data.project);
+    setWorkspaceVersionConflict(null);
     const snapId = res.data.projectSnapshotId ?? null;
     const snapHash = res.data.projectSnapshotHash ?? null;
     const snapVer = res.data.projectSnapshotVersion ?? res.data.liveModelVersion ?? 0;
     setRemoteWorkspaceStatus((prev) => ({
       draftCount: prev?.draftCount ?? 0,
-      differs: false,
+      /**
+       * 正常情况下同步完就是不同步了；但若 PUT 在飞期间用户又改了模型，
+       * 标成 differs=true 才是诚实的——否则角标会说"已同步"而本地其实更新。
+       */
+      differs: versionRef.current !== modelVersionAtRequest,
       liveModelVersion: snapVer,
       stale: false,
       snapshotReady: Boolean(snapId && snapHash),
@@ -1525,6 +1735,39 @@ export function App() {
     toast('ok', `已将当前网页修改同步到服务器（v${snapVer}），现在可直接导出 PDF / DXF`);
     return true;
   }, [token, unitIdentityReadOnly]);
+
+  /**
+   * 冲突二选一 · 选项 A：放弃本地修改，装回服务端版本。
+   * 用户明确点了才执行 —— 这是"不要静默覆盖"的另一半：
+   * 我们既不静默用本地盖云端，也不静默用云端盖本地。
+   */
+  const adoptServerVersionOnConflict = useCallback((): void => {
+    const conflict = workspaceVersionConflict;
+    if (!conflict) return;
+    try {
+      bus.replaceProject(conflict.project, `载入云端版本 v${conflict.liveModelVersion ?? '?'}（冲突时用户选择保留云端）`);
+      setWorkspaceVersionConflict(null);
+      toast('ok', `已载入云端版本 v${conflict.liveModelVersion ?? '?'}，本地未保存的修改已放弃`);
+    } catch (error) {
+      // replaceProject 会做完整校验；被拒时保留冲突态让用户改走"强制覆盖"，不假装成功。
+      toast('error', `载入云端版本失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [workspaceVersionConflict, toast]);
+
+  /**
+   * 冲突二选一 · 选项 B：明确用本地覆盖云端。
+   * 这是**唯一**还会发 force:true 的路径，且必须由用户在冲突界面里点确认，
+   * 不再是每次同步的无条件默认。
+   */
+  const forceOverwriteServerOnConflict = useCallback((): void => {
+    void (async () => {
+      const conflict = workspaceVersionConflict;
+      if (!conflict) return;
+      const ok = await syncLocalToServer(true);
+      // 成功时 syncLocalToServer 内部已清空冲突态；失败则保留，让用户能看见并重试。
+      if (ok) toast('ok', '已按你的选择用本地版本覆盖云端');
+    })();
+  }, [workspaceVersionConflict, syncLocalToServer, toast]);
 
   const repairWorkspaceUnitIds = useCallback(async (): Promise<void> => {
     preserveDuplicateDraftBeforeHealthySwitch();
@@ -1707,6 +1950,46 @@ export function App() {
           </button>
         </div>
       ) : null}
+      {workspaceVersionConflict ? (
+        <div
+          className="workspace-version-conflict-banner"
+          role="alertdialog"
+          data-testid="workspace-version-conflict-banner"
+          style={{ background: '#fef2f2', borderBottom: '1px solid #ef4444', color: '#7f1d1d', padding: '10px 16px', fontSize: 13, lineHeight: 1.5 }}
+        >
+          <strong>云端已被其他端修改，本地未覆盖。</strong>{' '}
+          <span data-testid="workspace-version-conflict-detail">
+            云端当前 v{workspaceVersionConflict.liveModelVersion ?? '?'}；{workspaceVersionConflict.message}
+          </span>{' '}
+          <button
+            type="button"
+            data-testid="workspace-version-conflict-adopt-server"
+            style={{ marginLeft: 12, border: '1px solid currentColor', borderRadius: 4, padding: '3px 10px', background: 'transparent', color: 'inherit', fontWeight: 600, cursor: 'pointer' }}
+            title="放弃本地未保存的修改，载入云端版本"
+            onClick={adoptServerVersionOnConflict}
+          >
+            用云端版本覆盖本地（v{workspaceVersionConflict.liveModelVersion ?? '?'}）
+          </button>
+          <button
+            type="button"
+            data-testid="workspace-version-conflict-force-local"
+            style={{ marginLeft: 8, border: '1px solid #b91c1c', borderRadius: 4, padding: '3px 10px', background: '#dc2626', color: '#ffffff', fontWeight: 600, cursor: 'pointer' }}
+            title="以服务端当前版本为基线，明确用本地修改覆盖云端（会丢弃云端那次修改）"
+            onClick={forceOverwriteServerOnConflict}
+          >
+            ⚠ 用本地版本强制覆盖云端
+          </button>
+          <button
+            type="button"
+            data-testid="workspace-version-conflict-dismiss"
+            style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 4, padding: '3px 8px', background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+            title="先不管，保持本地状态（云端保持原样，不做任何写入）"
+            onClick={() => setWorkspaceVersionConflict(null)}
+          >
+            稍后再说
+          </button>
+        </div>
+      ) : null}
       {workspaceMode ? (
         <WorkspaceTopBar
           project={bus.getState()}
@@ -1781,6 +2064,7 @@ export function App() {
             accountConnected={Boolean(token)}
             onAccountOpen={() => setAccountOpen(true)}
             liveDraftPreview={liveDraftPreview}
+            agentEvents={agentEvents}
             onApplyLiveDraft={(dId) => void applyLiveDraftQuick(dId)}
             onOpenRemoteDrafts={openRemoteDrafts}
             onSyncLocalToServer={() => void syncLocalToServer()}

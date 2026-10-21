@@ -1290,6 +1290,33 @@ select.input { height: 24px; padding: 0 4px; }
 .workspace-chat-composer { flex: 0 0 auto; position: relative; margin: auto -6px -4px; padding: 10px 10px 8px; border-top: 1px solid #e2e7ee; background: #fff; box-shadow: 0 -4px 12px #0f172a08; }
 .workspace-whole-room-sheet, .workspace-live-draft-stage { margin: 0 0 16px; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; box-shadow: 0 2px 6px #0f172a0a; overflow: hidden; }
 .workspace-live-draft-stage { border-color: #2563eb; background: #f8fbff; box-shadow: 0 0 0 2px #dbeafe; }
+/**
+ * A2：主画布顶部的实时草稿带（三种视图都钉住）。
+ * 视觉口径刻意与正式图区分：**虚线边框** + 蓝色顶条 + "尚未入库"标签 ——
+ * 用户一眼就知道这是 Agent 正在画的草稿，不是已入库的正式图。
+ * 它只占一条（不是整屏），不会把用户正在看的 3D / 平面画布挤走。
+ */
+.workspace-live-draft-band { margin: 0 0 12px; border: 2px dashed #2563eb; border-radius: 8px; background: #f8fbff; overflow: hidden; position: sticky; top: 0; z-index: 3; }
+.workspace-live-draft-band-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 7px 12px; background: repeating-linear-gradient(135deg, #eff6ff, #eff6ff 10px, #e7f0fd 10px, #e7f0fd 20px); border-bottom: 1px dashed #93c5fd; }
+.workspace-live-draft-band-tag { font-size: 11.5px; font-weight: 700; color: #1d4ed8; }
+.workspace-live-draft-band-meta { font-size: 11px; color: #1e3a8a; }
+.workspace-live-draft-band-hint { font-size: 10.5px; color: #64748b; font-style: italic; }
+.workspace-live-draft-band-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.workspace-live-draft-band-body:empty { display: none; }
+.workspace-live-draft-band-log-only { background: #fff; }
+/** A3：事件流面板（最新在前，最多 50 条；没有事件时整块不渲染）。 */
+.workspace-agent-log { padding: 6px 10px 8px; }
+.workspace-agent-log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 2px 0 5px; border-bottom: 1px solid #e2e8f0; }
+.workspace-agent-log-head strong { font-size: 11.5px; color: var(--text); }
+.workspace-agent-log-head span { font-size: 10.5px; color: var(--text-2); }
+.workspace-agent-log-list { list-style: none; margin: 0; padding: 4px 0 0; max-height: 132px; overflow-y: auto; }
+.workspace-agent-log-item { display: flex; align-items: baseline; gap: 7px; padding: 2px 0; font-size: 11px; line-height: 1.5; color: var(--text-2); }
+.workspace-agent-log-time { flex: 0 0 auto; font-variant-numeric: tabular-nums; font-size: 10px; color: #94a3b8; }
+.workspace-agent-log-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.workspace-agent-log-round { flex: 0 0 auto; padding: 0 5px; border-radius: 8px; background: #eff6ff; color: #1d4ed8; font-size: 9.5px; }
+.workspace-agent-log-item.is-failed .workspace-agent-log-text { color: #b42318; }
+.workspace-agent-log-item.is-init .workspace-agent-log-text { color: #1d4ed8; font-weight: 600; }
+.workspace-agent-log-item.is-draft-deleted .workspace-agent-log-text { color: #94a3b8; text-decoration: line-through; }
 .workspace-whole-room-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #e2e8f0; background: #f8fafc; flex-wrap: wrap; }
 .workspace-live-draft-stage .workspace-whole-room-head { background: #eff6ff; border-bottom-color: #bfdbfe; }
 .workspace-whole-room-head strong { font-size: 13px; color: var(--text); }

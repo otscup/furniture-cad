@@ -30,6 +30,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { buildSystemPrompt, extractJson } from '../shared/aiContract.mjs';
+import { deriveFocusFromHistory, renderFocusStack } from '../shared/focusStack.mjs';
 import { summarizeProjectContext } from '../server/agentLoop.mjs';
 import { emptyProject, rectRoom, createCabinet } from '../src/core/docFactory.ts';
 import type { RuleSet } from '../src/core/types.ts';
@@ -145,9 +146,14 @@ interface NluCase {
  *     所以真正该看的是 pass^k（稳定性），pass@k 只能当「会不会」的上限。
  *     调研报告里的 90% pass@1 → pass^8 只剩 43%，说的就是这件事。
  *
- *   默认 k=3（每条 3 次）。用 NLU_K 环境变量可调。
+ *   ★ 默认 k=5，不是 3 ──
+ *     实测教训：k=3 时多轮场景 pass^3 是 75%，k=5 却是 100% ——
+ *     那个 75% 完全是**噪声**（一条用例抖一次就掉 25%）。
+ *     用 k=3 判断「某个改动有没有用」= 抽签。
+ *   用 NLU_K 环境变量可调；判断改动前后的差异时**必须 k>=5 且做 A/B 对照**
+ *   （NLU_NO_FOCUS=1 可关掉焦点栈做对照）。
  */
-const K = Math.max(1, Number(process.env.NLU_K ?? 3) || 3);
+const K = Math.max(1, Number(process.env.NLU_K ?? 5) || 5);
 
 const CASES: NluCase[] = [
   /**
@@ -310,9 +316,17 @@ async function runOnce(
   model: string,
   c: NluCase,
   ctx: string,
-  history: Array<{ role: string; text: string }> = [],
+  history: Array<{ role: string; text: string; agentSummary?: string; agentSteps?: string }> = [],
+  project: unknown = null,
 ): Promise<RunResult> {
-  const messages: unknown[] = [{ role: 'system', content: sys }];
+  // ★ 焦点栈：真实会话里 Agent 通道会把它注入 system 提示词（server/agentLoop.mjs）。
+  //   评测必须**同样**注入，否则测的是「没有焦点」的表现。
+  // ★ NLU_NO_FOCUS=1 可以**关掉**焦点栈 ——
+  //   用来做「有/无焦点栈」的对照实验（同一批用例、同一个模型、只差这一点）。
+  const focusText = process.env.NLU_NO_FOCUS
+    ? ''
+    : renderFocusStack(deriveFocusFromHistory(history, project));
+  const messages: unknown[] = [{ role: 'system', content: focusText ? sys + '\n' + focusText : sys }];
   // ★ 多轮：先喂历史，再喂本轮 ——
   //   「再宽点」的意思全在历史里，丢了就只剩一个没有主语的词。
   for (const h of history) messages.push({ role: h.role, content: h.text });
@@ -388,18 +402,32 @@ async function evaluateModel(model: string): Promise<void> {
       // ★ 多轮：先把前几轮跑一遍（建立指代对象），把对话存进 history，
       //   再跑**最后一轮**并判定它。
       //   判定只看最后一轮 —— 前几轮是铺垫。
-      const history: Array<{ role: string; text: string }> = [];
+      const history: Array<{ role: string; text: string; agentSummary?: string; agentSteps?: string }> = [];
       const turns = c.turns ?? [{ q: c.q, wantActions: c.wantActions, wantClarify: c.wantClarify }];
       const last = turns[turns.length - 1]!;
       for (let ti = 0; ti < turns.length - 1; ti++) {
         const t = turns[ti]!;
-        const pre = await runOnce(model, { ...c, q: t.q, wantActions: t.wantActions, wantClarify: t.wantClarify }, ctx, history);
+        const pre = await runOnce(model, { ...c, q: t.q, wantActions: t.wantActions, wantClarify: t.wantClarify }, ctx, history, project);
         //   ctx 已经出现在 system 之后的第一条 user 消息与本轮 user 消息里，
         //   再放一遍会让上下文重复 3 次（36k+ 字符）⇒ 模型困惑 / 上游超长报错。
         history.push({ role: 'user', text: t.q });
-        history.push({ role: 'assistant', text: pre.reply || (pre.actions.length ? pre.actions.join('、') : '（追问）') });
+        // ★ 带上**结构化的工具调用记录** —— 焦点栈就是从它推导事实的。
+        //   真实会话里前端发的就是 agentSteps（JSON 字符串），这里模拟同样的形状，
+        //   评测才反映得出「有焦点栈」与「没焦点栈」的差别。
+        history.push({
+          role: 'assistant',
+          text: pre.reply || (pre.actions.length ? pre.actions.join('、') : '（追问）'),
+          agentSummary: pre.reply || '',
+          agentSteps: JSON.stringify([
+            { round: 1, tool: 'cabinet.create_cabinet', ok: true, args: { cabinetId: 'c1', name: '主卧衣柜' } },
+            ...(pre.actions.length
+              ? [{ round: 1, tool: 'cabinet.layout', ok: true, args: { cabinetId: 'c1' },
+                   changes: [{ path: 'params.width', op: 'set', value: 2000 }] }]
+              : []),
+          ]),
+        });
       }
-      runs.push(await runOnce(model, { ...c, q: last.q, wantActions: last.wantActions, wantClarify: last.wantClarify }, ctx, history));
+      runs.push(await runOnce(model, { ...c, q: last.q, wantActions: last.wantActions, wantClarify: last.wantClarify }, ctx, history, project));
     }
     const hits = runs.filter((x) => x.pass).length;
     const st = stats.get(c.scenario)!;

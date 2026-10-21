@@ -1,3 +1,4 @@
+import { deriveFocusFromHistory, renderFocusStack } from '../shared/focusStack.mjs';
 /**
  * ══════════════════════════════════════════════════════════════════════
  *  Agent 循环编排器（内置 AI Agent 模式）
@@ -447,6 +448,7 @@ export function buildAgentSystemPrompt(opts = {}) {
     visionResult = null,
     images = [],
     currentDraftId = null,
+    focusText = '',
   } = opts;
   const staticRules = `你是家具 CAD 的 AI 装配 Agent。用户说出意图后，你调用 MCP 工具在 draft 草稿里搭建柜体。
 
@@ -475,6 +477,7 @@ export function buildAgentSystemPrompt(opts = {}) {
   意图**不会自动生效**：用户要在界面上点确认才算数，所以你提完就如实告诉他"已提为待确认目标"，不要宣称已经改好。
   如果用户只是让你建柜子/改尺寸，**不要**提 intentRequest。`;
   const dynamicContext = [
+    focusText,
     rulesBlock,
     recipeBlock,
     seqHint,
@@ -603,6 +606,18 @@ export async function runAgentLoop(opts) {
    * 目的是让验收能**真的构造出提示词**来检查内容，
    * 而不是扫源码找字符串（源码扫描守不住重构：P0-1 拆分提示词时它就误报过）。
    */
+  /**
+   * ★ 焦点（2026-10-21）—— 上一轮动过哪只柜、改成多少。
+   *
+   *   跨轮指代（「再宽点」「第一格」「那个抽屉」）全靠它：
+   *   没有它，模型每轮都要从自由文本里重新推断焦点 ⇒ 它飘
+   *   （NLU 评测卡实测多轮场景 pass^3 只有 75%，是三个场景里最弱的）。
+   *
+   *   有了它，「再加 200」这种相对量能直接用**当前绝对值**换算成目标值。
+   */
+  const focusFacts = deriveFocusFromHistory(history, workspaceProject);
+  const focusText = renderFocusStack(focusFacts);
+
   const { systemPrompt } = buildAgentSystemPrompt({
     rulesBlock,
     recipeBlock,
@@ -612,6 +627,7 @@ export async function runAgentLoop(opts) {
     projectContextText,
     visionResult,
     images,
+    focusText,
     currentDraftId,
   });
 

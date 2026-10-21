@@ -1312,6 +1312,9 @@ export const COMPILED_ACTIONS = [
   'cabinet.addUnit',
   'cabinet.removeUnit',
   'cabinet.setBoardMaterial',
+  // ★ 2026-10-21 新增（见 AGENT-CAPABILITY-2026-10-21.md）
+  'cabinet.setUnitDoorMaterial',
+  'cabinet.setUnitFeature',
   'cabinet.setBackMaterial',
   'cabinet.create',
   'cabinet.duplicate',

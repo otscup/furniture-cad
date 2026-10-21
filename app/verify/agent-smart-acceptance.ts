@@ -453,11 +453,17 @@ section('4b. 当前方案摘要：真正能测到行为');
         id: 'c1', roomId: 'r1', name: '主卧衣柜',
         params: { cabinetType: 'base', width: 1800, height: 2400, depth: 600, mountHeight: 0 },
         placement: { x: 100, y: 60 },
-        units: [
-          { kind: 'hanging', rod: { count: 1 }, shelves: { count: 0 } },
-          { kind: 'drawers', drawers: { count: 3 }, shelves: { count: 0 } },
-          { kind: 'shelves', shelves: { count: 2 } },
-        ],
+        // ★ 2026-10-21：分区在 `cab.layout.units`，**不在** `cab.units`。
+        //   原来的测试数据放在顶层 `units` —— 而真实结构里那个字段**根本不存在**，
+        //   于是旧实现（读 c.units）在**生产里**分区结构一直是空的，
+        //   而这个测试却绿着 —— 典型的「测试数据与生产数据不同构」。
+        layout: {
+          units: [
+            { kind: 'hanging', rod: { count: 1 }, shelves: { count: 0 } },
+            { kind: 'drawers', drawers: { count: 3 }, shelves: { count: 0 } },
+            { kind: 'shelves', shelves: { count: 2 } },
+          ],
+        },
       },
     ],
   };

@@ -187,9 +187,44 @@ export function summarizeProjectContext(project, activeRoomId, history = []) {
     if (r.id === activeRoomId && rCabs.length > 0) {
       for (const c of rCabs) {
         const p = c.params || {};
-        const units = Array.isArray(c.units) ? c.units : [];
+        /**
+         * ★ 2026-10-21 修：分区在 `cab.layout.units`，**不在** `cab.units`。
+         *
+         *   原来这里读 `c.units` —— 那个字段**根本不存在**
+         *   （实测 `Array.isArray(cab.units) === false`），
+         *   于是 units 恒为空数组 ⇒ **分区结构从来没进过提示词**。
+         *   表现：模型说「我读不到当前分区的层板数」—— 它说的是事实。
+         *
+         *   修完之后，模型才能算「再加两层」这类**相对量**。
+         */
+        const layout = c.layout ?? {};
+        const units = Array.isArray(layout.units) ? layout.units : [];
+        const rows = Array.isArray(layout.rows) ? layout.rows : [];
         let unitStr = '';
-        if (units.length > 0) {
+        /**
+         * ★ 顺序很重要：先判 rows，再判 units。
+         *
+         *   实测（2026-10-21）：多行柜的 layout 里**同时有** `units` 与 `rows`
+         *   —— `units` 是第一行的副本（长度 1），`rows` 才是完整的行结构。
+         *   所以先判 units 会永远命中那个「1 个分区」的副本，
+         *   多行柜的真实结构就丢了（模型看不到第 2 行）。
+         */
+        if (rows.length > 0) {
+          // 多行柜：分区在 rows[j].units 里
+          const rowDesc = rows.map((row, ri) => {
+            const us = Array.isArray(row.units) ? row.units : [];
+            const ps = us.map((u) => {
+              let s = describeUnitKind(u.kind);
+              if (u.shelves && u.shelves.count) s += `/${u.shelves.count}层板`;
+              if (u.drawers && u.drawers.count) s += `/${u.drawers.count}抽`;
+              if (u.doors && u.doors.count) s += `/${u.doors.count}门`;
+              if (u.rod && u.rod.count) s += '/挂衣杆';
+              return s;
+            });
+            return `第${ri + 1}行(${ps.join('、') || '空'})`;
+          });
+          unitStr = `，上下 ${rows.length} 行（${rowDesc.join('，')}）`;
+        } else if (units.length > 0) {
           const parts = units.map((u) => {
             let s = describeUnitKind(u.kind);
             if (u.doors && u.doors.count) s += `/${u.doors.count}门`;

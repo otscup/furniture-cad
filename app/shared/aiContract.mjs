@@ -347,7 +347,6 @@ export const ACTIONS = {
     label: '新增一个分区',
     target: 'cabinet',
     params: {
-      /**
       kind: { type: 'enum', from: 'units.kind', desc: 'drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区 / appliance 电器格（洗衣机位）' },
       requestedWidth: { type: 'number', min: 100, max: 4000, unit: 'mm', desc: '请求净宽' },
       nickname: { type: 'string', max: MAX_STRING, optional: true },
@@ -1558,6 +1557,12 @@ export function buildSystemPrompt(options = {}) {
    */
   lines.push('5. 说"做不到"必须是**具体的能力缺口**，不是"这句话有点绕"。按这个顺序判断：①清单里有没有一条动作能直接做到 —— 有就做；②能不能用清单里的动作**拼**出来（见后面【形体怎么组合】）—— 能就拼，一次给全；③三条都试过、确实一条都靠不上，才可以在 reply 里说做不到，并点名缺什么。**不许**把"没听懂 / 有歧义 / 怕猜错"包装成"做不到"。');
   lines.push('6. 不要凭空发明用户**没给**的关键数字：用户说"高一点"却不给数，就别自己挑一个高度。反过来，**用户给了数字就必须照着做**——他给了「长 2200、台面宽 750、高 1000、另一边 1200」，就按这个建：台面宽当**进深**（depth）、柜高当 height、2200 与 1200 各是一条臂的 width，然后在 reply 里一行说明你按什么口径理解。口头口径错了没关系，两段式预览会先画出来，用户纠偏。**只有当用户一个数字都没给时**才允许反过来问他要哪一个。');
+  lines.push('7. ★ **该问什么、不该问什么**（2026-10-21）：');
+  lines.push('   · **缺参数才问**：用户说「建个柜子」没说宽高 ⇒ 问宽高；用户说「踢脚改成100」给全了 ⇒ **直接做，不要问「改哪台」**。');
+  lines.push('   · **有歧义才问**：同一个房间里有多台柜子、而用户的话确实指代不清（"刚才那个""这柜子"）⇒ 问是哪台；**指代清楚就动手**。');
+  lines.push('   · **能从上下文推出来的就别问**：项目摘要里已经列了柜体名、尺寸、分区结构、上一轮改了什么 —— 先用这些信息推断，别把能查的东西拿去问用户。');
+  lines.push('   · 追问时 **actions 给空数组**，在 reply 里问清缺的那一项（一次问全，别挤牙膏）。');
+  lines.push('8. ★ 「叫 X」「命名 X」默认指**柜体**改名（cabinet.rename），不是项目改名（project.rename）。只有用户明确说「项目」「整个工程」「方案」改名时才用 project.rename —— 项目改名会把整个工程的名字换掉，代价大得多。');
   lines.push('');
   lines.push('输出格式（严格的 JSON，不要 markdown 代码围栏）：');
   lines.push('{ "reply": "给用户看的中文说明，一两句", "actions": [ { "action": "动作名", "target": { "cabinetName": "柜体名字" }, "params": { ... }, "reason": "为什么这么做" } ] }');

@@ -113,6 +113,9 @@ const MINIMAL: Record<string, unknown> = {
   'cabinet.renameUnit': { action: 'cabinet.renameUnit', target: { cabinetName: cab0.name, unit: 1 }, params: { nickname: '抽屉区' } },
   'cabinet.addUnit': { action: 'cabinet.addUnit', target: { cabinetName: cab0.name }, params: { kind: 'shelves', requestedWidth: 400, count: 3 } },
   'cabinet.removeUnit': { action: 'cabinet.removeUnit', target: { cabinetName: cab0.name, unit: 3 }, params: {} },
+  // ★ 2026-10-21 新增（见 AGENT-CAPABILITY-2026-10-21.md）
+  'cabinet.setUnitDoorMaterial': { action: 'cabinet.setUnitDoorMaterial', target: { cabinetName: cab0.name, unit: 1 }, params: { material: 'M_GLASS_8_GREY' } },
+  'cabinet.setUnitFeature': { action: 'cabinet.setUnitFeature', target: { cabinetName: cab0.name, unit: 1 }, params: { feature: 'ledStrip', value: 'front' } },
   'cabinet.setBoardMaterial': { action: 'cabinet.setBoardMaterial', target: { cabinetName: cab0.name }, params: { materialId: 'M_BOARD_18_WOOD' } },
   'cabinet.setBackMaterial': { action: 'cabinet.setBackMaterial', target: { cabinetName: cab0.name }, params: { materialId: 'M_BACK_9' } },
   'cabinet.create': { action: 'cabinet.create', target: {}, params: { name: '新柜', width: 1200 } },

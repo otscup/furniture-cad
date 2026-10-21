@@ -734,6 +734,8 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       let resolvedVisionResult: unknown = undefined;
       if (imgs.length > 0 && !(window as any).__syncOnlyBus) {
         try {
+          // ★ 模型没看图 ⇒ 识别结果不可信（如实告诉用户，别给假结果）
+          let sawNoImage = false;
           const collected: Array<{ result: any; mode: 'render' | 'dimension'; name: string }> = [];
           for (const img of imgs) {
             const vrRes = await fetch('/api/ai/vision', {
@@ -743,16 +745,21 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             });
             if (vrRes.ok) {
               const vrJson = await vrRes.json();
+              if (vrJson?.sawNoImage) sawNoImage = true;
               if (vrJson?.ok && vrJson.result) {
                 collected.push({ result: vrJson.result, mode: img.mode, name: img.name });
               }
             }
           }
-          if (collected.length > 1) {
-            resolvedVisionResult = mergeVisionResults(collected);
-          } else if (collected.length === 1) {
-            resolvedVisionResult = collected[0]!.result;
-          }
+    if (collected.length > 1) {
+      resolvedVisionResult = mergeVisionResults(collected);
+    } else if (collected.length === 1) {
+      resolvedVisionResult = collected[0]!.result;
+    }
+    // ★ 模型没看图 ⇒ 这次识别结果不可信，如实告诉用户（别让他照着假结果建模）
+    if (sawNoImage) {
+      props.onToast?.('warn', '当前视觉模型不支持图片输入，这次的识别结果不可信 —— 请换用支持图片的模型（配置 AI_VISION_MODEL）。');
+    }
         } catch {
           /* vision 预提取失败不阻断 Agent 主调用 */
         }

@@ -126,7 +126,8 @@
     "verify:context-summary": "node --experimental-strip-types verify/context-summary-acceptance.ts",
     "verify:focus-stack": "node --experimental-strip-types verify/focus-stack-acceptance.ts",
     "verify:focus-stack-mutations": "node verify/focus-stack-mutation.mjs",
-    "verify:server-integrity": "node verify/server-integrity.mjs"
+    "verify:server-integrity": "node verify/server-integrity.mjs",
+    "eval:vision": "node verify/vision-eval.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

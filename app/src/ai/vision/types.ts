@@ -148,6 +148,14 @@ export interface VisionResult {
    * 没有就留空 —— 普通「看不见生产结构」走 notVisible → caveat（用户确认即可）。
    */
   ambiguous?: string[];
+  /**
+   * ★ 模型**没看图**（网关报 image_tokens = 0）⇒ 本次识别结果不可信。
+   *
+   *   实测 deepseek-v4.1-flash 会对图片乱猜（「这是 SVG 源码文本」），
+   *   却返回一份结构完整、置信度 high 的结果 —— 用户会照着它建模。
+   *   有这个标记，界面就能**如实说不可信**，而不是默默给假结果。
+   */
+  sawNoImage?: boolean;
 }
 
 /** 喂给 VisionProvider 的输入 */

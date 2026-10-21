@@ -74,6 +74,8 @@ export class RemoteVisionProvider implements VisionProvider {
     if (!result || !Array.isArray(result.cabinets)) {
       throw new Error('视觉识别服务返回的结果形状不对（缺少 cabinets 数组）');
     }
+    // ★ 透传「模型没看图」标记，让界面能如实说结果不可信
+    if (body.sawNoImage) result.sawNoImage = true;
     return result;
   }
 }

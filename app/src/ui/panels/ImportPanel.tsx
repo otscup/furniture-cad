@@ -118,9 +118,13 @@ export function ImportPanel(props: {
         filename: fileLabel ?? undefined,
         hint: hintText.trim() || (useMock ? 'fixture:main' : undefined),
       };
-      const { design } = await analyzeImageToNormalized(provider, input, {
+      const { result: visionResult, design } = await analyzeImageToNormalized(provider, input, {
         label: fileLabel ?? (useMock ? '示例图（离线 Mock）' : undefined),
       });
+      // ★ 模型没看图 ⇒ 识别结果不可信，如实告诉用户
+      if (visionResult.sawNoImage) {
+        props.onToast?.('warn', '当前视觉模型不支持图片输入，这次的识别结果不可信 —— 请换用支持图片的模型（配置 AI_VISION_MODEL）。');
+      }
       setNd(design);
       setIssues(validateNormalized(design, bus.getState()));
       setAck(false);

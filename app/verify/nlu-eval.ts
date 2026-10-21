@@ -45,7 +45,17 @@ const envOf = (k: string): string => {
 };
 const BASE = process.env.AI_BASE_URL || envOf('AI_BASE_URL');
 const KEY = process.env.AI_API_KEY || envOf('AI_API_KEY');
-const MODEL = process.env.NLU_MODEL || process.env.AI_MODEL || envOf('AI_MODEL');
+/**
+ * ★ 支持一次跑多个模型（2026-10-21）──
+ *
+ *   NLU_MODELS 用逗号分隔；不设就只跑 NLU_MODEL（或 .env 里的默认）。
+ *   一次跑完能直接横向对比，比一个一个跑省事得多。
+ */
+const MODELS: string[] = (
+  process.env.NLU_MODELS
+    ? process.env.NLU_MODELS.split(',').map((x) => x.trim()).filter(Boolean)
+    : [process.env.NLU_MODEL || process.env.AI_MODEL || envOf('AI_MODEL')].filter(Boolean)
+);
 
 /**
  * 造一个真实项目。
@@ -104,6 +114,26 @@ interface NluCase {
   /** 两种回答都算对（追问也行、给对动作也行）—— 用于「本身就有歧义」的请求 */
   allowClarify?: boolean;
 }
+/**
+ * ★ 重复次数 k（2026-10-21）——
+ *
+ *   为什么必须重复跑 ──
+ *   实测发现：**同一句话、同一上下文，两次运行结果不同**。
+ *   「换成玻璃门」一次追问「换哪一格」、一次直接改两个 —— 两次都对，
+ *   但这说明「跑通一次」不能代表「这个行为稳定」。
+ *
+ *   两个口径 ──
+ *   pass@k   = k 次里**至少对 1 次**（乐观：偶尔对就算会）
+ *   pass^k   = k 次**全对**（悲观：k 次都对才算稳定）
+ *
+ *   ★ 家具出错图是**不可逆返工** ——
+ *     所以真正该看的是 pass^k（稳定性），pass@k 只能当「会不会」的上限。
+ *     调研报告里的 90% pass@1 → pass^8 只剩 43%，说的就是这件事。
+ *
+ *   默认 k=3（每条 3 次）。用 NLU_K 环境变量可调。
+ */
+const K = Math.max(1, Number(process.env.NLU_K ?? 3) || 3);
+
 const CASES: NluCase[] = [
   /**
    * ★ 场景 A：只有一台柜 —— 指代清楚，该做就做
@@ -153,18 +183,25 @@ const CASES: NluCase[] = [
 
 async function chat(model: string, messages: unknown[], maxTokens = 8192) {
   const t0 = Date.now();
-  const r = await fetch(BASE.replace(/\/+$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + KEY },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.1 }),
-    signal: AbortSignal.timeout(180000),
-  });
-  const txt = await r.text();
-  const ms = Date.now() - t0;
-  if (!r.ok) return { ok: false, status: r.status, ms, raw: txt.slice(0, 200) };
-  const j = JSON.parse(txt);
-  const m = (j?.choices?.[0]?.message ?? {}) as { content?: string };
-  return { ok: true, ms, content: String(m.content ?? ''), finish: j?.choices?.[0]?.finish_reason, usage: j?.usage };
+  try {
+    const r = await fetch(BASE.replace(/\/+$/, '') + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + KEY },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.1 }),
+      signal: AbortSignal.timeout(180000),
+    });
+    const txt = await r.text();
+    const ms = Date.now() - t0;
+    if (!r.ok) return { ok: false, status: r.status, ms, raw: txt.slice(0, 200) };
+    const j = JSON.parse(txt);
+    const m = (j?.choices?.[0]?.message ?? {}) as { content?: string };
+    return { ok: true, ms, content: String(m.content ?? ''), finish: j?.choices?.[0]?.finish_reason, usage: j?.usage };
+  } catch (e) {
+    // ★ 网关超时/网络错误**不能**让整个评测崩掉 ——
+    //   pass^k 就是要量「有多少次没跑成」，崩了就什么都量不到。
+    //   而且超时本身就是一个结果（模型太慢 = 实际不可用）。
+    return { ok: false, status: 0, ms: Date.now() - t0, raw: 'EXC: ' + String((e as Error)?.message ?? e).slice(0, 120) };
+  }
 }
 
 /** 场景 → 柜数 */
@@ -172,29 +209,32 @@ const CAB_COUNT = { single: 1, multi: 3 } as const;
 
 const sys = buildSystemPrompt({});
 
-if (!BASE || !KEY || !MODEL) {
+if (!BASE || !KEY || MODELS.length === 0) {
   console.log('未配置 AI_BASE_URL / AI_API_KEY / AI_MODEL —— 跳过（联网评测需要网关）');
   console.log('='.repeat(64));
   process.exit(0);
 }
 
-console.log(`模型：${MODEL}`);
-console.log(`用例：${CASES.length} 条（单柜场景 ${CASES.filter((c) => c.scenario === 'single').length} 条 / 多柜场景 ${CASES.filter((c) => c.scenario === 'multi').length} 条）`);
-console.log('='.repeat(64));
 
-let actionHit = 0;
-let actionTotal = 0;
-let clarifyHit = 0;
-let clarifyTotal = 0;
-/** 分场景统计：混在一起看不出「该问时问没问」 */
-const byScenario = new Map<string, { actionHit: number; actionTotal: number; clarifyHit: number; clarifyTotal: number }>();
-for (const sc of ['single', 'multi']) byScenario.set(sc, { actionHit: 0, actionTotal: 0, clarifyHit: 0, clarifyTotal: 0 });
-const details: string[] = [];
+/**
+ * 一条用例在 k 次运行里的结果。
+ */
+interface RunResult {
+  pass: boolean;
+  actions: string[];
+  reply: string;
+  ms: number;
+  parseFail: boolean;
+  /** 网关调用是否成功（失败 = 超时/非 JSON 响应） */
+  ok: boolean;
+  status?: number;
+}
 
-for (const c of CASES) {
-  const { project, bedroom } = buildProject(CAB_COUNT[c.scenario]);
-  const ctx = summarizeProjectContext(project, bedroom.id, []);
-  const r = await chat(MODEL, [
+/**
+ * 跑一条用例一次，返回判定结果。
+ */
+async function runOnce(model: string, c: NluCase, ctx: string): Promise<RunResult> {
+  const r = await chat(model, [
     { role: 'system', content: sys },
     { role: 'user', content: ctx + '\n\n用户说：' + c.q },
   ]);
@@ -212,49 +252,111 @@ for (const c of CASES) {
       parseFail = true;
     }
   }
-  const st = byScenario.get(c.scenario)!;
+  // 判定：期望动作命中 = 通过；期望追问 = 没给动作 = 通过；allowClarify = 两者都行
+  let pass: boolean;
   if (c.allowClarify) {
-    // 两种都对：给了期望动作 **或** 追问了
-    const didAction = c.wantActions.some((w) => actions.includes(w));
-    const didClarify = actions.length === 0;
-    const pass = didAction || didClarify;
-    if (pass) { actionHit++; actionTotal++; st.actionHit++; st.actionTotal++; }
-    else { actionTotal++; st.actionTotal++; }
-    console.log(`  ${pass ? 'v' : 'x'} [${c.scenario}] ${c.q.padEnd(22)} 期望=动作或追问  实际=${actions.join('/') || '(追问)'}  ${r.ms}ms`);
-    if (!pass && reply) details.push(`[${c.scenario}] ${c.q} —— 模型答：${reply.slice(0, 90)}`);
-    continue;
-  }
-  if (c.wantClarify) {
-    clarifyTotal++;
-    st.clarifyTotal++;
-    // 正确澄清 = 没有瞎给动作（动作数组为空）
-    const didClarify = actions.length === 0;
-    if (didClarify) { clarifyHit++; st.clarifyHit++; }
-    console.log(`  ${didClarify ? 'v' : 'x'} [${c.scenario}] ${c.q.padEnd(22)} 期望=追问  实际=${actions.join('/') || '(追问)'}  ${r.ms}ms`);
-    if (!didClarify) details.push(`[${c.scenario}] ${c.q} —— 应该追问却直接给了动作：${actions.join(', ')}`);
+    pass = c.wantActions.some((w) => actions.includes(w)) || actions.length === 0;
+  } else if (c.wantClarify) {
+    pass = actions.length === 0;
   } else {
-    actionTotal++;
-    st.actionTotal++;
-    const hit = c.wantActions.some((w) => actions.includes(w));
-    if (hit) { actionHit++; st.actionHit++; }
-    console.log(`  ${hit ? 'v' : 'x'} [${c.scenario}] ${c.q.padEnd(22)} 期望=${c.wantActions.join('/')}  实际=${actions.join('/') || (parseFail ? '(JSON 截断)' : '-')}  ${r.ms}ms`);
-    if (!hit && reply) details.push(`[${c.scenario}] ${c.q} —— 模型答：${reply.slice(0, 90)}`);
+    pass = c.wantActions.some((w) => actions.includes(w));
   }
+  return { pass, actions, reply, ms: r.ms, parseFail, ok: r.ok, status: r.status };
 }
 
-console.log('='.repeat(64));
-console.log('★ 分场景看（混在一起看不出「该问时问没问」）：');
-for (const [sc, st] of byScenario) {
-  const aRate = st.actionTotal ? st.actionHit / st.actionTotal : 0;
-  const cRate = st.clarifyTotal ? st.clarifyHit / st.clarifyTotal : 0;
-  console.log(`  ${sc === 'single' ? '单柜（该做就做）' : '多柜（该问就问）'}：动作 ${st.actionHit}/${st.actionTotal} = ${(aRate * 100).toFixed(0)}%   澄清 ${st.clarifyHit}/${st.clarifyTotal} = ${(cRate * 100).toFixed(0)}%`);
+/** 统计口径 */
+interface Stat {
+  /** 用例数 */
+  n: number;
+  /** pass@1：单次跑的平均正确率 */
+  passAt1: number;
+  /** pass@k：k 次里至少对 1 次的用例占比 */
+  passAtK: number;
+  /** pass^k：k 次全对的用例占比（稳定性） */
+  passPowK: number;
+  /** k 次全对的用例数 */
+  stable: number;
+  /** k 次里有时对有时不对的用例数 */
+  unstable: number;
 }
-console.log('');
-console.log(`总的动作命中率：${actionHit}/${actionTotal} = ${actionTotal ? ((actionHit / actionTotal) * 100).toFixed(0) : 0}%`);
-console.log(`总的正确澄清率：${clarifyHit}/${clarifyTotal} = ${clarifyTotal ? ((clarifyHit / clarifyTotal) * 100).toFixed(0) : 0}%`);
-if (details.length) {
+
+/**
+ * 评测一个模型。
+ */
+async function evaluateModel(model: string): Promise<void> {
+  const MODEL = model;   // ★ 本函数内的 chat() 用它
   console.log('');
-  console.log('未命中明细：');
-  for (const d of details) console.log('  · ' + d);
+  console.log('━'.repeat(64));
+  console.log('模型：' + MODEL + '   每条跑 ' + K + ' 次');
+  console.log('━'.repeat(64));
+  const stats = new Map<string, Stat>();
+  for (const sc of ['single', 'multi']) {
+    stats.set(sc, { n: 0, passAt1: 0, passAtK: 0, passPowK: 0, stable: 0, unstable: 0 });
+  }
+  const details: string[] = [];
+  const unstableCases: string[] = [];
+
+  for (const c of CASES) {
+    const { project, bedroom } = buildProject(CAB_COUNT[c.scenario]);
+    const ctx = summarizeProjectContext(project, bedroom.id, []);
+    const runs: RunResult[] = [];
+    for (let i = 0; i < K; i++) runs.push(await runOnce(model, c, ctx));
+    const hits = runs.filter((x) => x.pass).length;
+    const st = stats.get(c.scenario)!;
+    st.n++;
+    st.passAt1 += hits / K;
+    if (hits >= 1) st.passAtK++;
+    if (hits === K) { st.passPowK++; st.stable++; }
+    else {
+      st.unstable++;
+      if (hits > 0) {
+        // ★ 带上每次失败的原因 —— 「不稳定」可能是模型犹豫，也可能是超时/截断，
+        //   这两者的修法完全不同（前者改提示词，后者改超时/输出预算）。
+        const why = runs.filter((x) => !x.pass).map((x) =>
+          !x.ok ? ('网关失败:' + (x.status ?? '?'))
+            : x.parseFail ? 'JSON截断'
+            : (x.actions.length ? '给了别的动作:' + x.actions.join('/') : '纯追问'));
+        unstableCases.push('[' + c.scenario + '] ' + c.q + ' —— ' + hits + '/' + K + ' 次对（不稳定）；失败原因：' + why.join(' / '));
+      }
+    }
+    const mark = hits === K ? 'v' : hits === 0 ? 'x' : '~';
+    const acts = [...new Set(runs.flatMap((x) => x.actions))].join('/') || '(追问)';
+    console.log('  ' + mark + ' [' + c.scenario + '] ' + c.q.padEnd(22) + ' ' + hits + '/' + K + '  ' + acts.slice(0, 52));
+    if (hits === 0) {
+      const r0 = runs[0];
+      details.push('[' + c.scenario + '] ' + c.q + ' —— 0/' + K + ' 次对。模型答：' + (r0.reply || (r0.parseFail ? '(JSON 截断)' : '')).slice(0, 100));
+    }
+  }
+
+  console.log('='.repeat(64));
+  console.log('★ 分场景（每条跑 ' + K + ' 次）—— 混在一起看不出「该问时问没问」：');
+  for (const [sc, st] of stats) {
+    const label = sc === 'single' ? '单柜（该做就做）' : '多柜（该问就问）';
+    const n = Math.max(1, st.n);
+    console.log('  ' + label + '：pass@1 ' + (st.passAt1 / n * 100).toFixed(0) + '%   '
+      + 'pass@' + K + ' ' + (st.passAtK / n * 100).toFixed(0) + '%   '
+      + 'pass^' + K + ' ' + (st.passPowK / n * 100).toFixed(0) + '%   '
+      + '（全对 ' + st.stable + ' / 不稳定 ' + st.unstable + ' / 共 ' + st.n + '）');
+  }
+  console.log('');
+  console.log('★ 两个口径的区别 —— 家具出错图不可逆，**pass^k 才是该盯的那个**：');
+  console.log('  pass@k = k 次里至少对 1 次（会不会）');
+  console.log('  pass^k = k 次全对（稳不稳）      —— 差值越大说明越飘');
+  if (unstableCases.length) {
+    console.log('');
+    console.log('★ 不稳定的用例（k 次里有时对有时不对）：');
+    for (const d of unstableCases) console.log('  · ' + d);
+  }
+  if (details.length) {
+    console.log('');
+    console.log('完全没对的用例：');
+    for (const d of details) console.log('  · ' + d);
+  }
+  console.log('='.repeat(64));
+}
+
+// ── 跑所有模型 ──
+for (const m of MODELS) {
+  await evaluateModel(m);
 }
 console.log('='.repeat(64));

@@ -1565,6 +1565,78 @@ async function handleApi(req, res, pathname) {
    *    顺带一处事实错误：那句"只消耗 1 个 token"也不对 —— 实测 total_tokens 是 6
    *    （prompt 5 + completion 1），而且推理 token 一样计费。
    */
+  /**
+   * 探测一个模型**看得见图**吗。
+   *
+   * ── 判据：prompt_tokens 的增量 ──
+   *   同一句话，带图与不带图各发一次，看 prompt_tokens 差多少。
+   *   差 ≈ 0 ⇒ **图压根没被转发给模型**（实测 glm-5.2 就是这样）。
+   *   差 ≫ 0 ⇒ 图进去了（但模型**可能仍看不懂** —— deepseek 就是这样：
+   *   差 184，它却答不出颜色）。
+   *
+   * ⇒ 这个探测只回答「图送到了没有」，**不**回答「模型看懂没看懂」——
+   *   后者要看识别结果对不对（见 verify/vision-eval.mjs）。
+   *
+   * @param {string} baseUrl 网关地址
+   * @param {string} key API Key
+   * @param {string} model 模型名
+   * @returns {Promise<object>} 探测结果
+   */
+  async function probeVisionCapability(baseUrl, key, model) {
+    // 8x8 纯红 PNG（75 字节）—— 比 1x1 可靠：1x1 时 token 增量只有 66，8x8 才分得开。
+    const RED_PNG =
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC';
+    const ask = async (withImage) => {
+      const content = withImage
+        ? [{ type: 'text', text: '这张图是什么颜色？' }, { type: 'image_url', image_url: { url: RED_PNG } }]
+        : [{ type: 'text', text: '这张图是什么颜色？' }];
+      const r = await fetchWithTimeout(
+        `${baseUrl}/chat/completions`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+          body: JSON.stringify({ model, messages: [{ role: 'user', content }], max_tokens: 512 }),
+        },
+        Number(env.AI_TIMEOUT_MS ?? 60000)
+      );
+      if (!r.ok) return { ok: false, error: `HTTP ${r.status}` };
+      const j = JSON.parse(await r.text());
+      return {
+        ok: true,
+        pt: Number(j?.usage?.prompt_tokens ?? 0),
+        said: String(j?.choices?.[0]?.message?.content ?? '').trim().slice(0, 60),
+      };
+    };
+    try {
+      const plain = await ask(false);
+      const withImg = await ask(true);
+      if (!plain.ok || !withImg.ok) return { ok: false, error: plain.error ?? withImg.error };
+      const delta = withImg.pt - plain.pt;
+      return {
+        ok: true,
+        model,
+        plainPromptTokens: plain.pt,
+        imagePromptTokens: withImg.pt,
+        delta,
+        /** 图有没有送进去（只看 token 增量） */
+        imageReachedModel: delta > 0,
+        /**
+         * ★ 模型自己**承认**看见了吗？
+         *   探针问「这张图是什么颜色？」，纯红图的答案应该是「红」。
+         *   实测三种模型三种表现：
+         *     sensenova -> 「这张图是纯红色」⇒ 真看见了
+         *     deepseek -> 增量 184（图送到了）但**答不出颜色** ⇒ 拿到了却不认
+         *     glm-5.2  -> 增量 0（图压根没送）⇒ 「您好」
+         *   ⇒ 「图送到了」与「模型看懂了」是**两件事**，分开报。
+         */
+        modelSawColor: /红|red/i.test(withImg.said ?? ''),
+        said: withImg.said,
+      };
+    } catch (e) {
+      return { ok: false, error: e?.name === 'AbortError' ? '超时' : e.message };
+    }
+  }
+
   if (pathname === '/api/test' && req.method === 'POST') {
     const baseUrl = (env.AI_BASE_URL || s.baseUrl || '').replace(/\/+$/, '');
     const key = env.AI_API_KEY || '';
@@ -1629,9 +1701,18 @@ async function handleApi(req, res, pathname) {
       const reasoning = String(choice?.message?.reasoning_content ?? '');
       const usage = parsed?.usage ?? null;
       const spoke = content.length > 0;
+      // ★ 视觉能力探测：这个模型**看得见图**吗？
+      //   视觉模型配错了，识图功能是**坏的但看不出**（见 NEW-MODELS-2026-10-22.md）。
+      //   用户点「测试」时能直接看到「这个模型不看图」，就不用自己去猜。
+      const visionModel = env.AI_VISION_MODEL || model;
+      const vision = visionModel && visionModel !== model
+        ? await probeVisionCapability(baseUrl, key, visionModel)
+        : null;
+
       return json(res, 200, {
         ok: spoke,
         reachable: true,
+        vision,
         spoke,
         latencyMs,
         model: parsed?.model ?? model,

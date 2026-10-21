@@ -303,9 +303,69 @@ export function resolveCabinet(project: Project, target: AiAction['target']): Ca
  * 返回 0 起的 index —— 因为 CommandBus 的路径用的是数组下标。
  * 这个 +1/−1 的换算只在这里做一次，界面上给用户看的永远是 1 起序号。
  */
-export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined): number | string {
+/**
+ * 已有分区的**功能开关 / 枚举**规格表（2026-10-21）。
+ *
+ * ★ 为什么要有这张表 ──
+ *   裤架、格子抽、灯带安装位这三个都是**建分区时能给、已有分区改不了**的。
+ *   NLU 评测卡（verify/nlu-eval.ts）里「加个裤架」的模型回答是：
+ *     「现有动作里没有为已有分区加裤架或改分区功能的入口」
+ *   —— 它说的是事实。
+ *
+ * ★ 每个条目声明四件事 ──
+ *   path      写路径（必须已在 commandBus 的白名单里）；
+ *   values    合法取值；
+ *   precheck  适用前提（不满足就报错并说明该做什么，不静默写入）；
+ *   label     给用户看的名字。
+ *
+ * ★ precheck 为什么必须有 ──
+ *   给没有挂衣杆的分区加裤架是**语义错误**（裤架要挂在杆上）。
+ *   静默写进去会画出一个挂不上的裤架 —— 看起来生效了，实际是废件。
+ */
+const FEATURE_SPECS: Record<string, {
+  path: string;
+  values: string[];
+  label: string;
+  precheck: (unit: UnitSpec) => string | null;
+}> = {
+  trouserRack: {
+    path: 'trouserRack',
+    values: ['true', 'false'],
+    label: '裤架',
+    precheck: (u) =>
+      u.kind !== 'hanging'
+        ? `分区「${u.nickname ?? u.id}」不是挂衣区，裤架要挂在挂衣杆上`
+        : !u.rod || !u.rod.count
+          ? `分区「${u.nickname ?? u.id}」没有挂衣杆，裤架无处可挂 —— 想加裤架请用 cabinet.addUnit 建一个带挂衣杆的分区`
+          : null,
+  },
+  drawerStyle: {
+    path: 'drawers.style',
+    values: ['plain', 'grid'],
+    label: '抽面表达',
+    precheck: (u) =>
+      !u.drawers || !u.drawers.count
+        ? `分区「${u.nickname ?? u.id}」没有抽屉，抽面表达无处可改 —— 想改用格子抽请用 cabinet.addUnit 建一个抽屉分区`
+        : null,
+  },
+  ledStrip: {
+    path: 'shelves.ledStrip',
+    values: ['none', 'center', 'front', 'angled45'],
+    label: '灯带安装位',
+    precheck: (u) =>
+      u.kind !== 'shelves'
+        ? `分区「${u.nickname ?? u.id}」不是层板区，灯带装在层板前缘`
+        : null,
+  },
+};
+
+export function resolveUnitIndex(
+  cab: Cabinet,
+  ref: number | string | undefined,
+  rowIndex?: number,
+): number | string {
   /**
-   * ⚠ 多行柜（v0.3）：本阶段 AI 还**不能指定"哪一行"**。
+   * ⚠ 多行柜（v0.3）：AI 必须指明**哪一行**。
    *
    * 这里必须**拒绝**，而不是默认取第 0 行：多行柜的"第 2 分区"在每一行里都存在，
    * 缺行信息时无法确定对象。猜错一行的后果是**安静改错分区** ——
@@ -313,9 +373,37 @@ export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined)
    * 这与本文件其它地方"宁可报错不许猜"的口径一致。
    *
    * 界面上直接改不受影响：界面知道用户点的是哪一行（PickLine 带 rowIndex）。
+   *
+   * ★ 2026-10-21：加了 rowIndex 参数 ──
+   *   底层的 rowIndex 早就有了（commandBus 的 targetRowOf、PickLine 都带），
+   *   缺的只是 AI 契约这一层 ⇒ 模型只能说「AI 还不能指定是哪一行」（实测）。
+   *   NLU 评测卡里「那个挂衣区下面加一层格子」「换成玻璃门」被这条卡住。
+   *
+   *   给定 rowIndex 时，ref 是**该行内**的序号（1 起），
+   *   返回的是**整柜**的扁平序号（canonicalUnits 的下标）。
    */
+  const rows = layoutRows(cab.layout);
   if (isMultiRow(cab.layout)) {
-    return `柜体「${cab.name}」分了上下 ${layoutRows(cab.layout).length} 行，本阶段 AI 还不能指定是哪一行 —— 请在界面上直接改那一行里的分区`;
+    if (rowIndex === undefined || rowIndex === null) {
+      return `柜体「${cab.name}」分了上下 ${rows.length} 行，要指明是哪一行 —— 请给 rowIndex（0 = 最上面那行，0~${rows.length - 1}）`;
+    }
+    const ri = Number(rowIndex);
+    if (!Number.isInteger(ri) || ri < 0 || ri >= rows.length) {
+      return `rowIndex = ${ri} 超出范围（柜体「${cab.name}」共 ${rows.length} 行，0~${rows.length - 1}）`;
+    }
+    const rowUnits = rows[ri]!.units ?? [];
+    if (rowUnits.length === 0) return `柜体「${cab.name}」第 ${ri + 1} 行没有任何分区`;
+    if (ref === undefined || ref === null) {
+      return `没有指明是哪个分区（该行有 ${rowUnits.length} 个：target.unit 用 1 起序号或分区昵称）`;
+    }
+    const hit = pickUnitIn(rowUnits, ref);
+    if (typeof hit === 'string') return hit;
+    // 把「行内序号」翻译成「整柜扁平序号」
+    const flat = canonicalUnits(cab.layout);
+    const target = flat.find((u) => u.id === rowUnits[hit]!.id);
+    const flatIdx = target ? flat.indexOf(target) : -1;
+    if (flatIdx < 0) return `分区「${rowUnits[hit]!.nickname ?? rowUnits[hit]!.id}」定位失败`;
+    return flatIdx;
   }
   /**
    * 走 canonical 取法：单行柜下它与 `layout.units` 逐项同一对象（v0.2 逐位等价）；
@@ -324,6 +412,19 @@ export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined)
    */
   const units = canonicalUnits(cab.layout);
   if (units.length === 0) return `柜体「${cab.name}」没有任何分区`;
+  const hit = pickUnitIn(units, ref);
+  if (typeof hit === 'string') return hit;
+  return hit;
+}
+
+/**
+ * 在给定分区列表里按「序号（1 起）或昵称」定位一个分区。
+ *
+ * @param units 分区列表
+ * @param ref 序号（1 起）或昵称
+ * @returns 列表下标；错误时返回错误信息字符串
+ */
+function pickUnitIn(units: UnitSpec[], ref: number | string | undefined): number | string {
   if (ref === undefined || ref === null) return '没有指明是哪个分区（需要 target.unit：1 起序号或分区昵称）';
   if (typeof ref === 'number') {
     const i = Math.round(ref) - 1;
@@ -334,10 +435,10 @@ export function resolveUnitIndex(cab: Cabinet, ref: number | string | undefined)
   const exact = units.map((u, i) => ({ u, i })).filter((x) => x.u.nickname === s);
   if (exact.length === 1) return exact[0].i;
   if (exact.length > 1) return `有 ${exact.length} 个分区都叫「${s}」`;
-  const fuzzy = units.map((u, i) => ({ u, i })).filter((x) => (x.u.nickname ?? '').includes(s) || s.includes(x.u.nickname ?? '\u0000'));
+  const fuzzy = units.map((u, i) => ({ u, i })).filter((x) => (x.u.nickname ?? '').includes(s) || s.includes(x.u.nickname ?? ''));
   if (fuzzy.length === 1) return fuzzy[0].i;
   if (fuzzy.length > 1) return `「${s}」匹配到多个分区：${fuzzy.map((x) => x.u.nickname ?? x.u.id).join('、')}`;
-  return `柜体「${cab.name}」里没有叫「${s}」的分区（现有：${units.map((u, i) => `${i + 1}.${u.nickname ?? u.id}`).join('、')}）`;
+  return `没有叫「${s}」的分区（现有：${units.map((u, i) => `${i + 1}.${u.nickname ?? u.id}`).join('、')}）`;
 }
 
 /** 分区是否具备某类功能 —— 依据是 UnitSpec 上那个子规格对象在不在 */
@@ -449,7 +550,7 @@ function checkPartTarget(
         .join('、')}）—— 请用 target.unit 指明是哪一个`,
     };
   }
-  const i = resolveUnitIndex(cab, action.target.unit);
+  const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
   if (typeof i === 'string') return { ok: false, error: i };
   const found = occurrences.find((x) => x.unitIndex === i);
   if (!found) {
@@ -642,7 +743,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
     case 'cabinet.setUnitWidth': {
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
-      const i = resolveUnitIndex(cab, action.target.unit);
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
       if (typeof i === 'string') return { ok: false, error: i };
       return { ok: true, command: CMD.setUnitWidth(cab, i, mm(p.width as number), src), summary: `改「${cab.name}」第 ${i + 1} 分区净宽` };
     }
@@ -650,7 +751,7 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
     case 'cabinet.setUnitParam': {
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
-      const i = resolveUnitIndex(cab, action.target.unit);
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
       if (typeof i === 'string') return { ok: false, error: i };
       const unit = canonicalUnits(cab.layout)[i];
       const key = String(p.param);
@@ -671,10 +772,97 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       return { ok: true, command: CMD.setUnitInt(cab, i, key, v, label, src), summary: `改「${cab.name}」第 ${i + 1} 分区 ${key}` };
     }
 
+    /**
+     * 改已有分区的**门板材质**（2026-10-21 补）。
+     *
+     * ★ 为什么需要这个动作 ──
+     *   之前 doorMaterial 只能在 cabinet.create / cabinet.addUnit 时给，
+     *   于是「把这一格换成玻璃门」这个诉求**没有任何动作能表达**。
+     *   NLU 评测卡（2026-10-21）里模型的回答是：
+     *     「这个改不了：现有动作里没有「修改已建分区门板材质」这一项」
+     *   —— 它说的是事实。给它这个动作，模型就不用再这么说了。
+     *
+     * ★ 为什么不用 setUnitParam 的 param 参数 ──
+     *   UNIT_PARAM_RANGES 是**数值**参数的区间表（抽屉数/层板数/门缝），
+     *   门板材质是**枚举**（引用 RuleSet.materials），不是数值。
+     *   硬塞进那张表会污染它的语义（那张表的每个条目都有 min/max/integer）。
+     *   ⇒ 独立成一个动作，参数语义干净。
+     */
+    case 'cabinet.setUnitDoorMaterial': {
+      const cab = resolveCabinet(project, action.target);
+      if (typeof cab === 'string') return { ok: false, error: cab };
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
+      if (typeof i === 'string') return { ok: false, error: i };
+      const unit = canonicalUnits(cab.layout)[i];
+      const material = String(p.material);
+      // 材质 id 必须存在 —— 不存在直接报错，不静默降级成木门（那会让用户以为玻璃门装上了）
+      const dm = checkDoorMaterial(rules, material);
+      if (dm) return { ok: false, error: `门板材质：${dm}` };
+      // 这个分区根本没有门 ⇒ 改门板材质没有意义，指路到「加门」
+      if (!unit.doors || !unit.doors.count) {
+        return {
+          ok: false,
+          error: `分区「${unit.nickname ?? unit.id}」没有门（开放格），没有门板材质可改。想装门请用 cabinet.addUnit 或重建该分区。`,
+        };
+      }
+      const label = `门板材质 → ${material}`;
+      return {
+        ok: true,
+        command: CMD.setUnitString(cab, i, 'doors.material', material, label, src),
+        summary: `改「${cab.name}」第 ${i + 1} 分区的门板材质`,
+      };
+    }
+
+    /**
+     * 改已有分区的**功能开关 / 枚举**（2026-10-21 补）。
+     *
+     * ★ 为什么单独一个动作，而不是塞进 setUnitParam ──
+     *   setUnitParam 走 UNIT_PARAM_RANGES —— 那张表每个条目都有 min/max/integer，
+     *   是**数值**参数的区间表。裤架是布尔、格子抽与灯带是枚举，
+     *   硬塞进去会污染那张表的语义。
+     *   ⇒ 开关与枚举走独立动作，参数语义干净。
+     *
+     * ★ 覆盖的三个 ──
+     *   trouserRack（挂衣区带裤架）、drawerStyle（格子抽）、ledStrip（灯带安装位）。
+     *   它们此前**只能建分区时给**，已有分区改不了 ——
+     *   NLU 评测卡里「加个裤架」被这条卡住，模型答「现有动作里没有加裤架的入口」。
+     */
+    case 'cabinet.setUnitFeature': {
+      const cab = resolveCabinet(project, action.target);
+      if (typeof cab === 'string') return { ok: false, error: cab };
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
+      if (typeof i === 'string') return { ok: false, error: i };
+      const unit = canonicalUnits(cab.layout)[i];
+      const feature = String(p.feature);
+      const raw = String(p.value);
+      /**
+       * 每个 feature 的：合法值、写入路径、适用前提、以及一句话说明。
+       *
+       * ★ 适用前提要查 ──
+       *   给没有挂衣杆的分区加裤架是**语义错误**（裤架挂在杆上），
+       *   静默写进去会画出一个挂不上的裤架。
+       */
+      const spec = FEATURE_SPECS[feature];
+      if (!spec) {
+        return { ok: false, error: `功能开关 "${feature}" 不认识（可用：${Object.keys(FEATURE_SPECS).join('、')}）` };
+      }
+      if (!spec.values.includes(raw)) {
+        return { ok: false, error: `${feature} 的取值 "${raw}" 不对（可用：${spec.values.join('、')}）` };
+      }
+      const pre = spec.precheck(unit);
+      if (pre) return { ok: false, error: pre };
+      const label = `${spec.label} → ${raw}`;
+      return {
+        ok: true,
+        command: CMD.setUnitString(cab, i, spec.path, raw, label, src),
+        summary: `改「${cab.name}」第 ${i + 1} 分区的${spec.label}`,
+      };
+    }
+
     case 'cabinet.renameUnit': {
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
-      const i = resolveUnitIndex(cab, action.target.unit);
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
       if (typeof i === 'string') return { ok: false, error: i };
       const nick = String(p.nickname);
       return {
@@ -688,14 +876,33 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
       /**
-       * 多行柜：新分区加到哪一行没有合理缺省（第 0 行是最上面那行，常常不是用户想加的地方）。
-       * AI 契约在本阶段没有"行"这个参数，所以明确拒绝，而不是悄悄加到第 0 行。
+       * 多行柜：新分区加到哪一行**必须显式指定**。
+       *
+       * ★ 为什么不能缺省 ──
+       *   第 0 行是最上面那行，常常不是用户想加的地方。
+       *   缺省加到第 0 行 = 静默做错决定 ⇒ 宁可报错并说明要指哪一行。
+       *
+       * ★ 2026-10-21：契约加了 rowIndex，这个拒绝改成「要求指明行」 ──
+       *   底层的 rows 结构、addUnit 命令的 rowIndex、commandBus 的 targetRowOf
+       *   **本来就都有** —— 缺的只是契约这一层。
+       *   于是模型只能说「做不到，请到界面上加」（NLU 评测卡实测）。
        */
-      if (isMultiRow(cab.layout)) {
+      const rowCount = layoutRows(cab.layout).length;
+      const hasRowIndex = p.rowIndex !== undefined && p.rowIndex !== null;
+      if (isMultiRow(cab.layout) && !hasRowIndex) {
         return {
           ok: false,
-          error: `柜体「${cab.name}」分了上下 ${layoutRows(cab.layout).length} 行，本阶段 AI 还不能指定新分区加到哪一行 —— 请在界面上直接加`,
+          error: `柜体「${cab.name}」分了上下 ${rowCount} 行，新分区加到哪一行？rowIndex 用 0~${rowCount - 1}（0 = 最上面那行）。`,
         };
+      }
+      if (hasRowIndex) {
+        const ri = Number(p.rowIndex);
+        if (!Number.isInteger(ri) || ri < 0 || ri >= rowCount) {
+          return {
+            ok: false,
+            error: `rowIndex = ${ri} 超出范围（柜体「${cab.name}」共 ${rowCount} 行，0~${rowCount - 1}）`,
+          };
+        }
       }
       const kind = String(p.kind) as UnitSpec['kind'];
       if (kind === 'hanging' && p.rodHeight === undefined && p.count !== undefined) {
@@ -739,13 +946,13 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
               }
             : undefined,
       });
-      return { ok: true, command: CMD.addUnit(cab.id, cab.name, unit, src), summary: `「${cab.name}」新增分区 ${unit.nickname ?? unit.id}` };
+      return { ok: true, command: CMD.addUnit(cab.id, cab.name, unit, src, hasRowIndex ? Number(p.rowIndex) : undefined), summary: `「${cab.name}」新增分区 ${unit.nickname ?? unit.id}` };
     }
 
     case 'cabinet.removeUnit': {
       const cab = resolveCabinet(project, action.target);
       if (typeof cab === 'string') return { ok: false, error: cab };
-      const i = resolveUnitIndex(cab, action.target.unit);
+      const i = resolveUnitIndex(cab, action.target.unit, action.params?.rowIndex === undefined ? undefined : Number(action.params.rowIndex));
       if (typeof i === 'string') return { ok: false, error: i };
       const rowUnits = canonicalUnits(cab.layout);
       if (rowUnits.length <= 1) return { ok: false, error: `柜体「${cab.name}」只剩一个分区，删掉就没有柜体结构了` };

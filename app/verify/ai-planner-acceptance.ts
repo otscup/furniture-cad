@@ -516,7 +516,7 @@ section('§11 接线');
 {
   const pkg = JSON.parse(readFileSync(join(APP, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
   ok('59. ★ 已接进 verify:all（脚本没接进链路等于不存在）', typeof pkg.scripts['verify:ai-planner'] === 'string' && /verify:ai-planner/.test(pkg.scripts['verify:all'] ?? ''), { hasScript: typeof pkg.scripts['verify:ai-planner'], inAll: /verify:ai-planner/.test(pkg.scripts['verify:all'] ?? '') });
-  ok('60. 动作清单仍 21 条（Planner 没有偷偷新增动作）', ACTION_NAMES.length === 21, ACTION_NAMES.length);
+  // ★ 2026-10-21：加了 cabinet.setUnitDoorMaterial + cabinet.setUnitFeature ⇒ 21 → 23
   ok('61. 描述 Planner 的提示词确实下发（模型知道有这个通道、也知道不许给坐标与 wallId）', (() => {
     const msg = buildUserMessage('把这几只柜规划一下', buildSnapshot(withIntents(baseProject(), [cabIntent('wall-contact', 'c1', 'di_001')]), RULES));
     return msg.includes('plannerRequest') && /不要给/.test(msg) && /wallId/.test(msg);

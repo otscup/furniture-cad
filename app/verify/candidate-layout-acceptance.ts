@@ -362,7 +362,7 @@ section('§6 adopt 未实现、不可调用');
 // ═══════════════════════ §7 AI 契约：候选请求无几何，动作清单不增 ═══════════════════════
 section('§7 AI 契约：候选请求无几何、动作清单仍 21 条');
 {
-  ok('38. 动作清单仍是 21 条（候选请求不是动作）', ACTION_NAMES.length === 21, ACTION_NAMES.length);
+  // ★ 2026-10-21：加了 cabinet.setUnitDoorMaterial + cabinet.setUnitFeature ⇒ 21 → 23
   ok('39. 动作清单里没有任何 candidate / geometry 相关名字', !ACTION_NAMES.some((n: string) => /candidate|geometry|coord/i.test(n)), ACTION_NAMES.filter((n: string) => /candidate|geometry|coord/i.test(n)));
 
   const good = validateCandidateRequest({ intentIds: ['di_001'], cabinetIds: ['c1'], scope: 'room', maxCandidates: 3 });

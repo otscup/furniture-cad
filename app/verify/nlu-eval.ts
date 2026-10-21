@@ -45,7 +45,7 @@ const envOf = (k: string): string => {
 };
 const BASE = process.env.AI_BASE_URL || envOf('AI_BASE_URL');
 const KEY = process.env.AI_API_KEY || envOf('AI_API_KEY');
-const MODEL = process.env.AI_MODEL || envOf('AI_MODEL');
+const MODEL = process.env.NLU_MODEL || process.env.AI_MODEL || envOf('AI_MODEL');
 
 /** 造一个真实项目：主卧 + 客厅，各有柜子 */
 function buildProject() {
@@ -87,8 +87,8 @@ const CASES: NluCase[] = [
   { q: '刚才那个柜子太宽了，缩到800', wantActions: ['cabinet.resize'] },
   { q: '主卧的床旁边那个柜子往左挪一点', wantActions: ['cabinet.nudge', 'cabinet.move'] },
   { q: '那个挂衣区下面加一层格子', wantActions: ['cabinet.addUnit', 'cabinet.setUnitParam'] },
-  { q: '换成玻璃门', wantActions: ['cabinet.setUnitParam', 'cabinet.addUnit'] },
-  { q: '加个裤架', wantActions: ['cabinet.setUnitParam', 'cabinet.addUnit'] },
+  { q: '换成玻璃门', wantActions: ['cabinet.setUnitDoorMaterial', 'cabinet.setUnitParam', 'cabinet.addUnit'] },
+  { q: '加个裤架', wantActions: ['cabinet.setUnitFeature', 'cabinet.setUnitParam', 'cabinet.addUnit'] },
   { q: '这柜子下面留个洗衣机的位置', wantActions: ['cabinet.addUnit'] },
   { q: '把两个柜子连起来', wantActions: ['assembly.create'] },
   { q: '叫「主卧衣柜」', wantActions: ['cabinet.rename'] },

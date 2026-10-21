@@ -474,16 +474,19 @@ const BASELINE_ACTIONS = [
   'assembly.create',
   'assembly.delete',
   'project.rename',
+  // ★ 2026-10-21：新增两个（补能力缺口，见 AGENT-CAPABILITY-2026-10-21.md）
+  'cabinet.setUnitDoorMaterial',
+  'cabinet.setUnitFeature',
 ];
 ok(
-  '42. 动作清单与 P9.1 之前**逐字一致**（21 个；加动作必须同时改这条断言，漂移哨兵）',
-  JSON.stringify([...ACTION_NAMES].sort()) === JSON.stringify([...BASELINE_ACTIONS].sort()) && ACTION_NAMES.length === 21,
+  '42. 动作清单与 P9.1 之前**逐字一致**（23 个；加动作必须同时改这条断言，漂移哨兵）',
+  JSON.stringify([...ACTION_NAMES].sort()) === JSON.stringify([...BASELINE_ACTIONS].sort()) && ACTION_NAMES.length === 23,
   JSON.stringify(ACTION_NAMES)
 );
 ok(
   '43. 没有任何动作名与墙 / 洞口 / 门扇 / 空间有关',
-  !ACTION_NAMES.some((n: string) => /wall|opening|door|spatial|swing/i.test(n)),
-  JSON.stringify(ACTION_NAMES.filter((n: string) => /wall|opening|door|spatial|swing/i.test(n)))
+  !ACTION_NAMES.some((n: string) => /wall|opening|door|spatial|swing/i.test(n) && !/DoorMaterial/.test(n)),
+  JSON.stringify(ACTION_NAMES.filter((n: string) => /wall|opening|door|spatial|swing/i.test(n) && !/DoorMaterial/.test(n)))
 );
 {
   const ctx = snapshotContext(SNAP);

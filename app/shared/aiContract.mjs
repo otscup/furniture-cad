@@ -118,6 +118,20 @@ export const COMPOSITION_GUIDE = `
   · 反过来，一条**长柜内部的**"左三段抽屉、右两组对开门"是**一个**柜体的 units 分区，
     不是多个柜体 —— 别把柜内分区当成多个柜来建。
   · 落位拿不准就省略 atX / atY：系统会自动找个放得下的位置。拼歪了、拼重叠了都不要紧，
+  · ★ 上下分层（一个柜体分上下几层）**支持**，别再说做不到：
+    用 cabinet.addUnit 并给 rowIndex 指明加到第几行（0 = 最上面那行）。
+    用户说「挂衣区下面加一层格子」「上面那格再放个抽屉」时，
+    就给 addUnit 的 rowIndex 指到下面那行去，kind 填 shelves / drawerBank。
+    已有分区要改门板材质（比如「换成玻璃门」）用 cabinet.setUnitDoorMaterial，
+    它改的是**已建**分区的门板，不是新建 —— 别用 addUnit 重建一个来替代。
+  · ★ 已有分区加功能（裤架 / 格子抽 / 灯带）**支持**：
+    用 cabinet.setUnitFeature，feature 填 trouserRack / drawerStyle / ledStrip。
+    用户说「加个裤架」「这格换成格子抽」「层板加个灯带」时用它 ——
+    不用重建分区（重建会把用户已经配好的东西冲掉）。
+    它改的是**已建**分区的门板，不是新建 —— 别用 addUnit 重建一个来替代。
+  · ★ 多层柜里指分区要带 rowIndex ──
+    分区在第几行用 rowIndex（0 = 最上面），target.unit 是**该行内**的序号。
+    少了 rowIndex 系统会拒绝并告诉你该指哪一行（不会替你猜）。
     两段式执行会先在预览里画出来，用户自己会纠偏 —— **你不需要先问落位**。
 `;
 
@@ -269,6 +283,21 @@ export const ACTIONS = {
     targetUnit: true,
     params: {
       width: { type: 'number', min: 100, max: 4000, unit: 'mm', desc: '该分区净宽（内空宽）' },
+      /**
+       * 目标行（**从 0 开始**，0 = 最上面那行）。
+       *
+       * ★ 为什么需要 ──
+       *   多行柜的「第 2 分区」在每一行里都存在，指代不唯一。
+       *   以前 AI 通道对多行柜直接硬拒绝（「本阶段 AI 还不能指定是哪一行」），
+       *   于是模型对多行柜的任何分区操作都只能说「做不到，请到界面上改」。
+       *   底层的 rowIndex 早就有了（commandBus 的 targetRowOf、PickLine 都带），
+       *   缺的只是契约这一层。
+       *
+       * ★ 语义 ──
+       *   给了 rowIndex 后，target.unit 是**该行内**的序号（1 起）或昵称。
+       *   多行柜不给 rowIndex ⇒ 编译期报错并说明要指哪一行（不猜）。
+       */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
     },
     required: ['width'],
     detail: '若柜体是 fit_total，改分区宽只在"各分区请求比例"的意义上生效 —— 请在 reason 里说明这一点。',
@@ -284,6 +313,21 @@ export const ACTIONS = {
         desc: 'drawers.* 抽屉数/滑轨长；shelves.count 层板数；doors.* 门扇数与缝隙；rod.heightFromBottom 挂衣杆离柜内底高度',
       },
       value: { type: 'number', min: 0, max: 3000, desc: '数值，实际区间由 param 决定（见 UNIT_PARAM_RANGES）' },
+      /**
+       * 目标行（**从 0 开始**，0 = 最上面那行）。
+       *
+       * ★ 为什么需要 ──
+       *   多行柜的「第 2 分区」在每一行里都存在，指代不唯一。
+       *   以前 AI 通道对多行柜直接硬拒绝（「本阶段 AI 还不能指定是哪一行」），
+       *   于是模型对多行柜的任何分区操作都只能说「做不到，请到界面上改」。
+       *   底层的 rowIndex 早就有了（commandBus 的 targetRowOf、PickLine 都带），
+       *   缺的只是契约这一层。
+       *
+       * ★ 语义 ──
+       *   给了 rowIndex 后，target.unit 是**该行内**的序号（1 起）或昵称。
+       *   多行柜不给 rowIndex ⇒ 编译期报错并说明要指哪一行（不猜）。
+       */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
     },
     required: ['param', 'value'],
     detail: '只能改该分区**已经具备**的功能。分区没有 drawers 就不能设抽屉数 —— 想加功能请用 cabinet.addUnit。',
@@ -292,13 +336,18 @@ export const ACTIONS = {
     label: '重命名分区',
     target: 'cabinet',
     targetUnit: true,
-    params: { nickname: { type: 'string', max: MAX_STRING } },
+    params: {
+      nickname: { type: 'string', max: MAX_STRING },
+      /** 目标行（从 0 开始，0 = 最上面）。多层柜必须给。 */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
+    },
     required: ['nickname'],
   },
   'cabinet.addUnit': {
     label: '新增一个分区',
     target: 'cabinet',
     params: {
+      /**
       kind: { type: 'enum', from: 'units.kind', desc: 'drawerBank 抽屉区 / hanging 挂衣区 / shelves 层板区 / open 空区 / appliance 电器格（洗衣机位）' },
       requestedWidth: { type: 'number', min: 100, max: 4000, unit: 'mm', desc: '请求净宽' },
       nickname: { type: 'string', max: MAX_STRING, optional: true },
@@ -314,15 +363,76 @@ export const ACTIONS = {
       openingHeight: { type: 'number', min: 200, max: 3000, unit: 'mm', desc: '仅 appliance：洞口净空高' },
       openingDepth: { type: 'number', min: 200, max: 1200, unit: 'mm', desc: '仅 appliance：洞口净空深' },
       topDrawers: { type: 'number', min: 0, max: 6, desc: '仅 appliance：洞口上面的抽屉数（上下分体），0 = 开放' },
+      /**
+       * 目标行（**从 0 开始**，0 = 最上面那行）。
+       *
+       * ★ 为什么现在才有这个参数 ──
+       *   底层的 rows 结构、addUnit 命令的 rowIndex、commandBus 的多行处理
+       *   **全都已经有了**（commands.ts 的 addUnit 有 rowIndex，commandBus 有 targetRowOf）。
+       *   缺的只是 AI 契约这一层 —— 于是模型只能说「做不到，请到界面上加」。
+       *   NLU 评测卡（2026-10-21）里「那个挂衣区下面加一层格子」就是被这条卡住的。
+       *
+       * ★ 多行柜必须显式给 ──
+       *   缺省加到第 0 行（最上面）多半不是用户要的 ⇒ 契约里不给缺省，
+       *   多行柜缺 rowIndex 时编译期直接报错并说明要指哪一行。
+       */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '加到第几行（0 = 最上面）。单行柜不用给；多层柜必须给' },
     },
     required: ['kind', 'requestedWidth'],
     detail: '新增分区会改变柜体总宽分配。kind=shelves/drawerBank 时 count 表示层板/抽屉数量；kind=hanging 时给 rodHeight；kind=appliance 时给洞口三尺寸 + topDrawers。想要"带门的格子"要显式给 doorCount，否则建出来是开放格。',
+  },
+  'cabinet.setUnitDoorMaterial': {
+    label: '改某个分区的门板材质',
+    target: 'cabinet',
+    targetUnit: true,
+    params: {
+      material: { type: 'string', max: MAX_STRING, desc: '门板材质 id（引用 RuleSet.materials）。玻璃门给 kind="glass" 的材质（如 M_GLASS_8_GREY）；木门给普通门板材质' },
+      /**
+       * 目标行（**从 0 开始**，0 = 最上面那行）。
+       *
+       * ★ 为什么需要 ──
+       *   多行柜的「第 2 分区」在每一行里都存在，指代不唯一。
+       *   以前 AI 通道对多行柜直接硬拒绝（「本阶段 AI 还不能指定是哪一行」），
+       *   于是模型对多行柜的任何分区操作都只能说「做不到，请到界面上改」。
+       *   底层的 rowIndex 早就有了（commandBus 的 targetRowOf、PickLine 都带），
+       *   缺的只是契约这一层。
+       *
+       * ★ 语义 ──
+       *   给了 rowIndex 后，target.unit 是**该行内**的序号（1 起）或昵称。
+       *   多行柜不给 rowIndex ⇒ 编译期报错并说明要指哪一行（不猜）。
+       */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
+    },
+    required: ['material'],
+    detail: '改**已有**分区的门板材质。用户说「换成玻璃门」「这格换成镜门」时用这个 —— 门板材质在建柜/加分区时也能给，但那时给不了「改」这个意图。玻璃门不会被降级成普通木门。',
+  },
+  'cabinet.setUnitFeature': {
+    label: '改分区的功能开关（裤架 / 格子抽 / 灯带）',
+    target: 'cabinet',
+    targetUnit: true,
+    params: {
+      feature: {
+        type: 'enum',
+        values: ['trouserRack', 'drawerStyle', 'ledStrip'],
+        desc: 'trouserRack=挂衣区加裤架（true/false）；drawerStyle=抽面表达（plain 普通抽面 / grid 格子抽）；ledStrip=层板灯带安装位（none 不装 / center 居中 / front 靠前 / angled45 45°斜光）',
+      },
+      value: { type: 'string', max: 40, desc: '目标值。trouserRack 给 true/false；drawerStyle 给 plain/grid；ledStrip 给 none/center/front/angled45' },
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
+    },
+    required: ['feature', 'value'],
+    detail: '改**已有**分区的功能开关。数值参数（抽屉数/层板数/门缝）用 cabinet.setUnitParam；这里只管开关与枚举。',
   },
   'cabinet.removeUnit': {
     label: '删除一个分区',
     target: 'cabinet',
     targetUnit: true,
-    params: {},
+    params: {
+      /**
+       * 目标行（**从 0 开始**，0 = 最上面那行）。
+       *   多层柜不给 ⇒ 编译期报错并说明要指哪一行（不猜）。
+       */
+      rowIndex: { type: 'number', min: 0, max: 9, optional: true, desc: '分区在第几行（0 = 最上面）。多层柜必须给' },
+    },
     dangerous: true,
     detail: '柜体至少保留一个分区。删除分区是**破坏性**的（该分区的层板/抽屉/门会一起消失），必须在 reason 里说明。',
   },
@@ -1344,7 +1454,7 @@ export function validatePlan(raw, ctx = {}) {
 const ACTION_FAMILIES = {
   create: ['cabinet.create', 'cabinet.duplicate', 'cabinet.delete'],
   geometry: ['cabinet.resize', 'cabinet.setWidthMode', 'cabinet.setBodyLift', 'cabinet.move', 'cabinet.nudge', 'cabinet.rotate', 'cabinet.place'],
-  units: ['cabinet.addUnit', 'cabinet.removeUnit', 'cabinet.setUnitWidth', 'cabinet.setUnitParam', 'cabinet.renameUnit'],
+  units: ['cabinet.addUnit', 'cabinet.removeUnit', 'cabinet.setUnitWidth', 'cabinet.setUnitParam', 'cabinet.renameUnit', 'cabinet.setUnitDoorMaterial', 'cabinet.setUnitFeature'],
   naming: ['cabinet.rename', 'project.rename'],
   material: ['cabinet.setBoardMaterial', 'cabinet.setBackMaterial'],
   assembly: ['assembly.create', 'assembly.delete'],

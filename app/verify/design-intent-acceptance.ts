@@ -538,8 +538,9 @@ section('§3 没有坐标写入口：载荷禁一切数字 + scope 无实体 + �
   {
     // 契约层：没给 AI 新增任何"写意图"的动作
     ok(
-      '59. AI 动作清单仍是 21 条（漂移哨兵：加动作必须同时改这条断言）',
-      ACTION_NAMES.length === 21,
+      // ★ 2026-10-21：加了 cabinet.setUnitDoorMaterial + cabinet.setUnitFeature ⇒ 21 → 23
+    '59. AI 动作清单仍是 23 条（漂移哨兵：加动作必须同时改这条断言）',
+      ACTION_NAMES.length === 23,
       JSON.stringify(ACTION_NAMES)
     );
     ok(

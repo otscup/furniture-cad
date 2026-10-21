@@ -410,15 +410,15 @@ const WRITABLE: Record<string, RegExp[]> = {
   'cabinet.layout': [
     /^layout\.type$/,
     /^layout\.widthMode$/,
-    /^layout\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
-    /^layout\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
+    /^layout\.units\[\d+\]\.(requestedWidth|nickname|kind|trouserRack)$/,
+    /^layout\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct|style)$/,
     /^layout\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
     /^layout\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
     /^layout\.units\[\d+\]\.appliance\.(name|openingWidth|openingHeight|openingDepth|topDrawers)$/,
     // 双面柜（岛台）的背面排 —— 与前排同一套旋钮，同一条白名单管两排
-    /^layout\.backUnits\[\d+\]\.(requestedWidth|nickname|kind)$/,
-    /^layout\.backUnits\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
+    /^layout\.backUnits\[\d+\]\.(requestedWidth|nickname|kind|trouserRack)$/,
+    /^layout\.backUnits\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct|style)$/,
     /^layout\.backUnits\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
     /^layout\.backUnits\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.backUnits\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,
@@ -433,8 +433,8 @@ const WRITABLE: Record<string, RegExp[]> = {
      * 也就是说 P1 不可能把单行柜悄悄变成多行柜，只会被拒绝。
      */
     /^layout\.rows\[\d+\]\.height$/,
-    /^layout\.rows\[\d+\]\.units\[\d+\]\.(requestedWidth|nickname|kind)$/,
-    /^layout\.rows\[\d+\]\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(requestedWidth|nickname|kind|trouserRack)$/,
+    /^layout\.rows\[\d+\]\.units\[\d+\]\.(drawers)\.(count|gap|runner|runnerLength|boxHeightDeduct|style)$/,
     /^layout\.rows\[\d+\]\.units\[\d+\]\.(shelves)\.(count|gapPerSide|ledStrip|tilt)$/,
     /^layout\.rows\[\d+\]\.units\[\d+\]\.(doors)\.(count|gapOuter|gapMid|hinge|hingeSide|material)$/,
     /^layout\.rows\[\d+\]\.units\[\d+\]\.(rod)\.(count|heightFromBottom|hardware)$/,

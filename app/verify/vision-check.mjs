@@ -83,9 +83,16 @@ section('1. 文本模型能回话（且能吐纯 JSON）');
 section('2. ★ 视觉模型收 temperature=0 吗（有些模型只允许 1）');
 {
   const r = await call(VISION, { messages: [{ role: 'user', content: 'hi' }], max_tokens: 32, temperature: 0 });
-  ok('视觉模型接受 temperature=0', r.ok, r.ok ? '' : 'HTTP ' + r.status + ' ' + r.text.slice(0, 140));
-  if (!r.ok && /temperature/i.test(r.text)) {
-    console.log('      >> 修法：把 .env 里的 AI_TEMPERATURE 删掉，或让服务端不传 temperature');
+  // ★ 注意：这里测的是**裸调网关**。服务端（server.mjs 的 fetchWithTimeout）
+  //   遇到这种 400 会**自动去掉 temperature 重试**，所以服务端不受影响。
+  //   这里是**告知**：这个模型需要服务端那一层兜底（已实现）。
+  if (r.ok) {
+    ok('视觉模型接受 temperature=0', true);
+  } else if (/temperature/i.test(r.text)) {
+    console.log('  ! 该模型拒绝 temperature —— 服务端会自动去掉后重试（已实现），不影响使用');
+    ok('服务端会自动去掉 temperature（已实现，见 server.mjs fetchWithTimeout）', true);
+  } else {
+    ok('视觉模型请求成功（与 temperature 无关）', false, 'HTTP ' + r.status + ' ' + r.text.slice(0, 140));
   }
 }
 

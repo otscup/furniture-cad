@@ -903,11 +903,49 @@ async function readBody(req) {
   }
 }
 
+/**
+ * 调上游（带超时）。
+ *
+ * ★ 自动去掉 temperature（2026-10-22）──
+ *   有些模型**拒绝**这个参数：
+ *     kimi-k3 → HTTP 400 "field Temperature invalid, only 1 is allowed for this model"
+ *   ⇒ 遇到这种 400 就**去掉该字段重试一次**（不传 = 用模型默认 = 多数模型是 1）。
+ *
+ *   为什么放在这里而不是每个端点各写一遍 ──
+ *   所有上游调用都经过这个函数（7 处），改一处就全好了；
+ *   而且这是**网关协议层**的事，不是业务语义。
+ *
+ * ★ 只在错误信息**明确提到 temperature** 时才重试 ——
+ *   否则 400 会掩盖真正的错误（比如参数写错），重试只是浪费一次。
+ *
+ * @param {string} url 上游地址
+ * @param {object} init fetch 参数（body 是 JSON 字符串）
+ * @param {number} timeoutMs 超时
+ * @returns {Promise<Response>}
+ */
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const r = await fetch(url, { ...init, signal: ac.signal });
+    if (r.status !== 400 || !init?.body) return r;
+    // 读一份错误正文，判断是不是 temperature 的问题
+    const text = await r.clone().text();
+    if (!/temperature/i.test(text)) return r;
+    // 去掉 temperature 重试
+    try {
+      const payload = JSON.parse(init.body);
+      delete payload.temperature;
+      const ac2 = new AbortController();
+      const timer2 = setTimeout(() => ac2.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...init, body: JSON.stringify(payload), signal: ac2.signal });
+      } finally {
+        clearTimeout(timer2);
+      }
+    } catch {
+      return r;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -3687,7 +3725,7 @@ server.listen(PORT, HOST, () => {
   //   所以视觉必须用另一个模型，否则功能看着在、实际是坏的。
   const visionModel = env.AI_VISION_MODEL || env.AI_MODEL || '';
   const visionSame = !env.AI_VISION_MODEL || visionModel === env.AI_MODEL;
-  console.log(`  视觉模型  ${visionModel || '（未配置）'}${visionSame ? '  ← 与文本模型相同，若该模型不支持图片则识图不可用' : ''}`);
+  console.log(`  视觉模型  ${visionModel || '（未配置）'}${visionSame ? '  ← ★ 与文本模型相同/未单独配置：该模型若不支持图片，识图就是坏的（跑 npm run check:vision 验）' : ''}`);
   console.log(`  记忆文件  ${MEM_PATH}`);
   console.log(`  账号库    ${ACCOUNTS_PATH}`);
   console.log(`  审计日志  ${AUDIT_PATH}`);

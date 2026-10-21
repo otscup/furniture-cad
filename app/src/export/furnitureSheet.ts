@@ -886,16 +886,31 @@ function drawFrame(
     rows: Array<[string, string?]>,
     opts: { rowHeight?: number; fontSize?: number } = {},
   ): void => {
-    const vSize = 150;  // 竖排小字
-    const vX = sx + 250; // 左侧竖排位置：保留内边距，文字不越过侧栏竖线
-    const n = title.length;
     const sectionRowH = opts.rowHeight ?? rowH;
     const sectionFont = opts.fontSize ?? SZ_TABLE;
-    // 竖排：逐字从上往下，垂直居中于整个分区
+    const n = title.length;
     const sectionH = rows.length * sectionRowH;
-    const startY = ty + 40 - (n * vSize * 0.6);  // 居中偏移
-    for (let i = 0; i < n; i++) {
-      prims.push(textPrim(vX, startY - i * vSize, title[i]!, vSize, L_TEXT, 'c'));
+    /**
+     * ── 竖排标题必须整段落在本分区内（2026-10-20 重叠事故修复）──
+     *
+     * 历史实现两处错：
+     *   ① vSize 固定 150、与分区实际高度无关 —— 分区行数一多，标题只覆盖上半截，
+     *      剩下的字掉到下一个分区（甚至掉到底部客户栏）造成压字；
+     *   ② startY 用 ty + 40 - (n * vSize * 0.6) 这个魔数，不以分区底为界。
+     *
+     * 现在：
+     *   · 字号按分区高度自适应（sectionH / n），夹在 [90, 150] 保持可读；
+     *   · 起点 = 分区顶减半个字格，逐字向下，**保证不越出分区底**；
+     *   · 分区太矮放不下全部标题字时**少画字**而不是溢出去压别的东西
+     *     （宁可标题显示「门板」也不能压住下单/交货日期）。
+     */
+    const vX = sx + 250;
+    const vSize = Math.max(90, Math.min(150, Math.floor(sectionH / Math.max(1, n))));
+    const fits = Math.max(1, Math.floor(sectionH / vSize));
+    const shownTitle = title.slice(0, fits);
+    const startY = ty - Math.floor(vSize / 2);
+    for (let i = 0; i < shownTitle.length; i++) {
+      prims.push(textPrim(vX, startY - i * vSize, shownTitle[i]!, vSize, L_TEXT, 'c'));
     }
     // 分区左侧竖线（标题与内容分隔）
     const secTop = ty + 80;
@@ -907,6 +922,23 @@ function drawFrame(
       if (value) prims.push(textPrim(sx + 1150, ty, value, sectionFont, L_TEXT, 'l'));
       prims.push(linePrim(vX + 110, ty - sectionRowH * 0.38, SIDE_R, ty - sectionRowH * 0.38, L_BORDER, 0.6));
       ty -= sectionRowH;
+    }
+    /**
+     * ── 竖排标题的纵向占位必须被"消化"掉（2026-10-20 第二处重叠）──
+     *
+     * 上面把标题字限制在分区内是对的，但分区结束后 ty 只减了内容行的高度，
+     * 没有扣掉标题最后一字的**下半个字格**。后续 drawRow 的文字以 y 为中心、
+     * 上下各占 size/2，于是"门板尺寸"的"寸"（底边 ty-30）会咬住紧随其后的
+     * "下单日期"（顶边 ty+60）—— 实测交叠 30 单位（3mm）。
+     *
+     * 这里把 ty 压到「最后一字底边 - 半个字格 - 下一行半高 - 安全间距」之下，
+     * 保证分区之后的任何文字都不会与竖排标题相交。空间不足时后续行自然被
+     * 下面的余量判断放弃（宁可少一行，不能压字）。
+     */
+    if (shownTitle.length > 0) {
+      const lastCharY = startY - (shownTitle.length - 1) * vSize;
+      const titleFloor = lastCharY - vSize / 2 - SZ_TABLE / 2 - 40;
+      ty = Math.min(ty, titleFloor);
     }
   };
 

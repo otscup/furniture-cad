@@ -611,6 +611,21 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   // ═══════════════ 1. 正视图（从前看，含门 / 抽面）═══════════════
   F.rect(0, W, 0, H, L_FRAME, 2.4);
   drawFrontLike(F, true);
+  /**
+   * ── 电器图形也要画在**外观图**上（2026-10-21 修）──
+   *
+   * ★ 修的是一个实测缺陷：电器柜（冰箱 / 洗衣机）走的是"只画外框、不画板件"的
+   *   分支，而电器本身的轮廓（冰箱对开门线、洗衣机圆门）只画在**内部结构图**里。
+   *   结果：外观正面图是一张**全空的外框**，读图的人看不出这里放的是洗衣机还是冰箱。
+   *
+   * 参考图《世园润府》p4 的洗衣机柜：外观正面图里**明确画出洗衣机的圆形门、
+   * 控制面板、观察窗** —— 那才是给客户看的那张图。
+   *
+   * 做法：把电器图形抽成共享函数，外观图与内部图都调用。
+   * 只对纯电器柜调用（混排柜的电器位由 drawLifestyleItems 在内部图处理）。
+   */
+  const isPureApplianceCab = L.rows.every((r) => r.units.length > 0 && r.units.every((u) => u.kind === 'appliance'));
+  if (isPureApplianceCab) drawApplianceGlyphs(F);
 
   // ═══════════════ 2. 俯视图（从上往下看）═══════════════
   // 俯视图看到的"顶面"就是顶板；两侧是侧板；最后面是背板；
@@ -1009,9 +1024,75 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     pickLines,
   };
 
-  // ── 内部结构图的生活物品示意（生活化展示）──
-  // 只在内部图画（internal），外观图（front）不画。
-  // 用细线（0.7），图层 L_HW，不遮挡结构线。所有坐标均为柜体局部（X, Z），经 P 映射。
+  /**
+   * ── 电器图形（冰箱 / 洗衣机）—— 外观图与内部图**共用** ──
+   *
+   * 参考图 p4 洗衣机柜：外观正面图里明确画出圆形门、控制面板、观察窗。
+   * 只画外框会让读图的人看不出这里放的是什么电器。
+   *
+   * 坐标一律用**柜体局部 (X, Z)** —— ViewPainter 的 rect/line/arc 内部已经带了
+   * 这个视图的映射，调用方不该自己 map（第一版就是自己 map 才写成了 spread 数组）。
+   */
+  function drawApplianceGlyphs(P: ViewPainter): void {
+    const LW = 1.1;
+    for (const ctx of rowCtxs) {
+      ctx.units.forEach((u, i) => {
+        if (u.kind !== 'appliance' || !u.appliance) return;
+        const a = u.appliance;
+        const netW = ctx.nets[i]!;
+        const x0 = ctx.unitX0[i]!;
+        const ow = Math.min(a.openingWidth, netW);
+        const ax0 = x0 + (netW - ow) / 2;
+        const az = apertureZIn(ctx, u);
+        if (!az) return;
+        const oh = az.z1 - az.z0;
+        if (oh < 200) return;
+
+        if (oh >= 1200) {
+          /* ── 冰箱：外框 + 中缝（对开门）+ 上下门分界 + 两个竖向把手 ── */
+          P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, LW);
+          P.line(ax0 + ow / 2, ax0 + ow / 2, az.z0, az.z1, L_HW, LW);
+          const splitZ = az.z0 + oh * 0.62;
+          P.line(ax0, ax0 + ow, splitZ, splitZ, L_HW, LW);
+          const hW = 24;
+          const hGap = ow * 0.06;
+          P.rect(ax0 + ow / 2 - hGap - hW, ax0 + ow / 2 - hGap, az.z0 + oh * 0.3, az.z0 + oh * 0.55, L_HW, LW);
+          P.rect(ax0 + ow / 2 + hGap, ax0 + ow / 2 + hGap + hW, az.z0 + oh * 0.3, az.z0 + oh * 0.55, L_HW, LW);
+        } else {
+          /* ── 洗衣机：外框 + 控制面板 + 圆形观察窗 + 下方检修门 ── */
+          P.rect(ax0, ax0 + ow, az.z0, az.z1, L_HW, LW);
+          const panelTop = az.z1 - 20;
+          const panelBot = az.z0 + oh * 0.76;
+          if (panelTop - panelBot > 40) {
+            P.line(ax0, ax0 + ow, panelBot, panelBot, L_HW, LW);
+            const kz = (panelTop + panelBot) / 2;
+            const kr = Math.min(26, (panelTop - panelBot) * 0.3);
+            // 面板旋钮（两个圆）—— 用 arc 画在局部坐标
+            for (const f of [0.22, 0.42]) {
+              P.arc(ax0 + ow * f, kz, kr, 0, Math.PI * 2, L_HW, LW);
+            }
+            P.rect(ax0 + ow * 0.6, ax0 + ow * 0.92, panelBot + 8, panelTop - 8, L_HW, LW);
+          }
+          const cz = az.z0 + oh * 0.42;
+          const outerR = Math.min(ow, oh * 0.62) * 0.34;
+          if (outerR > 30) {
+            P.arc(ax0 + ow / 2, cz, outerR, 0, Math.PI * 2, L_HW, 1.4);
+            P.arc(ax0 + ow / 2, cz, outerR * 0.78, 0, Math.PI * 2, L_HW, LW);
+            // 窗内一道斜反光（参考图里也有）
+            P.line(ax0 + ow / 2 - outerR * 0.5, ax0 + ow / 2 + outerR * 0.5, cz - outerR * 0.5, cz + outerR * 0.5, L_HW, LW);
+          }
+          const dz0 = az.z0 + oh * 0.08;
+          const dz1 = az.z0 + oh * 0.22;
+          if (dz1 - dz0 > 20) {
+            P.rect(ax0 + ow * 0.38, ax0 + ow * 0.62, dz0, dz1, L_HW, LW);
+            P.arc(ax0 + ow * 0.5, (dz0 + dz1) * 0.55, Math.max(6, outerR * 0.08), 0, Math.PI * 2, L_HW, LW);
+          }
+        }
+      });
+    }
+  }
+
+
   function drawLifestyleItems(P: ViewPainter): void {
     const LW = 0.7;
     // 柜体是否算"高柜"（衣柜/顶柜语境）：总高 ≥ 1800
@@ -1028,27 +1109,56 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         const netW = ctx.nets[i]!;
         if (netW < 150) return; // 太窄不画，避免糊成一团
 
-        // ── 1. 挂衣区：2-3 件挂着的衣服（衣架 + 衣服轮廓）──
+        // ── 1. 挂衣区：衣服挂在杆上（衣架 + 衣服轮廓，与参考图同款）──
         if (u.rod && u.rod.count > 0) {
           const rodZ = rowZ0 + u.rod.heightFromBottom;
-          const n = Math.min(3, Math.max(2, Math.floor(netW / 350)));
           const isLong = rowNH >= 1200; // 长衣/短衣按净高区分
-          // 衣服肩线在挂杆下 70mm；衣摆与本行顶面至少留 50mm，不能只按杆高算衣长。
+          /**
+           * ── 为什么改成"按可用宽度铺满" ──
+           *
+           * ★ 修的是"悬浮感"（用户实测反馈）：上一版固定画 2-3 件、间距按
+           *   `netW*(k+1)/(n+1)` 均分，于是宽格子里衣服稀稀拉拉挂在中间，
+           *   两边大片空白 —— 看起来像飘在空中，而不是挂在杆上。
+           *
+           * 参考图 p5 的做法：衣服**沿杆排满**，件与件之间只留一个衣架的间隙。
+           *
+           * 做法：先定单件占宽（肩宽 × 间距系数），再用它反算件数，上限 6 件。
+           */
+          /**
+           * 件数与单件宽度 —— 按参考图 p5 **实测像素**标定。
+           *
+           * 参考图：778 宽的挂衣格里排 **3 件**，每件肩宽约 210mm（半宽 105），
+           * 件间净距约 50mm ⇒ 单件占宽约 260mm ⇒ slotW = 260。
+           *
+           * 上一版用 2.4×半肩宽 = 288，floor(776/288) 只能排 2 件；
+           * 且每件被拉宽到 240（比参考图宽），整排只占中间一段、两边空着
+           * —— 观感就是"飘着"。现在 776/260 = 2（仍不足 3）……
+           * 所以再放宽一档：按 netW/4 与 260 取小，保证窄格也排得下。
+           */
+          const slotW = Math.min(260, netW / 4);
+          const n = Math.max(2, Math.min(6, Math.floor(netW / slotW)));
+          const garmentHalfW = Math.min(110, slotW * 0.42);
           const maxGarmentH = rowNH - u.rod.heightFromBottom - 70 - 50;
           const garmentH = isLong ? Math.min(900, maxGarmentH) : Math.min(600, maxGarmentH);
           if (garmentH > 200) {
+            const actualSlot = netW / n;
             for (let k = 0; k < n; k++) {
-              const hx = x0 + (netW * (k + 1)) / (n + 1);
-              const hw = Math.min(90, netW / (n + 1) / 2); // 半宽
-              // 衣架钩（杆上小竖线）
-              P.line(hx, hx, rodZ, rodZ + 25, L_HW, LW);
-              // 衣架肩（两条斜线）
-              P.line(hx, hx - hw, rodZ + 25, rodZ + 70, L_HW, LW);
-              P.line(hx, hx + hw, rodZ + 25, rodZ + 70, L_HW, LW);
-              // 衣服轮廓（梯形：肩宽 → 下摆稍宽）
-              const shoulderZ = rodZ + 70;
+              // 居中在各自槽位里 —— 这样整排从格左铺到格右，不再挤在中间
+              const hx = x0 + actualSlot * (k + 0.5);
+              // 肩半宽占槽位的 40%（参考图比例），但不超 garmentHalfW
+              const hw = Math.min(garmentHalfW, actualSlot * 0.4);
+              /**
+               * 衣架钩要**真的钩在杆上**：从杆往下 0 → 25 的短竖线，
+               * 然后两条肩线从钩底张到肩宽。原来的钩只有 25mm 长，
+               * 在 2400mm 高的柜里几乎看不见，观感上衣服就是"飘着"。
+               */
+              P.line(hx, hx, rodZ, rodZ + 30, L_HW, 1.0);
+              P.line(hx, hx - hw, rodZ + 30, rodZ + 80, L_HW, LW);
+              P.line(hx, hx + hw, rodZ + 30, rodZ + 80, L_HW, LW);
+              // 衣服轮廓（梯形：肩宽 → 下摆稍宽），参考图同款
+              const shoulderZ = rodZ + 80;
               const hemZ = shoulderZ + garmentH;
-              const hemHW = hw + 25;
+              const hemHW = hw * 1.15;
               P.poly(
                 [
                   { x: hx - hw, y: shoulderZ },
@@ -1083,16 +1193,84 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
               }
             }
           }
-          // 顶柜（高处层板格）：画被子/枕头示意（圆角矩形用 poly 近似）
-          if (isTallCab && rowZ0 > 1500) {
-            const qw = Math.min(300, netW * 0.6);
-            const qx = x0 + (netW - qw) / 2;
-            const qz0 = rowZ0 + 20;
-            const qz1 = Math.min(rowZ0 + 220, rowZ0 + rowNH - 20);
-            if (qz1 - qz0 > 80) {
-              // 被子：矩形 + 中间一道折痕线
-              P.rect(qx, qx + qw, qz0, qz1, L_HW, LW);
-              P.line(qx, qx + qw, (qz0 + qz1) / 2, (qz0 + qz1) / 2, L_HW, LW);
+          /**
+           * 顶柜（高处层板格）：被子 + 枕头示意。
+           *
+           * ── 对标参考图《世园润府》的画法 ──
+           *   被子 = **圆角矩形**（横向长条），内部再画一条同形状的内轮廓线，
+           *          表示"叠好的被子有厚度、有折边"；
+           *   枕头 = 竖立的**圆弧三角**（三个小尖），摆在被子右侧。
+           *   整组左右排开：1-2 条被子 + 2-3 个枕头。
+           *
+           * ── 为什么不用矩形 + 一道横线 ──
+           *   上一版画的是"矩形 + 中线"。参考图里被子是**双层轮廓的圆角条**，
+           *   一眼能看出是叠起来的被褥；单层矩形看起来像个抽屉。
+           */
+          /**
+           * 触发的判据：**柜内顶部的那一格**才画被子。
+           *
+           * ★ 修的是一个实测 bug（2026-10-21）：
+           *   原来写的是 `rowZ0 > 1500` —— 对**单行柜**（rows 只有一行）来说
+           *   rowZ0 恒为 0（内空底），这条永远为假 ⇒ 顶柜的被子从来没画出来过。
+           *   只有在"多行柜 + 上面那行"时才碰巧成立。
+           *
+           * 现在按"这一格的顶部是否接近柜内顶"判断，与行数无关：
+           *   rowZ0 + rowNH 距柜内顶部 100mm 以内 ⇒ 这是最上面那格 ⇒ 画被子。
+           * 同时保留 isTallCab（矮柜/餐边柜不画被褥）。
+           */
+          const isTopCompartment = rowZ0 + rowNH >= H - t - 100;
+          if (isTallCab && isTopCompartment) {
+            const availH = Math.min(220, rowNH - 40);
+            if (availH > 80) {
+              const quiltW = Math.min(360, netW * 0.55);
+              const quiltH = Math.min(availH * 0.45, 90);
+              const leftX = x0 + 20;
+              /**
+               * 被子摆在**这一格的顶部**，不是底部。
+               *
+               * 坐标系 Y 轴向上 ⇒ "格子的上方"是 rowZ0 + rowNH 那一侧。
+               * 第一版写成 rowZ0 + 20（贴着格底），实测渲染出来被子掉到了柜子最下面。
+               */
+              const baseZ = rowZ0 + rowNH - 20 - (quiltH * 2 + 6);
+              // 被子：两条叠放（上短下长），每条都是双层圆角轮廓
+              const drawQuilt = (qx: number, qz: number, w2: number, h2: number): void => {
+                const r = Math.min(28, h2 * 0.45);
+                // 外轮廓（圆角矩形）
+                P.poly([
+                  { x: qx + r, y: qz }, { x: qx + w2 - r, y: qz },
+                  { x: qx + w2, y: qz + r }, { x: qx + w2, y: qz + h2 - r },
+                  { x: qx + w2 - r, y: qz + h2 }, { x: qx + r, y: qz + h2 },
+                  { x: qx, y: qz + h2 - r }, { x: qx, y: qz + r },
+                ], L_HW, LW, true);
+                // 内轮廓（留 8mm 边，表示折边）
+                const ir = Math.max(6, r - 8), ix = qx + 8, iz = qz + 8;
+                const iw = w2 - 16, ih = h2 - 16;
+                if (iw > 20 && ih > 12) {
+                  P.poly([
+                    { x: ix + ir, y: iz }, { x: ix + iw - ir, y: iz },
+                    { x: ix + iw, y: iz + ir }, { x: ix + iw, y: iz + ih - ir },
+                    { x: ix + iw - ir, y: iz + ih }, { x: ix + ir, y: iz + ih },
+                    { x: ix, y: iz + ih - ir }, { x: ix, y: iz + ir },
+                  ], L_HW, LW, true);
+                }
+              };
+              drawQuilt(leftX, baseZ, quiltW, quiltH);
+              drawQuilt(leftX, baseZ + quiltH + 6, quiltW * 0.85, quiltH);
+              // 枕头：右侧竖立的圆弧三角（参考图里是三个小尖并排）
+              const pillowX = leftX + quiltW + 16;
+              const pillowW = Math.min(220, netW - (pillowX - x0) - 20);
+              if (pillowW > 60) {
+                const pn = Math.min(3, Math.max(2, Math.floor(pillowW / 60)));
+                const pw = pillowW / pn;
+                for (let pi = 0; pi < pn; pi++) {
+                  const px = pillowX + pi * pw;
+                  const ph = Math.min(quiltH * 2 + 6, availH);
+                  // 枕头 = 三条弧线构成的"竖立软包"轮廓
+                  P.line(px + pw * 0.15, px + pw * 0.5, baseZ, baseZ + ph * 0.85, L_HW, LW);
+                  P.line(px + pw * 0.5, px + pw * 0.85, baseZ + ph * 0.85, baseZ, L_HW, LW);
+                  P.line(px + pw * 0.15, px + pw * 0.85, baseZ, baseZ, L_HW, LW);
+                }
+              }
             }
           }
         }
@@ -1300,76 +1478,84 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
             if (withFronts) {
               /**
-               * 开向对角线 —— 与销售图纸同款：
-               *   · 双扇对开画 X 形（左扇 ↘、右扇 ↗，两条线在门缝处交叉）；
-               *   · 单扇按 hingeSide：铰链在左 → 门往右开 → 线从右上到左下（指向开门侧）；
-               *   · 三扇及以上：全部同向（行业简画；逐扇铰链标注待数据细化）。
-               * 注意 PickLine 不受影响：点的是门缝/外轮廓，对角线只是表达符号。
-               * 2026-10-04 v8：X 线加回来（v7 误删），对标参考 PDF 门板 X 交叉线
+               * ══════════════════════════════════════════════════════════
+               *  门板开向符号 —— 对标参考图纸《世园润府》的行业画法
+               *
+               * ── 参考图里到底是什么样（逐像素核过 PDF 线段坐标）──
+               *   每一扇门内，从**铰链边**向对侧画一组**虚线**，呈 `<` 或 `>` 形：
+               *     · 铰链在左 ⇒ 门向左开 ⇒ 两条虚线从左上、左下角汇到右边中点，形如 `>`
+               *     · 铰链在右 ⇒ 门向右开 ⇒ 两条虚线从右上、右下角汇到左边中点，形如 `<`
+               *   即「尖头指向铰链边，开口朝自由边」—— 尖的那一端就是铰链。
+               *
+               * ── 为什么不是原来的 X 对角线 ──
+               *   上一版画的是门板对角 X（两条实线交叉）+ 竖向虚线箭头。
+               *   实测与参考图**完全不是一回事**：参考图从不画 X，也从不画箭头，
+               *   只有一组开向虚线。X 线会让读图的人以为门是对角切开的。
+               *
+               * ── 虚线要铺满门板 ──
+               *   参考图里这组虚线从门的一个角一直走到对角，跨满整块门板。
+               *   （用户明确要求：全部虚线铺满门板）
+               * ══════════════════════════════════════════════════════════
                */
-              // v8：恢复 diag 函数（画门板 X 交叉线，实线）
-              const diag = (x1: number, y1: number, x2: number, y2: number): void => {
-                P.line(x1, x2, y1, y2, L_FRONT, 0.8);
+              /**
+               * 虚线节奏 —— 与参考图对齐。
+               *
+               * 参考图实测：段长约 55–90 单位、间隔约 45 单位（PDF 单位）。
+               * 本系统 1 单位 = 1mm，门高 1880mm，所以用 [90, 50] 大约得到 13 段，
+               * 与参考图里一扇 2280mm 高的门上的段数相当。
+               *
+               * 第一版用了 [140, 90]，段太长间隔太大 —— 在小尺寸门板上会退化成
+               * "只有一两条线"的观感（实测渲染出来像只画了一条）。
+               */
+              const swingDash = [90, 50];
+              /**
+               * 画一扇门的开向符号。
+               * @param l 门左边 x
+               * @param rr 门右边 x
+               * @param t 门顶 z
+               * @param b 门底 z
+               * @param hingeLeft true = 铰链在左（尖头朝左）
+               */
+              const drawSwing = (l: number, rr: number, t: number, b: number, hingeLeft: boolean): void => {
+                const midZ = (t + b) / 2;
+                if (hingeLeft) {
+                  // 铰链在左 ⇒ 尖头在左 ⇒ 两条线从左中出发，分别到右上、右下（形如 >）
+                  P.line(l, rr, midZ, t, L_FRONT, 0.9, swingDash);
+                  P.line(l, rr, midZ, b, L_FRONT, 0.9, swingDash);
+                } else {
+                  // 铰链在右 ⇒ 尖头在右 ⇒ 两条线从右中出发，分别到左上、左下（形如 <）
+                  P.line(rr, l, midZ, t, L_FRONT, 0.9, swingDash);
+                  P.line(rr, l, midZ, b, L_FRONT, 0.9, swingDash);
+                }
               };
-              if (widths.length === 2) {
-                // 对开 X 形：v8 恢复（对标参考 PDF）
-                if (k === 0) {
-                  const openL = x0 + dr.gapOuter;
-                  const openR = openL + widths[0]! + dr.gapMid + widths[1]!;  // v8 恢复
-                  diag(openL, zBot, openR, zTop);  // v8 恢复：X 实线
-                  diag(openL, zTop, openR, zBot);  // v8 恢复：X 实线
-                  // v8：双扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
-                  // 用户要求：虚线双向 <> 覆盖整个门板
-                  const w0 = widths[0]!, w1 = widths[1]!;
-                  // 左扇：虚线双向箭头，覆盖整个门板高度
-                  const l_cx = openL + w0 / 2;
-                  P.line(l_cx, l_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(l_cx, l_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                  // 右扇：虚线双向箭头，覆盖整个门板高度
-                  const r_x0 = openL + w0 + dr.gapMid;
-                  const r_cx = r_x0 + w1 / 2;
-                  P.line(r_cx, r_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(r_cx, r_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                }
-              } else if (widths.length === 1) {
-                // 单扇门：v8 恢复 X 对角线（对标参考 PDF）
-                const hingeLeft = (dr.hingeSide ?? 'left') === 'left';
-                if (hingeLeft) diag(left, zTop, right, zBot);
-                else diag(right, zTop, left, zBot);
-                // v8：虚线箭头改竖向（上下开门方向，对标参考 PDF）
-                // 用户要求：虚线双向 <> 覆盖整个门板
-                const cx = (left + right) / 2;
-                // 竖向虚线，覆盖整个门板高度
-                P.line(cx, cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
-                // 上箭头（指向上），虚线
-                P.line(cx, cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                P.line(cx, cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                // 下箭头（指向下），虚线
-                P.line(cx, cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                P.line(cx, cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-              } else {
-                const side = (dr.hingeSide ?? 'left') === 'left';
-                for (let j = 0; j < widths.length; j++) {
-                  const l2 = j === 0 ? left : x0 + dr.gapOuter + widths.slice(0, j).reduce((a, w2) => a + w2 + dr.gapMid, 0);
-                  const r2 = l2 + widths[j];
-                  if (side) diag(l2, zTop, r2, zBot);
-                  else diag(r2, zTop, l2, zBot);
-                  // v8：多扇门虚线箭头改竖向（上下开门方向，对标参考 PDF）
-                  // 用户要求：虚线双向 <> 覆盖整个门板
-                  const j_cx = (l2 + r2) / 2;
-                  P.line(j_cx, j_cx, zTop, zBot, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx - 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx + 35, zTop, zTop + 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx - 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                  P.line(j_cx, j_cx + 35, zBot, zBot - 60, L_HW, 0.9, HINGE_DASH);
-                }
+              /**
+               * 每扇门的铰链在哪一侧。
+               *   · 单扇：按 hingeSide
+               *   · 双扇对开：左扇铰链在左、右扇铰链在右（中间相遇）
+               *   · 三扇及以上：首扇左、末扇右、中间交替（行业简画）
+               */
+              const totalDoors = widths.length;
+              const hingeLeftFor = (idx: number): boolean => {
+                if (totalDoors === 1) return (dr.hingeSide ?? 'left') === 'left';
+                if (totalDoors === 2) return idx === 0;
+                if (idx === 0) return true;
+                if (idx === totalDoors - 1) return false;
+                return idx % 2 === 0;
+              };
+              /**
+               * 玻璃门额外画两道斜纹表示「黑框灰玻」材质。
+               * 只表达**材质**不表达开向；线型刻意与开向虚线不同，避免读混。
+               */
+              if (isGlass) {
+                const hatch = (f: number): void => {
+                  const hx = left + w * f;
+                  const run = Math.min(right - hx, zBot - zTop);
+                  if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
+                };
+                hatch(0.33);
+                hatch(0.66);
               }
+              drawSwing(left, right, zTop, zBot, hingeLeftFor(k));
             }
             x += w + dr.gapMid;
           }

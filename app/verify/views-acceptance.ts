@@ -437,10 +437,17 @@ if (doorUnit) {
     JSON.stringify({ widths: widths2, zTop, zBot })
   );
 
-  // C7d 开向标注：双扇对开 = X 形 2 条斜线，端点都落在门板范围内
+  /**
+   * ── C7d 开向标注：口径已改（2026-10-21）──
+   *
+   * 旧预期：双扇对开 = X 形 2 条斜线（横跨两扇门）。
+   * 新口径（对标参考图《世园润府》）：**每扇门各自画 2 条虚线，呈 < / > 形** ——
+   *   尖头指向铰链边、开口朝自由边，虚线铺满整块门板。
+   * 所以门数 n ⇒ 开向线 2n 条，每条端点都落在**它自己那扇门**的范围内。
+   */
   ok(
-    `C7d 开向标注：双扇对开正视图有 ${widths2.length} 条斜向开向线（X 形交叉），端点落在门板范围内`,
-    diags.length === widths2.length &&
+    `C7d 开向标注：双扇对开正视图有 ${widths2.length * 2} 条开向虚线（每扇 2 条，< / > 形），端点落在门板范围内`,
+    diags.length === widths2.length * 2 &&
       diags.every((seg) => {
         const xs = seg.map((q) => q.x);
         const ys = seg.map((q) => q.y);
@@ -462,9 +469,22 @@ if (doorUnit) {
     doorShelfW === null ? '该分区无层板' : JSON.stringify(R.front.filter((r) => Math.abs(r.y1 - r.y0 - t) < TOL))
   );
 
-  // C7f 单扇门开向方向：hingeSide=left → 对角线左上→右下；hingeSide=right → 右上→左下
   const singleCab = JSON.parse(JSON.stringify(cab)) as typeof cab;
   const sdu = singleCab.layout.units[idx2]!;
+  /**
+   * ── C7f 开向方向：口径已改（2026-10-21）──
+   *
+   * 旧口径：单扇门画 1 条对角线（hingeSide=left → 左上到右下）。
+   * 新口径（对标参考图）：每扇门 2 条虚线汇于铰链边中点，呈 < / >。
+   *   hingeSide=left  ⇒ 尖头在**左**边中部、两条线分别到右上角与右下角（形如 >）
+   *   hingeSide=right ⇒ 尖头在**右**边中部、两条线分别到左上角与左下角（形如 <）
+   *
+   * 所以断言改成：
+   *   ① 恰好 2 条线；
+   *   ② 两条线共享同一个起点（尖头）；
+   *   ③ 尖头的 x 落在铰链那一侧；
+   *   ④ 另一端分别在门的上角与下角。
+   */
   sdu.doors = { ...sdu.doors!, count: 1, hingeSide: 'left' };
   const diagL = frontDiagonals(buildCabinetViews(singleCab, rules).prims.front, inv.front);
   sdu.doors = { ...sdu.doors!, hingeSide: 'right' };
@@ -472,18 +492,25 @@ if (doorUnit) {
   const oneW = doorWidths(sdu, netW2, rules)[0]!;
   const lx0 = x02 + dr.gapOuter;
   const rx1 = lx0 + oneW;
-  const dirOk = (d: Vec2[][], fromLeft: boolean): boolean =>
-    d.length === 1 &&
-    (fromLeft
-      ? Math.abs(d[0]![0].x - lx0) < TOL && Math.abs(d[0]![0].y - zTop) < TOL && Math.abs(d[0]![1].x - rx1) < TOL && Math.abs(d[0]![1].y - zBot) < TOL
-      : Math.abs(d[0]![0].x - rx1) < TOL && Math.abs(d[0]![0].y - zTop) < TOL && Math.abs(d[0]![1].x - lx0) < TOL && Math.abs(d[0]![1].y - zBot) < TOL);
+  /** 判一份开向：2 条线，尖头在铰链侧中部，另两端到上下角。 */
+  const swingOk = (d: Vec2[][], hingeLeft: boolean): boolean => {
+    if (d.length !== 2) return false;
+    const a = d[0]!, b = d[1]!;
+    // ② 共享起点（尖头）
+    if (Math.abs(a[0]!.x - b[0]!.x) > TOL || Math.abs(a[0]!.y - b[0]!.y) > TOL) return false;
+    const apexX = a[0]!.x;
+    // ③ 尖头在铰链侧（留 15% 门宽的容差）
+    if (hingeLeft ? apexX > lx0 + oneW * 0.15 : apexX < rx1 - oneW * 0.15) return false;
+    // ④ 另两端分别到上角与下角
+    const ends = [a[1]!, b[1]!].sort((p1, p2) => p1.y - p2.y);
+    return Math.abs(ends[0]!.y - zTop) < TOL && Math.abs(ends[1]!.y - zBot) < TOL;
+  };
   ok(
-    'C7f 单扇门开向：hingeSide=left 对角线从左上到右下；hingeSide=right 从右上到左下（hingeSide 只影响图面，不影响板件清单）',
-    dirOk(diagL, true) && dirOk(diagR, false),
+    'C7f 单扇门开向：hingeSide=left 呈 >（尖头在左）；hingeSide=right 呈 <（尖头在右）（hingeSide 只影响图面，不影响板件清单）',
+    swingOk(diagL, true) && swingOk(diagR, false),
     JSON.stringify({ left: diagL, right: diagR })
   );
 }
-
 // C8 踢脚板
 ok(
   'C8 踢脚板：正视 [t,W-t]×[0,bodyLift] / 侧视 [D-2t,D-t]×[0,bodyLift]',

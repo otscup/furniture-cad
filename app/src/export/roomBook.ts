@@ -255,7 +255,23 @@ export interface RoomBookCabinet {
   name: string;
   index: number;
   mapTag: string;
+  /**
+   * 组的**代表柜**类型（组内 mountHeight 最低那只）。
+   * 混排组（地柜+吊柜）请用 memberTypes 判断清单归属 —— 见下。
+   */
   cabinetType: 'base' | 'wall' | 'tall' | 'island';
+  /**
+   * 组内**实际包含**的柜型（去重）。
+   *
+   * ── 为什么要这个字段（2026-10-21）──
+   *   一页 = 一组之后，一个组可能同时有 base 和 wall（地柜+吊柜合成一页）。
+   *   布局页的清单要按柜型分两行显示（"地柜/高柜" 与 "吊柜"），
+   *   而单看 cabinetType 只能给出一个值 ⇒ 混排组会被归到其中一边，
+   *   另一边显示"无"，看起来像柜子凭空消失（实测就踩到了）。
+   *
+   *   单柜页的 memberTypes 是 [cabinetType]，行为与以前完全一致。
+   */
+  memberTypes: Array<'base' | 'wall' | 'tall' | 'island'>;
   width: number;
   height: number;
   depth: number;
@@ -313,6 +329,131 @@ export interface RoomBook {
  * 房间顺序来自 Project.rooms，房间内按工作区坐标稳定排序；每个柜体独立生成一张图纸，
  * 共享语义模型和几何生成器。悬空 roomId 会进入显式的“未分配房间”组。
  */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  柜体分组（"一组一页"，对齐工厂标准版式）
+ *
+ * ── 它解决什么（用户实测反馈）──
+ *   "复杂柜子比如橱柜，可以分为地柜和吊柜。但是正面图能看到整个地柜和吊柜的
+ *    外观带面板的。复杂部分可以在同房间把吊柜和地柜分开展示。但是不要全部拆分开来。"
+ *
+ *   历史行为：`buildRoomBook` 对 `group.cabinets` 逐个出页
+ *   （见下方 `buildFurnitureSheet(group.room, [cabinet], ...)`），
+ *   于是"一厨六柜"就变成六页，每页只看得见自己那一个，
+ *   用户看到的就是"柜子被拆成了几个"。
+ *
+ * ── 分组判据（宁可少合，不可乱合）──
+ *   同一房间内，**X 投影重叠 ≥ 80%** 且 **竖直方向不重叠**
+ *   （一个落地 + 一个壁挂）的柜体，视为同一"上下叠放组"，合成一页：
+ *     · 该页的**立面外观图 = 整组**（地柜+吊柜一起画，这才是"一眼看到整体"）
+ *     · **平面图**按地柜/吊柜分开并排（对齐参考 PDF 第 2 页餐边柜）
+ *     · 结构图仍是整组，细节靠分区分段表达
+ *   不在同一 X 区间的柜体**不合并**（例如 L 型另一条臂、房间对面的柜）。
+ *
+ * ── 为什么要 ≥80% 而不是任意重叠 ──
+ *   参考图纸里地柜吊柜是标准上下对齐（X 完全一致）。用 80% 容纳现场少量偏差，
+ *   又不至于把"并排两个柜"误判成一组。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+export interface CabinetGroup {
+  /** 组内柜体，**竖直方向从下到上**排序（作图顺序有意义） */
+  cabinets: Cabinet[];
+  /** 组的代表名（取组内最靠下的柜体名，或房间名） */
+  name: string;
+  /** 组内是否有吊柜（决定平面图是否要左右并排两张） */
+  hasWall: boolean;
+  hasBase: boolean;
+}
+
+/** 柜体的水平投影区间 [x0, x1)（沿墙方向的展开坐标，L/U 型已展开）。 */
+function horizontalSpan(cabinet: Cabinet): { x0: number; x1: number } {
+  const w = cabinet.params.width;
+  const x = cabinet.placement.x;
+  return { x0: x, x1: x + w };
+}
+
+/** 柜体的竖直区间 [z0, z1)。 */
+function verticalSpan(cabinet: Cabinet): { z0: number; z1: number } {
+  const z0 = cabinet.params.mountHeight ?? 0;
+  return { z0, z1: z0 + cabinet.params.height };
+}
+
+/** 两个水平区间是否"基本同一段"（重叠 / 较窄者 ≥ 80%）。 */
+function sameHorizontalBand(a: { x0: number; x1: number }, b: { x0: number; x1: number }): boolean {
+  const overlap = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+  if (overlap <= 0) return false;
+  const narrower = Math.min(a.x1 - a.x0, b.x1 - b.x0);
+  if (narrower <= 0) return false;
+  return overlap / narrower >= 0.8;
+}
+
+/** 两个竖直区间是否重叠（重叠即算"并排同高"，不能合成上下组）。 */
+function verticalOverlap(a: { z0: number; z1: number }, b: { z0: number; z1: number }): boolean {
+  return a.z0 < b.z1 && a.z1 > b.z0;
+}
+
+/**
+ * 把一个房间的柜体按"上下叠放"分组。
+ *
+ * @param cabinets 房间内的柜体（顺序不敏感）
+ * @returns 分组结果；每组的 cabinets 按 mountHeight 从低到高排序
+ */
+export function groupCabinetsForSheets(cabinets: Cabinet[]): CabinetGroup[] {
+  const groups: Cabinet[][] = [];
+  const used = new Set<string>();
+
+  // 先按 mountHeight 升序，保证"落地柜先成组，吊柜随后并入"
+  const sorted = [...cabinets].sort((a, b) => {
+    const za = a.params.mountHeight ?? 0;
+    const zb = b.params.mountHeight ?? 0;
+    if (za !== zb) return za - zb;
+    return a.placement.x - b.placement.x;
+  });
+
+  for (const cabinet of sorted) {
+    if (used.has(cabinet.id)) continue;
+    const band = horizontalSpan(cabinet);
+    const members = [cabinet];
+    used.add(cabinet.id);
+
+    /**
+     * 只与"已经在本组里、且竖直不重叠"的柜体尝试合并。
+     * 这样 3 个同高并排地柜不会互相吞并（它们水平重叠），
+     * 而地柜上方的吊柜可以并进来。
+     */
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const candidate of sorted) {
+        if (used.has(candidate.id)) continue;
+        const cBand = horizontalSpan(candidate);
+        if (!sameHorizontalBand(band, cBand)) continue;
+        // 必须与组内**每一个**成员都竖直不重叠，才能作为"同一叠"
+        const overlapsAny = members.some((m) => verticalOverlap(verticalSpan(m), verticalSpan(candidate)));
+        if (overlapsAny) continue;
+        members.push(candidate);
+        used.add(candidate.id);
+        changed = true;
+      }
+    }
+
+    members.sort((a, b) => (a.params.mountHeight ?? 0) - (b.params.mountHeight ?? 0));
+    groups.push(members);
+  }
+
+  return groups.map((members) => {
+    const hasWall = members.some((c) => (c.params.cabinetType === 'wall') || (c.params.mountHeight ?? 0) > 300);
+    const hasBase = members.some((c) => (c.params.cabinetType !== 'wall') && (c.params.mountHeight ?? 0) <= 300);
+    return {
+      cabinets: members,
+      name: members[0]?.name ?? '柜体组',
+      hasWall,
+      hasBase,
+    };
+  });
+}
+
 export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: string): RoomBook {
   const geometry = generateProject(project, rules);
 
@@ -330,6 +471,8 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     const layoutSafetyNote = group.cabinets.some((cabinet) =>
       (cabinet.params.counterCutouts?.length ?? 0) > 0 || allUnits(cabinet.layout).some((unit) => unit.kind === 'appliance' && unit.appliance)
     ) ? '参考预留｜非 CNC 开孔｜待拆单确认。柜体编号通过引线对应下方清单；图中虚线/洞口为设计参考，须按实机与拆单复核，不代表已完成加工。' : null;
+    /** 上下叠放分组结果（一页一组）。放在 return 之前只算一次。 */
+    const sheetGroups = groupCabinetsForSheets(group.cabinets);
     // [fix] 预计算本房间所有柜子的 ViewSet，供立面图复用，避免重复调 buildCabinetViews
     // TODO: buildFurnitureSheet 内部也调 buildCabinetViews，理想情况应把这份缓存继续往下传，
     // 彻底消除 roomBook 构建时的双倍计算。目前先解决立面图内部的重复（缓存回填机制已就绪）。
@@ -353,7 +496,20 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     elevationSvg: elevation.rendered > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
     elevationSkipped: elevation.skipped,
     roomSheetSvg: roomWholeSheet ? primsToSvg(roomWholeSheet.prims, 'dwg-sheet room-whole-sheet') : null,
-    cabinets: group.cabinets.map((cabinet, index) => {
+    /**
+     * ★ 遍历粒度从"柜体"改为"上下叠放组"。
+     *   同一个组只出一页（sheetGroup.cabinets 可能含 2 个以上柜体）。
+     *   组内第一个柜体作为"代表柜"提供摘要信息，其余成员信息合并进来。
+     */
+    cabinets: sheetGroups.map((sheetGroup, index) => {
+      const cabinet = sheetGroup.cabinets[0]!;
+      /**
+       * 组的语义名。上下叠放组（地柜+吊柜）用房间名 + 序号，
+       * 因为"厨房橱柜"这种才是图纸上该出现的标题（参考 PDF 第 12 页）。
+       */
+      const groupRoomBaseName = sheetGroups.length > 1
+        ? `${group.room.name}橱柜${index + 1}`
+        : `${group.room.name}橱柜`;
       const generated = geometry.cabinets[cabinet.id];
       const warningNotes = generated
         ? cabinetWarningIssues(cabinet, generated, rules).map((issue) => formatCabinetWarning(cabinet, issue))
@@ -378,7 +534,27 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       if (finishedEnds === 'left' || finishedEnds === 'right') craftNotes.push(`${finishedEnds === 'left' ? '左' : '右'}见光板`);
       else if (finishedEnds === 'both') craftNotes.push('双侧见光板');
 
-      const cabinetType = cabinet.params.cabinetType ?? ((cabinet.params.mountHeight ?? 0) > 0 ? 'wall' : 'base');
+      /**
+       * 组的柜型 —— **按代表柜（组内最低那个）的真实类型**，不能因为"组里有吊柜"就把整组标成 wall。
+       *
+       * ★ 修的是一个实测 bug（2026-10-21）：
+       *   上一版写的是 `hasWall ? 'wall' : ...`，于是"地柜+吊柜"的组被整体标成 wall，
+       *   布局页的清单里就出现「地柜/高柜：**无**」+「吊柜：厨房橱柜1 …（吊柜底 **0mm**）」——
+       *   三组地柜凭空消失，还编出一个"吊柜底 0mm"的矛盾读数。
+       *
+       *   正确口径：组的**代表柜是组内 mountHeight 最低的那只**（groupCabinetsForSheets
+       *   已经按标高从低到高排好序，所以 [0] 就是地柜）。
+       *   组内既有地柜又有吊柜这件事，由 groupSize / groupIds 表达，不需要篡改 cabinetType。
+       */
+      const representativeIsWall = (cabinet.params.cabinetType === 'wall') || (cabinet.params.mountHeight ?? 0) > 300;
+      const cabinetType = cabinet.params.cabinetType ?? (representativeIsWall ? 'wall' : 'base');
+      /**
+       * 组内实际柜型（去重）。单柜页只有一个元素，与 cabinetType 相同；
+       * 地柜+吊柜的混排组是 ['base','wall']，清单两行都要列。
+       */
+      const memberTypes = [...new Set(sheetGroup.cabinets.map((c) =>
+        c.params.cabinetType ?? (((c.params.mountHeight ?? 0) > 300 ? 'wall' : 'base') as 'base' | 'wall')
+      ))] as Array<'base' | 'wall' | 'tall' | 'island'>;
       const referenceNotes = (cabinet.params.counterCutouts ?? []).map((cutout) => `${cutout.name} ${cutout.width}×${cutout.depth}mm（X=${cutout.x}, Y=${cutout.y}mm）`);
       for (const unit of units) if (unit.kind === 'appliance' && unit.appliance) {
         referenceNotes.push(`${unit.appliance.name}安装净空 ${unit.appliance.openingWidth}×${unit.appliance.openingHeight}×${unit.appliance.openingDepth}mm`);
@@ -387,13 +563,38 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
         ? `参考预留｜非 CNC 开孔｜待拆单确认（适用于台面虚线标记）。${referenceNotes.join('；')}。电器净空须按实机复核，不代表柜体加工完成。`
         : null;
 
-      const sheet = buildFurnitureSheet(group.room, [cabinet], project, rules, { furnitureName: cabinet.name });
+      /**
+       * ★ 一页 = 一组（对齐工厂标准版式）。
+       *
+       *   历史写法是 `[cabinet]` —— 每个柜体单独出一页，于是"一厨六柜"变成六页，
+       *   每页只看得见自己，用户看到的就是"柜子被拆成了几个"。
+       *   现在传入**整个上下叠放组**：立面外观图会把地柜+吊柜一起画出来
+       *   （"一眼看到整个柜子"），平面图由 buildFurnitureSheet 内部按地柜/吊柜
+       *   自动分成左右两张并排（参考 PDF 第 2 页餐边柜的写法）。
+       *
+       *   注意：本组可能有多个柜体，所以下面的摘要字段要按"组"聚合并对多值做去重，
+       *   不能直接读 `cabinet.params`（那只能代表组内第一个）。
+       */
+      const groupMembers = sheetGroup.cabinets;
+      /**
+       * 页名：单柜 = 柜名；**上下叠放组 = 用"柜体组"的语义名**，不要把两个柜名用 + 串起来
+       * （"地柜A + 吊柜A" 在图纸标题上又长又乱，而且会被误读成两台独立家具）。
+       * 参考 PDF 的标题是家具名（"餐边柜"/"厨房橱柜"），不是柜体编号。
+       */
+      const groupName = sheetGroup.cabinets.length > 1
+        ? (sheetGroup.hasWall && sheetGroup.hasBase ? `${groupRoomBaseName}` : `${cabinet.name}`)
+        : cabinet.name;
+      const sheet = buildFurnitureSheet(group.room, groupMembers, project, rules, { furnitureName: groupName });
+      const groupMapTags = groupMembers.map((c) => mapTags.get(c.id) ?? '?').join('/');
       return {
         id: cabinet.id,
-        name: cabinet.name,
+        groupIds: groupMembers.map((c) => c.id),
+        groupSize: groupMembers.length,
+        name: groupName,
         index: index + 1,
-        mapTag: mapTags.get(cabinet.id) ?? `C${index + 1}`,
+        mapTag: groupMapTags,
         cabinetType,
+        memberTypes,
         width: cabinet.params.width,
         height: cabinet.params.height,
         depth: cabinet.params.depth,
@@ -508,10 +709,32 @@ export function roomBookHtml(
   const layoutRoomIds = new Set(options.layoutRoomIds ?? book.sections.map((section) => section.roomId));
   for (const section of book.sections) {
     const scheduleItems = (cabinets: RoomBookCabinet[]) => cabinets.map((cabinet) =>
-      `<span class="layout-schedule-tag">${esc(cabinet.mapTag)}</span>${esc(cabinet.name)} ${cabinet.width}×${cabinet.height}×${cabinet.depth}mm${cabinet.cabinetType === 'wall' ? `（吊柜底 ${cabinet.mountHeight}mm）` : ''}`
+      `<span class="layout-schedule-tag">${esc(cabinet.mapTag)}</span>${esc(cabinet.name)} ${cabinet.width}×${cabinet.height}×${cabinet.depth}mm${
+        // 只有**纯吊柜组**才标"吊柜底 xxx mm"；混排组的 mountHeight 是代表柜（地柜）的 0，
+        // 标出来就是假的（"吊柜底 0mm" 实测就出现过）
+        cabinet.cabinetType === 'wall' && (cabinet.memberTypes ?? []).length <= 1 ? `（吊柜底 ${cabinet.mountHeight}mm）` : ''
+      }`
     ).join('　·　');
-    const base = section.cabinets.filter((cabinet) => cabinet.cabinetType === 'base' || cabinet.cabinetType === 'island' || cabinet.cabinetType === 'tall');
-    const wall = section.cabinets.filter((cabinet) => cabinet.cabinetType === 'wall');
+    /**
+     * 按**组内实际柜型**分列，而不是只看代表柜的 cabinetType。
+     *
+     * ★ 修的是一个实测 bug（2026-10-21）：一页一组之后，
+     *   "地柜+吊柜"的混排组如果只按 cabinetType 判，会被整组归到一边 ——
+     *   于是布局页出现「地柜/高柜：**无**」+「吊柜：…（吊柜底 **0mm**）」，
+     *   三组地柜凭空消失，还编出一个矛盾的"吊柜底 0mm"。
+     *
+     * 现在用 memberTypes：混排组在两行里**都出现**（这是它真实的构成）。
+     */
+    const hasBaseType = (c: RoomBookCabinet) => (c.memberTypes ?? [c.cabinetType]).some((t) => t === 'base' || t === 'tall' || t === 'island');
+    const hasWallType = (c: RoomBookCabinet) => (c.memberTypes ?? [c.cabinetType]).includes('wall');
+    /**
+     * 混排组（地柜+吊柜）**两行都列** —— 它确实同时含有两种柜。
+     *
+     * 只在一边列会让另一边显示"无"，而房间明明有吊柜 —— 那是假读数。
+     * 同一个 mapTag（"B1/W1"）在两行各出现一次，读图的人一看就知道这是同一组。
+     */
+    const base = section.cabinets.filter(hasBaseType);
+    const wall = section.cabinets.filter(hasWallType);
     const specialNotes = section.cabinets.flatMap((cabinet) => cabinet.referenceNotes.map((note) => `${cabinet.mapTag} ${cabinet.name}：${note}`));
     const layoutNote = section.layoutSafetyNote ? `<aside class="layout-safety-note">${esc(section.layoutSafetyNote)}</aside>` : '';
     const schedule = `<div class="layout-schedule" aria-label="柜体编号、名称和完整尺寸清单"><div class="layout-schedule-row"><strong>地柜/高柜：</strong>${scheduleItems(base) || '无'}</div><div class="layout-schedule-row"><strong>吊柜：</strong>${scheduleItems(wall) || '无'}</div><div class="layout-schedule-row layout-schedule-special"><strong>参考预留 / 设备净空：</strong>${esc(specialNotes.join('　·　') || '无')}</div></div>`;

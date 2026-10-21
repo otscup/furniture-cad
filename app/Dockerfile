@@ -98,6 +98,14 @@ COPY src/ai/compileProposal.ts ./src/ai/compileProposal.ts
 COPY src/ai/planRunner.ts ./src/ai/planRunner.ts
 COPY src/ai/proposal.ts ./src/ai/proposal.ts
 
+# src/ai/vision/types.ts：server/server.mjs 在 /api/ai/vision 路由里 **静态 import** 它
+# 来生成给模型的接口定义（visionResultSchemaText）。
+# 漏拷的后果与上面同类：镜像能起来、/api 正常，
+# 只有 /api/ai/vision 抛模块找不到（生产识图全挂）——宿主源码树里复现不出来。
+# ★ 这条 import 是静态的（不是动态 import），所以**模块加载期**就会炸，
+#   表现为整个服务起不来，比动态 import 的 500 更早暴露。
+COPY src/ai/vision/types.ts ./src/ai/vision/types.ts
+
 # 运行时数据目录（账号库/审计/记忆/验证码库/.env 都会被 APP_*_PATH 指到这里）
 RUN mkdir -p /app/data
 

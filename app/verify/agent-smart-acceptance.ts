@@ -26,7 +26,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { buildSystemPrompt, validatePlan, detectActionFamilies, ACTION_NAMES } from '../shared/aiContract.mjs';
-import { summarizeProjectContext, failureHint, replaySequence } from '../server/agentLoop.mjs';
+import { summarizeProjectContext, failureHint, replaySequence , buildAgentSystemPrompt } from '../server/agentLoop.mjs';
 import { matchRecipes, renderRecipes, recipeBlockFor, RECIPES } from '../shared/recipes.mjs';
 import {
   retrieveRules,
@@ -115,7 +115,16 @@ section('1. 标准配方库：命中即注入，不命中不加料');
    *   只接 plan 通道 = 用户根本看不到配方。
    */
   ok('★ Agent 通道也接了配方（agentLoop 引用 recipeBlockFor）', agentSrc.includes('recipeBlockFor'));
-  ok('★ Agent 通道把配方块插进了系统提示词', agentSrc.includes('recipeBlock ? recipeBlock +'));
+  /**
+   * ★ 改成**行为断言**（2026-10-21）——
+   *   原来是扫源码找 `recipeBlock ? recipeBlock +` 这个字符串。
+   *   P0-1 把提示词拆成静态段+动态段后，它立刻变红，
+   *   **但功能一点没坏** —— 这正是源码扫描的毛病。
+   *
+   *   现在直接调用 buildAgentSystemPrompt 构造出真实的提示词再检查。
+   */
+  const { systemPrompt: promptWithRecipe } = buildAgentSystemPrompt({ recipeBlock: '【配方】衣柜：先建柜再分区' });
+  ok('★ ★ Agent 通道把配方块插进了系统提示词（行为断言）', promptWithRecipe.includes('【配方】衣柜'));
   ok('★ 服务端把配方模块传给了 Agent（server 引用 recipeBlockFor 或 agentLoop 内部取）', agentSrc.includes('recipeBlockFor(intent)') || serverSrc.includes('recipeBlockFor'));
 
   /**
@@ -336,7 +345,13 @@ section('4. 当前方案摘要：分区结构 + 上一轮改了什么');
    * ── 4.2 摘要必须真的进了提示词 ──
    *   写了摘要但没插进提示词 = 白写（老毛病）。
    */
-  ok('★ projectContextText 进了 Agent 系统提示词', /projectContextText \?/.test(agentSrc));
+  /**
+   * ★ 同样改成行为断言 ──
+   *   「写了摘要但没插进提示词 = 白写」这个坑值得守，
+   *   但守它的方式不该是扫源码。
+   */
+  const { systemPrompt: promptWithCtx } = buildAgentSystemPrompt({ projectContextText: '【上下文】主卧有一台柜' });
+  ok('★ ★ projectContextText 进了 Agent 系统提示词（行为断言）', promptWithCtx.includes('【上下文】主卧有一台柜'));
 }
 
 // ═══════════════ 5. 错误信息带建议 ═══════════════

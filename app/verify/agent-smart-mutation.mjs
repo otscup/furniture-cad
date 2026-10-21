@@ -212,9 +212,14 @@ mutate('★ 摘要不再带上一轮改了什么', TARGETS.agent,
   "  if (false) {",
   '上一轮做了什么');
 mutate('摘要不再进系统提示词', TARGETS.agent,
-  "${projectContextText ? `${projectContextText}\\n` : ''}",
-  "",
+  "    projectContextText,",
+  "    '',",
   'projectContextText');
+mutate('★ 配方不再进系统提示词', TARGETS.agent,
+  "    recipeBlock,",
+  "    '',",
+  '配方块插进了系统提示词');
+
 
 // ── 5. 错误信息带建议（行为）──
 console.log('\n5. 错误信息带建议');

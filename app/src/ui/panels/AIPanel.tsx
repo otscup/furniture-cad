@@ -360,6 +360,14 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
   // 支持同时上传效果图+尺寸图等多张，各自独立设类型
   const [pendingImages, setPendingImages] = useState<Array<{ id: string; dataUrl: string; name: string; mode: 'render' | 'dimension' }>>([]);
   const [imageMode, setImageMode] = useState<'render' | 'dimension'>('render');
+  /**
+   * ★ 用户告知的参考尺寸（mm）—— P0-4，2026-10-21
+   *
+   *   这条链路此前**完全断的**：前端不传、服务端不读，
+   *   「这柜子宽 900」这个信息从来没进过模型。
+   *   有了它，模型就能把整柜尺寸的 source 从 estimate 提升到 reference。
+   */
+  const [knownScaleMm, setKnownScaleMm] = useState<number | ''>('');
   const [imageUrl, setImageUrl] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingVisionRun, setPendingVisionRun] = useState<PlanRun | null>(null);
@@ -731,7 +739,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
             const vrRes = await fetch('/api/ai/vision', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
-              body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: q || undefined }),
+              body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: q || undefined, knownScaleMm: knownScaleMm || undefined }),
             });
             if (vrRes.ok) {
               const vrJson = await vrRes.json();
@@ -894,7 +902,7 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
         const r = await fetch('/api/ai/vision', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(props.token ? { Authorization: `Bearer ${props.token}` } : {}) },
-          body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: hint || undefined }),
+          body: JSON.stringify({ image: img.dataUrl, mode: img.mode, hint: hint || undefined, knownScaleMm: knownScaleMm || undefined }),
         });
         const j = await r.json();
         if (!j.ok) {
@@ -1646,6 +1654,29 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
               disabled={busy}
               onChange={() => setImageMode('dimension')}
             /> 尺寸图
+          </label>
+          {/**
+           * ★ 参考尺寸输入（P0-4）——
+           *   告诉模型「图里某个东西真实宽多少毫米」，它就能把像素比例换算成真实尺寸，
+           *   尺寸来源从 estimate（不可下料）升级成 reference（可用）。
+           *   留空 = 不给参考，纯视觉估计。
+           * */}
+          <label className="ai-mode-label" title="告诉 AI 图里某个参照物的真实宽度（如门洞 900mm），它就能换算出真实尺寸">
+            参考尺寸
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={100000}
+              placeholder="mm"
+              value={knownScaleMm}
+              disabled={busy}
+              style={{ width: 72 }}
+              onChange={(e) => {
+                const v = e.target.value;
+                setKnownScaleMm(v === '' ? '' : Number(v));
+              }}
+            />
           </label>
         </div>
         {/* 待发送的图片预览（多图） */}

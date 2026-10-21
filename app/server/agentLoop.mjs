@@ -375,6 +375,85 @@ export function failureHint(error, code) {
       return '';
   }
 }
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  Agent 系统提示词构造（P0-1 / P0-5，2026-10-21）
+ *
+ *  ── 为什么把它抽出来 ──
+ *    此前这段在 runAgentLoop 内部，验收只能**扫源码**来判断
+ *    「配方块有没有进提示词」—— 而源码扫描守不住重构：
+ *    P0-1 把提示词拆成静态段+动态段后，扫 `recipeBlock ? recipeBlock +`
+ *    立刻变红，但功能其实一点没坏。
+ *
+ *    抽成可 import 的函数后，验收能**真的构造出提示词**再检查内容。
+ *    （与项目里 selectProjectRules / pickSequences 同一个套路：
+ *    凡是「决定」散落在大函数里的，就提出来。）
+ *
+ *  ── 静态 / 动态的切分理由 ──
+ *    网关（gpt-load）做**纯前缀匹配**：system 里只要有一处逐字变化，
+ *    从变化点往后全部缓存不上。而 rulesBlock / recipeBlock / seqHint
+ *    **每一轮都变** ⇒ 它们必须在静态规则**之后**。
+ *
+ *    实测：动态在开头 cached=0；动态在末尾 cached=1024。
+ *
+ * @param opts 注入内容
+ * @returns { staticRules, dynamicContext, systemPrompt }
+ *           systemPrompt = staticRules + '\n' + dynamicContext
+ */
+export function buildAgentSystemPrompt(opts = {}) {
+  const {
+    rulesBlock = '',
+    recipeBlock = '',
+    seqHint = '',
+    roomId = '',
+    roomName = '',
+    projectContextText = '',
+    visionResult = null,
+    images = [],
+    currentDraftId = null,
+  } = opts;
+  const staticRules = `你是家具 CAD 的 AI 装配 Agent。用户说出意图后，你调用 MCP 工具在 draft 草稿里搭建柜体。
+
+规则：
+- 所有写操作只进 draft，不碰 live。
+- 先理解意图，拆成工具调用。支持按顺序创建柜体、调整参数、建立组合。
+- 新建房间（cad.create_room）只需传 name 与 w、h（x、y 可省略或传 0，系统会自动将新房间排布在已有房间右侧，绝不重叠）。
+- 新建柜体（cad.create_cabinet）默认放在当前房间；若不传 x、y，系统会自动在当前房间内寻找不撞墙、不重叠的贴墙位置（且吊柜 mountHeight>0 会自动对齐在地柜正上方）。
+- 一排连续的厨房地柜、吊柜，先分别创建独立柜体模块，再按地柜排、吊柜排分别调用 cad.create_assembly 组成柜组；连接只描述相邻模块关系。
+- 组合只用于整体展示/操作，不代表把多个柜箱合成一只柜，也不自动生成连续台面、共享顶板或 CNC 开孔；不要合并柜体模块尺寸或板件。
+- 当用户同时提供两张图（效果图 + 尺寸图）时：以【效果图】确定柜体外观布局（地柜/吊柜排布、门扇、抽屉、开放格、电器位），以【尺寸图】上的毫米标注数值作为精确宽/高/深尺寸！
+- 工具报错时读错误信息，调整参数重试。同一问题最多重试 3 轮，修不好就停下说明原因。
+- 完成后调用 cad.validate 确认 0 错误。
+- 【设计目标 intentRequest】当用户的诉求是**方向性的**（"柜子别跑到屋外去""别挡门窗""要贴墙"），而不是要你立刻改某只柜时，
+  你可以在**最终回答**里附一个 JSON 代码块表达设计目标，系统会把它作为**待用户确认**的意图：
+  \`\`\`json
+  {"intentRequest": {"goal": "room-inside", "scope": {"kind": "cabinet", "cabinetId": "cab_001"}, "statement": "柜体必须完整落在房间内"}}
+  \`\`\`
+  可用 goal（只能用这些）：
+  - room-inside：柜体完整落在房间内（别跑到屋外/压到墙上）
+  - near-opening / opening-clear：柜体不挡门窗洞口
+  - wall-contact：柜体贴墙
+  - standalone：柜体与其它柜体不相接
+  - door-swing-clear / kitchen-workflow / storage-priority / circulation-priority：**暂不支持**，提了也只会被告知"没有构造器"，别反复提
+  **绝对不要**在 intentRequest 里写 x / y / rotation / wallId —— 摆法由系统算。
+  意图**不会自动生效**：用户要在界面上点确认才算数，所以你提完就如实告诉他"已提为待确认目标"，不要宣称已经改好。
+  如果用户只是让你建柜子/改尺寸，**不要**提 intentRequest。`;
+  const dynamicContext = [
+    rulesBlock,
+    recipeBlock,
+    seqHint,
+    roomId ? `- 当前工作区房间为「${roomName || roomId}」（roomId=${roomId}）；新建柜体默认放在此房间，除非用户明确指定其他房间。` : '',
+    projectContextText,
+    visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}` : '',
+    images && images.length > 0 ? `用户附了 ${images.length} 张图（${images.map(i => `${i.name || '图片'}:${i.mode === 'dimension' ? '尺寸图' : '效果图'}`).join('、')}），请结合图片理解意图。尺寸图上的标注数字优先采用。` : '',
+    currentDraftId ? `继续使用 draft ${currentDraftId}。` : '没有 draft 时工具会自动创建。',
+    `当前 draft：${currentDraftId ?? '无（工具会自动创建）'}`,
+  ].filter(Boolean).join('\n');
+  const systemPrompt = staticRules + '\n' + dynamicContext;
+  return { staticRules, dynamicContext, systemPrompt };
+}
+
 export async function runAgentLoop(opts) {
   const { intent, images, visionResult, draftId, roomId, roomName, workspaceProject, token, mcpBaseUrl, aiConfig, onStep, history, projectRules } = opts;
   const steps = [];
@@ -483,36 +562,23 @@ export async function runAgentLoop(opts) {
    *   后者是前者的降级方案，命中不了完全重放时兜底。
    */
   const seqHint = renderSequenceHint(opts.similarSeq);
-  const systemPrompt = `你是家具 CAD 的 AI 装配 Agent。用户说出意图后，你调用 MCP 工具在 draft 草稿里搭建柜体。
 
-${rulesBlock ? rulesBlock + '\n' : ''}${recipeBlock ? recipeBlock + '\n' : ''}${seqHint ? seqHint + '\n' : ''}规则：
-- 所有写操作只进 draft，不碰 live。${currentDraftId ? `继续使用 draft ${currentDraftId}。` : '没有 draft 时工具会自动创建。'}
-- 先理解意图，拆成工具调用。支持按顺序创建柜体、调整参数、建立组合。
-- 新建房间（cad.create_room）只需传 name 与 w、h（x、y 可省略或传 0，系统会自动将新房间排布在已有房间右侧，绝不重叠）。
-- 新建柜体（cad.create_cabinet）默认放在当前房间「${roomName || roomId}」（roomId=${roomId}）；若不传 x、y，系统会自动在当前房间内寻找不撞墙、不重叠的贴墙位置（且吊柜 mountHeight>0 会自动对齐在地柜正上方）。
-- 一排连续的厨房地柜、吊柜，先分别创建独立柜体模块，再按地柜排、吊柜排分别调用 cad.create_assembly 组成柜组；连接只描述相邻模块关系。
-- 组合只用于整体展示/操作，不代表把多个柜箱合成一只柜，也不自动生成连续台面、共享顶板或 CNC 开孔；不要合并柜体模块尺寸或板件。
-- 当用户同时提供两张图（效果图 + 尺寸图）时：以【效果图】确定柜体外观布局（地柜/吊柜排布、门扇、抽屉、开放格、电器位），以【尺寸图】上的毫米标注数值作为精确宽/高/深尺寸！
-- 工具报错时读错误信息，调整参数重试。同一问题最多重试 3 轮，修不好就停下说明原因。
-- 完成后调用 cad.validate 确认 0 错误。
-- 【设计目标 intentRequest】当用户的诉求是**方向性的**（"柜子别跑到屋外去""别挡门窗""要贴墙"），而不是要你立刻改某只柜时，
-  你可以在**最终回答**里附一个 JSON 代码块表达设计目标，系统会把它作为**待用户确认**的意图：
-  \`\`\`json
-  {"intentRequest": {"goal": "room-inside", "scope": {"kind": "cabinet", "cabinetId": "cab_001"}, "statement": "柜体必须完整落在房间内"}}
-  \`\`\`
-  可用 goal（只能用这些）：
-  - room-inside：柜体完整落在房间内（别跑到屋外/压到墙上）
-  - near-opening / opening-clear：柜体不挡门窗洞口
-  - wall-contact：柜体贴墙
-  - standalone：柜体与其它柜体不相接
-  - door-swing-clear / kitchen-workflow / storage-priority / circulation-priority：**暂不支持**，提了也只会被告知"没有构造器"，别反复提
-  **绝对不要**在 intentRequest 里写 x / y / rotation / wallId —— 摆法由系统算。
-  意图**不会自动生效**：用户要在界面上点确认才算数，所以你提完就如实告诉他"已提为待确认目标"，不要宣称已经改好。
-  如果用户只是让你建柜子/改尺寸，**不要**提 intentRequest。
-${roomId ? `- 当前工作区房间为「${roomName || roomId}」（roomId=${roomId}）；新建柜体默认放在此房间，除非用户明确指定其他房间。\n` : ''}${projectContextText ? `${projectContextText}\n` : ''}
-
-${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSON.stringify(visionResult, null, 2)}\n` : ''}${images && images.length > 0 ? `用户附了 ${images.length} 张图（${images.map(i => `${i.name || '图片'}:${i.mode === 'dimension' ? '尺寸图' : '效果图'}`).join('、')}），请结合图片理解意图。尺寸图上的标注数字优先采用。\n` : ''}
-当前 draft：${currentDraftId ?? '无（工具会自动创建）'}`;
+  /**
+   * 提示词构造抽到 buildAgentSystemPrompt（见该函数的注释）——
+   * 目的是让验收能**真的构造出提示词**来检查内容，
+   * 而不是扫源码找字符串（源码扫描守不住重构：P0-1 拆分提示词时它就误报过）。
+   */
+  const { systemPrompt } = buildAgentSystemPrompt({
+    rulesBlock,
+    recipeBlock,
+    seqHint,
+    roomId,
+    roomName,
+    projectContextText,
+    visionResult,
+    images,
+    currentDraftId,
+  });
 
   const messages = [
     { role: 'system', content: systemPrompt },

@@ -61,6 +61,7 @@ import {
   validateIntentRequest,
   detectActionFamilies,
 } from '../shared/aiContract.mjs';
+import { visionResultSchemaText } from '../src/ai/vision/types.ts';
 import { quotaView } from '../shared/quota.mjs';
 import { selectProjectRules } from '../shared/ruleRetrieval.mjs';
 import { findReplayable, findSimilar, saveRunSequence, pickSequences, similarityThresholdFor } from './sequenceStore.mjs';
@@ -1852,26 +1853,16 @@ async function handleApi(req, res, pathname) {
     '你是定制家具设计软件里的视觉识别助手。用户会发一张**带尺寸标注的图纸**（平面布置图/立面图/大样图），',
     '你要识别并**只输出**一个 JSON 对象，符合下面的 TypeScript 形状（不要输出任何多余文字，也不要用 markdown 代码块包裹）：',
     '',
-    'interface VisionResult {',
-    '  cabinets: VisionCabinet[];',
-    '  relations?: { from: string; to: string; kind: "L-shape" | "side-by-side" | "stacked" | "adjacent"; confidence: "high"|"medium"|"low" }[];',
-    '  scale?: { known: boolean; text?: string; referenceMm?: number; confidence: "high"|"medium"|"low" };',
-    '  overallConfidence: "high"|"medium"|"low";',
-    '  notes?: string[];',
-    '  ambiguous?: string[];',
-    '}',
-    'interface VisionCabinet {',
-    '  ref: string; name?: string;',
-    '  width?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-    '  height?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-    '  depth?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-    '  rows?: { heightMm?: number; heightRatio?: number; units?: VisionUnit[]; confidence: "high"|"medium"|"low" }[];',
-    '  units?: VisionUnit[];',
-    '  components?: { type: "door"|"drawer"|"open-shelf"|"shelf"|"appliance-cavity"; location?: string; confidence: "high"|"medium"|"low" }[];',
-    '  rotation?: number; room?: string; confidence: "high"|"medium"|"low";',
-    '  notVisible?: ("depth"|"board-thickness"|"inner-partitions"|"connection"|"real-size")[];',
-    '}',
-    'interface VisionUnit { kind: "shelves"|"drawerBank"|"hanging"|"open"|"appliance"; widthMm?: number; widthRatio?: number; count?: number; doorCount?: number; confidence: "high"|"medium"|"low" }',
+      // ★ 接口定义**由 src/ai/vision/types.ts 生成**（P0-5，2026-10-21）——
+      //
+      //   此前这段是手写的，而真正的类型定义在 types.ts。两处各写一遍 ⇒ 必然漂移。
+      //   实测后果：types.ts 的 VisionUnit 有 rodHeight / applianceName /
+      //   openingWidth / openingHeight / openingDepth，而手写版**没有**
+      //   ⇒ 模型永远给不出挂衣杆高度和电器洞口尺寸，
+      //   而 visionResultToNormalized 明确要透传 rodHeight。
+      //
+      //   单一真源 = types.ts；这里只负责把它渲染进提示词。
+      visionResultSchemaText(),
     '',
     '读图纪律（最重要）：',
     '· 这是**尺寸图**，尺寸以**标注数字**为准 —— 每个 width/height/depth 的 source 能填 "annotation" 就填 "annotation"，并在 notes 里写清"宽 3600 取自底部标注线"。',
@@ -2633,13 +2624,43 @@ async function handleApi(req, res, pathname) {
     const body = await readBody(req);
     const baseUrl = (env.AI_BASE_URL || '').replace(/\/+$/, '');
     const key = env.AI_API_KEY || '';
-    const model = body.model || env.AI_MODEL || s.model;
+    /**
+     * ★ 视觉端点用**独立模型**（P0-3，2026-10-21）──
+     *
+     *   实测（gpt-load 网关只有两个模型）：
+     *     deepseek-v4.1-flash      发图后 usage 里 image_tokens = 0 ⇒ 根本不看图
+     *     sensenova-6.8-flash-lite 能看图（能正确识别衣柜的挂衣/层板/抽屉分区）
+     *
+     *   而语言理解正好相反：deepseek 的 NLU 命中 7/12、4-18s；
+     *   sensenova 只有 5/12，且 6 次把 8192 预算烧在推理上导致 JSON 输出不完整。
+     *
+     *   ⇒ **文本通道与视觉通道必须用不同模型**，
+     *     用同一个必然有一头顾不上。
+     *
+     *   优先级：body.model（前端显式指定）> AI_VISION_MODEL > AI_MODEL。
+     */
+    const model = body.model || env.AI_VISION_MODEL || env.AI_MODEL || s.model;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
     const multiImages = Array.isArray(body.images)
       ? body.images.filter((img) => img && typeof img.dataUrl === 'string' && img.dataUrl)
       : [];
     const primaryImage = typeof body.image === 'string' && body.image ? body.image : (multiImages[0]?.dataUrl ?? '');
     if (!primaryImage) return json(res, 400, { ok: false, error: 'image 不能为空（应为 data URL）' });
+    /**
+     * ★ 用户给的参考尺寸（P0-4，2026-10-21）──
+     *
+     *   这条链路此前**完全断的**：
+     *     前端 providers/remote.ts 传了 knownScaleMm，
+     *     但 AIPanel 的两处请求体只有 {image, mode, hint}，
+     *     服务端也从没读过这个字段。
+     *   ⇒ 用户说「这柜子宽 900」这个信息**从来没进过模型**。
+     *
+     *   现在服务端读了它，并写进提示词 ——
+     *   模型就能用这个参考物换算像素比例，
+     *   把整柜尺寸的 source 从 estimate 提升到 reference。
+     */
+    const knownScaleMm = Number(body.knownScaleMm);
+    const hasKnownScale = Number.isFinite(knownScaleMm) && knownScaleMm > 0;
     const hasDimensionImg = body.mode === 'dimension' || multiImages.some((img) => img.mode === 'dimension');
     const hasRenderImg = body.mode === 'render' || multiImages.some((img) => img.mode !== 'dimension');
     // mode: 'render'（效果图，默认）| 'dimension'（尺寸图/平面布置图，带标注）| 'fusion'（效果图+尺寸图联合识别）
@@ -2657,26 +2678,16 @@ async function handleApi(req, res, pathname) {
       '你是定制家具设计软件里的视觉识别助手。用户会发一张柜体效果图/截图，',
       '你要识别并**只输出**一个 JSON 对象，符合下面的 TypeScript 形状（不要输出任何多余文字，也不要用 markdown 代码块包裹）：',
       '',
-      'interface VisionResult {',
-      '  cabinets: VisionCabinet[];',
-      '  relations?: { from: string; to: string; kind: "L-shape" | "side-by-side" | "stacked" | "adjacent"; confidence: "high"|"medium"|"low" }[];',
-      '  scale?: { known: boolean; text?: string; referenceMm?: number; confidence: "high"|"medium"|"low" };',
-      '  overallConfidence: "high"|"medium"|"low";',
-      '  notes?: string[];',
-      '  ambiguous?: string[];',
-      '}',
-      'interface VisionCabinet {',
-      '  ref: string; name?: string;',
-      '  width?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-      '  height?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-      '  depth?: { value: number; confidence: "high"|"medium"|"low"; source: "annotation"|"reference"|"estimate" };',
-      '  rows?: { heightMm?: number; heightRatio?: number; units?: VisionUnit[]; confidence: "high"|"medium"|"low" }[];',
-      '  units?: VisionUnit[];',
-      '  components?: { type: "door"|"drawer"|"open-shelf"|"shelf"|"appliance-cavity"; location?: string; confidence: "high"|"medium"|"low" }[];',
-      '  rotation?: number; room?: string; confidence: "high"|"medium"|"low";',
-      '  notVisible?: ("depth"|"board-thickness"|"inner-partitions"|"connection"|"real-size")[];',
-      '}',
-      'interface VisionUnit { kind: "shelves"|"drawerBank"|"hanging"|"open"|"appliance"; widthMm?: number; widthRatio?: number; count?: number; doorCount?: number; confidence: "high"|"medium"|"low" }',
+      // ★ 接口定义**由 src/ai/vision/types.ts 生成**（P0-5，2026-10-21）——
+      //
+      //   此前这段是手写的，而真正的类型定义在 types.ts。两处各写一遍 ⇒ 必然漂移。
+      //   实测后果：types.ts 的 VisionUnit 有 rodHeight / applianceName /
+      //   openingWidth / openingHeight / openingDepth，而手写版**没有**
+      //   ⇒ 模型永远给不出挂衣杆高度和电器洞口尺寸，
+      //   而 visionResultToNormalized 明确要透传 rodHeight。
+      //
+      //   单一真源 = types.ts；这里只负责把它渲染进提示词。
+      visionResultSchemaText(),
       '',
       '诚实纪律（最重要）：',
       '· 图片里**看不见**真实深度、板厚、隐藏隔板、柜体连接方式、整柜真实尺寸（无标注时只是视觉估计）—— 一律写进 notVisible，不要编造具体数值。',
@@ -2684,9 +2695,20 @@ async function handleApi(req, res, pathname) {
       '· 只把你**确实看见**的左右分区(units) / 上下分层(rows) / 门·抽屉·开放格(components) 写进去；看不见内部结构的别脑补层板。',
       '· 若连柜体数量都判断不清，把疑问写进 ambiguous（字符串数组），cabinets 可留空。',
     ].join('\n');
-    const userText = typeof body.hint === 'string' && body.hint.trim()
+    /**
+     * ★ 参考尺寸写进**用户消息**而不是 system ──
+     *   system 是静态前缀，动态内容放后面才能命中 prefix cache
+     *   （P0-1 实测：动态在 system 开头 => cached_tokens 恒为 0）。
+     */
+    const scaleHint = hasKnownScale
+      ? `\n【已知参考尺寸】用户告知图中某个参照物的真实宽度是 ${knownScaleMm}mm。`
+        + `请用它换算图中各柜的真实尺寸，并把对应尺寸的 source 填 "reference"、`
+        + `scale.known 填 true、scale.referenceMm 填 ${knownScaleMm}。`
+        + `若那个参照物其实不在图里，请照实说看不到，不要硬套。`
+      : '';
+    const userText = (typeof body.hint === 'string' && body.hint.trim()
       ? body.hint
-      : '请识别这张柜体效果图，给出结构化 JSON。';
+      : '请识别这张柜体效果图，给出结构化 JSON。') + scaleHint;
     try {
       // 安全前置 ③/④：输出预算过服务端硬顶闸（此前 body.maxTokens 原值透传，可被绕过）
       const mt = enforceMaxTokens(body, env.AI_MAX_TOKENS);
@@ -2710,9 +2732,25 @@ async function handleApi(req, res, pathname) {
             ],
           },
         ],
-        temperature: 0.2,
+        temperature: 0,
         max_tokens: mt.value,
       };
+      /**
+       * ★ 补 response_format（P0-4，2026-10-21）──
+       *
+       *   vision 此前是**唯一**没设 response_format 的 AI 端点
+       *   （aiContract.mjs 的 design/plan 通道都设了 json_object）。
+       *   讽刺的是 vision 恰恰是**最容易**产出畸形 JSON 的端点
+       *   —— 输出长、嵌套深、还常被模型包在 ```json 围栏里。
+       *
+       *   网关实测：json_object 支持；json_schema 返回 HTTP 400（网关不认），
+       *   所以只能用 json_object（它只是提示，不保证严格合规，
+       *   后面的正则剥围栏 + 服务端形状校验仍然要留着）。
+       *
+       *   temperature 也从 0.2 降到 0 —— 这是**抽取**任务不是创作任务，
+       *   0.2 的随机性只会让同一张图两次识别出不同结构。
+       */
+      payload.response_format = { type: 'json_object' };
       const r = await fetchWithTimeout(
         `${baseUrl}/chat/completions`,
         {

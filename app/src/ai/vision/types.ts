@@ -180,3 +180,74 @@ export interface VisionProvider {
   /** 同步识别一张图 */
   analyze(input: VisionInput): Promise<VisionResult>;
 }
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  提示词接口定义 —— **由本文件生成**（P0-5，2026-10-21）
+ *
+ *  ── 为什么要有这个 ──
+ *    此前 VisionUnit / VisionCabinet 的接口定义**手写在 server.mjs 的提示词里**，
+ *    而真正的类型定义在本文件。两处各写一遍 ⇒ 必然漂移。
+ *
+ *    实测后果（不是理论风险）：
+ *      本文件 VisionUnit 有 rodHeight / applianceName / openingWidth / openingHeight
+ *      四个字段，而提示词里**只有 kind|widthMm|widthRatio|count|doorCount|confidence**
+ *      ⇒ **模型永远给不出挂衣杆高度和电器洞口尺寸**，
+ *      而 visionResultToNormalized 明确要透传 rodHeight（「P9.9 约束一」）。
+ *      前端在等一个模型不会给的值。
+ *
+ *  ── 修法 ──
+ *    接口定义只在这里维护一份，服务端从这儿取。
+ *    要加字段 ⇒ 改类型（TS 会报错）⇒ 改这里的生成器 ⇒ 提示词自动跟上。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+
+export const VISION_CONFIDENCE_VALUES: Confidence[] = ['high', 'medium', 'low'];
+export const VISION_DIM_SOURCE_VALUES: DimSource[] = ['annotation', 'reference', 'estimate'];
+export const VISION_UNIT_KINDS: VisionUnit['kind'][] = ['shelves', 'drawerBank', 'hanging', 'open', 'appliance'];
+export const VISION_COMPONENT_TYPES: VisionComponentType[] = ['door', 'drawer', 'open-shelf', 'shelf', 'appliance-cavity'];
+export const VISION_NOT_VISIBLE_REASONS: NotVisibleReason[] = ['depth', 'inner-partitions', 'board-thickness', 'connection', 'real-size'];
+export const VISION_RELATION_KINDS: VisionRelationKind[] = ['L-shape', 'side-by-side', 'stacked', 'adjacent'];
+
+/** 枚举值渲染成 TypeScript 字面量联合（给提示词用） */
+function lit<T extends string>(values: readonly T[]): string {
+  return values.map((v) => `"${v}"`).join('|');
+}
+
+/**
+ * 生成 VisionResult 的接口定义文本（给提示词用）。
+ *
+ * ★ 这是**唯一**的来源 —— server.mjs 直接调用它，不再手写一遍。
+ *
+ * @returns 多行 TypeScript 接口定义文本
+ */
+export function visionResultSchemaText(): string {
+  return [
+    'interface VisionResult {',
+    '  cabinets: VisionCabinet[];',
+    `  relations?: { from: string; to: string; kind: ${lit(VISION_RELATION_KINDS)}; confidence: ${lit(VISION_CONFIDENCE_VALUES)} }[];`,
+    '  scale?: { known: boolean; text?: string; referenceMm?: number; confidence: ' + lit(VISION_CONFIDENCE_VALUES) + ' };',
+    `  overallConfidence: ${lit(VISION_CONFIDENCE_VALUES)};`,
+    '  notes?: string[];',
+    '  ambiguous?: string[];',
+    '}',
+    'interface VisionCabinet {',
+    '  ref: string; name?: string;',
+    `  width?: { value: number; confidence: ${lit(VISION_CONFIDENCE_VALUES)}; source: ${lit(VISION_DIM_SOURCE_VALUES)} };`,
+    `  height?: { value: number; confidence: ${lit(VISION_CONFIDENCE_VALUES)}; source: ${lit(VISION_DIM_SOURCE_VALUES)} };`,
+    `  depth?: { value: number; confidence: ${lit(VISION_CONFIDENCE_VALUES)}; source: ${lit(VISION_DIM_SOURCE_VALUES)} };`,
+    `  rows?: { heightMm?: number; heightRatio?: number; units?: VisionUnit[]; confidence: ${lit(VISION_CONFIDENCE_VALUES)} }[];`,
+    '  units?: VisionUnit[];',
+    `  components?: { type: ${lit(VISION_COMPONENT_TYPES)}; location?: string; confidence: ${lit(VISION_CONFIDENCE_VALUES)} }[];`,
+    '  rotation?: number; room?: string; confidence: ' + lit(VISION_CONFIDENCE_VALUES) + ';',
+    `  notVisible?: (${lit(VISION_NOT_VISIBLE_REASONS)})[];`,
+    '}',
+    'interface VisionUnit {',
+    `  kind: ${lit(VISION_UNIT_KINDS)};`,
+    '  widthMm?: number; widthRatio?: number; count?: number; doorCount?: number;',
+    '  rodHeight?: number;',
+    '  applianceName?: string; openingWidth?: number; openingHeight?: number; openingDepth?: number;',
+    `  confidence: ${lit(VISION_CONFIDENCE_VALUES)};`,
+    '}',
+  ].join('\n');
+}

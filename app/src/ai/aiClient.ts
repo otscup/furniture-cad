@@ -62,6 +62,29 @@ export interface PlanResponse {
    * 迟早会有人忘记发，界面就停在旧数字上。
    */
   quota?: QuotaView;
+  /**
+   * AI 提的**设计意图请求**（2026-10-20 新增）。
+   *
+   * ── 它是"待确认"，不是"已生效" ──
+   *   拿到它之后只能建 `makeCandidateIntent`（status=candidate），
+   *   由用户在界面上确认才升级为 active。AI 没有任何直接激活的通道。
+   *
+   * ── 为什么必须一路带到这里（而不是服务端悄悄丢掉）──
+   *   提示词从 P9.3 起就告诉模型"你可以额外输出这些请求"，
+   *   而链路曾经只读 reply/actions —— 模型写了、用户以为生效了、实际蒸发。
+   *   这是契约铁律禁止的"静默忽略"，所以字段必须原样送到界面。
+   */
+  intentRequest?: {
+    goal: string;
+    scope: { kind: 'cabinet'; cabinetId: string } | { kind: 'room'; roomId: string };
+    openingKind?: 'door' | 'window';
+    statement?: string;
+  };
+  /**
+   * 意图请求**被契约拒绝**的原因（带坐标 / 未知目标词 / 坏 scope）。
+   * 必须显示：模型写了但被拒，用户要知道为什么，否则他只会看到"AI 没反应"。
+   */
+  intentRequestError?: { code: string; error: string };
 }
 
 /** 带上登录 token（local-open 模式下没有 token，也就不带） */
@@ -148,6 +171,13 @@ export async function requestPlan(opts: {
     usage: (body.usage as PlanResponse['usage']) ?? null,
     ms: body.ms as number | undefined,
     quota: (body.quota as QuotaView | undefined) ?? undefined,
+    /**
+     * 设计意图请求原样送到界面。
+     * 服务端已过契约校验；这里只做类型收窄，**不重新判定** ——
+     * 判定规则只有一份（shared/aiContract.mjs 的 validateIntentRequest）。
+     */
+    ...(body.intentRequest ? { intentRequest: body.intentRequest as PlanResponse['intentRequest'] } : {}),
+    ...(body.intentRequestError ? { intentRequestError: body.intentRequestError as PlanResponse['intentRequestError'] } : {}),
   };
 }
 

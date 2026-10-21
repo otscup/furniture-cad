@@ -36,7 +36,7 @@ import { parseProjectFile, serializeProjectFile } from '../src/core/projectFile.
 import { generateProject } from '../src/core/geometry/project.ts';
 import { deriveManufacturing } from '../src/core/manufacturing/index.ts';
 import { toNeutralExport } from '../src/export/neutralSheet.ts';
-import { ACTION_NAMES, buildUserMessage, validateAction } from '../shared/aiContract.mjs';
+import { ACTION_NAMES, INTENT_GOAL_WORDS, buildUserMessage, validateAction, validateIntentRequest } from '../shared/aiContract.mjs';
 import {
   CONDITION_GOALS,
   DESIGN_INTENT_DRAFT_KEYS,
@@ -91,6 +91,31 @@ function ok(name: string, cond: unknown, detail: unknown = ''): void {
 function section(t: string): void {
   console.log(`\n── ${t} ──`);
 }
+
+/**
+ * ── 词表镜像断言（2026-10-20）──
+ *   shared/aiContract.mjs 里有一份 INTENT_GOAL_WORDS（契约层自带，避免 import 实现层，
+ *   否则 shared/ 会被 core/ 牵着走）。两份一旦漂移，AI 就会被允许提一个 core 不认识
+ *   的目标、或者被拒一个合法目标。这条断言把两份钉在一起：只改一边会红。
+ */
+section('词表镜像：契约层 INTENT_GOAL_WORDS ⇄ core DESIGN_INTENT_GOAL_ORDER');
+ok(
+  '契约层的 INTENT_GOAL_WORDS 与 core 的 DESIGN_INTENT_GOAL_ORDER 逐项相同',
+  JSON.stringify(INTENT_GOAL_WORDS) === JSON.stringify([...DESIGN_INTENT_GOAL_ORDER]),
+  '契约=' + JSON.stringify(INTENT_GOAL_WORDS) + ' core=' + JSON.stringify([...DESIGN_INTENT_GOAL_ORDER])
+);
+ok(
+  'validateIntentRequest 接受合法目标（room-inside + cabinet scope）',
+  validateIntentRequest({ goal: 'room-inside', scope: { kind: 'cabinet', cabinetId: 'c1' } }).ok === true
+);
+ok(
+  'validateIntentRequest 拒绝词表外的目标',
+  validateIntentRequest({ goal: 'make-it-pretty', scope: { kind: 'cabinet', cabinetId: 'c1' } }).code === 'UNKNOWN_GOAL'
+);
+ok(
+  'validateIntentRequest 拒绝带坐标的请求（几何红线）',
+  validateIntentRequest({ goal: 'room-inside', scope: { kind: 'cabinet', cabinetId: 'c1' }, x: 100 }).code === 'GEOMETRY_FORBIDDEN'
+);
 
 /**
  * 负样本判据：**必须因为"这个原因"被拒**。

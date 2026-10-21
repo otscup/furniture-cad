@@ -60,12 +60,31 @@ import {
 } from './model.ts';
 
 /**
- * 本阶段**只对这两个目标**做确定性构造。
- * 别的词要么是取舍方向（判不出对错），要么需要另外的构造器
- * （近洞口 / 开门净空 / 房间内外 …）—— 现在硬造就是拍脑袋。
- * 造不出来的**如实**进 `unresolved`，不假装造出来了。
+ * 哪些目标能做**确定性构造**（枚举摆法）。
+ *
+ * ── 分类纪律：priority 类永远不在这里 ──
+ *   `class: 'priority'` 的目标（动线优先 / 储物优先 / 通行优先）是**取舍方向**，
+ *   没有"位置"可言 —— 它们属于评分层（P9.4），不属于摆放枚举。
+ *   硬给它们造构造器 = 源码里说的"拍脑袋"。`storage-priority` 尤其容易误判：
+ *   储物量能算，但"够不够"取决于用户放什么，不是一个空间命题。
+ *
+ * ── 2026-10-20 补的两个（原本缺失，但都是纯确定性可判的）──
+ *   · `room-inside`  ：柜体必须完整落在房间回路内（`classifyCabRoom === 'inside'`）。
+ *                      这是**最基础的合法性约束** —— 柜子不该跑到墙外或隔壁房间。
+ *   · `near-opening` ：柜体不挡门窗洞口（`classifyCabOpening === 'clear'`）。
+ *                      `opening-clear` 是它的同义约束（都要"让开洞口"），共用同一判据。
+ *
+ * ── 仍然造不出来的（如实进 unresolved，不假装）──
+ *   · `door-swing-clear`：需要门扇开启扇形几何，而当前 `spatial/derive` **没有**这个事实。
+ *     要补就得先在 spatial 层引入扇形相交判定 —— 那是另一个阶段的事。
  */
-const CONSTRUCTIVE_GOALS: readonly DesignIntentGoal[] = ['wall-contact', 'standalone'];
+const CONSTRUCTIVE_GOALS: readonly DesignIntentGoal[] = [
+  'wall-contact',
+  'standalone',
+  'room-inside',
+  'near-opening',
+  'opening-clear',
+];
 
 /** 策略的人话（三档候选 A/B/C 的来源；顺序即优先级） */
 const STRATEGY_ZH: Record<string, string> = {
@@ -171,11 +190,33 @@ function cloneWithPlacements(project: Project, list: Array<{ targetId: string; r
 
 /**
  * 目标满足性 —— **只翻译既有事实，不新增判定**。
- *   wall-contact：柜体对任一面墙的关系是 `touching`（贴墙）→ 满足；
- *   standalone  ：柜体与任何其它柜体都没有接触（`deriveContacts` 为空）→ 满足；
+ *
+ *   wall-contact ：柜体对任一面墙的关系是 `touching`（贴墙）→ 满足；
+ *   standalone   ：柜体与任何其它柜体都没有接触（`deriveContacts` 为空）→ 满足；
+ *   room-inside  ：柜体 footprint **完整落在房间回路内**（`room === 'inside'`）→ 满足。
+ *                  'crossing'（压到墙上/跨出边界）与 'outside'（跑到屋外）都不算。
+ *                  'unknown'（房间回路不闭合/墙退化）同样不算 —— **判不出来就不给过**，
+ *                  这比"大概是好的就放行"安全。
+ *   near-opening ：柜体**不挡住**任何门窗洞口（所有 `openings` 关系都是 'clear'）→ 满足。
+ *                  洞口关系为 'unknown'（span 非法/墙退化）时**不算满足**，同上理由。
+ *   opening-clear：与 near-opening 同一判据（都要"让开洞口"）。
+ *
  *   其余目标本阶段不产生候选，这里一律 false（不会被问到）。
  */
-function satisfiesGoal(goal: DesignIntentGoal, cabId: string, facts: SpatialFacts, contacts: Contact[]): boolean {
+/**
+ * 导出仅供**验收**直接调用（不导出就没法测"判据本身"）。
+ *
+ * ── 为什么必须直接测它（2026-10-20 变异测试的教训）──
+ *   我原以为"端到端跑一遍候选生成"就能守住这个判据。实测发现**不能**：
+ *   `candidateSpots` 只枚举贴墙且不挡洞口的位置，所以把 satisfiesGoal 的
+ *   near-opening 分支改成恒 true，端到端测试**照样全绿** —— 因为生成器
+ *   根本不会产生"挡门"的候选，那个判据在端到端里从未被触发过。
+ *
+ *   这类"测试通过本身可错"正是项目 MEMORY 里记的坑。
+ *   所以判据必须**单独可测**：给一个已知 inside/outside、clear/overlap 的事实集，
+ *   直接断言它返回什么。
+ */
+export function satisfiesGoal(goal: DesignIntentGoal, cabId: string, facts: SpatialFacts, contacts: Contact[]): boolean {
   switch (goal) {
     case 'wall-contact': {
       const f = facts.cabinets.find((c) => c.cabId === cabId);
@@ -183,6 +224,19 @@ function satisfiesGoal(goal: DesignIntentGoal, cabId: string, facts: SpatialFact
     }
     case 'standalone':
       return !contacts.some((c) => c.a === cabId || c.b === cabId);
+    case 'room-inside': {
+      const f = facts.cabinets.find((c) => c.cabId === cabId);
+      return f?.room === 'inside';
+    }
+    case 'near-opening':
+    case 'opening-clear': {
+      const f = facts.cabinets.find((c) => c.cabId === cabId);
+      if (!f) return false;
+      // 没有任何洞口 ⇒ 约束自然满足（不挡任何东西）
+      if (f.openings.length === 0) return true;
+      // 全部 clear 才算满足；任何一个 overlap / unknown 都不算
+      return f.openings.every((o) => o.relation === 'clear');
+    }
     default:
       return false;
   }

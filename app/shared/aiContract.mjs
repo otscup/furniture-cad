@@ -676,6 +676,132 @@ export function validatePlannerRequest(raw) {
 }
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ *  设计意图请求（2026-10-20 新增）—— AI 表达"这份设计要以什么为目标"的唯一入口
+ *
+ *  ── 为什么是 request 而不是 action ──
+ *    与 candidateRequest / plannerRequest 同一条纪律：动作（ACTIONS）是"改模型"的，
+ *    每一跳都要过 CommandBus；设计意图**不改模型**（它只描述目标），
+ *    所以不该混进动作清单。动作清单仍然 28 条，一个字没变。
+ *
+ *  ── 铁律一：AI 提的意图只能是 candidate ──
+ *    makeCandidateIntent() 没有参数能造成 active（见 core/designIntent/model.ts）。
+ *    想生效只能走 confirmIntent() —— 那是**用户**的动作。
+ *    这条在 P9.2 就定死了，本入口只把已有通道打开，不放松任何约束。
+ *
+ *  ── 铁律二：请求里没有几何 ──
+ *    与另两个请求一致：不许 x / y / rotation / wallId。
+ *    "贴哪面墙""摆在哪"是系统落位决定，不是 AI 能拍板的。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+/**
+ * 设计目标词表 —— **契约层自带一份**，不从 core 反向 import。
+ *
+ * ── 为什么允许两份 ──
+ *   本文件是三方 import 的契约真源（server / src / verify 都引它），
+ *   而 core/designIntent/vocabulary.ts 是实现层。契约 import 实现 = 依赖倒置。
+ *
+ * ── 那怎么保证不漂移 ──
+ *   verify/design-intent-acceptance.ts 有一条断言：本数组与 DESIGN_INTENT_GOAL_ORDER
+ *   **逐项相同**。加了新目标忘了改这里，那条会红。
+ *   （与 issueCatalog 的"唯一真源"同一套纪律：允许镜像，但必须有断言钉住。）
+ */
+export const INTENT_GOAL_WORDS = [
+  'kitchen-workflow',
+  'storage-priority',
+  'circulation-priority',
+  'wall-contact',
+  'opening-clear',
+  'door-swing-clear',
+  'near-opening',
+  'standalone',
+  'room-inside',
+];
+
+export const INTENT_REQUEST_KEYS = ['goal', 'scope', 'openingKind', 'statement'];
+
+/** 明确点名拒收的"几何"键（白名单本就会挡，这里只为给更清楚的话术） */
+const INTENT_GEOMETRY_KEYS = new Set(['x', 'y', 'rotation', 'wallId', 'placement', 'geometry', 'coordinates']);
+
+/**
+ * 校验（并归一化）一个设计意图请求。白名单口径与其它请求完全一致。
+ *
+ * 只做**形状**：goal 认不认识、scope 形状对不对 —— 柜体/房间 id 存不存在
+ * 由调用方对着项目判（与 plannerRequest 同一分层口径）。
+ *
+ * @returns { ok: true, request } | { ok: false, code, error }
+ */
+export function validateIntentRequest(raw, options = {}) {
+  if (!isPlainObject(raw)) return { ok: false, code: 'NOT_OBJECT', error: '设计意图请求不是一个对象' };
+
+  const geo = Object.keys(raw).filter((k) => INTENT_GEOMETRY_KEYS.has(k));
+  if (geo.length > 0) {
+    return {
+      ok: false,
+      code: 'GEOMETRY_FORBIDDEN',
+      error: `设计意图请求不许带几何字段：${geo.join('、')} —— 你只能表达"要什么目标"，摆法由系统算`,
+    };
+  }
+  const extra = Object.keys(raw).filter((k) => !INTENT_REQUEST_KEYS.includes(k));
+  if (extra.length > 0) {
+    return { ok: false, code: 'EXTRA_KEY', error: `设计意图请求里出现了契约外的字段：${extra.join('、')}` };
+  }
+
+  const goal = raw.goal;
+  if (typeof goal !== 'string' || !goal) {
+    return { ok: false, code: 'BAD_GOAL', error: '设计意图请求缺少 goal（目标词）' };
+  }
+  const allowed = Array.isArray(options.allowedGoals) && options.allowedGoals.length > 0
+    ? options.allowedGoals
+    : INTENT_GOAL_WORDS;
+  if (!allowed.includes(goal)) {
+    return {
+      ok: false,
+      code: 'UNKNOWN_GOAL',
+      error: `目标词「${goal}」不在词表里。合法值：${allowed.join(' | ')}`,
+    };
+  }
+
+  const out = { goal };
+
+  const scope = raw.scope;
+  if (!isPlainObject(scope)) {
+    return { ok: false, code: 'BAD_SCOPE', error: 'scope 必须是对象：{ kind:"cabinet", cabinetId } 或 { kind:"room", roomId }' };
+  }
+  const scopeExtra = Object.keys(scope).filter((k) => !['kind', 'cabinetId', 'roomId'].includes(k));
+  if (scopeExtra.length > 0) {
+    return { ok: false, code: 'EXTRA_KEY', error: `scope 里出现了契约外的字段：${scopeExtra.join('、')}` };
+  }
+  if (scope.kind === 'cabinet') {
+    if (typeof scope.cabinetId !== 'string' || !scope.cabinetId) {
+      return { ok: false, code: 'BAD_SCOPE', error: 'scope.kind="cabinet" 时必须给 cabinetId（柜体 id）' };
+    }
+    out.scope = { kind: 'cabinet', cabinetId: scope.cabinetId };
+  } else if (scope.kind === 'room') {
+    if (typeof scope.roomId !== 'string' || !scope.roomId) {
+      return { ok: false, code: 'BAD_SCOPE', error: 'scope.kind="room" 时必须给 roomId（房间 id）' };
+    }
+    out.scope = { kind: 'room', roomId: scope.roomId };
+  } else {
+    return { ok: false, code: 'BAD_SCOPE', error: `scope.kind 只允许 "cabinet" 或 "room"，收到 "${String(scope.kind)}"` };
+  }
+
+  if (raw.openingKind !== undefined) {
+    if (raw.openingKind !== 'door' && raw.openingKind !== 'window') {
+      return { ok: false, code: 'BAD_OPENING_KIND', error: `openingKind 只允许 "door" 或 "window"，收到 "${String(raw.openingKind)}"` };
+    }
+    out.openingKind = raw.openingKind;
+  }
+  if (raw.statement !== undefined) {
+    if (typeof raw.statement !== 'string' || raw.statement.length > MAX_STRING) {
+      return { ok: false, code: 'BAD_STATEMENT', error: `statement 必须是 ${MAX_STRING} 字以内的字符串` };
+    }
+    out.statement = raw.statement;
+  }
+  return { ok: true, request: out };
+}
+
+/**
  * 部件词汇表（闭合，Task #25 A3）—— 来自 core/geometry/pickLines.ts 的 CabinetPart。
  * AI 只允许用清单里的部件名指"图上那条线"；写别的一律整条拒收。
  */
@@ -1117,10 +1243,107 @@ export function validatePlan(raw, ctx = {}) {
  * 模型就会去猜一个不存在的动作名，然后被拒收 —— 而"AI 老是做错事"
  * 这种印象一旦形成，人就不会再用了。生成保证了不可能漂移。
  */
-export function buildSystemPrompt() {
+/**
+ * 系统提示词。
+ *
+ * @param {object} [options]
+ * @param {Array<{nl:string, tags?:string[]}>} [options.projectRules]
+ *   **本项目的既定约定**（来自 `memory/corrections.jsonl` 里 status=active 的条目）。
+ *
+ *   ── 为什么必须注入（2026-10-21）──
+ *     这个系统早就有"纠正记忆"机制：管理后台可编辑、`memoryStore` 有投影、
+ *     `currentKnowledge()` 也汇总好了 —— 但它**从来没传给 LLM**。
+ *     `aiContract.mjs` 里 "correction" 一词出现 0 次。
+ *     也就是说：用户在管理后台写的每一条纠正（"面板整板不拆""侧板就是 1 块"）
+ *     AI **完全看不到**，每次都得在对话里重新说一遍。
+ *
+ *   ── 为什么放在系统提示的**最前面一段**而不是末尾 ──
+ *     这些是**既定事实**，不是补充说明。放在前面能让模型在读动作清单之前
+ *     就带上这个上下文；放在末尾容易被长清单冲淡。
+ *
+ *   ── 为什么只收 nl + tags，不收整个 Correction ──
+ *     契约文件是三方 import 的真源（server / src / verify），不该依赖
+ *     `src/ai/memory.ts` 的类型。只取"要念给模型听的那句话"就够了。
+ */
+/**
+ * ── 提示词裁剪（2026-10-21）──
+ *
+ * 问题：buildSystemPrompt 原本每次都把 **28 条动作**的完整参数说明全发，
+ *      实测 9731 字符。而 Agent 每建一个柜要调 5-6 次模型，每次全量发一遍 ⇒
+ *      单柜建柜 33.9 秒，其中相当一部分是重复传输与处理这 9700 字。
+ *
+ * 做法：**按用户这句话猜它需要哪几族动作**，只详细列那几族的参数，
+ *      其余族只列一行标题（名字 + 简短 label）。
+ *
+ * ── 为什么保留「其余族的一行标题」而不是彻底删掉 ──
+ *   彻底删掉会让模型**不知道这个能力存在**，于是明明能做也说"做不到"。
+ *   保留一行标题既省 token，又让模型知道"还能做这些"。
+ *
+ * ── 保守原则：认不出来就全量发 ──
+ *   裁剪的前提是"猜对了"。猜错会让模型用错参数甚至拒绝执行。
+ *   所以没有明确线索时**一律全量** —— 宁可慢，不能因为省 token 而答错。
+ */
+const ACTION_FAMILIES = {
+  create: ['cabinet.create', 'cabinet.duplicate', 'cabinet.delete'],
+  geometry: ['cabinet.resize', 'cabinet.setWidthMode', 'cabinet.setBodyLift', 'cabinet.move', 'cabinet.nudge', 'cabinet.rotate', 'cabinet.place'],
+  units: ['cabinet.addUnit', 'cabinet.removeUnit', 'cabinet.setUnitWidth', 'cabinet.setUnitParam', 'cabinet.renameUnit'],
+  naming: ['cabinet.rename', 'project.rename'],
+  material: ['cabinet.setBoardMaterial', 'cabinet.setBackMaterial'],
+  assembly: ['assembly.create', 'assembly.delete'],
+};
+
+/** 用户这句话命中哪些族。命中越少越保守（少于 1 族 ⇒ 返回 null 表示全量）。 */
+function detectActionFamilies(text) {
+  const hay = String(text ?? '');
+  if (!hay.trim()) return null;
+  const hit = new Set();
+  // 建柜 / 加柜 / 再来一个
+  if (/(建|新建|加|添加|再来|复制|删掉|删除|去掉)/.test(hay)) hit.add('create');
+  // 尺寸 / 位置
+  if (/(宽|高|深|尺寸|大小|挪|移|旋转|转一下|贴|靠墙|对齐|位置|踢脚|离地)/.test(hay)) hit.add('geometry');
+  // 分区 / 格子
+  if (/(分区|格子|层板|抽屉|挂衣|隔板|门|格)/.test(hay)) hit.add('units');
+  // 改名
+  if (/(改名|重命名|叫|名字)/.test(hay)) hit.add('naming');
+  // 材质
+  if (/(材质|板材|背板|板子)/.test(hay)) hit.add('material');
+  // 组合
+  if (/(组合|柜组|拼|一排|整组|成组)/.test(hay)) hit.add('assembly');
+  /**
+   * 只有**恰好命中 1~2 族**才裁剪。命 3 族以上说明这句话涉及面很广，
+   * 裁剪省不下多少、猜错风险却变大 —— 直接全量。
+   */
+  if (hit.size === 0 || hit.size > 2) return null;
+  return hit;
+}
+export function buildSystemPrompt(options = {}) {
+  const projectRules = Array.isArray(options.projectRules) ? options.projectRules : [];
   const lines = [];
   lines.push('你是一个定制家具设计系统的**命令规划器**。你的唯一输出是一段 JSON。');
   lines.push('');
+  /**
+   * 本项目的既定约定（来自管理后台的纠正记忆）。
+   *
+   * ★ 必须先**过滤出真有内容的条目**，再用"过滤后是否为空"决定要不要输出标题。
+   *   原来写的是 `if (projectRules.length > 0)` —— 数组非空但条目全是空白时，
+   *   会留下一段只有标题、没有任何条目的空壳。那比"没这段"更糟：
+   *   模型会读到"本项目的既定约定："然后发现下面什么都没有，
+   *   容易理解成"这个项目没有约定"（而事实是"有约定但没写清"）。
+   *   验收 correction-prompt-acceptance 的第 2 节就是钉这个。
+   */
+  const ruleLines = [];
+  for (const rule of Array.isArray(projectRules) ? projectRules.slice(0, 30) : []) {
+    const text = String(rule?.nl ?? '').trim();
+    if (!text) continue;
+    const tags = Array.isArray(rule?.tags) && rule.tags.length > 0 ? `（${rule.tags.join('/')}）` : '';
+    ruleLines.push(`- ${text}${tags}`);
+  }
+  if (ruleLines.length > 0) {
+    lines.push('【本项目的既定约定】');
+    lines.push('下面这些是这个项目**已经确认过**的做法（来自管理后台的纠正记录）。它们优先于你的通用常识：');
+    lines.push(...ruleLines);
+    lines.push('');
+  }
   lines.push('绝对规则（违反任何一条，你的输出会被程序直接丢弃）：');
   lines.push('1. 你**不能**输出几何：不能给坐标、点、线段、板件清单、图元。板件的裁切尺寸由系统的参数化模型推导，与你无关。');
   lines.push('2. 你**不能**修改工厂规则集：板材幅面、封边标准、五金型号、工艺上限都来自工厂规则文件，只读。');
@@ -1141,12 +1364,37 @@ export function buildSystemPrompt() {
   lines.push('输出格式（严格的 JSON，不要 markdown 代码围栏）：');
   lines.push('{ "reply": "给用户看的中文说明，一两句", "actions": [ { "action": "动作名", "target": { "cabinetName": "柜体名字" }, "params": { ... }, "reason": "为什么这么做" } ] }');
   lines.push('');
-  lines.push(`动作清单（共 ${ACTION_NAMES.length} 个）：`);
+  /**
+   * ── 按意图裁剪动作清单 ──
+   *
+   * `opts.focusText` 是用户这一句话（调用方传进来的）。命中的族详细展开，
+   * 未命中的族只给一行标题。`detectActionFamilies` 返回 null 时全量发（保守兜底）。
+   *
+   * 为什么传的是"用户原话"而不是"快照"：裁剪要判的是**这次想干什么**，
+   * 而快照描述的是"现在有什么" —— 两者无关。
+   */
+  const focusedFamilies = detectActionFamilies(options.focusText);
+  /** 命中族包含的动作名集合；null = 全部展开 */
+  const detailed = focusedFamilies
+    ? new Set([...focusedFamilies].flatMap((f) => ACTION_FAMILIES[f] ?? []))
+    : null;
+  const trimmedCount = detailed ? ACTION_NAMES.filter((n) => !detailed.has(n)).length : 0;
+  lines.push(
+    detailed
+      ? `动作清单（共 ${ACTION_NAMES.length} 个；本次详细列出 ${detailed.size} 个，其余 ${trimmedCount} 个只列名字 —— 需要时也**可以**用，参数形状与名字同名同义）：`
+      : `动作清单（共 ${ACTION_NAMES.length} 个）：`
+  );
   for (const [name, spec] of Object.entries(ACTIONS)) {
-    const ps = Object.entries(spec.params ?? {}).map(([k, p]) => describeParam(k, p, spec));
     const req = (spec.required ?? []).length ? `【必填 ${spec.required.join(', ')}】` : '';
     const atl = spec.atLeastOne ? `【至少给一个 ${spec.atLeastOne.join('/')}】` : '';
-    const danger = spec.dangerous ? '【破坏性，仅当用户明确要求才可用】' : '';
+    const danger = spec.dangerous ? `【破坏性，仅当用户明确要求才可用】` : '';
+    const isDetailed = !detailed || detailed.has(name);
+    if (!isDetailed) {
+      // 裁剪掉参数说明，但保留"这个能力存在" —— 否则模型会声称做不到
+      lines.push(`- ${name} —— ${spec.label}${req}${atl}${danger}`);
+      continue;
+    }
+    const ps = Object.entries(spec.params ?? {}).map(([k, p]) => describeParam(k, p, spec));
     lines.push(`- ${name} —— ${spec.label}${req}${atl}${danger}`);
     if (ps.length) lines.push(`    参数：${ps.join('；')}`);
     if (spec.detail) lines.push(`    说明：${spec.detail}`);
@@ -1279,6 +1527,36 @@ export function buildUserMessage(text, snapshot, history = []) {
       '**绝对不要给** x / y / rotation / polygon / placement，也**不要给 wallId**（"贴哪面墙"是系统的落位决定，不是你能拍板的）——' +
       '坐标一律由系统的确定性落位引擎算。系统据此枚举候选并给出确定性评分；' +
       '**候选不会被自动采用**，你也**不要**替用户挑一个"推荐方案"：你只负责把需求组织成规划目标。'
+  );
+  /**
+   * 设计意图请求的读法（2026-10-20 新增）。
+   *
+   * ── 为什么现在才说"你可以提" ──
+   *   上一版这里写的是"**这一轮你不能新增或修改设计意图**（目前没有这条通道，写了也不会生效）"。
+   *   那是因为当时确实没有入口 —— 说了"你可以提"而实际丢弃，就是契约铁律禁止的"静默忽略"。
+   *   现在通道开了（validateIntentRequest → makeCandidateIntent），所以可以如实告诉模型。
+   *
+   * ── 仍然必须说清的三件事 ──
+   *  ① 只能进 candidate，**不会自动生效**，必须用户确认 —— 不说清，模型会以为说完就落地了；
+   *  ② 不许给几何 —— 与另两个请求同一条铁律；
+   *  ③ 目标是"取舍方向"时（priority 类）没有摆放构造器，提了也不会产生候选 ——
+   *     不说清，模型会反复提"storage-priority"然后抱怨系统没反应。
+   */
+  lines.push(
+    '如果用户表达的是**设计方向**（"这个厨房要动线顺手""柜子要靠窗""别挡门""柜子别跑到屋外去"），' +
+      '你可以额外输出一个 `intentRequest`：`{ goal, scope, openingKind?, statement? }`。' +
+      '`goal` 只能从这些词里选：' + INTENT_GOAL_WORDS.join(' | ') + '。' +
+      '`scope` 是 `{ kind:"cabinet", cabinetId }` 或 `{ kind:"room", roomId }`（只给 id）。' +
+      '**绝对不要给** x / y / rotation / wallId —— 摆法由系统算。'
+  );
+  lines.push(
+    '关于 intentRequest 的三条纪律：① 你提的意图只会进 **candidate（待确认）** 状态，' +
+      '**不会自动生效** —— 必须用户在界面上确认才变成 active，系统会自动弹确认；' +
+      '② 目前 `room-inside`（柜体别跑到屋外/墙外）、`near-opening` / `opening-clear`（别挡门窗洞口）、' +
+      '`wall-contact`、`standalone` 这五个**能真的枚举出候选摆法**；' +
+      '`door-swing-clear` 与 `kitchen-workflow` / `storage-priority` / `circulation-priority` 暂时**没有构造器**，' +
+      '提了只会进 unresolved 并如实告诉你"这个目标本阶段不产生候选" —— 别再重复提同一个。' +
+      '③ 用户如果只是让你"建个柜子"，不需要提意图；意图是**方向性诉求**才用。'
   );
   lines.push('');
   lines.push('【用户这一句要求】');
@@ -1601,7 +1879,15 @@ export function buildDesignSystemPrompt() {
 }
 
 export function buildDesignRequest(model, text, snapshot, opts = {}) {
-  const sys = buildDesignSystemPrompt();
+  /**
+   * 设计方案通道同样要带既定约定 —— 与规划通道同源（activeProjectRules()）。
+   * 不带给它，就会出现"规划时知道面板不拆、出方案时又忘了"的割裂。
+   */
+  const rulesBlock = Array.isArray(opts.projectRules) && opts.projectRules.length > 0
+    ? '\n\n【本项目的既定约定】（来自管理后台的纠正记录，优先于通用常识）\n' +
+      opts.projectRules.slice(0, 30).map((r) => '- ' + String(r?.nl ?? '').trim()).filter((x) => x !== '- ').join('\n')
+    : '';
+  const sys = buildDesignSystemPrompt() + rulesBlock;
   // P6：知识摘要作为 system prompt 附加段 —— AI 只把它当参考，产出仍是
   // DesignProposal，仍走 validateProposal → dryRun → 确认 → CommandBus。
   const knowledge = typeof opts.knowledgeDigest === 'string' ? opts.knowledgeDigest.trim() : '';
@@ -1621,7 +1907,19 @@ export function buildChatRequest(model, text, snapshot, opts = {}) {
   return {
     model,
     messages: [
-      { role: 'system', content: buildSystemPrompt() },
+      /**
+       * `projectRules` 由调用方从 `memory/corrections.jsonl` 的 active 条目取来。
+       * 不在这里直接读文件：契约文件是三方 import 的纯函数真源，
+       * 读写文件会让它变成"有副作用的模块"，验收与浏览器环境都会难测。
+       */
+      { role: 'system', content: buildSystemPrompt({
+        projectRules: opts.projectRules ?? [],
+        /**
+         * 用户原话 —— 用来判断"这次要用哪几族动作"，从而裁剪动作清单。
+         * 不传就是全量（保守兜底，与 detectActionFamilies 返回 null 同一口径）。
+         */
+        focusText: text,
+      }) },
       { role: 'user', content: buildUserMessage(text, snapshot, opts.history ?? []) },
     ],
     temperature: opts.temperature ?? 0.1,

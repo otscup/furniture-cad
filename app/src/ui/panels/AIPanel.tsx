@@ -23,6 +23,7 @@ import { CandidateComparePanel } from './candidateCompare.tsx';
 import { resolveSelection, type StoredCandidateSelection } from './candidateCompareLogic.ts';
 import { candidateKey } from '../../core/candidateLayout/generate.ts';
 import { planCandidates, type PlannerPlan } from '../../core/planner/index.ts';
+import { makeCandidateIntent, confirmIntent } from '../../core/designIntent/index.ts';
 import { compiledRules } from '../../state/memoryStore.ts';
 import { currentKnowledge } from '../../ai/knowledge/index.ts';
 import { Pill, Row, Section, Text } from './common.tsx';
@@ -197,6 +198,25 @@ interface PlanBundle {
   err: string;
   lastApply: string;
   run: PlanRun | null;
+  /**
+   * AI 提的**待确认设计意图**（2026-10-20）。
+   *
+   * ── 为什么它要一路走到界面上 ──
+   *   提示词早就告诉模型"你可以提 intentRequest"，而链路曾经只读 reply/actions。
+   *   模型写了、用户以为生效了、实际蒸发 —— 这正是契约铁律禁止的"静默忽略"。
+   *
+   * ── 它是"待确认"，不是"已生效" ──
+   *   AI 只能产生 candidate（makeCandidateIntent 没有参数能造 active）。
+   *   必须在界面上由用户点「确认」才走 confirmIntent() 升级为 active。
+   */
+  intentRequest: {
+    goal: string;
+    scope: { kind: 'cabinet'; cabinetId: string } | { kind: 'room'; roomId: string };
+    openingKind?: 'door' | 'window';
+    statement?: string;
+  } | null;
+  /** 意图请求被契约拒绝的原因（带坐标 / 未知目标词 / 坏 scope）—— 必须显示，否则用户只看到"AI 没反应" */
+  intentRequestError: { code: string; error: string } | null;
 }
 
 /**
@@ -250,6 +270,8 @@ const EMPTY_PLAN: PlanBundle = {
   err: '',
   lastApply: '',
   run: null,
+  intentRequest: null,
+  intentRequestError: null,
 };
 
 const EMPTY_DESIGN: DesignBundle = {
@@ -775,6 +797,19 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
       if (agentDraftIds(agentTurn.agentSteps).length > 0) {
         window.dispatchEvent(new Event('furniture:server-drafts-updated'));
       }
+      /**
+       * ── 接住 AI 提的设计意图（2026-10-20）──
+       *
+       * 服务端已经过 validateIntentRequest（形状/词表/几何三条闸），
+       * 这里只负责**显示**并等用户确认 —— 绝不自动生效。
+       * 同时把"被拒的原因"也存下来：模型写了但被拒，用户要能看到为什么。
+       */
+      if (j.intentRequest || j.intentRequestError) {
+        setPlan({
+          intentRequest: j.intentRequest ?? null,
+          intentRequestError: j.intentRequestError ?? null,
+        });
+      }
       setConvo({ chat: [...next, agentTurn] });
     } catch (e) {
       const errTurn: Turn = {
@@ -1013,6 +1048,45 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
    * （确定性枚举 + 确定性评分），把 `PlannerPlan` 交给 `CandidateComparePanel` 消费。
    * 不调 AI、不改模型、不写盘。
    */
+  /**
+   * ── 确认 / 否掉 AI 提的设计意图（2026-10-20）──
+   *
+   * 这是 AI 意图**唯一**能生效的路径：AI 只能产 candidate，
+   * 必须用户在这里点一下才走 confirmIntent() 升级成 active。
+   * 确认后立即触发一次候选枚举，让用户看到"这个目标能摆成哪几种"。
+   */
+  const confirmAiIntent = useCallback(() => {
+    const req = plan.intentRequest;
+    if (!req || props.readOnly) return;
+    try {
+      const state = bus.getState();
+      const taken = new Set((state.designIntents ?? []).map((i) => i.id));
+      const intent = makeCandidateIntent({
+        goal: req.goal as never,
+        scope: req.scope as never,
+        ...(req.openingKind ? { openingKind: req.openingKind } : {}),
+        ...(req.statement ? { statement: req.statement } : {}),
+        detail: `AI 从对话中推断（${req.statement ?? req.goal}）`,
+        taken,
+      });
+      // ① 先落成 candidate（绝不直接 active）
+      const withCandidate = [...(state.designIntents ?? []), intent];
+      const confirmed = confirmIntent(withCandidate, intent.id);
+      // ② 写回模型：走 replaceProject 这一条既有写入口
+      bus.replaceProject({ ...state, designIntents: confirmed }, `确认 AI 提出的设计目标：${req.goal}`);
+      setPlan({ intentRequest: null, intentRequestError: null });
+      props.onToast?.('ok', `已确认设计目标「${req.goal}」，正在枚举候选摆法…`);
+      // ③ 立刻跑一次候选枚举，让用户看到结果（不自动采用任何候选）
+      window.setTimeout(() => generateCompare(), 0);
+    } catch (e) {
+      props.onToast?.('error', `确认意图失败：${e instanceof Error ? e.message : e}`);
+    }
+  }, [bus, plan.intentRequest, props, setPlan]);
+
+  const dismissAiIntent = useCallback(() => {
+    setPlan({ intentRequest: null, intentRequestError: null });
+  }, [setPlan]);
+
   const generateCompare = useCallback(() => {
     if (busy) return;
     setBusyKind('plan');
@@ -1697,6 +1771,60 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
           </Row>
         ) : null}
       </Section>
+
+      {/* ═══════════════ AI 提出的设计意图（待确认）═══════════════
+           ★ 提示词从 P9.3 起就允许模型提 intentRequest，但链路曾经只读 reply/actions，
+             模型写了、用户以为生效了、实际蒸发。这一块是那条通道在界面上的落点。
+             纪律：AI 只能让意图进 candidate，必须用户在这里点头才生效。 */}
+      {plan.intentRequestError ? (
+        <Section title="AI 提了一个设计目标，但不符合契约" defaultOpen>
+          <div className="alert alert-error">
+            {plan.intentRequestError.error}
+          </div>
+          <p className="note">
+            （AI 想表达一个设计方向，但契约不允许 —— 这是系统挡住了它，不是 AI 没反应。
+            你可以换个说法，例如"让柜子别跑到屋外去"。）
+          </p>
+        </Section>
+      ) : null}
+
+      {plan.intentRequest ? (
+        <Section title="AI 想确立一个设计目标（等你确认）" defaultOpen>
+          <Row label="目标" derived hint="AI 从你的话里推断出的设计方向">
+            <Text mono>{plan.intentRequest.goal}</Text>
+          </Row>
+          <Row label="作用对象" derived hint="这个目标管的是哪只柜 / 哪个房间">
+            <Text mono>
+              {plan.intentRequest.scope.kind === 'cabinet'
+                ? `柜体 ${(plan.intentRequest.scope as { cabinetId: string }).cabinetId}`
+                : `房间 ${(plan.intentRequest.scope as { roomId: string }).roomId}`}
+            </Text>
+          </Row>
+          {plan.intentRequest.statement ? (
+            <Row label="AI 的理解" derived>
+              <Text>{plan.intentRequest.statement}</Text>
+            </Row>
+          ) : null}
+          <p className="note">
+            确认后系统会把这个目标写进模型（状态变为 active），并立即枚举几种满足它的摆法给你预览。
+            <strong>不会自动改动任何柜体</strong> —— 你还要在候选里自己挑一份。
+          </p>
+          <div className="btn-row">
+            <button
+              type="button"
+              className="tb-btn primary small"
+              data-testid="ai-confirm-intent"
+              disabled={props.readOnly}
+              onClick={() => confirmAiIntent()}
+            >
+              确认这个目标
+            </button>
+            <button type="button" className="tb-btn small" data-testid="ai-dismiss-intent" onClick={() => dismissAiIntent()}>
+              不用了
+            </button>
+          </div>
+        </Section>
+      ) : null}
 
       {/* ═══════════════ 计划：失败 / 说明 / 干跑预览 ═══════════════ */}
       {plan.err ? (

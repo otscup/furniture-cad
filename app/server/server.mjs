@@ -206,6 +206,7 @@ function detectFamiliesFor(text) {
  * @param {object} env readEnv() 的结果
  * @returns {number}
 
+ */
 // ── 导出链路的外部程序 ──
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
@@ -2639,7 +2640,28 @@ async function handleApi(req, res, pathname) {
      *
      *   优先级：body.model（前端显式指定）> AI_VISION_MODEL > AI_MODEL。
      */
+    /**
+     * ★ 视觉端点必须用**能看图**的模型（2026-10-22）。
+     *
+     *   实测：deepseek-v4.1-flash 发图后 usage 里 image_tokens = 0
+     *   ⇒ 它**根本不看图**，会对着输入瞎猜
+     *   （「这是 SVG 源码文本，不是效果图」）。
+     *   所以视觉走独立配置 AI_VISION_MODEL，缺省时回落到 AI_MODEL。
+     *
+     *   ★ 回落时若命中「已知不看图」的模型，要**明说**——
+     *   否则用户看到的是「识图功能坏了」却没有任何提示。
+     */
     const model = body.model || env.AI_VISION_MODEL || env.AI_MODEL || s.model;
+    /**
+     * ★ 诚实提示：模型不看图时，识图结果毫无意义。
+     *
+     *   实测 deepseek-v4.1-flash 的 image_tokens 恒为 0 ——
+     *   它会对输入乱猜（把 SVG 源码当图片描述）。
+     *   这时候必须让用户知道「你看到的识别结果不可信」，
+     *   而不是给一份看起来很专业的假结果。
+     */
+    const visionSeesImages = !/deepseek|flash-lite$/i.test(model) || true; // 运行时按 usage 判断
+    const visionFallback = !body.model && !env.AI_VISION_MODEL;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
     const multiImages = Array.isArray(body.images)
       ? body.images.filter((img) => img && typeof img.dataUrl === 'string' && img.dataUrl)
@@ -2797,11 +2819,28 @@ async function handleApi(req, res, pathname) {
           generation: true,
         });
       }
+      // ★★ 诚实告警：模型没看图 ⇒ 识别结果毫无意义 ★★
+      //
+      //   实测 deepseek-v4.1-flash 发图后 usage 里 image_tokens = 0
+      //   ⇒ 它**根本不看图**，只是对着输入瞎猜
+      //   （实测它会说「这是 SVG 源码文本，不是效果图」）。
+      //
+      //   这时候给一份看起来很专业的识别结果，是**最坏的一种错**——
+      //   用户会照着它建模，出来的柜子跟原图毫无关系。
+      //   所以必须把「模型没看图」这件事**明说**。
+      // ★ 只有网关**明确报了** image_tokens = 0 才算「模型没看图」。
+      //   实测有些网关（如 gpt-load 走 sensenova）**根本不报**这个字段 ——
+      //   那时 image_tokens 是 undefined，**不能**当成 0（会冤枉一个其实看了图的模型）。
+      //   undefined ⇒ 无法判定 ⇒ 不报警，只在启动信息里提示过配置。
+      const imageTokensRaw = usage?.prompt_tokens_details?.image_tokens;
+      const sawNoImage = imageTokensRaw !== undefined && Number(imageTokensRaw) === 0;
+
       return json(res, 200, {
         ok: true,
         result: parsed,
         model: data?.model ?? model,
         usage,
+        sawNoImage,
         ms: Date.now() - t0,
         quota: gate.account ? quotaView(gate.account.plan, gate.account.usage) : undefined,
       });
@@ -3571,6 +3610,13 @@ server.listen(PORT, HOST, () => {
   console.log(`  配置文件  ${ENV_PATH}${existsSync(ENV_PATH) ? '' : '  ← 还不存在，保存设置时会自动创建'}`);
   console.log(`  API Key   ${env.AI_API_KEY ? maskKey(env.AI_API_KEY) : '（未配置）'}`);
   console.log(`  模型      ${env.AI_MODEL || '（未配置）'}`);
+  // ★ 视觉模型单列（2026-10-22）——
+  //   实测 deepseek-v4.1-flash 发图后 usage 里 image_tokens = 0 ⇒ 它**根本不看图**，
+  //   会对源码文本胡说（"这不是效果图，是 SVG 源码"）。
+  //   所以视觉必须用另一个模型，否则功能看着在、实际是坏的。
+  const visionModel = env.AI_VISION_MODEL || env.AI_MODEL || '';
+  const visionSame = !env.AI_VISION_MODEL || visionModel === env.AI_MODEL;
+  console.log(`  视觉模型  ${visionModel || '（未配置）'}${visionSame ? '  ← 与文本模型相同，若该模型不支持图片则识图不可用' : ''}`);
   console.log(`  记忆文件  ${MEM_PATH}`);
   console.log(`  账号库    ${ACCOUNTS_PATH}`);
   console.log(`  审计日志  ${AUDIT_PATH}`);

@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { csvCell } from './csvCell.mjs';
+import { resolvePythonExe } from './pythonExe.mjs';
 import { findDuplicateUnitIds } from '../src/core/unitIdentity.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -126,17 +127,16 @@ function runBuffer(cmd, args, opts = {}) {
  * 不许"假装导出成功"。
  */
 function pythonExe() {
-  const cand = [
-    process.env.APP_PYTHON,
-    join(ROOT, '.venv', 'Scripts', 'python.exe'),
-    join(ROOT, '..', '.venv', 'Scripts', 'python.exe'),
-    join(ROOT, '..', '.venv', 'bin', 'python'),
-    'python3',
-    'python',
-  ]
-    .filter(Boolean)
-    .filter((c) => (c.includes('/') || c.includes('\\') ? existsSync(c) : true));
-  return cand[0] ?? 'python';
+  const py = resolvePythonExe(ROOT);
+  if (!py) {
+    throw new Error(
+      '找不到可用的 Python 解释器。导出 DXF/PDF 需要 Python + ezdxf。安装方法：\n' +
+      '  python -m venv .venv  &&  .venv/Scripts/pip install ezdxf   （Windows）\n' +
+      '  python3 -m venv .venv && .venv/bin/pip install ezdxf        （macOS/Linux）\n' +
+      '或设置环境变量 APP_PYTHON 指向解释器的绝对路径。'
+    );
+  }
+  return py;
 }
 
 /**

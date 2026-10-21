@@ -48,6 +48,15 @@ export async function openWorkspace(opts) {
     onEvent = () => {},
     onDraftChange = null,
     onWorkspaceChange = null,
+    /**
+     * ── allowCreate（2026-10-20 审计 M1）──
+     *   默认 true：首次使用应该有一份可用工作区。
+     *   但**未鉴权的调用方**（例如 /api/health 在 PUBLIC_API 里）必须传 false ——
+     *   否则一个匿名请求就能在磁盘上凭空创建 workspaces/local-open/workspace.json。
+     *   传 false 且文件不存在时，不新建、也不报"装载失败"，而是返回
+     *   `{ok:false, absent:true}` 让调用方如实说"还没有工作区"。
+     */
+    allowCreate = true,
   } = opts;
   const fileSystem = opts.fileSystemAdapter
     ?? globalThis[Symbol.for('furniture-cad.workspaceFileSystemAdapter')]
@@ -135,6 +144,10 @@ export async function openWorkspace(opts) {
       .map((f) => ({ draftId: f.replace(/\.json$/, ''), content: fileSystem.readFileSync(join(draftsDir, f), 'utf8') }));
   };
   const draftIO = { persistDraft, loadDrafts, quarantineDraft, projectHash: hashProjectSnapshot };
+
+  if (!existsSync(filePath) && allowCreate === false) {
+    return { ok: false, absent: true, error: '还没有工作区（尚未创建）', filePath };
+  }
 
   if (existsSync(filePath)) {
     try {

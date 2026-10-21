@@ -53,6 +53,23 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 小时
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000;
+/**
+ * 每个账号保留多少个"来源"的失败计数桶（2026-10-20 审计 P1-4）。
+ * 锁定按 (账号, 来源) 维度生效，来源默认是客户端 IP；
+ * 上限防止恶意来源刷爆 accounts.json。
+ */
+const LOGIN_MAX_SOURCES = 32;
+
+/**
+ * 把一次登录请求归一化成"来源"标识。
+ * 默认用 IP（审计里本来就有）；没有 IP 时退化成固定桶，
+ * 保证"没有 IP 信息"也不会退化成账号级锁定。
+ */
+function loginSource(meta = {}) {
+  const ip = String(meta.ip ?? '').trim();
+  if (ip) return ip.slice(0, 64);
+  return 'no-ip';
+}
 const SCRYPT_KEYLEN = 64;
 /** scrypt 代价参数。写在这里、并且**记进哈希串**里 —— 见 hashPassword 的说明 */
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
@@ -359,6 +376,30 @@ export class AuthStore {  /**
   // ───────────────────────── 登录 / 会话 ─────────────────────────
 
   /**
+   * 取（或创建）某账号某来源的失败计数桶。
+   * 存储形状：account.loginFailures = { "<source>": { failedAttempts:[], lockedUntil:null } }
+   * 只保留最近有活动的若干个来源，防止无限增长。
+   */
+  #failureBucket(a, source, now) {
+    if (!a.loginFailures || typeof a.loginFailures !== 'object') a.loginFailures = {};
+    const key = String(source ?? 'unknown');
+    const cur = a.loginFailures[key];
+    if (cur && typeof cur === 'object') return cur;
+    // 清理：丢掉已过期的桶与超出容量的最旧条目
+    const keys = Object.keys(a.loginFailures);
+    if (keys.length >= LOGIN_MAX_SOURCES) {
+      const alive = keys.filter((k) => {
+        const b = a.loginFailures[k];
+        return b && b.lockedUntil && new Date(b.lockedUntil).getTime() > now;
+      });
+      a.loginFailures = Object.fromEntries(alive.slice(-(LOGIN_MAX_SOURCES - 1)).map((k) => [k, a.loginFailures[k]]));
+    }
+    const bucket = { failedAttempts: [], lockedUntil: null };
+    a.loginFailures[key] = bucket;
+    return bucket;
+  }
+
+  /**
    * 登录。
    *
    * 失败一律回同一个错误文案（"用户名或口令不正确"），不区分
@@ -372,34 +413,50 @@ export class AuthStore {  /**
       this.audit({ actor: null, action: 'auth.login', username: String(username ?? '').slice(0, 64), result: 'no_such_user', ip: meta.ip });
       return { ok: false, error: '用户名或口令不正确', code: 'BAD_CREDENTIALS' };
     }
-    if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) {
-      const left = Math.ceil((new Date(a.lockedUntil).getTime() - now) / 1000);
-      this.audit({ actor: a.id, action: 'auth.login', result: 'locked', ip: meta.ip });
-      return { ok: false, error: `账号已锁定，请 ${left} 秒后再试`, code: 'LOCKED' };
+    /**
+     * ── 锁定必须是「按 (账号, 来源) 维度」，不能是账号级（2026-10-20 审计 P1-4）──
+     *
+     * 历史缺陷：任何人只要知道用户名，连发 5 次错口令就能把 owner 锁 15 分钟，
+     * 而且 `authenticate()` 会因为 lockedUntil 把**已登录会话**一并作废 ——
+     * 攻击者用一句话就能把在线用户踢下线并持续续期。实测已复现。
+     *
+     * 现在：
+     *   · 未通过口令校验的尝试，只累加**该来源**的失败计数；
+     *   · 锁定也按来源生效；其它来源（含用户自己换台机器）不受影响；
+     *   · 已经持有的会话不再因他人爆破而失效（见 authenticate 的配套修改）。
+     */
+    const source = loginSource(meta);
+    const bucket = this.#failureBucket(a, source, now);
+    if (bucket.lockedUntil && new Date(bucket.lockedUntil).getTime() > now) {
+      const left = Math.ceil((new Date(bucket.lockedUntil).getTime() - now) / 1000);
+      this.audit({ actor: a.id, action: 'auth.login', result: 'locked', ip: meta.ip, source });
+      return { ok: false, error: `当前来源连续口令错误过多，请 ${left} 秒后再试`, code: 'LOCKED' };
     }
     if (a.status !== 'active') {
       this.audit({ actor: a.id, action: 'auth.login', result: 'disabled', ip: meta.ip });
       return { ok: false, error: '账号已停用，请联系管理员', code: 'DISABLED' };
     }
     if (!AuthStore.verifyPassword(password, a.password.hash, a.password.salt)) {
-      a.failedLogins = [...(a.failedLogins ?? []), now].filter((t) => now - t < LOGIN_WINDOW_MS);
+      bucket.failedAttempts = [...(bucket.failedAttempts ?? []), now].filter((t) => now - t < LOGIN_WINDOW_MS);
       let locked = false;
-      if (a.failedLogins.length >= LOGIN_MAX_FAILS) {
-        a.lockedUntil = new Date(now + LOCK_MS).toISOString();
-        a.failedLogins = [];
+      if (bucket.failedAttempts.length >= LOGIN_MAX_FAILS) {
+        bucket.lockedUntil = new Date(now + LOCK_MS).toISOString();
+        bucket.failedAttempts = [];
         locked = true;
       }
       this.#save();
-      this.audit({ actor: a.id, action: 'auth.login', result: locked ? 'fail+locked' : 'fail', ip: meta.ip, ua: meta.ua });
+      this.audit({ actor: a.id, action: 'auth.login', result: locked ? 'fail+locked' : 'fail', ip: meta.ip, ua: meta.ua, source });
       return {
         ok: false,
-        error: locked ? `连续 ${LOGIN_MAX_FAILS} 次口令错误，账号已锁定 ${LOCK_MS / 60000} 分钟` : '用户名或口令不正确',
+        error: locked ? `当前来源连续 ${LOGIN_MAX_FAILS} 次口令错误，已锁定 ${LOCK_MS / 60000} 分钟` : '用户名或口令不正确',
         code: locked ? 'LOCKED' : 'BAD_CREDENTIALS',
       };
     }
 
+    // 成功登录清掉**本来源**的失败计数；其它来源的计数各自到期自然消失。
+    delete a.loginFailures[source];
+    a.lockedUntil = null; // 兼容旧字段：不再作为账号级锁定使用
     a.failedLogins = [];
-    a.lockedUntil = null;
     a.lastLoginAt = new Date().toISOString();
     const token = randomBytes(32).toString('base64url'); // 明文 token 只出现在这一次响应里
     a.sessions = [
@@ -417,7 +474,17 @@ export class AuthStore {  /**
     return { ok: true, token, expiresAt: a.sessions[a.sessions.length - 1].expiresAt, account: AuthStore.publicView(a) };
   }
 
-  /** 校验 token。返回账号（已过停用/锁定/过期检查），或 null */
+  /**
+   * 校验 token。返回账号（已过停用/过期检查），或 null。
+   *
+   * ── 为什么不再检查 lockedUntil（2026-10-20 审计 P1-4）──
+   *   历史实现里 lockedUntil 是**账号级**的，而它同时被 authenticate 用作否决条件。
+   *   于是攻击者只要连发 5 次错口令，就能把 owner 的**已登录会话**一并作废
+   *   （实测：/api/auth/me 立刻 401）—— 一个"防爆破"机制反过来成了强制下线工具。
+   *
+   *   现在锁定只作用于"继续尝试用口令登录"这条路径（见 login()），
+   *   已签发的会话凭证按它自己的 expiresAt 到期。二者语义分开。
+   */
   authenticate(token) {
     if (!token) return null;
     const h = sha256(String(token));
@@ -427,7 +494,6 @@ export class AuthStore {  /**
       if (!s) continue;
       if (new Date(s.expiresAt).getTime() <= now) return null;
       if (a.status !== 'active') return null;
-      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;
       return a;
     }
     return null;
@@ -480,7 +546,7 @@ export class AuthStore {  /**
       const t = (a.tokens ?? []).find((x) => x.hash === h);
       if (!t) continue;
       if (a.status !== 'active') return null;
-      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;
+      // 同上：PAT 不因"某来源爆破口令"而失效（它本来就不是口令换来的）。
       return a;
     }
     return null;

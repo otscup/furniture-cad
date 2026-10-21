@@ -31,7 +31,7 @@
  */
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, statSync, createReadStream, mkdtempSync, rmSync } from 'node:fs';
-import { dirname, extname, join, normalize, resolve } from 'node:path';
+import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -43,6 +43,8 @@ import { csvCell } from './csvCell.mjs';
 import { exportDxf, exportCutlist, exportRoombook, exportPdf } from './exportCore.mjs';
 import * as mailer from './mailer.mjs';
 import { RegistrationStore, EMAIL_RE } from './registration.mjs';
+import { assertPublicUrl } from './ssrfGuard.mjs';
+import { resolvePythonExe } from './pythonExe.mjs';
 // P10.0 S2：MCP 基础层（Streamable HTTP /mcp）与它读取的服务端 Workspace 实体。
 // 两者都挂在**本进程**上 —— 不新增服务进程（方案 §二.1）。
 import { createMcpHandler, ALLOWED_TOOLS } from './mcp.mjs';
@@ -56,6 +58,7 @@ import {
   DEFAULT_MAX_TOKENS,
   resolveMaxTokens,
   MAX_OUTPUT_TOKENS_CAP,
+  validateIntentRequest,
 } from '../shared/aiContract.mjs';
 import { quotaView } from '../shared/quota.mjs';
 
@@ -87,6 +90,52 @@ const REGISTRATIONS_PATH = process.env.APP_REGISTRATIONS_PATH ? resolve(process.
 const WORKSPACE_PATH = process.env.APP_WORKSPACE_PATH ? resolve(process.env.APP_WORKSPACE_PATH) : join(dirname(ACCOUNTS_PATH), 'workspace.json');
 const MEM_DIR = dirname(MEM_PATH);
 const DIST = join(ROOT, 'dist');
+
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ *  本项目既定约定（纠正记忆）→ 提示词
+ *
+ * ── 它修的是什么（2026-10-21）──
+ *   这个系统早就有"纠正记忆"：管理后台可编辑 corrections.jsonl、memoryStore 有投影、
+ *   currentKnowledge() 也汇总好了 —— 但它**从来没传给 LLM**。
+ *   用户在管理后台写的每一条纠正（"面板整板不拆""侧板就是 1 块"），
+ *   AI 完全看不到，每次都得在对话里重新说一遍。
+ *
+ * ── 为什么在这里读文件，而不是在 aiContract 里 ──
+ *   aiContract.mjs 是三方 import 的**纯函数**真源（server / src / verify 都引它）。
+ *   让它去读文件 = 把它变成有副作用的模块，浏览器与验收环境都会难测。
+ *   读文件是服务端的事，所以落在服务端。
+ *
+ * ── 读数失败怎么办 ──
+ *   返回空数组，**绝不因为记忆文件读不了就让 AI 通道失败**。
+ *   记忆是"加分项"，不是"前置条件" —— 这个取舍与 workspaceHost 的
+ *   "通知失败不改变装载结果"是同一条纪律。
+ *
+ * ── 只取 status=active ──
+ *   pending（还没编译出可执行检查）、rejected 的条目不进提示词。
+ *   把未确认的东西当既定约定念给模型，等于让它按半成品规矩办事。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+function activeProjectRules() {
+  try {
+    if (!existsSync(MEM_PATH)) return [];
+    const out = [];
+    for (const line of readFileSync(MEM_PATH, 'utf8').split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t) continue;
+      let item;
+      try { item = JSON.parse(t); } catch { continue; }
+      if (!item || typeof item !== 'object') continue;
+      if (item.status !== 'active') continue;
+      const nl = String(item.nl ?? '').trim();
+      if (!nl) continue;
+      out.push({ nl, tags: Array.isArray(item.tags) ? item.tags.slice(0, 6) : [] });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 // ── 导出链路的外部程序 ──
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
@@ -178,14 +227,14 @@ async function fetchImageAsDataUrl(urlStr, maxRedirects = 3) {
     // 手动跟随重定向（以便每跳都做 SSRF 检查）
     if (resp.status >= 300 && resp.status < 400 && resp.headers.get('location')) {
       const loc = new URL(resp.headers.get('location'), url).toString();
-      const locUrl = new URL(loc);
-      if (locUrl.protocol !== 'http:' && locUrl.protocol !== 'https:') {
-        throw new Error('重定向到了非 http/https 地址');
-      }
-      const h = locUrl.hostname.toLowerCase();
-      if (/^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0|::1|localhost$|.*\.local$)/.test(h)) {
-        throw new Error('重定向到了内网地址');
-      }
+      /**
+       * ★ 每一跳都重新过 SSRF 判定（2026-10-20 审计 P1-1）。
+       *   旧实现这里还有一条独立正则，与入口那条各写一遍 —— 而两条都漏了 IPv6
+       *   （`URL.hostname` 返回 `[::1]`，正则里的 `::1` 永远匹配不上）。
+       *   现在统一走 assertPublicUrl：字面量网段 + DNS 解析后校验，一处判断。
+       */
+      const hop = await assertPublicUrl(loc);
+      if (!hop.ok) throw new Error(`重定向到了不可访问的地址：${hop.reason}`);
       url = loc;
       continue;
     }
@@ -205,19 +254,18 @@ async function fetchImageAsDataUrl(urlStr, maxRedirects = 3) {
  * 找不到就如实报错，不许"假装导出成功"。
  */
 function pythonExe() {
-  // 注意 .venv 在**项目根**，不是 app/ 下（ROOT = app）。spike/run.sh 用的也是 ../.venv。
-  const cand = [
-    process.env.APP_PYTHON,
-    join(ROOT, '.venv', 'Scripts', 'python.exe'),
-    join(ROOT, '..', '.venv', 'Scripts', 'python.exe'),
-    join(ROOT, '..', '.venv', 'bin', 'python'),
-    'python3',
-    'python',
-  ]
-    .filter(Boolean)
-    // 显式给的路径必须真的存在才用；裸命令名（'python'）无法 existsSync，直接保留作兜底
-    .filter((c) => (c.includes('/') || c.includes('\\') ? existsSync(c) : true));
-  return cand[0] ?? 'python';
+  // 唯一实现在 server/pythonExe.mjs —— 那里记录了这个函数的历史缺陷
+  // （裸命令名 python3 在 Windows 上不存在却永远被优先选中，导致导出链路整体不可用）。
+  const py = resolvePythonExe(ROOT);
+  if (!py) {
+    throw new Error(
+      '找不到可用的 Python 解释器。导出 DXF/PDF 需要 Python + ezdxf。安装方法：\n' +
+      '  python -m venv .venv  &&  .venv/Scripts/pip install ezdxf   （Windows）\n' +
+      '  python3 -m venv .venv && .venv/bin/pip install ezdxf        （macOS/Linux）\n' +
+      '或设置环境变量 APP_PYTHON 指向解释器的绝对路径。'
+    );
+  }
+  return py;
 }
 
 /** 跑一个子进程并收齐 stdout/stderr。cwd 固定到项目根，相对路径才不会飘。 */
@@ -367,13 +415,19 @@ function accountWorkspacePath(accountId) {
  * 打开指定账号的工作区（懒加载 + 缓存）。
  * 旧版单文件 data/workspace.json 在首次被认领时迁移到 admin 账号下。
  */
-async function openAccountWorkspace(accountId) {
+async function openAccountWorkspace(accountId, { allowCreate = true } = {}) {
   const aid = accountId || 'local-open';
   if (workspaceStates.has(aid)) {
     const entry = workspaceStates.get(aid);
     await entry.loading;
     return entry.state;
   }
+  /**
+   * 未鉴权的调用方（allowCreate:false）不许把一个工作区**凭空创建**出来。
+   * 但"文件存在但读不出来"必须照常回报失败 —— 那是要运维看见的故障，
+   * 不能因为调用方匿名就假装"还没有工作区"。
+   */
+  const fileAbsent = !existsSync(accountWorkspacePath(aid));
 
   const filePath = accountWorkspacePath(aid);
   const entry = {
@@ -400,6 +454,7 @@ async function openAccountWorkspace(accountId) {
     filePath,
     owner: aid,
     account: aid,
+    allowCreate,
     onEvent: (e) => auth.audit(e),
     onDraftChange: (draftId, content) => {
       if (content === null) {
@@ -468,8 +523,8 @@ async function openAccountWorkspace(accountId) {
 /**
  * /mcp 取工作区状态的唯一入口：按账号隔离，await 到底再返回。
  */
-const getWorkspaceState = async (accountId) => {
-  return openAccountWorkspace(accountId || 'local-open');
+const getWorkspaceState = async (accountId, opts) => {
+  return openAccountWorkspace(accountId || 'local-open', opts);
 };
 
 /** `/mcp` 的唯一处理器（同进程挂载，不新增服务进程）。 */
@@ -590,14 +645,61 @@ function currentSettings() {
 
 // ───────────────────────────── HTTP 工具 ─────────────────────────────
 
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+/**
+ * ── CORS + 跨站防护（2026-10-20 审计 P1-3）──
+ *
+ * 历史缺陷：`Access-Control-Allow-Origin: *` 无条件下发，且没有任何 Origin 校验。
+ * 后果是一个可复现的攻击链：用户访问恶意页面 → 页面 JS 直接
+ * `fetch('http://127.0.0.1:8787/api/auth/register', ...)` → 响应可读、并且带回 token
+ * → 在"还没有第一个账号"的窗口期里，攻击者直接成为 owner。
+ *
+ * 现在的口径：
+ *   · 默认只允许**同源**（浏览器不带 Origin 头 / Origin 与 Host 一致）；
+ *   · 需要跨源（例如把前端单独部署）时，在 data/.env 里配 `ALLOWED_ORIGINS`
+ *     （逗号分隔的**完整 origin**，如 `https://cad.example.com`）；
+ *   · 不留 `*` 这个口子 —— 它把一个本地工具变成了任意网页可调用的 API。
+ */
+function allowedOrigins() {
+  const raw = String(process.env.ALLOWED_ORIGINS ?? '').trim();
+  if (!raw) return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function json(res, code, body) {
-  cors(res);
+/** 判断某次请求的 Origin 是否被允许。没有 Origin（同源导航/curl）算允许。 */
+function originAllowed(req) {
+  const origin = String(req.headers?.origin ?? '').trim();
+  if (!origin) return true; // 非浏览器或同源导航
+  const list = allowedOrigins();
+  if (list.includes(origin)) return true;
+  // 同源判定：Origin 的 host 与本请求 Host 一致
+  try {
+    const o = new URL(origin);
+    const host = String(req.headers?.host ?? '').trim();
+    if (host && o.host === host) return true;
+    // 回环地址互认（127.0.0.1 与 localhost 视为同一台机器）
+    const loopback = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+    const oHost = o.hostname;
+    const reqHost = host.split(':')[0];
+    if (loopback.has(oHost) && loopback.has(reqHost)) return true;
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function cors(res, req) {
+  // 只在确实允许时才回 ACAO；不再无条件 '*'。
+  const origin = String(req?.headers?.origin ?? '').trim();
+  if (origin && originAllowed(req)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+function json(res, code, body, req) {
+  cors(res, req);
   const text = JSON.stringify(body, null, 2);
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
@@ -773,8 +875,29 @@ function bearer(req) {
 }
 
 /** 客户端标识：只用于审计，不做信任判断 */
+/**
+ * 客户端标识。
+ *
+ * ── 关于 `X-Forwarded-For`（2026-10-20 审计 P1-4 配套）──
+ *   登录锁定按 (账号, 来源) 维度生效，来源默认取直连 IP。但生产部署形态是
+ *   "nginx/caddy 终止 TLS → 反代到本进程"（见 DEPLOY.md），此时所有请求的
+ *   remoteAddress 都是 127.0.0.1 ⇒ 一个人爆破就锁住全公司。
+ *
+ *   因此：**仅在显式开启反向代理信任时**才采信 XFF（`TRUST_PROXY=1`）。
+ *   默认不信任 —— 否则任何人都能伪造该头来绕开锁定（那等于把限流关掉）。
+ *   反代单独部署时请在 data/.env 里写 `TRUST_PROXY=1` 并确保反代**覆盖**
+ *   （而不是追加）该头。
+ */
 function clientMeta(req) {
-  return { ip: req.socket?.remoteAddress ?? '', ua: req.headers?.['user-agent'] ?? '' };
+  const direct = req.socket?.remoteAddress ?? '';
+  let ip = direct;
+  if (process.env.TRUST_PROXY === '1') {
+    const xff = req.headers?.['x-forwarded-for'];
+    const first = Array.isArray(xff) ? xff[0] : String(xff ?? '').split(',')[0];
+    const candidate = String(first ?? '').trim();
+    if (candidate) ip = candidate.slice(0, 64);
+  }
+  return { ip, ua: req.headers?.['user-agent'] ?? '' };
 }
 
 /**
@@ -824,6 +947,22 @@ function requireAuth(req, res, pathname, opts = {}) {
 async function handleApi(req, res, pathname) {
   const env = readEnv();
   const s = currentSettings();
+
+  /**
+   * ★ 跨站请求必须先过 Origin 闸（2026-10-20 审计 P1-3）。
+   *
+   * 放在鉴权**之前**：因为要拦的正是"还没有账号、本来不需要 token"的窗口期
+   * —— 那时 requireAuth 一律放行，只有 Origin 能区分"用户自己"和"用户访问的恶意页面"。
+   * 写方法（非 GET/HEAD/OPTIONS）一律要求 Origin 可被允许；读方法同样检查，
+   * 避免恶意页面读取 /api/security/audit、/api/memory、/api/workspace 里的客户数据。
+   */
+  if (!originAllowed(req)) {
+    return json(res, 403, {
+      ok: false,
+      code: 'ORIGIN_FORBIDDEN',
+      error: '这个来源的跨站请求不被允许。若需要跨源访问，请在服务端 data/.env 配置 ALLOWED_ORIGINS。',
+    }, req);
+  }
 
   // ── 鉴权前置：除白名单外一律先过门 ──
   // 管理模式（账号 / 安全 / 系统设置**写操作**）额外要求 canManage；
@@ -881,19 +1020,37 @@ async function handleApi(req, res, pathname) {
        * 服务端工作区状态（按账号隔离，这里查当前账号的）。
        * `ok:false` 表示装载失败（损坏/不可读），此时 MCP 只读工具
        * 会返回 WORKSPACE_UNAVAILABLE —— **不静默重建**，所以这里必须能查见。
+       *
+       * ── 与 2026-10-20 审计 M1 的取舍 ──
+       *   原始缺陷是：/api/health 在 PUBLIC_API 里，未登录也能调，而它会走
+       *   getWorkspaceState('local-open') ⇒ 文件不存在就 create + save
+       *   ⇒ **一个未鉴权请求就能在磁盘上创建 workspace**，并把**绝对路径**回传给任何人。
+       *
+       *   现在分两种情形：
+       *     · 已登录：照旧装载并回报（这是运维真正要看的状态，MCP 验收也依赖它）；
+       *     · 未登录：**只读已装载的缓存，不触发懒加载**，且绝不回传 filePath。
+       *   这样既堵住了"未鉴权写盘 + 路径泄露"，又保留了登录用户的诊断能力。
        */
       workspace: await (async () => {
         try {
-          const ws = await getWorkspaceState(gate.account?.id);
+          const aid = gate.account?.id || 'local-open';
+          /**
+           * 未登录 ⇒ allowCreate:false：**装载已有的，绝不凭空新建**。
+           * 这样既能让运维看到"文件损坏/不可读"这类真故障（那必须收敛成 ok:false + error），
+           * 又堵住了"一个匿名请求就把 workspaces/local-open/workspace.json 造出来"的副作用。
+           */
+          const ws = await getWorkspaceState(aid, { allowCreate: Boolean(gate.account) });
           return {
             ok: ws.ok === true,
             loading: ws.loading === true,
-            filePath: ws.filePath,
+            absent: ws.absent === true,
+            // 只有已登录才回传路径 —— 未鉴权请求不该知道服务器目录结构
+            ...(gate.account ? { filePath: ws.filePath } : {}),
             workspaceId: ws.workspace?.workspaceId ?? null,
             error: ws.ok === true ? null : (ws.error ?? null),
           };
         } catch (e) {
-          return { ok: false, loading: false, filePath: null, workspaceId: null, error: String(e?.message ?? e) };
+          return { ok: false, loading: false, workspaceId: null, error: String(e?.message ?? e) };
         }
       })(),
       time: new Date().toISOString(),
@@ -1597,11 +1754,16 @@ async function handleApi(req, res, pathname) {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       return json(res, 400, { ok: false, error: '只支持 http/https 链接' });
     }
-    // 内网 IP 黑名单（SSRF 防护）
-    const host = url.hostname.toLowerCase();
-    const isPrivate = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|0\.0\.0\.0|::1|localhost$|.*\.local$)/.test(host);
-    if (isPrivate) {
-      return json(res, 400, { ok: false, error: '不允许访问内网地址' });
+    /**
+     * ★ SSRF 防护（2026-10-20 审计 P1-1）。旧实现是一条正则，两个已实测的洞：
+     *   ① `::1` 分支永远匹配不上 —— URL.hostname 对 IPv6 返回带方括号的 `[::1]`；
+     *      `[::ffff:127.0.0.1]` 返回 `[::ffff:7f00:1]`，同样放行。
+     *   ② 只比对主机名字符串，不做 DNS 解析后校验 ⇒ 任意域名解析到内网即绕过。
+     *   现在统一走 server/ssrfGuard.mjs：字面量网段 + 所有解析结果必须公网。
+     */
+    const guard = await assertPublicUrl(url);
+    if (!guard.ok) {
+      return json(res, 400, { ok: false, error: guard.reason });
     }
     try {
       const dataUrl = await fetchImageAsDataUrl(urlStr);
@@ -1745,6 +1907,14 @@ async function handleApi(req, res, pathname) {
    * 并自动错开重叠房间，解除 WORKSPACE_UNIT_ID_CONFLICT 只读锁定（POST /api/workspace/repair-unit-ids）。
    */
   if (pathname === '/api/workspace/repair-unit-ids' && req.method === 'POST') {
+    /**
+     * ★ 这是一个**会改项目文件**的写操作，必须要求设计权限（2026-10-20 审计 P1-6）。
+     *   历史缺陷：该路由既不在 managePaths 也不在 designPaths，
+     *   实测只读账号（viewer）调用返回 200 —— 只读账号不该能触发任何落盘改动。
+     */
+    if (gate.mode !== 'local-open' && !ROLES[gate.account?.role]?.canDesign) {
+      return json(res, 403, { ok: false, error: '只读账号不能执行修复操作', code: 'FORBIDDEN' });
+    }
     const aid = gate.account?.id || 'local-open';
     const ws = await getWorkspaceState(aid);
     if (!ws.ok) return workspaceUnavailable(res, ws);
@@ -2165,7 +2335,36 @@ async function handleApi(req, res, pathname) {
       });
       // 记账
       if (gate.account) auth.recordUsage(gate.account.id, { generation: false });
-      return json(res, 200, { ok: true, ...result });
+      /**
+       * ── 设计意图：校验后如实回传（2026-10-20）──
+       *
+       * Agent 循环已经从最终回答里捞出了 intentRequestRaw（未校验）。
+       * 这里过唯一的那份校验器：
+       *   · 合法 → 回 intentRequest，前端建 candidate 意图并请用户确认；
+       *   · 非法 → 回 intentRequestError，让用户知道"AI 写了但不合契约"，
+       *     而不是让他以为 AI 没反应。
+       * 校验规则只有一份（shared/aiContract.mjs），这里不重复实现。
+       */
+      let agentIntent;
+      let agentIntentError;
+      if (result.intentRequestRaw !== undefined) {
+        const v = validateIntentRequest(result.intentRequestRaw);
+        if (v.ok) agentIntent = v.request;
+        else agentIntentError = { code: v.code, error: v.error };
+        auth.audit({
+          actor: gate.account?.id ?? 'local-open',
+          action: 'ai.agent.intent',
+          result: v.ok ? 'accepted' : 'rejected',
+          code: v.ok ? undefined : v.code,
+        });
+      }
+      const { intentRequestRaw: _rawIntent, ...agentRest } = result;
+      return json(res, 200, {
+        ok: true,
+        ...agentRest,
+        ...(agentIntent ? { intentRequest: agentIntent } : {}),
+        ...(agentIntentError ? { intentRequestError: agentIntentError } : {}),
+      });
     } catch (e) {
       return json(res, 500, { ok: false, error: `Agent 执行失败：${e?.message ?? e}`, code: 'AGENT_FAILED' });
     }
@@ -2182,28 +2381,29 @@ async function handleApi(req, res, pathname) {
   const DATA_DIR = accountWorkspaceDir(gate.account?.id || 'local-open');
   if (pathname === '/api/projects' && req.method === 'GET') {
     const { listProjects, migrateIfNeeded } = await import('./projects.mjs');
-    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    await migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
     const projects = listProjects(DATA_DIR);
     return json(res, 200, { ok: true, projects });
   }
   if (pathname === '/api/projects' && req.method === 'POST') {
     const body = await readBody(req);
     const { createProject, listProjects, migrateIfNeeded } = await import('./projects.mjs');
-    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    await migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
     if (typeof body.name !== 'string' || !body.name.trim()) {
       return json(res, 400, { ok: false, error: '项目名称不能为空' });
     }
-    const p = createProject(DATA_DIR, body.name);
+    const p = await createProject(DATA_DIR, body.name);
     return json(res, 200, { ok: true, project: p, projects: listProjects(DATA_DIR) });
   }
   const activateMatch = pathname.match(/^\/api\/projects\/([^/]+)\/activate$/);
   if (activateMatch && req.method === 'POST') {
-    const { setActiveProject, getProjectFilePath, migrateIfNeeded } = await import('./projects.mjs');
-    let projectId;
-    try { projectId = decodeURIComponent(activateMatch[1]); }
-    catch { return json(res, 400, { ok: false, error: '项目 ID 编码无效', code: 'PROJECT_ID_INVALID' }); }
-    if (!/^[a-zA-Z0-9_-]+$/u.test(projectId)) return json(res, 400, { ok: false, error: '项目 ID 无效', code: 'PROJECT_ID_INVALID' });
-    migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    const { setActiveProject, getProjectFilePath, migrateIfNeeded, parseProjectId } = await import('./projects.mjs');
+    await migrateIfNeeded(DATA_DIR, WORKSPACE_PATH);
+    // projectId 的唯一解析口径：parseProjectId（字符白名单 + 解析后不出 projectsDir 的断言）。
+    // 三条 /api/projects/:id 路由共用这一处，不许各写一遍 —— 历史事故见 projects.mjs 文件头。
+    const parsedId = parseProjectId(DATA_DIR, activateMatch[1]);
+    if (!parsedId.ok) return json(res, 400, { ok: false, error: parsedId.error, code: parsedId.code });
+    const projectId = parsedId.id;
     const accountId = gate.account?.id || 'local-open';
     const projectFilePath = getProjectFilePath(DATA_DIR, projectId);
     if (!existsSync(projectFilePath)) return json(res, 404, { ok: false, error: `项目不存在：${projectId}`, code: 'PROJECT_NOT_FOUND' });
@@ -2255,7 +2455,7 @@ async function handleApi(req, res, pathname) {
         });
       }
 
-      setActiveProject(DATA_DIR, projectId);
+      await setActiveProject(DATA_DIR, projectId);
       const nextState = { ...candidateState, ok: true };
       const entry = workspaceStates.get(accountId) ?? { state: nextState, loading: Promise.resolve(nextState) };
       entry.state = nextState;
@@ -2278,10 +2478,19 @@ async function handleApi(req, res, pathname) {
   }
   const deleteMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
   if (deleteMatch && req.method === 'DELETE') {
-    const { deleteProject, listProjects } = await import('./projects.mjs');
-    const projectId = decodeURIComponent(deleteMatch[1]);
+    const { deleteProject, listProjects, parseProjectId } = await import('./projects.mjs');
+    /**
+     * ★ 安全闸（2026-10-20 审计 P0-1）：这里曾经直接 decodeURIComponent 就进 join()，
+     *   而 projects.mjs 用 `join(dir, id + '.json')` 拼路径 —— `..` 被 join 吃掉，
+     *   于是 `DELETE /api/projects/..%2F..%2F..%2Faccounts` 能删掉账号库，
+     *   重启后 auth.mjs 把"文件不存在"当成"还没有账号"，全站降级免鉴权。
+     *   现在与 activate 共用 parseProjectId（白名单 + 解析后不出目录的双断言）。
+     */
+    const parsedId = parseProjectId(DATA_DIR, deleteMatch[1]);
+    if (!parsedId.ok) return json(res, 400, { ok: false, error: parsedId.error, code: parsedId.code });
+    const projectId = parsedId.id;
     try {
-      deleteProject(DATA_DIR, projectId);
+      await deleteProject(DATA_DIR, projectId);
       return json(res, 200, { ok: true, projects: listProjects(DATA_DIR) });
     } catch (e) {
       return json(res, 400, { ok: false, error: e?.message ?? '删除失败' });
@@ -2487,6 +2696,12 @@ async function handleApi(req, res, pathname) {
       if (!mt.ok) return rejectMaxTokens(res, actor, 'plan', mt);
       const payload = buildChatRequest(model, text, body.snapshot, {
         history: Array.isArray(body.history) ? body.history : [],
+        /**
+         * 把管理后台确认过的纠正记忆念给模型（2026-10-21）。
+         * 这是"说一次就够"的落点：用户在管理后台写一遍，
+         * 之后每个请求都自动带上，不必在对话里反复强调。
+         */
+        projectRules: activeProjectRules(),
         temperature: Number(env.AI_TEMPERATURE ?? 0.1),
         // 关键点：规划请求必须尊重 .env 里的 AI_MAX_TOKENS。
         // 早先这里没传 maxTokens，buildChatRequest 永远落到 DEFAULT(4096)，
@@ -2629,6 +2844,31 @@ async function handleApi(req, res, pathname) {
         roomCount: Array.isArray(body.snapshot.rooms) ? body.snapshot.rooms.length : 0,
       };
       const plan = validatePlan(extracted.value, ctx);
+      /**
+       * ── 设计意图请求（2026-10-20 新增）──
+       *
+       * ★ 这里是在修一个**真实的"静默丢弃"缺陷**：
+       *   提示词从 P9.3 起就告诉模型"你可以额外输出 candidateRequest / plannerRequest"，
+       *   但服务端只读 reply / actions / rejected —— 那两个请求**从来没被解析过**，
+       *   模型认真写了，用户以为生效了，实际直接蒸发。这正是本文件铁律禁止的行为。
+       *
+       * 现在把 intentRequest 真的解析出来并校验形状：
+       *   · 非法（带坐标 / 未知目标词 / 坏 scope）→ 进 intentRequestError，如实回报；
+       *   · 合法 → 原样回给前端，由前端建 candidate 意图并弹确认（AI 无法自己激活）。
+       */
+      let intentRequest;
+      let intentRequestError;
+      if (extracted.value && typeof extracted.value === 'object' && extracted.value.intentRequest !== undefined) {
+        const v = validateIntentRequest(extracted.value.intentRequest);
+        if (v.ok) intentRequest = v.request;
+        else intentRequestError = { code: v.code, error: v.error };
+        auth.audit({
+          actor,
+          action: 'ai.plan.intent',
+          result: v.ok ? 'accepted' : 'rejected',
+          code: v.ok ? undefined : v.code,
+        });
+      }
       auth.audit({
         actor,
         action: 'ai.plan',
@@ -2652,6 +2892,9 @@ async function handleApi(req, res, pathname) {
         reply: plan.reply,
         actions: plan.actions,
         rejected: plan.rejected,
+        /** AI 提的设计意图（**待用户确认**，不会自动生效） */
+        ...(intentRequest ? { intentRequest } : {}),
+        ...(intentRequestError ? { intentRequestError } : {}),
         contractVersion: '1.0.0',
         /**
          * 这份计划是**从模型的思考过程里救出来的**（正文为空时的兜底）。
@@ -2720,6 +2963,8 @@ async function handleApi(req, res, pathname) {
         history: Array.isArray(body.history) ? body.history : [],
         // P6：前端算好的知识摘要（Resolver 是纯前端确定性函数，服务端只透传文本）
         knowledgeDigest: typeof body.knowledgeDigest === 'string' ? body.knowledgeDigest.slice(0, 4000) : '',
+        /** 管理后台确认过的纠正记忆（与 /api/ai/plan 同一份来源） */
+        projectRules: activeProjectRules(),
         temperature: Number(env.AI_TEMPERATURE ?? 0.2),
         maxTokens: mt.value,
       });
@@ -2993,12 +3238,46 @@ function serveStatic(req, res, pathname) {
   }
   const rel = pathname === '/' ? '/index.html' : pathname;
   const file = normalize(join(DIST, rel));
-  // 目录穿越防线：解析后的路径必须仍在 dist 内
-  if (!file.startsWith(DIST)) return json(res, 403, { ok: false, error: 'forbidden' });
+  /**
+   * 目录穿越防线：解析后的路径必须仍在 dist 内。
+   *
+   * 用 `DIST + sep` 而不是裸 `DIST` 做前缀 —— 后者是字符串前缀而非路径边界，
+   * 若存在 `dist-backup` 这类同前缀兄弟目录，`/../dist-backup/x` 会通过。
+   * 同时保留对 DIST 自身（index.html 情形）的放行。
+   */
+  const distRoot = resolve(DIST);
+  const resolvedFile = resolve(file);
+  if (resolvedFile !== distRoot && !resolvedFile.startsWith(distRoot + sep)) {
+    return json(res, 403, { ok: false, error: 'forbidden' });
+  }
 
-  const target = existsSync(file) && statSync(file).isFile() ? file : join(DIST, 'index.html');
+  let target = join(distRoot, 'index.html');
+  try {
+    if (existsSync(resolvedFile) && statSync(resolvedFile).isFile()) target = resolvedFile;
+  } catch {
+    /* 前端产物在检查与读取之间被替换：走 SPA 兜底 */
+  }
+  if (!existsSync(target)) {
+    return json(res, 404, { ok: false, error: '前端产物缺失（dist 不完整）' });
+  }
   res.writeHead(200, { 'Content-Type': MIME[extname(target)] ?? 'application/octet-stream' });
-  createReadStream(target).pipe(res);
+  /**
+   * ★ 必须挂 'error'（2026-10-20 审计 P1-6）。
+   *   existsSync 与 createReadStream 之间存在 TOCTOU：产物在两者之间被替换/删除时，
+   *   没有 'error' 监听的流会抛 unhandled 'error' 事件，**整个 Node 进程直接退出**。
+   *   （本进程也一直没有 uncaughtException 兜底，见文件末尾的进程级护栏。）
+   */
+  const stream = createReadStream(target);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      try {
+        json(res, 500, { ok: false, error: '静态文件读取失败' });
+      } catch { /* 响应已结束 */ }
+    } else {
+      try { res.end(); } catch { /* 已结束 */ }
+    }
+  });
+  stream.pipe(res);
 }
 
 // ───────────────────────────── 启动 ─────────────────────────────
@@ -3030,7 +3309,12 @@ const server = createServer((req, res) => {
     return;
   }
   if (req.method === 'OPTIONS') {
-    cors(res);
+    // 预检也要过 Origin 闸：不允许的来源直接拒绝，而不是回 204 放行。
+    if (!originAllowed(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, code: 'ORIGIN_FORBIDDEN', error: '这个来源的跨站请求不被允许' }));
+    }
+    cors(res, req);
     res.writeHead(204);
     return res.end();
   }
@@ -3046,6 +3330,43 @@ const server = createServer((req, res) => {
   }
   serveStatic(req, res, pathname);
 });
+
+/**
+ * ── 进程级护栏（2026-10-20 审计 P1-6）──
+ *
+ * 之前全仓没有 `process.on('uncaughtException'|'unhandledRejection')`。
+ * 后果：任何一处漏掉的异步拒绝或流错误（例如静态文件在 existsSync 与
+ * createReadStream 之间被替换）都会让 **整个服务直接退出**，而且没有日志线索。
+ *
+ * 口径：
+ *   · unhandledRejection / uncaughtException ⇒ **记日志 + 审计，但进程继续**；
+ *     单次请求的失败不该变成全站宕机（本服务是多用户共用的）。
+ *   · 只记录，不改写任何业务状态；真正的故障仍然通过 /api/health 的 dataWritable
+ *     与审计日志暴露出来。
+ *   · 连续崩太多次（进程级异常 20 次/分钟）才主动退出 —— 那种情况下继续跑
+ *     只会不断产生半截写入，退出让编排层（docker restart）接管更安全。
+ */
+const CRASH_WINDOW_MS = 60_000;
+const CRASH_MAX = 20;
+const crashTimes = [];
+function recordProcessFault(kind, err) {
+  const now = Date.now();
+  crashTimes.push(now);
+  while (crashTimes.length > 0 && now - crashTimes[0] > CRASH_WINDOW_MS) crashTimes.shift();
+  const detail = err?.stack ?? String(err ?? '');
+  console.error(`[致命?] ${kind}: ${detail}`);
+  try {
+    auth.audit({ actor: null, action: 'process.fault', kind, error: String(err?.message ?? err).slice(0, 300) });
+  } catch {
+    /* 审计落不下盘不是新故障 */
+  }
+  if (crashTimes.length >= CRASH_MAX) {
+    console.error(`[致命] 一分钟内 ${CRASH_MAX} 次进程级异常，主动退出交给编排层重启。`);
+    process.exit(1);
+  }
+}
+process.on('uncaughtException', (err) => recordProcessFault('uncaughtException', err));
+process.on('unhandledRejection', (reason) => recordProcessFault('unhandledRejection', reason));
 
 /**
  * 数据目录能不能写 —— 启动时实测一次，不靠猜。

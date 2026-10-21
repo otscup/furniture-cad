@@ -194,6 +194,30 @@ export function extractReplayable(steps) {
  * @type {number}
  */
 export const SIMILARITY_THRESHOLD = 0.45;
+/**
+ * 把配置里的阈值解析成一个可用的数字。
+ *
+ * ★ 为什么要有这个函数 ──
+ *   阈值可以配（.env 的 SEQ_SIMILARITY_THRESHOLD），
+ *   但**解析必须能测**。
+ *   服务端那份代码住在 server.mjs 里 —— 一 import 就会起服务，
+ *   验收脚本根本引不动（ruleRetrieval 那边踩过同样的坑，
+ *   最后把纯逻辑提到了 shared 里）。
+ *   所以「怎么解析」放这里，服务端只负责把 .env 的那一行传进来。
+ *
+ ★ 配坏了怎么办 ──
+ *   回落到默认值，**不**报错、**不**把功能带坏。
+ *   一个手滑写错的配置项，不该让整个序列复用停摆。
+ *
+ * @param {string|number|undefined} value 配置里的原始值
+ * @returns {number} 0~1 之间的阈值
+ */
+export function resolveSimilarityThreshold(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) return SIMILARITY_THRESHOLD;
+  if (raw <= 0 || raw > 1) return SIMILARITY_THRESHOLD;
+  return raw;
+}
 
 /**
  * 一次最多带几条范例。
@@ -233,70 +257,102 @@ const COUNT_UNITS = [
  * @returns {string} 规范化后的比较文本；空文本返回空串
  */
 /**
- * 字符串的简单校验和（用于把数字映射成一段确定性的等长填充）。
+ * ★ 私用区（PUA）码位的起点 ──
  *
- * ★ 为什么要它 ──
- *   相似度计算要能区分「宽600」和「宽800」，
- *   但又不能因为长度不同而让 Jaccard 的分母失真。
- *   所以把数字映射成**等长**的填充串：长度一样（分母可比），
- *   内容不同（不共享 bigram）。
- *
- * @param {string} s
- * @returns {string} 4 位十六进制
+ *   U+E000 ~ U+F8FF 是 Unicode 划给「私有使用」的码位：
+ *   正式字符集里不会有，也不会有用户输入正好是这些字符。
+ *   所以拿它当「数字的替身」是安全的 —— 不会撞上任何真实文字。
  */
-function checksum(s) {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    h1 = (h1 ^ c) >>> 0;
-    h1 = Math.imul(h1, 16777619) >>> 0;
-    h2 = (h2 + c * (i + 7)) >>> 0;
+const PUA_BASE = 0xe000;
+
+/**
+ * 私用区里可用的码位数量。
+ *
+ * ★ 为什么要留出这么多个 ──
+ *   数字要映射成**两位**私用区字符：两位才能让不同的数字
+ *   落在完全不同的码位组合上（一位只有 6400 种，够用但不宽裕）。
+ */
+const PUA_SPAN = 6400;
+
+/**
+ * 把一个数字映射成**两个私用区字符**。
+ *
+ * ★ 为什么要用私用区字符，而不是 '#' + 十六进制 ──
+ *   十六进制（'#600#' / '#800#'）仍会共享 bigram「00」「0#」——
+ *   实测「建个衣柜宽600」vs「做3个吊柜宽600」相似度 0.647，
+ *   **越过了 0.45 的阈值**：两个完全不同的需求被判成同一件事。
+ *
+ *   私用区字符不会：不同数字 ⇒ 不同码位 ⇒ **一个 bigram 都不共享**。
+ *   而「建个衣柜」与「建个衣柜宽600」共享的是「建个衣柜」那部分，
+ *   剩下的分母里带着尺寸的区分度 ⇒ 相似度自然落在 0.5 左右，
+ *   既是同一个任务，又没被当成同一句话。
+ *
+ * ★ 长度固定为 2 ──
+ *   Jaccard 的分母是「两边 bigram 集合的大小之和」，
+ *   数字长度不同（600 vs 8000）会让分母不可比。
+ *   固定两位 ⇒ 分母永远可比。
+ *
+ * @param {string} num 纯数字串
+ * @returns {string} 两个私用区字符
+ */
+function dimensionMarker(num) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < num.length; i++) {
+    h = (h ^ num.charCodeAt(i)) >>> 0;
+    h = Math.imul(h, 16777619) >>> 0;
   }
-  return ((h1 >>> 0) % 65536).toString(16).padStart(4, '0') + ((h2 >>> 0) % 65536).toString(16).padStart(4, '0');
+  const lo = h % PUA_SPAN;
+  const hi = Math.floor(h / PUA_SPAN) % PUA_SPAN;
+  return String.fromCharCode(PUA_BASE + lo, PUA_BASE + hi);
 }
 
+/**
+ * 把一句话变成「用于比较像不像」的文本。
+ *
+ * ★ 三条规矩 ──
+ *   ① 计数（数字 + 量词）**折叠掉** ——「建一个衣柜」≡「建个衣柜」。
+ *   ② 尺寸（裸数字）换成**按值区分的私用区标记** ——
+ *      保留区分度，且不与别的数字共享 bigram。
+ *   ③ 数字**前后的文字必须原样保留** ——
+ *      这条曾经错过：早先的写法在遇到数字时直接跳到数字处，
+ *      把「建个衣柜宽600」里的「建个衣柜」整个丢了，
+ *      于是「建个衣柜宽600」和「做3个吊柜宽600」都只剩一个标记 ⇒ 相似度 1.0，
+ *      两个完全不同的任务被判成同一件事。
+ *
+ * @param {string} text 用户原话
+ * @returns {string} 规范化后的比较文本；空文本返回空串
+ */
 function similarityText(text) {
   const base = intentFingerprint(text);
   if (!base) return '';
   const units = COUNT_UNITS.join('|');
   /**
-   * ★ 尺寸数字必须**保持区分度** ──
-   *
-   *   原来的做法只删「数字 + 量词」，裸数字（「宽600」里的 600）留在文本里。
-   *   结果 bigram 里仍然共享 `00`/`60` 这些片段，
-   *   「宽600的柜子」vs「宽800的柜子」相似度高达 0.5 ——
-   *   **越过了 0.45 的阈值**，范例会把模型带向错误尺寸。
-   *
-   *   修法：把裸数字替换成一个**按值区分**的标记
-   *   （不是删除 —— 删了会让两者 bigram 完全一样，相似度反而变 1）。
-   *   标记里带上数字本身，所以 600 与 800 产生的片段不同，
-   *   共享的 bigram 只剩「宽」「的」「柜」这些真正的语义部分。
+   * 找出所有「数字 + 量词」的位置 —— 那些是计数，要折叠。
    */
   const countRe = new RegExp('[0-9]+(?=' + units + ')', 'g');
   const countSpans = [];
   for (const m of base.matchAll(countRe)) countSpans.push([m.index, m.index + m[0].length]);
-  const inCount = (i) => countSpans.some(([s, e]) => i >= s && i < e);
+
   let out = '';
-  for (let i = 0; i < base.length; ) {
+  let i = 0;
+  while (i < base.length) {
     const d = /[0-9]/.exec(base.slice(i));
-    if (!d || d.index === undefined) { out += base.slice(i); break; }
+    if (!d || d.index === undefined) {
+      out += base.slice(i);
+      break;
+    }
     const start = i + d.index;
+    // ★ 数字**前面**的文字必须保留（早先就是漏了这一句）
+    out += base.slice(i, start);
     const numMatch = /^[0-9]+/.exec(base.slice(start));
     const num = numMatch ? numMatch[0] : base.slice(start);
-    if (inCount(start)) {
+    const isCount = countSpans.some(([s, e]) => start >= s && start < e);
+    if (isCount) {
       // 计数：折叠掉（「一个」≡「个」）
       out += '';
     } else {
-      // 尺寸参数：保留区分度，但**不共享任何 bigram**
-      //
-      //   直接写 #600# 与 #800# 仍会共享 bigram「00」「0#」——
-      //   实测相似度 0.556，越过了 0.45 的阈值。
-      //   改成用数字的**校验和**生成一段等长、互不相同的填充：
-      //   同样长度 ⇒ bigram 数量相同（分母可比），
-      //   内容不同 ⇒ 不共享 bigram（分子只剩真正的语义部分）。
-      const h = checksum(num);
-      out += '#' + h + '#';
+      // 尺寸参数：换成按值区分、长度固定的私用区标记
+      out += dimensionMarker(num);
     }
     i = start + num.length;
   }

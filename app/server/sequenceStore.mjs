@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { canReplay, extractReplayable, sequenceKey, matchSequences } from '../shared/sequenceStore.mjs';
+import { canReplay, extractReplayable, sequenceKey, matchSequences, resolveSimilarityThreshold } from '../shared/sequenceStore.mjs';
 
 /**
  * @param {string} path 序列文件路径
@@ -145,6 +145,60 @@ export function findSimilar(path, families = [], excludeKey = '', intent = '', t
     .filter((s) => Array.isArray(s.families) && s.families.some((f) => fam.has(f)))
     .sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
   return candidates[0] ?? null;
+}
+
+/**
+ * ★ 一次请求要用的两条序列，一次算完 ★
+ *
+ *   · replay  —— 完全一致的历史序列 ⇒ 直接重放（0 次模型调用）
+ *   · similar —— 够像的历史序列 ⇒ 当提示词范例
+ *
+ * ★ 为什么要把这两个决定收在一个函数里 ──
+ *   以前是 server.mjs 里两行散着调的。问题是**测不到**：
+ *   server.mjs 一 import 就会起服务（读 .env、监听端口），
+ *   验收脚本引不动 —— 于是只能用源码扫描断言，
+ *   而源码扫描守不住行为（改坏调用点的参数，函数名还在，断言照样绿）。
+ *
+ *   这与 shared/ruleRetrieval.mjs 里 selectProjectRules 是同一个教训。
+ *   所以「这次该用哪条序列」这个决定放在**可 import 的模块**里，
+ *   服务端只负责把路径、意图、动作族传进来。
+ *
+ * ★ 阈值为什么直接收 env 而不是收一个数字 ──
+ *   阈值有两个来源：.env 的配置项、还有默认值。
+ *   如果「读配置」这一步留在 server.mjs 里（它 import 即起服务），
+ *   这一步就**测不到** —— 只能扫源码。
+ *   所以这里直接收 env：解析在模块内完成，验收能直接测。
+ *
+ * @param {string} path 序列文件路径
+ * @param {string} intent 本次的意图原话
+ * @param {string[]} families 本次的动作族
+ * @param {object} [env] .env 的内容（读 SEQ_SIMILARITY_THRESHOLD）
+ * @param {number} [threshold] 直接指定阈值（不给才读 env）
+ * @returns {{replay: object|null, similar: object|null}}
+ */
+export function pickSequences(path, intent, families = [], env = null, threshold = undefined) {
+  const key = sequenceKey(intent, families);
+  const replay = findReplayable(path, key);
+  // 完全一致的那条已经走重放路径了，不必再当范例
+  const limit = threshold === undefined ? similarityThresholdFor(env) : threshold;
+  const similar = findSimilar(path, families, key, intent, limit);
+  return { replay, similar };
+}
+
+
+/**
+ * 从 .env 里取相似度阈值。
+ *
+ * ★ 为什么要单独一个函数 ──
+ *   .env 的解析住在 server.mjs 里，验收引不动它。
+ *   把「读哪个键、怎么兜底」放到可 import 的模块里，
+ *   验收就能直接测这几条规则（合法值 / 越界 / 空 / 非数字）。
+ *
+ * @param {object} env readEnv() 的结果
+ * @returns {number}
+ */
+export function similarityThresholdFor(env) {
+  return resolveSimilarityThreshold(env?.SEQ_SIMILARITY_THRESHOLD);
 }
 
 /**

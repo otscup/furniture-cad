@@ -21,7 +21,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -46,8 +46,10 @@ import {
   REPLAYABLE_TOOLS,
   similarityOf,
   matchSequences,
+  resolveSimilarityThreshold,
   SIMILARITY_THRESHOLD,
 } from '../shared/sequenceStore.mjs';
+import { findSimilar, pickSequences, similarityThresholdFor } from '../server/sequenceStore.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -802,6 +804,27 @@ section('9. 相似度匹配：换个说法也能找到历史序列');
     sim('宽600的柜子', '宽800的柜子') < SIMILARITY_THRESHOLD, sim('宽600的柜子', '宽800的柜子').toFixed(3));
 
   /**
+   * ★ ★ 数字**前面**的文字不能被吞掉 ──
+   *
+   *   这是实测抓出来的真 bug：
+   *   早先的写法在遇到数字时直接跳到数字处，把「建个衣柜宽600」里的
+   *   「建个衣柜」整个丢了 —— 于是这句话只剩一个「尺寸标记」，
+   *   和「做3个吊柜宽600」剩下的东西**一模一样** ⇒ 相似度 1.0。
+   *
+   *   两个完全不同的任务（建衣柜 vs 做吊柜）被判成同一件事，
+   *   范例会把模型直接带偏 —— 正是这个功能要避免的事。
+   */
+  ok('★ ★ 带尺寸的不同任务**不会**被判成相似（数字前的文字没被吞）',
+    sim('建个衣柜宽600', '做3个吊柜宽600') < SIMILARITY_THRESHOLD,
+    sim('建个衣柜宽600', '做3个吊柜宽600').toFixed(3));
+  ok('★ ★ 不同房间同尺寸的柜子**不会**被判成相似',
+    sim('客厅做个电视柜宽2000', '卧室做个书柜宽2000') < SIMILARITY_THRESHOLD,
+    sim('客厅做个电视柜宽2000', '卧室做个书柜宽2000').toFixed(3));
+  ok('★ ★ 同一个任务的不同尺寸**仍然算相似**（数字前文字保留 ⇒ 语义部分还在）',
+    sim('建个衣柜', '建个衣柜宽600') >= SIMILARITY_THRESHOLD,
+    sim('建个衣柜', '建个衣柜宽600').toFixed(3));
+
+  /**
    * ── matchSequences 的行为 ──
    */
   const seqs = [
@@ -835,6 +858,20 @@ section('9. 相似度匹配：换个说法也能找到历史序列');
   const m3b = matchSequences(seqs, '把柜子改宽点', ['create']);
   ok('★ 动作族闸门也挡住了（另一道防线）', m3b.length === 0, JSON.stringify(m3b.map((x) => x.key)));
 
+  /**
+   * ★ ★ 同族 + 带尺寸的两个**不同任务**，一个都不能进候选 ──
+   *   这是上一条「数字前文字被吞」那个 bug 的行为级断言。
+   *   少了它，变异「把前缀吞掉」不会被发现。
+   */
+  const sizedUnrelated = [
+    { key: 's1', intent: '建个衣柜宽600', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }], at: 1 },
+    { key: 's2', intent: '做3个吊柜宽600', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }], at: 2 },
+  ];
+  const m3s = matchSequences(sizedUnrelated, '做3个吊柜宽600', ['create']);
+  ok('★ ★ 带尺寸的同族不同任务不会互相冒出来（s1 被挡在外面）',
+    m3s.every((x) => x.key !== 's1'),
+    JSON.stringify(m3s.map((x) => x.key + '(' + x.similarity.toFixed(2) + ')')));
+
   const m4 = matchSequences(seqs, '加个书架', ['create']);
   ok('★ 完全无关的意图不返回', m4.length === 0, JSON.stringify(m4.map((x) => x.key)));
 
@@ -853,6 +890,158 @@ section('9. 相似度匹配：换个说法也能找到历史序列');
   ];
   const m6 = matchSequences(dangerSeqs, '帮我建个衣柜', ['create']);
   ok('★ ★ 含删除类的序列不会被选为范例', m6.length === 0, JSON.stringify(m6.map((x) => x.key)));
+
+  /**
+   * ── 阈值可配 ──
+   *   0.45 是**实测标定**出来的，但项目不同、用户说话习惯不同，
+   *   所以阈值必须能配（.env 的 SEQ_SIMILARITY_THRESHOLD）。
+   *
+   *   这里测的是 matchSequences 接受 threshold 参数 ——
+   *   服务端那层把它从 .env 读出来传进来。
+   */
+  const loose = matchSequences(sameFamUnrelated, '建个衣柜', ['create'], { threshold: 0.1 });
+  ok('★ 阈值可以调低（放宽后同族的也能进来）', loose.length === 1, JSON.stringify(loose.map((x) => x.key)));
+  const strict = matchSequences(seqs, '帮我建个衣柜', ['create'], { threshold: 0.95 });
+  ok('★ 阈值可以调高（收紧后普通的改写也不够格了）', strict.length === 0, JSON.stringify(strict.map((x) => x.key)));
+  ok('★ 默认阈值就是 SIMILARITY_THRESHOLD', SIMILARITY_THRESHOLD === 0.45, String(SIMILARITY_THRESHOLD));
+
+  /**
+   * ★ 服务端那层真的把 .env 的阈值接上了 ──
+   *   这一段是**行为断言**：直接测服务端导出的函数（相似度阈值解析、
+   *   pickSequences 的返回值），而不是扫源码。
+   *   变异「不读 .env」「不传意图」时它会红。
+   */
+  ok('★ 服务端用的是序列选择入口 pickSequences（决定集中在一处，可测）',
+    serverSrc.includes('pickSequences('),
+    serverSrc.match(/pickSequences\([\s\S]{0,200}?\)/)?.[0] ?? '');
+  ok('★ 服务端把 .env 交给 pickSequences（阈值解析在可测的模块里）',
+    /pickSequences\([\s\S]{0,400}?env,/.test(serverSrc),
+    serverSrc.match(/pickSequences\([\s\S]{0,400}?\)/)?.[0]?.slice(0, 200) ?? '');
+  /**
+   * ★ 阈值解析必须**直接调函数**测 ──
+   *   上一版是源码扫描（`/if (raw <= 0 || raw > 1) return SIMILARITY_THRESHOLD;/`）。
+   *   那种断言守不住行为：把函数体整个换成「返回 0.45」，
+   *   源码里那句话还在，断言照样绿。
+   *   所以解析逻辑提到了 shared 里（resolveSimilarityThreshold），
+   *   这里直接测它的返回值。
+   */
+  ok('★ 合法阈值原样返回', resolveSimilarityThreshold('0.6') === 0.6, String(resolveSimilarityThreshold('0.6')));
+  ok('★ 数字型阈值也认', resolveSimilarityThreshold(0.3) === 0.3, String(resolveSimilarityThreshold(0.3)));
+  ok('★ ★ 非法值回落到默认（配置坏了不能把功能带坏）',
+    resolveSimilarityThreshold('abc') === SIMILARITY_THRESHOLD, String(resolveSimilarityThreshold('abc')));
+  ok('★ ★ 越界的值回落到默认（0 与 大于 1）',
+    resolveSimilarityThreshold('0') === SIMILARITY_THRESHOLD && resolveSimilarityThreshold('1.5') === SIMILARITY_THRESHOLD,
+    String(resolveSimilarityThreshold('0')) + ' / ' + String(resolveSimilarityThreshold('1.5')));
+  ok('★ 空值回落到默认', resolveSimilarityThreshold('') === SIMILARITY_THRESHOLD, String(resolveSimilarityThreshold('')));
+  ok('★ undefined 回落到默认', resolveSimilarityThreshold(undefined) === SIMILARITY_THRESHOLD, String(resolveSimilarityThreshold(undefined)));
+
+  /**
+   * ★ findSimilar 这层（服务端那层）也要真的按相似度筛 ──
+   *   上面只测了共享函数 matchSequences —— 服务端那层如果还按老办法
+   *   「取最近一条」，共享函数测得再好也白搭。
+   *   这里直接测服务端导出的 findSimilar（真文件、真落盘）。
+   */
+  const tmpDir = join(here, '.tmp-seqsim');
+  rmSync(tmpDir, { recursive: true, force: true });
+  mkdirSync(tmpDir, { recursive: true });
+  try {
+    const seqPath = join(tmpDir, 'sequences.jsonl');
+    const okSteps = [{ tool: 'cad.create_cabinet', args: { name: 'A', width: 600 } }];
+    writeFileSync(seqPath, [
+      JSON.stringify({ key: '建个衣柜|create', intent: '建个衣柜', families: ['create'], steps: okSteps, at: 3 }),
+      JSON.stringify({ key: '建个鞋柜|create', intent: '建个鞋柜', families: ['create'], steps: okSteps, at: 2 }),
+    ].join('\n') + '\n', 'utf8');
+    const fs1 = findSimilar(seqPath, ['create'], '', '建个衣柜');
+    ok('★ 服务端 findSimilar 找到相似的那条', fs1?.intent === '建个衣柜', JSON.stringify(fs1?.intent));
+    const fs2 = findSimilar(seqPath, ['create'], '', '帮我建个衣柜');
+    ok('★ 服务端 findSimilar 换个说法也能找到', fs2?.intent === '建个衣柜', JSON.stringify(fs2?.intent));
+    const fs3 = findSimilar(seqPath, ['create'], '', '把柜子改宽点');
+    ok('★ ★ 服务端 findSimilar 低于阈值时返回 null（不返回不相关的范例）', fs3 === null, JSON.stringify(fs3));
+    const fs4 = findSimilar(seqPath, ['create'], '', '做3个吊柜宽600');
+    ok('★ ★ 服务端 findSimilar 带尺寸的不同任务不返回', fs4 === null, JSON.stringify(fs4));
+    const fs5 = findSimilar(seqPath, ['geometry'], '', '建个衣柜');
+    ok('★ 服务端 findSimilar 动作族不匹配时返回 null', fs5 === null, JSON.stringify(fs5));
+
+    // 含删除类的序列：安全底线
+    const delPath = join(tmpDir, 'danger.jsonl');
+    writeFileSync(delPath, JSON.stringify({
+      key: 'd|create', intent: '建个衣柜', families: ['create'],
+      steps: [{ tool: 'cad.create_cabinet', args: {} }, { tool: 'cad.delete_object', args: {} }], at: 9,
+    }) + '\n', 'utf8');
+    const fs6 = findSimilar(delPath, ['create'], '', '帮我建个衣柜');
+    ok('★ ★ 服务端 findSimilar 也不会选中含删除类的序列', fs6 === null, JSON.stringify(fs6));
+    /**
+     * ★ ★ 降级路径（没有意图原话）也必须守住删除类底线 ──
+     *   服务端 findSimilar 有两条路：
+     *     · 有 intent ⇒ 走 matchSequences（共享函数自己也过滤 canReplay）；
+     *     · 没有 intent ⇒ 走「取最近一条」的**降级路径**。
+     *   降级路径是服务端**自己**过滤 canReplay 的 ——
+     *   如果那一层不挡，含删除类的序列就会从降级路径漏进来。
+     */
+    const fs7 = findSimilar(delPath, ['create'], '', '');
+    ok('★ ★ 降级路径（无 intent）也不会返回含删除类的序列', fs7 === null, JSON.stringify(fs7));
+
+    /**
+     * ★ ★ pickSequences：服务端**真正**用的那个入口 ──
+     *   服务端以前是两行散着调的（findReplayable + findSimilar），
+     *   散着调就**测不到** —— 只能扫源码，而源码扫描守不住行为。
+     *   现在这个决定收在一个可 import 的函数里，直接测它的返回值。
+     */
+    const picked = pickSequences(seqPath, '建个衣柜', ['create']);
+    ok('★ ★ pickSequences 完全一致时给出重放序列', picked.replay?.intent === '建个衣柜', JSON.stringify(picked.replay?.intent));
+    ok('★ ★ pickSequences 完全一致时不再重复当范例', picked.similar === null || picked.similar?.intent !== '建个衣柜', JSON.stringify(picked.similar?.intent));
+
+    const picked2 = pickSequences(seqPath, '帮我建个衣柜', ['create']);
+    ok('★ ★ pickSequences 换说法时给的是范例而不是重放',
+      picked2.replay === null && picked2.similar?.intent === '建个衣柜',
+      JSON.stringify({ replay: picked2.replay?.intent, similar: picked2.similar?.intent }));
+
+    const picked3 = pickSequences(seqPath, '把柜子改宽点', ['create']);
+    ok('★ ★ pickSequences 不相关时两条都是 null（宁可没有范例）',
+      picked3.replay === null && picked3.similar === null,
+      JSON.stringify({ replay: picked3.replay?.intent, similar: picked3.similar?.intent }));
+
+    const picked4 = pickSequences(delPath, '帮我建个衣柜', ['create']);
+    ok('★ ★ pickSequences 不会挑中含删除类的序列',
+      picked4.replay === null && picked4.similar === null,
+      JSON.stringify({ replay: picked4.replay?.intent, similar: picked4.similar?.intent }));
+
+    /**
+     * ★ 阈值从 .env 来的那条路 ──
+     *   similarityThresholdFor 是服务端真正调的那个函数（可 import ⇒ 可测）。
+     */
+    ok('★ .env 里配了阈值时用配置值', similarityThresholdFor({ SEQ_SIMILARITY_THRESHOLD: '0.7' }) === 0.7, String(similarityThresholdFor({ SEQ_SIMILARITY_THRESHOLD: '0.7' })));
+    ok('★ .env 没配时用默认阈值', similarityThresholdFor({}) === SIMILARITY_THRESHOLD, String(similarityThresholdFor({})));
+    ok('★ .env 配坏了用默认阈值（配置坏了不能把功能带坏）',
+      similarityThresholdFor({ SEQ_SIMILARITY_THRESHOLD: 'oops' }) === SIMILARITY_THRESHOLD,
+      String(similarityThresholdFor({ SEQ_SIMILARITY_THRESHOLD: 'oops' })));
+    /**
+     * ★ 阈值真的从 .env 一路走到 pickSequences ──
+     *   这是**行为断言**：调 pickSequences 并给它一个配了阈值的 env，
+     *   看它挑出来的候选是不是按那个阈值来的。
+     *   （把「读配置」留在 server.mjs 里的话，这一步就测不到 ——
+     *    只能扫源码，而源码扫描守不住行为。）
+     */
+    const looseEnv = pickSequences(seqPath, '做个鞋柜', ['create'], { SEQ_SIMILARITY_THRESHOLD: '0.1' });
+    ok('★ 阈值从 .env 一路生效（放宽后同族的鞋柜也进来了）',
+      looseEnv.similar?.intent === '建个鞋柜', JSON.stringify(looseEnv.similar?.intent));
+    const strictEnv = pickSequences(seqPath, '帮我建个衣柜', ['create'], { SEQ_SIMILARITY_THRESHOLD: '0.95' });
+    ok('★ 阈值从 .env 一路生效（收紧后同义改写也不够格了）',
+      strictEnv.similar === null, JSON.stringify(strictEnv.similar?.intent));
+    /**
+     * ★ ★ 「意图原话」被丢掉时，必须**一条候选都不给** ──
+     *   上一条断言（换说法也能找到）只钉住「相似时能找到」；
+     *   但如果实现把意图原话丢掉、退化成「取最近一条」，
+     *   那么「建个鞋柜」这种**不相关**的需求反而会被塞一条衣柜的范例。
+     *   所以这里直接钉住：意图不相关 ⇒ 一条都不给。
+     */
+    const noIntent = pickSequences(seqPath, '建个鞋柜', ['create']);
+    ok('★ ★ 完全不同的意图一条候选都不给（不会退化成「取最近一条」）',
+      noIntent.similar === null,
+      JSON.stringify(noIntent.similar?.intent));
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 console.log('\n' + '='.repeat(64));
@@ -865,3 +1054,5 @@ if (fail === 0) {
   process.exitCode = 1;
 }
 console.log('='.repeat(64));
+
+

@@ -63,7 +63,7 @@ import {
 } from '../shared/aiContract.mjs';
 import { quotaView } from '../shared/quota.mjs';
 import { selectProjectRules } from '../shared/ruleRetrieval.mjs';
-import { findReplayable, findSimilar, saveRunSequence } from './sequenceStore.mjs';
+import { findReplayable, findSimilar, saveRunSequence, pickSequences, similarityThresholdFor } from './sequenceStore.mjs';
 import { sequenceKey } from '../shared/sequenceStore.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -189,6 +189,21 @@ function detectFamiliesFor(text) {
   if (!f) return [];
   return f instanceof Set ? [...f] : Array.isArray(f) ? [...f] : [];
 }
+
+/**
+ * 相似序列的相似度阈值（可配）。
+ *
+ * ★ 为什么要能配 ──
+ *   0.45 是拿本项目真实说法**实测标定**出来的：
+ *   该像的落在 0.40~1.00，不该像的 ≤ 0.20，0.45 在两簇中间的空档里。
+ *   但「像不像」跟项目有关：某个项目里用户天天说「来一个X」，
+ *   那默认阈值就可能偏严。
+ *
+ *   配置项：.env 里的 SEQ_SIMILARITY_THRESHOLD（0~1）。
+ *   配错（越界 / 非数字）时**回落到默认值** —— 配置坏了不能把功能带坏。
+ *
+ * @param {object} env readEnv() 的结果
+ * @returns {number}
 
 // ── 导出链路的外部程序 ──
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
@@ -2384,21 +2399,32 @@ async function handleApi(req, res, pathname) {
          * 查一条**完全一致**的历史成功序列 —— 命中就重放，0 次模型调用。
          * 没命中就传 null，Agent 照常走模型（并可把本次成功记进库里）。
          */
-        replaySeq: findReplayable(SEQ_PATH, sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim()))),
         /**
-         * 相似序列：没有完全一致时，把上次的做法当范例给模型。
+         * ★ 操作序列复用：一次算完两条 ──
+         *
+         *   · replay  —— 完全一致的历史序列 ⇒ 直接重放（0 次模型调用）
+         *   · similar —— 够像的历史序列 ⇒ 当提示词范例
+         *
+         * ★ 为什么收在 pickSequences 里 ──
+         *   决定「这次该用哪条序列」的逻辑必须**可测**。
+         *   放在 server.mjs 里验收就引不动（import 即起服务），
+         *   只能退化成源码扫描断言 —— 而源码扫描守不住行为：
+         *   把传参改坏，函数名还在，断言照样绿。
          *
          * ★ 传 intent 是必须的 ──
-         *   findSimilar 用**相似度**（bigram Jaccard）挑候选，
-         *   阈值以下**不返回** —— 宁可没有范例，也不要给不相关的范例
+         *   相似度（bigram Jaccard）低于阈值时**不返回** ——
+         *   宁可没有范例，也不要给不相关的范例
          *   （模型会照抄不相关的范例，那比不给更糟）。
          */
-        similarSeq: findSimilar(
-          SEQ_PATH,
-          detectFamiliesFor(body.intent.trim()),
-          sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim())),
-          body.intent.trim(),
-        ),
+        ...(() => {
+          const picked = pickSequences(
+            SEQ_PATH,
+            body.intent.trim(),
+            detectFamiliesFor(body.intent.trim()),
+            env,
+          );
+          return { replaySeq: picked.replay, similarSeq: picked.similar };
+        })(),
         aiConfig: {
           baseUrl,
           apiKey: key,

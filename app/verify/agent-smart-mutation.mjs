@@ -39,6 +39,7 @@ const TARGETS = {
   contract: join(appDir, 'shared', 'aiContract.mjs'),
   agent: join(appDir, 'server', 'agentLoop.mjs'),
   server: join(appDir, 'server', 'server.mjs'),
+  serverseq: join(appDir, 'server', 'sequenceStore.mjs'),
 };
 
 let pass = 0;
@@ -65,14 +66,24 @@ function runAcceptance() {
 
 function mutate(label, file, from, to, expectRed) {
   const original = readFileSync(file, 'utf8');
-  if (!original.includes(from)) {
+  /**
+   * ★ 锚点必须按**该文件真实的换行**去匹配 ──
+   *   本项目一部分文件是 CRLF、一部分是 LF。
+   *   锚点写成 LF 而目标是 CRLF ⇒ `original.includes(from)` 恒为 false，
+   *   变异会「锚点不存在」而根本没测上 ——
+   *   看起来是「没测」，实际是「测了个寂寞」。
+   */
+  const eol = original.includes('\r\n') ? '\r\n' : '\n';
+  const fromReal = from.replace(/\n/g, eol);
+  const toReal = to.replace(/\n/g, eol);
+  if (!original.includes(fromReal)) {
     fail++;
     failures.push(label + '（变异锚点找不到，源码可能变了）');
     console.log(`  ✗ ${label} — 锚点不存在，测不了`);
     return;
   }
   try {
-    writeFileSync(file, original.replace(from, to), 'utf8');
+    writeFileSync(file, original.replace(fromReal, toReal), 'utf8');
     const r = runAcceptance();
     const red = r.count > 0;
     const caught = red && r.names.some((n) => n.includes(expectRed));
@@ -278,9 +289,81 @@ mutate('★ 动作族闸门失效（建柜序列给改尺寸用）', TARGETS.seq
   "    if (false) continue;",
   '动作族不匹配时不返回');
 mutate('★ 尺寸数字不区分了（宽600 ≈ 宽800）', TARGETS.sequence,
-  "      out += '#' + h + '#';",
-  "      out += '#' + num + '#';",
+  "      out += dimensionMarker(num);",
+  "      out += num;",
   '「宽600」vs「宽800」**不**折叠');
+
+/**
+ * ★ 下面三个变异守的是**实测抓出来的真 bug**。
+ *
+ *   早先的实现在遇到数字时直接跳到数字处，把数字**前面**的文字吞了：
+ *   「建个衣柜宽600」只剩一个尺寸标记，和「做3个吊柜宽600」剩下的东西
+ *   一模一样 ⇒ 相似度 1.0 —— 两个完全不同的任务被判成同一件事。
+ *
+ *   ★ 为什么这类 bug 逃过了验收 ──
+ *   当时的断言只测了「宽600」vs「宽800」这种**只有数字不同**的样本，
+ *   而它们的比较文本碰巧一样，测不出前缀被吞。
+ *   必须补上「**前缀不同**、数字相同」的样本才测得出来。
+ */
+mutate('★ 数字前面的文字被吞了（不同任务被判成相似）', TARGETS.sequence,
+  "    out += base.slice(i, start);",
+  "    out += '';",
+  '带尺寸的不同任务');
+/**
+ * ★ 私用区标记退化成裸数字 ──
+ *   「#600#」这种写法仍会共享 bigram「00」，
+ *   两个只有前缀不同的任务会重新撞在一起。
+ *   这条变异守的是「尺寸必须按值区分」。
+ */
+mutate('★ 私用区标记退化成裸数字（宽600 与 做3个吊柜宽600 又撞上）', TARGETS.sequence,
+  "      out += dimensionMarker(num);",
+  "      out += num;",
+  '「宽600」vs「宽800」**不**折叠');
+/**
+ * ★ 私用区标记失去区分度（所有数字共用一个标记）──
+ *   所有尺寸都变成同一个标记 ⇒ 「宽600」与「宽800」不再有区别。
+ */
+mutate('★ 私用区标记失去区分度（所有数字共用一个标记）', TARGETS.sequence,
+  "  return String.fromCharCode(PUA_BASE + lo, PUA_BASE + hi);",
+  "  return String.fromCharCode(PUA_BASE, PUA_BASE + 1);",
+  '「宽600」vs「宽800」**不**折叠');
+/**
+ * ★ 计数不再折叠（「建一个衣柜」与「建个衣柜」不再等价）──
+ *   单独一条：守的是「计数折叠」这个能力本身。
+ */
+mutate('★ 计数不再折叠（一个 ≡ 个）', TARGETS.sequence,
+  "    const isCount = countSpans.some(([s, e]) => start >= s && start < e);",
+  "    const isCount = false;",
+  '计数被折叠');
+
+/**
+ * ★ 服务端那层的变异 ──
+ *   共享函数测得再好，服务端那层如果还按老办法「取最近一条」，
+ *   照样会把不相关的范例塞进提示词 —— 必须单独钉住。
+ */
+mutate('★ 服务端不按相似度筛（退回「取最近一条」）', TARGETS.serverseq,
+  "    const matched = matchSequences(pool, intent, families, threshold === undefined ? {} : { threshold });",
+  "    const matched = pool.filter((s) => Array.isArray(s.families) && s.families.some((f) => fam.has(f))).slice(0, 1);",
+  '服务端 findSimilar 低于阈值时返回 null');
+mutate('★ 服务端不再排除不可重放的序列（删除类序列能进候选池）', TARGETS.serverseq,
+  "    .filter((s) => canReplay(s.steps).ok);",
+  "    .filter((s) => true);",
+  '降级路径（无 intent）也不会返回含删除类的序列');
+mutate('★ 序列选择入口不再把意图原话传下去（退回「最近一条」）', TARGETS.serverseq,
+  "  const similar = findSimilar(path, families, key, intent, limit);",
+  "  const similar = findSimilar(path, families, key, '', limit);",
+  '完全不同的意图一条候选都不给（不会退化成「取最近一条」）');
+mutate('★ 序列选择入口不再用 .env 的阈值（写死默认）', TARGETS.serverseq,
+  "  const limit = threshold === undefined ? similarityThresholdFor(env) : threshold;",
+  "  const limit = threshold === undefined ? resolveSimilarityThreshold(undefined) : threshold;",
+  '阈值从 .env 一路生效（收紧后同义改写也不够格了）');
+mutate('★ 序列选择入口不再查相似范例（只剩重放）', TARGETS.serverseq,
+  "  const similar = findSimilar(path, families, key, intent, limit);",
+  "  const similar = null;",
+  'pickSequences 换说法时给的是范例而不是重放');
+
+
+
 
 console.log('\n' + '-'.repeat(64));
 const final = runAcceptance();

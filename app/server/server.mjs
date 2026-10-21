@@ -2733,16 +2733,6 @@ async function handleApi(req, res, pathname) {
      *   否则用户看到的是「识图功能坏了」却没有任何提示。
      */
     const model = body.model || env.AI_VISION_MODEL || env.AI_MODEL || s.model;
-    /**
-     * ★ 诚实提示：模型不看图时，识图结果毫无意义。
-     *
-     *   实测 deepseek-v4.1-flash 的 image_tokens 恒为 0 ——
-     *   它会对输入乱猜（把 SVG 源码当图片描述）。
-     *   这时候必须让用户知道「你看到的识别结果不可信」，
-     *   而不是给一份看起来很专业的假结果。
-     */
-    const visionSeesImages = !/deepseek|flash-lite$/i.test(model) || true; // 运行时按 usage 判断
-    const visionFallback = !body.model && !env.AI_VISION_MODEL;
     if (!baseUrl || !key) return json(res, 400, { ok: false, error: '尚未配置 Base URL / API Key' });
     const multiImages = Array.isArray(body.images)
       ? body.images.filter((img) => img && typeof img.dataUrl === 'string' && img.dataUrl)

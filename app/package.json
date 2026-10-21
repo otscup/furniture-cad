@@ -128,7 +128,8 @@
     "verify:focus-stack-mutations": "node verify/focus-stack-mutation.mjs",
     "verify:server-integrity": "node verify/server-integrity.mjs",
     "eval:vision": "node verify/vision-eval.mjs",
-    "verify:vision-probe": "node verify/vision-probe-acceptance.mjs"
+    "verify:vision-probe": "node verify/vision-probe-acceptance.mjs",
+    "check:vision": "node verify/vision-check.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

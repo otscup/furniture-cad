@@ -2385,8 +2385,20 @@ async function handleApi(req, res, pathname) {
          * 没命中就传 null，Agent 照常走模型（并可把本次成功记进库里）。
          */
         replaySeq: findReplayable(SEQ_PATH, sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim()))),
-        /** 相似序列：没有完全一致时，把上次的做法当范例给模型 */
-        similarSeq: findSimilar(SEQ_PATH, detectFamiliesFor(body.intent.trim()), sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim()))),
+        /**
+         * 相似序列：没有完全一致时，把上次的做法当范例给模型。
+         *
+         * ★ 传 intent 是必须的 ──
+         *   findSimilar 用**相似度**（bigram Jaccard）挑候选，
+         *   阈值以下**不返回** —— 宁可没有范例，也不要给不相关的范例
+         *   （模型会照抄不相关的范例，那比不给更糟）。
+         */
+        similarSeq: findSimilar(
+          SEQ_PATH,
+          detectFamiliesFor(body.intent.trim()),
+          sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim())),
+          body.intent.trim(),
+        ),
         aiConfig: {
           baseUrl,
           apiKey: key,

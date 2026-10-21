@@ -255,6 +255,33 @@ mutate('★ 重放用裸的 replaySeq 变量（运行时会 undefined）', TARGE
   "    const replay = await replaySequence(replaySeq, {",
   '重放调用从 opts.replaySeq 取');
 // ── 还原后复跑 ──
+// ── 8. 相似度匹配（2026-10-21）──
+console.log('\n8. 相似度匹配');
+mutate('★ 相似度恒为 0（什么都不像）', TARGETS.sequence,
+  "  if (inter === 0) return 0;",
+  "  if (inter === 0) return 0; return 0;",
+  '高于阈值');
+mutate('★ 阈值拦不住（低于阈值也返回）', TARGETS.sequence,
+  "    if (similarity < threshold) continue;",
+  "    if (false) continue;",
+  '同族但内容不像时**不返回**');
+mutate('★ 相似度比较不看内容（只看类型）', TARGETS.sequence,
+  "    const similarity = similarityOf(seq, intent);",
+  "    const similarity = 1;",
+  '同族但内容不像时**不返回**');
+mutate('★ 删除类序列不再被拦（安全底线）', TARGETS.sequence,
+  "    if (!canReplay(seq.steps).ok) continue;",
+  "    if (false) continue;",
+  '含删除类的序列不会被选为范例');
+mutate('★ 动作族闸门失效（建柜序列给改尺寸用）', TARGETS.sequence,
+  "    if (!sf.some((f) => fam.has(f))) continue;",
+  "    if (false) continue;",
+  '动作族不匹配时不返回');
+mutate('★ 尺寸数字不区分了（宽600 ≈ 宽800）', TARGETS.sequence,
+  "      out += '#' + h + '#';",
+  "      out += '#' + num + '#';",
+  '「宽600」vs「宽800」**不**折叠');
+
 console.log('\n' + '-'.repeat(64));
 const final = runAcceptance();
 if (final.count === 0) {

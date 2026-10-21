@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { canReplay, extractReplayable, sequenceKey } from '../shared/sequenceStore.mjs';
+import { canReplay, extractReplayable, sequenceKey, matchSequences } from '../shared/sequenceStore.mjs';
 
 /**
  * @param {string} path 序列文件路径
@@ -117,16 +117,32 @@ export function findReplayable(path, key) {
  * @param {string} path 序列文件路径
  * @param {string[]} families 本次的动作族
  * @param {string} excludeKey 要排除的 key（自己）
+ * @param {string} intent 本次的意图原话（用于算相似度）
+ * @param {number} [threshold] 相似度阈值（默认 SIMILARITY_THRESHOLD）
  * @returns {object|null}
  */
-export function findSimilar(path, families = [], excludeKey = '') {
+export function findSimilar(path, families = [], excludeKey = '', intent = '', threshold = undefined) {
   const all = readSequences(path);
   const fam = new Set(families);
   if (fam.size === 0) return null;
-  const candidates = all
+  const pool = all
     .filter((s) => s.key !== excludeKey)
+    .filter((s) => canReplay(s.steps).ok);
+  /**
+   * ★ 有意图原话 ⇒ 走**相似度匹配** ──
+   *   原来这里只按动作族筛，然后取**最近一条** ——
+   *   那可能是一条毫不相干的序列（只要动作族碰巧相同）。
+   *   给模型一段不相关的范例，它会照抄 —— 比不给更糟。
+   *
+   *   现在按 bigram 相似度排序，**低于阈值一律不返回**。
+   */
+  if (intent) {
+    const matched = matchSequences(pool, intent, families, threshold === undefined ? {} : { threshold });
+    return matched[0] ?? null;
+  }
+  // 没有意图原话（老数据/降级路径）：退回到「最近一条」，但仍要求动作族相同
+  const candidates = pool
     .filter((s) => Array.isArray(s.families) && s.families.some((f) => fam.has(f)))
-    .filter((s) => canReplay(s.steps).ok)
     .sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
   return candidates[0] ?? null;
 }

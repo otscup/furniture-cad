@@ -149,6 +149,29 @@ export function deriveSpatialFacts(project: Project): SpatialFacts {
     return { roomId: r.id, closed: loop.status === 'ok', problem: loop.status === 'ok' ? null : loop.status };
   });
 
+  /**
+   * ★ 墙的元信息**预计算一次** ──
+   *
+   *   wallInteriorSide(loop.poly, w) 只取决于（房间回路, 墙），**与柜无关**；
+   *   但它原来在**每只柜 × 每面墙**的循环体内算一遍。
+   *   30 房 30 柜时 = 30 × 120 = 3600 次（正确只需 120 次）。
+   *
+   *   同样，wallRectOf(w) 也是每柜每墙重算。
+   *
+   *   现在都提前算成一张按墙 id 的表，柜循环内只查表。
+   */
+  const wallMeta = new Map<string, { rect: ReturnType<typeof wallRectOf>; side: 1 | -1 | null }>();
+  for (const r of project.rooms) {
+    const loop = loopByRoom.get(r.id);
+    const loopOk = loop?.status === 'ok';
+    for (const w of r.walls) {
+      wallMeta.set(w.id, {
+        rect: wallRectOf(w),
+        side: loopOk ? wallInteriorSide(loop!.poly, w) : null,
+      });
+    }
+  }
+
   const cabinets = project.cabinets.map((cab: Cabinet) => {
     const room = project.rooms.find((r) => r.id === cab.roomId);
     const fp = getCabinetFootprint(cab);
@@ -156,17 +179,15 @@ export function deriveSpatialFacts(project: Project): SpatialFacts {
     const openings: SpatialFacts['cabinets'][number]['openings'] = [];
     if (fp.length > 0) {
       for (const r of project.rooms) {
-        const loop = loopByRoom.get(r.id);
-        const loopOk = loop?.status === 'ok';
         for (const w of r.walls) {
-          const rect = wallRectOf(w);
+          const meta = wallMeta.get(w.id);
+          const rect = meta?.rect;
           if (rect) {
             const { relation, gap } = classifyCabWall(fp, rect);
             if (relation !== 'none') walls.push({ wallId: w.id, relation, gap });
           }
           if (w.openings) {
-            // 室内侧只取决于墙与房间回路（与柜无关），先算一次
-            const side: 1 | -1 | null = loopOk ? wallInteriorSide(loop!.poly, w) : null;
+            const side = meta?.side ?? null;
             for (const o of w.openings) {
               openings.push({ openingId: o.id, wallId: w.id, kind: o.kind, relation: classifyCabOpening(fp, w, o, side) });
             }

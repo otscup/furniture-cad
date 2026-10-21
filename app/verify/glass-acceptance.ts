@@ -132,7 +132,28 @@ section('4. 门板图：黑框灰玻斜线填充');
   // 45° 斜线：2 点开放 poly 且 |dx|==|dy|（开向对角线 dx≠dy：门宽≠门高）
   const hatchGlass = R.prims.front.filter((p) => p.k === 'poly' && !p.closed && p.pts.length === 2 && is45(p.pts[1]!.x - p.pts[0]!.x, p.pts[1]!.y - p.pts[0]!.y));
   const hatchWood = woodR.prims.front.filter((p) => p.k === 'poly' && !p.closed && p.pts.length === 2 && is45(p.pts[1]!.x - p.pts[0]!.x, p.pts[1]!.y - p.pts[0]!.y));
-  ok(`玻璃门正视图有 45° 斜线（每扇 2 道，共 ${nDoors * 2}）`, hatchGlass.length === nDoors * 2, `hatch=${hatchGlass.length}`);
+  /**
+   * ★ 口径已改（2026-10-21）——
+   *
+   *   旧断言：「每扇 2 道，共 4 道」。
+   *   那是**上一版自己发明的画法**（两道短斜线），不是参考图纸的画法。
+   *
+   *   参考图纸的实测（PDF 内容流）：玻璃门是**满铺的 45° 等距平行线**，
+   *   每条被门板矩形裁剪（所以长度不同，但 dx 严格等于 dy），
+   *   间距中位数 = 板宽的 8.3%。
+   *
+   *   满铺之后条数取决于门宽与间距，不是固定值 ——
+   *   所以断言改成「**很多条** + **都严格 45°**」。
+   */
+  ok(`玻璃门正视图有满铺 45° 斜线（>20 条，实测 ${hatchGlass.length}）`, hatchGlass.length > 20, `hatch=${hatchGlass.length}`);
+  /**
+   * 每条都必须是**严格的 45°**（|dx| == |dy|）。
+   * 这条断言是本轮的关键：
+   *   第一版实现画的是「左下角到右上角再 clamp」，dx=288 dy=2280 —— 根本不是 45°，
+   *   而且因为不满足 is45，筛查根本认不出来（画了 43 条却报 0 条）。
+   */
+  const non45 = hatchGlass.filter((p) => !is45(p.pts[1]!.x - p.pts[0]!.x, p.pts[1]!.y - p.pts[0]!.y));
+  ok('★ 每条玻璃斜线都是严格的 45°（|dx| == |dy|）', non45.length === 0, `${non45.length} 条不是 45 度`);
   ok('木门没有 45° 斜线', hatchWood.length === 0, `hatch=${hatchWood.length}`);
 
   // 斜线端点全部在门洞矩形内（正视图局部坐标：origin 平移回去）

@@ -2,7 +2,7 @@ import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/typ
 import { generateProject } from '../core/geometry/project.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
 import { buildFurnitureSheet, computeUnfoldedWallX, groupByRoom } from './furnitureSheet.ts';
-import { buildCabinetViews, type ViewSet } from '../core/geometry/views.ts';
+import { buildCabinetViews, buildProjectViews, type ViewSet } from '../core/geometry/views.ts';
 import { GENERATOR_VERSION } from './neutralSheet.ts';
 import { allUnits } from '../core/layoutModel.ts';
 import { cabinetWarningIssues, formatCabinetWarning } from './warningNotes.ts';
@@ -456,6 +456,20 @@ export function groupCabinetsForSheets(cabinets: Cabinet[]): CabinetGroup[] {
 
 export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: string): RoomBook {
   const geometry = generateProject(project, rules);
+  /**
+   * ★ 整份项目的四视图，**整本图纸册只算一次** ──
+   *
+   *   buildFurnitureSheet 需要它来把 drawingEdits 的坐标换算到图幅上。
+   *   以前每次调 buildFurnitureSheet 都重新算一遍 ——
+   *   而 buildRoomBook 会对每个房间调一次、对每个叠放组再调一次，
+   *   于是 buildProjectViews 被算 (房间数 + 组数) 次，
+   *   每次又遍历项目里**全部**柜体 ⇒ **O(房间数 × 柜数²)**。
+   *
+   *   实测（每房 10 柜）：
+   *     1 房 183 ms → 2 房 480 ms → 4 房 3090 ms → 8 房 **22133 ms**
+   *   8 房 80 柜要 22 秒。改成算一次后降到 O(柜数)。
+   */
+  const projectViews = buildProjectViews(project, rules);
 
   const sections: RoomBookSection[] = groupByRoom(project).map((group) => {
     const callouts = buildRoomPlanCallouts(group.cabinets);
@@ -486,7 +500,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     }
     const elevation = buildRoomElevation(group.cabinets, rules, viewSetCache);
     const roomWholeSheet = group.cabinets.length > 0
-      ? buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜` })
+      ? buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜`, projectViews })
       : null;
     return {
     roomId: group.room.id,
@@ -584,7 +598,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
       const groupName = sheetGroup.cabinets.length > 1
         ? (sheetGroup.hasWall && sheetGroup.hasBase ? `${groupRoomBaseName}` : `${cabinet.name}`)
         : cabinet.name;
-      const sheet = buildFurnitureSheet(group.room, groupMembers, project, rules, { furnitureName: groupName });
+      const sheet = buildFurnitureSheet(group.room, groupMembers, project, rules, { furnitureName: groupName, projectViews });
       const groupMapTags = groupMembers.map((c) => mapTags.get(c.id) ?? '?').join('/');
       return {
         id: cabinet.id,

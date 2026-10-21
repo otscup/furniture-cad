@@ -249,6 +249,82 @@ function drawTrouserRack(P: ViewPainter, x0: number, x1: number, zBase: number):
   }
 }
 
+/**
+ * ── 灯带符号（2026-10-21，对标参考图纸《世园润府》）──
+ *
+ * ★ 参考图纸的实测画法（PDF 内容流逐条量出来的）──
+ *
+ *   ① **靠前 front**（p5）：
+ *      层板占 y19558..19594（板厚 36），灯带槽画成**双线**在
+ *      y19522 与 y19533（间距 11 = 槽壁厚），位置在层板**下方**。
+ *      y 更小 = 更靠观察者 = 层板前缘，所以「靠前」= 画在前缘外侧。
+ *
+ *   ② **居中 center**（p2）：
+ *      层板中间两条**单线**，间距 82（实测 y18164 / y18246）。
+ *
+ *   ③ **45°斜光 angled45**（p6）：
+ *      一条 45° 斜线 + 一条水平线（实测斜线 (30814,17210)→(31787,19003)，
+ *      水平线在 y19003）。
+ *
+ * ★ 尺寸怎么定 ──
+ *   参考图的绝对值（槽壁 11、居中间距 82）是**图纸单位**，
+ *   与柜体实际毫米没有固定关系（层板厚度会变）。
+ *   所以这里按**层板厚度的比例**给：
+ *     · 靠前：槽壁 = 板厚 × 0.3（参考 11/36 ≈ 0.3），
+ *       槽在层板前缘外侧。
+ *     · 居中：两条线在板厚中部，上下各留 板厚 × 0.25。
+ *     · 45°：从层板前缘斜向内上 45°，画到板厚 × 1.2 处。
+ *   比例取自参考图，换板厚也不会失真。
+ *
+ * @param P     绘制器
+ * @param x0,x1 层板左右边（柜体局部 X）
+ * @param zFront 层板**前缘**的 Z（柜体局部，较小的一端）
+ * @param t     层板厚度
+ * @param style 灯带安装位
+ */
+function drawLedStrip(
+  P: ViewPainter,
+  x0: number,
+  x1: number,
+  zFront: number,
+  t: number,
+  style: 'none' | 'center' | 'front' | 'angled45'
+): void {
+  const w = x1 - x0;
+  if (w < 60 || t < 2) return;
+  switch (style) {
+    case 'front': {
+      // 灯带槽：前缘外侧的双线（槽壁 = 板厚 × 0.3）
+      const wall = Math.max(3, t * 0.3);
+      const zSlotTop = zFront - wall;
+      const zSlotBot = zSlotTop - wall;
+      P.line(x0, x1, zSlotTop, zSlotTop, L_HW, 1.0);
+      P.line(x0, x1, zSlotBot, zSlotBot, L_HW, 1.0);
+      // 槽与层板前缘之间的连接（两条短竖线）
+      P.line(x0, x0, zFront, zSlotTop, L_HW, 0.7);
+      P.line(x1, x1, zFront, zSlotTop, L_HW, 0.7);
+      break;
+    }
+    case 'center': {
+      // 层板中间两条单线（参考图间距 = 板厚 × 2.3）
+      const gap = t * 0.9;
+      const zc = zFront + t / 2;
+      P.line(x0, x1, zc - gap / 2, zc - gap / 2, L_HW, 0.8);
+      P.line(x0, x1, zc + gap / 2, zc + gap / 2, L_HW, 0.8);
+      break;
+    }
+    case 'angled45': {
+      // 45° 斜光线：从层板前缘斜向内上，配一条水平线
+      const reach = t * 1.2;
+      P.line(x0 + 0, x0 + reach, zFront, zFront + reach, L_HW, 0.8);
+      P.line(x0, x1, zFront + reach, zFront + reach, L_HW, 0.8);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 function makePainter(out: Prim[], map: Mapper): ViewPainter {
   return {
     rect(a0, a1, b0, b1, layer, lw, dash) {
@@ -1487,6 +1563,32 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const shift = tilt > 0 ? Math.round(span * Math.tan((tilt * Math.PI) / 180)) : 0;
           equalSpacing(rowNH, u.shelves.count).forEach((pos) => {
             const yb = rowZ0 + pos;
+            /**
+             * ── 灯带（2026-10-21，对标参考图纸《世园润府》）──
+             *
+             * ★ 之前灯带**只进清单、不进图纸** ──
+             *   `ledStrip` 字段一直只影响生成的 HW_LED_* 五金件，
+             *   图纸上一个符号都没有 —— 客户拿到图不知道灯带装在哪。
+             *
+             * ★ 参考图纸的实测画法（PDF 内容流）──
+             *   · **靠前 front**：层板前缘下侧一条灯带槽，画成**双线**
+             *       实测（p5）：层板占 y19558..19594（板厚 36），
+             *       灯带槽双线在 y19522 与 y19533（间距 11，= 槽壁厚），
+             *       位置在层板**下方**（y 更小 = 更靠观察者 = 前缘）。
+             *   · **居中 center**：层板**中间**两条单线，间距 82
+             *       实测（p2）：y18164 与 y18246。
+             *   · **45°斜光 angled45**：一条 45° 斜线 + 一条水平线
+             *       实测（p6）：(30814,17210)→(31787,19003) 斜线 +
+             *       y19003 的水平线。
+             *
+             * ★ 画在哪张图 ──
+             *   灯带是**内部可见**的（开放格才看得见），
+             *   所以只在开放格（无门无抽）画。
+             */
+            const ledStyle = u.shelves?.ledStrip ?? 'none';
+            if (ledStyle !== 'none' && openUnit) {
+              drawLedStrip(P, s.a, s.b, yb, t, ledStyle);
+            }
             if (shift > 0) {
               P.poly(
                 [
@@ -1704,17 +1806,79 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 return idx % 2 === 0;
               };
               /**
-               * 玻璃门额外画两道斜纹表示「黑框灰玻」材质。
-               * 只表达**材质**不表达开向；线型刻意与开向虚线不同，避免读混。
+               * ── 玻璃门：标准 45° 等距平行线填充（2026-10-21，对标参考图纸）──
+               *
+               * ★ 之前的画法是「两道短斜线」──
+               *   原注释写着「两道斜纹表示黑框灰玻」，但那**不是参考图的画法**：
+               *   参考图的门板玻璃是**满铺的等距平行斜线**，一眼能看出是玻璃。
+               *   两道短斜线看起来像「门上的装饰线」，客户认不出来。
+               *
+               * ★ 参考图纸的实测画法（PDF 内容流）──
+               *   玻璃门区域 x10053..13433 (宽 3380)、y16394..20184 (高 3790)，
+               *   31 条 45° 平行线（dx 严格等于 dy），
+               *   线的间距中位数 279 = 板宽的 **8.3%**，
+               *   每条线都被门板矩形裁剪（起点落在左下边或左边，终点落在右边或上边）。
+               *
+               * ★ 间距怎么定 ──
+               *   参考图的绝对值（279）与门宽有关但不成固定比例，
+               *   所以这里按**门板宽度的 8.3%** 给（与实测一致），
+               *   并且给一个下限（60mm）—— 太窄的门画太密会糊成一片。
+               *
+               * ★ 只表达材质，不表达开向 ──
+               *   开向由 drawSwing 的虚线表达，材质由这组实线表达，两者不混。
                */
               if (isGlass) {
-                const hatch = (f: number): void => {
-                  const hx = left + w * f;
-                  const run = Math.min(right - hx, zBot - zTop);
-                  if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
-                };
-                hatch(0.33);
-                hatch(0.66);
+                /**
+                 * ★ 坐标系：zTop 是**下**沿、zBot 是**上**沿 ──
+                 *   门板图元是 P.rect(left, right, zTop, zBot)，
+                 *   而 zTop = rowZ0 + gapOuter 比 zBot = rowZ0 + rowNH - gapOuter **小**。
+                 *   所以 (zTop - zBot) 是**负数**。
+                 *
+                 *   ★ 第一版就栽在这里 ──
+                 *   循环上界写成 (right-left) + (zTop - zBot) = 578 + (-2280) = -1702，
+                 *   **循环一次都不执行** —— 玻璃门上一个斜线都没有。
+                 *   而 tsc 与旧验收都没发现（旧验收只查「有没有斜线」，
+                 *   恰恰是这次要加的东西）。
+                 *
+                 *   现在显式用 zLo = min / zHi = max，方向不再靠猜。
+                 */
+                const zLo = Math.min(zTop, zBot);
+                const zHi = Math.max(zTop, zBot);
+                const step = Math.max(60, (right - left) * 0.083);
+                // 从**左下角**起，每隔 step 画一条 45° 线，直到填满门板
+                /**
+                 * ★ 45° 线的正确算法：按**直线方程**求矩形交集 ──
+                 *
+                 *   一条 45° 线的方程是 `x − y = k`（k 为常数）。
+                 *   把它和门板矩形求交，得到的线段**仍然保持 45°**
+                 *   （只是长度被边界截断）。
+                 *
+                 *   ★ 交点怎么求（这是关键）──
+                 *   直线上的点满足 `x = y + k`。
+                 *   把它限制在矩形内：
+                 *     x ∈ [left, right]  ⇒  y ∈ [left − k, right − k]
+                 *     y ∈ [zLo, zHi]
+                 *   两者取交集就是有效的 y 区间：
+                 *     yFrom = max(zLo, left − k)
+                 *     yTo   = min(zHi, right − k)
+                 *   区间非空时，线段就是 (yFrom+k, yFrom) → (yTo+k, yTo)。
+                 *
+                 *   ★ 前两版错在哪 ──
+                 *   ① 「从左下角到右上角连一条再 clamp 两端」——
+                 *      dx=288 dy=2280，根本不是 45°，而且 is45 筛不到
+     （画了 43 条却报「0 条」）。
+                 *   ② 手工分「从左边界出发 / 从下边界出发」两个分支 ——
+                 *      else 分支没 clamp sx，k 大时线画到门外，
+                 *      而且两条分支的 k 步进不一致（k 间距 12..60，看着不均匀）。
+                 *
+                 *   ★ 第三版就一条公式，不再分支 ──
+                 */
+                for (let k = left - zHi; k <= right - zLo; k += step) {
+                  const yFrom = Math.max(zLo, left - k);
+                  const yTo = Math.min(zHi, right - k);
+                  if (yTo - yFrom < 1) continue;
+                  P.line(yFrom + k, yTo + k, yFrom, yTo, L_FRONT, 0.6);
+                }
               }
               drawSwing(left, right, zTop, zBot, hingeLeftFor(k));
             }

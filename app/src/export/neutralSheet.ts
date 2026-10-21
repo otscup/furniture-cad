@@ -1,5 +1,6 @@
 import type { BBox, Cabinet, CabinetGeometry, Issue, Panel, Prim, Project, PurchasedItem, RuleSet, Vec2 } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { buildProjectViews } from '../core/geometry/views.ts';
 import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
 import { drawingPrims, planSourceKeys as makePlanSourceKeys } from '../core/drawingEdits.ts';
 import { cabinetWarningIssues, formatCabinetWarning } from './warningNotes.ts';
@@ -264,10 +265,19 @@ export function toNeutralExport(
   if (which.includes('sheet')) {
     const groups = groupByRoom(project);
     let sheetIndex = 0;
+    /**
+     * ★ 整份项目的四视图，**整次导出只算一次** ──
+     *
+     *   sheetMode='cabinet'（默认）下会对**每只柜**调一次 buildFurnitureSheet，
+     *   而它每次都 buildProjectViews(project) 遍历全部柜体 ⇒ O(柜数²)。
+     *   实测：5 柜 29 ms → 20 柜 258 ms → 40 柜 932 ms（完美二次曲线）。
+     *   改成算一次后降到 O(柜数)。
+     */
+    const projectViews = buildProjectViews(project, rules);
     for (const group of groups) {
       if ((sheetMode === 'room' || sheetMode === 'both') && group.cabinets.length > 0) {
         sheetIndex += 1;
-        const roomSheet = buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜` });
+        const roomSheet = buildFurnitureSheet(group.room, group.cabinets, project, rules, { furnitureName: `${group.room.name}整体柜`, projectViews });
         const roomSuffix = group.room.id.replace(/[^A-Za-z0-9]/g, '').slice(-8) || String(sheetIndex);
         const roomPrims = [...roomSheet.prims];
         if (group.cabinets.some((c) => hasUnmachinedReference(c))) {
@@ -285,7 +295,7 @@ export function toNeutralExport(
       if (sheetMode === 'room') continue;
       for (const cabinet of group.cabinets) {
         sheetIndex += 1;
-        const sheet = buildFurnitureSheet(group.room, [cabinet], project, rules, { furnitureName: cabinet.name });
+        const sheet = buildFurnitureSheet(group.room, [cabinet], project, rules, { furnitureName: cabinet.name, projectViews });
         const idSuffix = cabinet.id.replace(/[^A-Za-z0-9]/g, '').slice(-8) || String(sheetIndex);
         const sheetPrims = [...sheet.prims];
         if (hasUnmachinedReference(cabinet)) {

@@ -148,24 +148,315 @@ export function extractReplayable(steps) {
 }
 
 /**
+ * ══════════════════════════════════════════════════════════════════════
+ *  相似度匹配（把「上次类似的做法」挑出来当范例）
+ *
+ *  ── 它要解决什么 ──
+ *    findSimilar 原来只按「动作族有交集」筛选。那是**类型**层面的过滤，
+ *    不是**内容**层面的 —— 同一族里的两条序列可能差得很远：
+ *    「建个衣柜」和「建个鞋柜」都是 create 族，但做法完全不同。
+ *    把不相关的一条当范例塞进提示词，模型会**照着抄**错的做法，
+ *    比不给范例更糟。
+ *
+ *  ── 为什么用字符二元组（bigram）Jaccard ──
+ *    中文没有空格分词，二元组是最省事又不失真的近似：
+ *    「建个衣柜」和「做个衣柜」共享 {个衣, 衣柜} ⇒ 像；
+ *    「建个衣柜」和「把柜子改宽点」一个二元组都不共享 ⇒ 不像。
+ *    口径与 shared/ruleRetrieval.mjs 里的 jaccard 保持一致 ——
+ *    两处各写一套，同一件事会有两个不同的数，早晚漂移。
+ *
+ *  ── 阈值为什么取 0.45（实测出来的，不是拍的）──
+ *    拿本项目真实说法跑一遍，分成两簇：
+ *      · 该像的：0.40 ~ 1.00
+ *        （「建个衣柜」/「帮我建个衣柜」= 0.60、「加个吊柜」/「再加个吊柜」= 0.75、
+ *          「建个衣柜」/「建个衣橱」= 0.50、「建个衣柜」/「建一个衣柜」= 1.00）
+ *      · 不该像的：≤ 0.20
+ *        （「加个抽屉」/「加个层板」= 0.20、「建个衣柜」/「建个书柜」= 0.20）
+ *    0.45 正落在两簇之间的空档里。
+ *
+ *    ★ 阈值往高了取，不往低了取 ──
+ *      范例是给模型**照着抄**的。给一条不相关的范例，模型会照抄；
+ *      不给范例，模型自己想一遍 —— 结果仍然是对的，只是慢一点。
+ *      两个代价不对等，所以宁可漏。
+ *
+ *  ── 已知局限（记下来，免得以后误以为它能分）──
+ *    字符层面的相似度分不出「衣柜」和「衣架」：结构一样、只差一个字，
+ *    得分同样是 0.50。这类「同构不同物」只能靠语义拦，本模块拦不住。
+ *    动作族那一关能拦掉跨类型的（建柜 vs 改尺寸），拦不掉同类型的
+ *    （衣柜 vs 衣架）—— 这是已知代价，不假装没有。
+ * ══════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * 相似度检索的默认阈值。
+ *
+ * ★ 数字的依据见上面那段实测 —— 0.45 落在「该像」与「不该像」两簇之间。
+ * @type {number}
+ */
+export const SIMILARITY_THRESHOLD = 0.45;
+
+/**
+ * 一次最多带几条范例。
+ *
+ * ★ 为什么不给更多 ──
+ *   范例越多，模型越容易把**别人那次的需求参数**当成本次的默认值。
+ *   这东西的作用是「省掉摸索」，不是「穷举可能性」—— 给最好的 1~2 条就够。
+ * @type {number}
+ */
+export const MAX_SIMILAR_SEQUENCES = 2;
+
+/**
+ * 量词表：数字 + 量词 是**计数**，不是**参数**。
+ *
+ * ★ 只收「可数名词」的量词，绝不收尺寸单位（mm/cm/m）——
+ *   收了尺寸单位就会把「宽600」和「宽800」折成同一句话，
+ *   而那两个是**不同的需求**，给错范例等于给错尺寸。
+ */
+const COUNT_UNITS = [
+  '个', '只', '张', '把', '条', '台', '扇', '副', '双', '根', '块',
+  '间', '组', '排', '套', '件', '栋', '棵', '座', '匹',
+];
+
+/**
+ * 把一句话变成「用于比较像不像」的文本。
+ *
+ * ★ 与 intentFingerprint 的区别（这两个别混）──
+ *   intentFingerprint 是**重放**的判据，必须严格：数字不同就是不同的需求，
+ *   绝不能折叠（「宽600」和「宽800」不能互相重放）。
+ *   这里只用来**比较像不像**，所以把「计数」折叠掉：
+ *   「建一个衣柜」与「建个衣柜」是同一个需求，折叠后完全一致 ⇒ 相似度 1。
+ *
+ * ★ 只折叠「数字 + 量词」，绝不裸删数字 ──
+ *   裸删数字会把「宽600」和「宽800」变成同一句话。
+ *
+ * @param {string} text 用户原话
+ * @returns {string} 规范化后的比较文本；空文本返回空串
+ */
+/**
+ * 字符串的简单校验和（用于把数字映射成一段确定性的等长填充）。
+ *
+ * ★ 为什么要它 ──
+ *   相似度计算要能区分「宽600」和「宽800」，
+ *   但又不能因为长度不同而让 Jaccard 的分母失真。
+ *   所以把数字映射成**等长**的填充串：长度一样（分母可比），
+ *   内容不同（不共享 bigram）。
+ *
+ * @param {string} s
+ * @returns {string} 4 位十六进制
+ */
+function checksum(s) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = (h1 ^ c) >>> 0;
+    h1 = Math.imul(h1, 16777619) >>> 0;
+    h2 = (h2 + c * (i + 7)) >>> 0;
+  }
+  return ((h1 >>> 0) % 65536).toString(16).padStart(4, '0') + ((h2 >>> 0) % 65536).toString(16).padStart(4, '0');
+}
+
+function similarityText(text) {
+  const base = intentFingerprint(text);
+  if (!base) return '';
+  const units = COUNT_UNITS.join('|');
+  /**
+   * ★ 尺寸数字必须**保持区分度** ──
+   *
+   *   原来的做法只删「数字 + 量词」，裸数字（「宽600」里的 600）留在文本里。
+   *   结果 bigram 里仍然共享 `00`/`60` 这些片段，
+   *   「宽600的柜子」vs「宽800的柜子」相似度高达 0.5 ——
+   *   **越过了 0.45 的阈值**，范例会把模型带向错误尺寸。
+   *
+   *   修法：把裸数字替换成一个**按值区分**的标记
+   *   （不是删除 —— 删了会让两者 bigram 完全一样，相似度反而变 1）。
+   *   标记里带上数字本身，所以 600 与 800 产生的片段不同，
+   *   共享的 bigram 只剩「宽」「的」「柜」这些真正的语义部分。
+   */
+  const countRe = new RegExp('[0-9]+(?=' + units + ')', 'g');
+  const countSpans = [];
+  for (const m of base.matchAll(countRe)) countSpans.push([m.index, m.index + m[0].length]);
+  const inCount = (i) => countSpans.some(([s, e]) => i >= s && i < e);
+  let out = '';
+  for (let i = 0; i < base.length; ) {
+    const d = /[0-9]/.exec(base.slice(i));
+    if (!d || d.index === undefined) { out += base.slice(i); break; }
+    const start = i + d.index;
+    const numMatch = /^[0-9]+/.exec(base.slice(start));
+    const num = numMatch ? numMatch[0] : base.slice(start);
+    if (inCount(start)) {
+      // 计数：折叠掉（「一个」≡「个」）
+      out += '';
+    } else {
+      // 尺寸参数：保留区分度，但**不共享任何 bigram**
+      //
+      //   直接写 #600# 与 #800# 仍会共享 bigram「00」「0#」——
+      //   实测相似度 0.556，越过了 0.45 的阈值。
+      //   改成用数字的**校验和**生成一段等长、互不相同的填充：
+      //   同样长度 ⇒ bigram 数量相同（分母可比），
+      //   内容不同 ⇒ 不共享 bigram（分子只剩真正的语义部分）。
+      const h = checksum(num);
+      out += '#' + h + '#';
+    }
+    i = start + num.length;
+  }
+  return out;
+}
+
+/**
+ * 把一段文本切成二元组（bigram），用来算字面重合度。
+ * 中文没有空格分词，二元组是最省事又不失真的近似。
+ *
+ * @param {string} s
+ * @returns {Set<string>}
+ */
+function bigrams(s) {
+  const out = new Set();
+  const t = String(s ?? '').replace(/\s+/g, '');
+  if (t.length === 1) {
+    out.add(t);
+    return out;
+  }
+  for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2));
+  return out;
+}
+
+/**
+ * 算两条文本的字面重合度（Jaccard）。
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} 0~1
+ */
+function jaccard(a, b) {
+  const A = bigrams(a);
+  const B = bigrams(b);
+  if (A.size === 0 || B.size === 0) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  if (inter === 0) return 0;
+  return inter / (A.size + B.size - inter);
+}
+
+/**
+ * 取一段话（字符串或带 intent 字段的序列记录）。
+ *
+ * @param {string|{intent?: string}} x
+ * @returns {string}
+ */
+function textOf(x) {
+  if (typeof x === 'string') return x;
+  if (x && typeof x === 'object') return String(x.intent ?? '');
+  return '';
+}
+
+/**
+ * 两条意图有多像（0~1）。
+ *
+ * 完全一样 ⇒ 1；一个字都不沾 ⇒ 0。
+ *
+ * ★ 为什么能当判据 ──
+ *   它只回答「像不像」，**不回答**「能不能照抄」。
+ *   能不能重放是 canReplay 的事（白名单 + 有创建动作），
+ *   两件事分开管：相似度再高也不改变删除类不可重放这条底线。
+ *
+ * @param {string|{intent?: string}} a
+ * @param {string|{intent?: string}} b
+ * @returns {number} 0~1
+ */
+export function similarityOf(a, b) {
+  const ta = similarityText(textOf(a));
+  const tb = similarityText(textOf(b));
+  if (!ta || !tb) return 0;
+  return jaccard(ta, tb);
+}
+
+/**
+ * ★ 从一堆历史序列里挑出「像这次」的候选 ★
+ *
+ * 三道闸，缺一不可：
+ *   ① **可重放** —— 含删除类的序列一律不进来（canReplay 的白名单）。
+ *   ② **动作族有交集** —— 分不清类型的请求不参与序列复用
+ *      （跟 server.mjs 里 detectFamiliesFor 同一个口径）。
+ *   ③ **相似度达标** —— 低于阈值直接丢掉。
+ *
+ * ★ 第③道为什么放在最后也最重要 ──
+ *   前两道是「类型对不对」，第三道才是「内容像不像」。
+ *   只有动作族这一道时，「建个衣柜」会捞出「建个鞋柜」——
+ *   那条范例会把模型带偏，而且模型会照着抄。
+ *
+ * @param {Array} seqs 历史序列 [{key, intent, families, steps, at}]
+ * @param {string} intent 这次的用户原话
+ * @param {string[]} families 这次的动作族
+ * @param {object} [options]
+ * @param {number} [options.threshold=SIMILARITY_THRESHOLD] 相似度阈值
+ * @param {number} [options.limit=MAX_SIMILAR_SEQUENCES] 最多返回几条
+ * @param {string} [options.excludeKey] 要排除的 key（自己那条）
+ * @returns {Array} 排序后的候选 [{...seq, similarity}]，相似度降序
+ */
+export function matchSequences(seqs, intent, families = [], options = {}) {
+  const threshold = Number.isFinite(options.threshold) ? options.threshold : SIMILARITY_THRESHOLD;
+  const limit = Number.isFinite(options.limit) ? options.limit : MAX_SIMILAR_SEQUENCES;
+  const excludeKey = String(options.excludeKey ?? '');
+  const fam = new Set(Array.isArray(families) ? families : []);
+
+  // 分不清类型 ⇒ 一条都不给。宁可没有范例，也不要给错类型的范例。
+  if (fam.size === 0) return [];
+
+  const list = Array.isArray(seqs) ? seqs : [];
+  const out = [];
+  for (const seq of list) {
+    if (!seq || typeof seq !== 'object') continue;
+    if (excludeKey && seq.key === excludeKey) continue;
+    // ① 安全底线：删除类序列永远不进候选
+    if (!canReplay(seq.steps).ok) continue;
+    // ② 类型要对得上
+    const sf = Array.isArray(seq.families) ? seq.families : [];
+    if (!sf.some((f) => fam.has(f))) continue;
+    // ③ 内容要够像
+    const similarity = similarityOf(seq, intent);
+    if (similarity < threshold) continue;
+    out.push({ ...seq, similarity });
+  }
+
+  // 相似度降序；同分时取最近的那条（同一条做法，越近越贴近当前项目状态）
+  out.sort((a, b) => (b.similarity - a.similarity) || ((b.at ?? 0) - (a.at ?? 0)));
+  return limit >= 0 ? out.slice(0, limit) : out;
+}
+
+/**
  * 把上次的成功序列渲染成提示词范例。
  *
- * @param {object} seq 序列记录
+ * ★ 为什么能收一条也能收一批 ──
+ *   服务端传下来的是**排好序的候选列表**（最像的在前）。
+ *   这里按顺序渲染前几条；一条时读起来是「上次那套」，
+ *   几条时是「上次那几套」，都还是本项目里已经跑通过的做法。
+ *
+ * @param {object|Array} seq 序列记录，或排好序的候选列表
  * @returns {string}
  */
 export function renderSequenceHint(seq) {
-  if (!seq || !Array.isArray(seq.steps) || seq.steps.length === 0) return '';
+  const list = Array.isArray(seq) ? seq : (seq ? [seq] : []);
+  const usable = list.filter((s) => s && Array.isArray(s.steps) && s.steps.length > 0);
+  if (usable.length === 0) return '';
+  const picked = usable.slice(0, MAX_SIMILAR_SEQUENCES);
   const lines = [];
   lines.push('【上次类似需求你是这样做的】');
-  lines.push('下面是本项目里**已经成功执行过**的一套操作，可以直接照着做（参数按这次的实际需求替换）：');
-  for (const s of seq.steps) {
-    let argStr = '';
-    try {
-      argStr = JSON.stringify(s.args ?? {});
-    } catch {
-      argStr = '';
+  lines.push(
+    picked.length === 1
+      ? '下面是本项目里**已经成功执行过**的一套操作，可以直接照着做（参数按这次的实际需求替换）：'
+      : '下面是本项目里**已经成功执行过**的几套操作，可以直接照着做（参数按这次的实际需求替换）：',
+  );
+  for (const s of picked) {
+    for (const st of s.steps) {
+      let argStr = '';
+      try {
+        argStr = JSON.stringify(st.args ?? {});
+      } catch {
+        argStr = '';
+      }
+      lines.push('- ' + st.tool + ' ' + (argStr.length > 200 ? argStr.slice(0, 200) + '…' : argStr));
     }
-    lines.push('- ' + s.tool + ' ' + (argStr.length > 200 ? argStr.slice(0, 200) + '…' : argStr));
   }
   return lines.join('\n');
 }

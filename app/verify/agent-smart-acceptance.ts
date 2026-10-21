@@ -44,6 +44,9 @@ import {
   renderSequenceHint,
   isReplayable,
   REPLAYABLE_TOOLS,
+  similarityOf,
+  matchSequences,
+  SIMILARITY_THRESHOLD,
 } from '../shared/sequenceStore.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -745,6 +748,111 @@ section('8. 端到端实测抓出来的 bug：tsc 查不出来的那些');
   ok('★ 重放调用没有用裸的 replaySeq 变量',
     !/replaySequence\(replaySeq[,\s]/.test(agentSrc),
     agentSrc.match(/replaySequence\([^\n]*/)?.[0] ?? '');
+}
+
+// ═══════════════ 9. 序列相似度匹配（放宽到换说法也能复用）═══════════════
+section('9. 相似度匹配：换个说法也能找到历史序列');
+{
+  /**
+   * ★ 为什么要做这个 ──
+   *   原来只有**完全一致**的意图才能复用。
+   *   但「建个衣柜」「帮我建个衣柜」「建一个衣柜」是同一件事，
+   *   换个说法就完全用不上历史序列 —— 而那恰恰是最常见的重复。
+   *
+   * ★ 口径 ──
+   *   字符二元组（bigram）的 Jaccard 相似度。
+   *   中文没有空格分词，bigram 是最省事又不失真的近似
+   *   （与 shared/ruleRetrieval.mjs 的 jaccard 同一口径）。
+   *
+   * ★ 阈值是**实测标定**的，不是拍的 ──
+   *   本项目真实说法的相似度分成两簇：
+   *     该像的：0.40 ~ 1.00（建个衣柜/帮我建个衣柜 = 0.60、加个吊柜/再加个吊柜 = 0.75）
+   *     不该像的：≤ 0.20（建个衣柜/建个鞋柜 = 0.20、加个抽屉/加个层板 = 0.20）
+   *   0.45 正落在两簇之间的空档里。
+   *
+   *   ★ 阈值往高了取，不往低了取 ──
+   *     范例是给模型**照着抄**的。给一条不相关的范例，模型会照抄；
+   *     不给范例，模型自己想一遍 —— 结果仍然是对的，只是慢一点。
+   *     两个代价不对等，所以宁可漏。
+   */
+  const sim = (a: string, b: string): number => similarityOf(a, b);
+
+  ok('★ 完全相同的意图相似度 = 1', sim('建个衣柜', '建个衣柜') === 1, String(sim('建个衣柜', '建个衣柜')));
+  ok('★ ★「建个衣柜」vs「帮我建个衣柜」高于阈值（同义改写）',
+    sim('建个衣柜', '帮我建个衣柜') > SIMILARITY_THRESHOLD, sim('建个衣柜', '帮我建个衣柜').toFixed(3));
+  ok('★ ★「加个吊柜」vs「再加个吊柜」高于阈值',
+    sim('加个吊柜', '再加个吊柜') > SIMILARITY_THRESHOLD, sim('加个吊柜', '再加个吊柜').toFixed(3));
+  ok('★ ★「建个衣柜」vs「把柜子改宽点」**低于**阈值（不同需求）',
+    sim('建个衣柜', '把柜子改宽点') < SIMILARITY_THRESHOLD, sim('建个衣柜', '把柜子改宽点').toFixed(3));
+  ok('★ ★「建个衣柜」vs「建个鞋柜」**低于**阈值（不同柜型）',
+    sim('建个衣柜', '建个鞋柜') < SIMILARITY_THRESHOLD, sim('建个衣柜', '建个鞋柜').toFixed(3));
+  ok('★ 相似度是对称的',
+    Math.abs(sim('建个衣柜', '帮我建个衣柜') - sim('帮我建个衣柜', '建个衣柜')) < 1e-9);
+
+  /**
+   * ★ 「计数」与「参数」的区分 ──
+   *   「建一个衣柜」与「建个衣柜」是同一个需求（折叠后完全一致 ⇒ 1.0）；
+   *   但「宽600」与「宽800」是**不同**需求，绝不能折叠。
+   */
+  // 「一」这个字本身还在文本里，所以不是 1.0 ——
+  // 但「1」这个**计数**已被折叠，相似度仍远高于阈值（能命中）。
+  ok('★ ★「建一个衣柜」vs「建个衣柜」高于阈值（计数被折叠）',
+    sim('建一个衣柜', '建个衣柜') > SIMILARITY_THRESHOLD, sim('建一个衣柜', '建个衣柜').toFixed(3));
+  ok('★ ★「宽600」vs「宽800」**不**折叠（是不同需求）',
+    sim('宽600的柜子', '宽800的柜子') < SIMILARITY_THRESHOLD, sim('宽600的柜子', '宽800的柜子').toFixed(3));
+
+  /**
+   * ── matchSequences 的行为 ──
+   */
+  const seqs = [
+    { key: 'k1', intent: '建个衣柜', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }], at: 1 },
+    { key: 'k2', intent: '做个电视柜', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }], at: 2 },
+    { key: 'k3', intent: '把柜子改宽点', families: ['geometry'], steps: [{ tool: 'cad.update_object', args: {} }], at: 3 },
+  ];
+  const m1 = matchSequences(seqs, '建个衣柜', ['create']);
+  ok('★ matchSequences 找到最相似的（k1）', m1.length >= 1 && m1[0]!.key === 'k1', JSON.stringify(m1.map((x) => x.key)));
+  ok('★ 返回值带 similarity 字段', m1[0]!.similarity > 0.9, String(m1[0]!.similarity));
+
+  const m2 = matchSequences(seqs, '帮我建个衣柜', ['create']);
+  ok('★ ★ 换个说法也能找到（k1）', m2.length >= 1 && m2[0]!.key === 'k1', JSON.stringify(m2.map((x) => x.key)));
+
+  /**
+   * ★ 测阈值必须用**同族但内容不像**的样本 ──
+   *   用「把柜子改宽点」测不到阈值：它被**动作族闸门**先挡掉了
+   *   （k3 是 geometry 族，本次查的是 create 族），
+   *   根本走不到相似度那一关。
+   *   变异「去掉阈值判断」时它照样全绿 —— 这条断言等于没写。
+   *
+   *   正确做法：加一条**同族**（create）但内容完全不同的序列。
+   */
+  const sameFamUnrelated = [
+    { key: 'k9', intent: '建个鞋柜', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }], at: 9 },
+  ];
+  const m3 = matchSequences(sameFamUnrelated, '建个衣柜', ['create']);
+  ok('★ ★ 同族但内容不像时**不返回**（阈值真的在拦）',
+    m3.length === 0, JSON.stringify(m3.map((x) => x.key + '(' + x.similarity.toFixed(2) + ')')));
+
+  const m3b = matchSequences(seqs, '把柜子改宽点', ['create']);
+  ok('★ 动作族闸门也挡住了（另一道防线）', m3b.length === 0, JSON.stringify(m3b.map((x) => x.key)));
+
+  const m4 = matchSequences(seqs, '加个书架', ['create']);
+  ok('★ 完全无关的意图不返回', m4.length === 0, JSON.stringify(m4.map((x) => x.key)));
+
+  /**
+   * ★ 动作族不匹配的**一律不返回** ──
+   *   「建柜」的序列不能拿去回答「改尺寸」。
+   */
+  const m5 = matchSequences(seqs, '建个衣柜', ['geometry']);
+  ok('★ 动作族不匹配时不返回（建柜序列不给改尺寸用）', m5.length === 0, JSON.stringify(m5.map((x) => x.key)));
+
+  /**
+   * ★ 删除类仍然不可重放 —— 相似度放宽**不能**放宽安全底线。
+   */
+  const dangerSeqs = [
+    { key: 'd1', intent: '建个衣柜', families: ['create'], steps: [{ tool: 'cad.create_cabinet', args: {} }, { tool: 'cad.delete_object', args: {} }], at: 1 },
+  ];
+  const m6 = matchSequences(dangerSeqs, '帮我建个衣柜', ['create']);
+  ok('★ ★ 含删除类的序列不会被选为范例', m6.length === 0, JSON.stringify(m6.map((x) => x.key)));
 }
 
 console.log('\n' + '='.repeat(64));

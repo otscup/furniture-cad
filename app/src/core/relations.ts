@@ -385,7 +385,18 @@ export function validateAssemblies(project: Project): Issue[] {
 
     // 空间上是否连成一片（软提示：一组柜分成两堆，多半是落位错了，但也可能用户有意）
     if (asm.memberIds.length > 1) {
-      const mine = deriveContacts(project).filter((c) => seenMember.has(c.a) && seenMember.has(c.b));
+      /**
+       * ★ 复用上面已经算好的 contactIndex，不再重算 ★
+       *
+       *   原来这里是 deriveContacts(project) —— 而 :333 的 contactIndex(project)
+       *   已经算过一遍同样的东西了。deriveContacts 是 O(柜数²)，
+       *   在**每个 assembly 的循环体内**再算一次 ⇒
+       *   validateAssemblies 变成 O(组合数 × 柜数²)。
+       *
+       *   contactIndex 的 key 是无序的 pairKey（a|b 与 b|a 同键），
+       *   所以用 values() 取回再按成员过滤，语义与原来完全一致。
+       */
+      const mine = [...contacts.values()].filter((c) => seenMember.has(c.a) && seenMember.has(c.b));
       if (!isConnected(asm.memberIds.filter((id) => cabById.has(id)), mine)) {
         out.push(buildIssue('ASSEMBLY-DISCONNECTED', {
           target: asm.id,

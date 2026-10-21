@@ -24,7 +24,7 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 import type { Cabinet, DrawingEntity, Prim, Project, Room, RuleSet, Vec2 } from '../core/types.ts';
-import { buildCabinetViews, buildProjectViews, DimLayout } from '../core/geometry/views.ts';
+import { buildCabinetViews, buildProjectViews, DimLayout, type ProjectViewSet } from '../core/geometry/views.ts';
 import { drawingEntityPrims } from '../core/drawingEdits.ts';
 import { computeCabinetLayout, doorWidths } from '../core/geometry/layout.ts';
 import { allUnits } from '../core/layoutModel.ts';
@@ -550,7 +550,7 @@ export function buildFurnitureSheet(
   cabinets: Cabinet[],
   project: Project,
   rules: RuleSet,
-  opts: { furnitureName?: string } = {}
+  opts: { furnitureName?: string; projectViews?: ProjectViewSet } = {}
 ): FurnitureSheetResult {
   const furnitureName = opts.furnitureName ?? room.name;
   const prims: Prim[] = [];
@@ -561,7 +561,23 @@ export function buildFurnitureSheet(
   const wallCabs = cabinets.filter((c) => classifyCabinet(c) === 'wall');
   const tallCabs = cabinets.filter((c) => classifyCabinet(c) === 'tall');
   const planCabs = [...baseCabs, ...tallCabs];
-  const projectViews = buildProjectViews(project, rules);
+  /**
+   * ★ 整份项目的四视图（供 drawingEdits 坐标换算用）──
+   *
+   * ★ 性能：这里曾经是 O(R×N²) 爆炸的根源 ──
+   *   buildProjectViews 会给**项目里每只柜**各跑一次 buildCabinetViews，
+   *   而 buildRoomBook 对每个房间调一次 buildFurnitureSheet、
+   *   对每个叠放组再调一次 ⇒ 总调用 = (房间数 + 组数) × 柜数。
+   *
+   *   实测（10 柜/房）：
+   *     1 房 183 ms → 2 房 480 ms → 4 房 3090 ms → 8 房 **22133 ms**
+   *   8 房 80 柜要 22 秒，纯属灾难。
+   *
+   * ★ 修法：让调用方算一次，传进来 ──
+   *   opts.projectViews 存在就用它，不存在才自己算（保持函数自足）。
+   *   调用方（roomBook / neutralSheet）在整次导出开头算一次 ⇒ 降到 O(N)。
+   */
+  const projectViews = opts.projectViews ?? buildProjectViews(project, rules);
   const drawings = project.drawingEdits ?? [];
 
   const planBase = buildRawView(planCabs, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);

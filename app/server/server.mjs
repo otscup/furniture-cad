@@ -59,8 +59,12 @@ import {
   resolveMaxTokens,
   MAX_OUTPUT_TOKENS_CAP,
   validateIntentRequest,
+  detectActionFamilies,
 } from '../shared/aiContract.mjs';
 import { quotaView } from '../shared/quota.mjs';
+import { selectProjectRules } from '../shared/ruleRetrieval.mjs';
+import { findReplayable, findSimilar, saveRunSequence } from './sequenceStore.mjs';
+import { sequenceKey } from '../shared/sequenceStore.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, '..');
@@ -77,6 +81,11 @@ const ROOT = join(here, '..');
  */
 const ENV_PATH = process.env.APP_ENV_PATH ? resolve(process.env.APP_ENV_PATH) : join(ROOT, '.env');
 const MEM_PATH = process.env.APP_MEM_PATH ? resolve(process.env.APP_MEM_PATH) : join(ROOT, 'memory', 'corrections.jsonl');
+/**
+ * 操作序列库（方案三）：本项目里**已经成功执行过**的操作序列。
+ * 同一句话再说一次时可以直接重放，省掉整轮模型调用。
+ */
+const SEQ_PATH = process.env.APP_SEQ_PATH ? resolve(process.env.APP_SEQ_PATH) : join(ROOT, 'memory', 'sequences.jsonl');
 const ACCOUNTS_PATH = process.env.APP_ACCOUNTS_PATH ? resolve(process.env.APP_ACCOUNTS_PATH) : join(ROOT, 'memory', 'accounts.json');
 const AUDIT_PATH = process.env.APP_AUDIT_PATH ? resolve(process.env.APP_AUDIT_PATH) : join(ROOT, 'memory', 'audit.jsonl');
 const REGISTRATIONS_PATH = process.env.APP_REGISTRATIONS_PATH ? resolve(process.env.APP_REGISTRATIONS_PATH) : join(ROOT, 'memory', 'pending-registrations.json');
@@ -129,12 +138,56 @@ function activeProjectRules() {
       if (item.status !== 'active') continue;
       const nl = String(item.nl ?? '').trim();
       if (!nl) continue;
-      out.push({ nl, tags: Array.isArray(item.tags) ? item.tags.slice(0, 6) : [] });
+      out.push({
+        nl,
+        tags: Array.isArray(item.tags) ? item.tags.slice(0, 6) : [],
+        scope: typeof item.scope === 'string' ? item.scope : '',
+      });
     }
     return out;
   } catch {
     return [];
   }
+}
+
+/**
+ * ★ 纠正记忆检索（方案二）★
+ *
+ * 之前是**整包塞进提示词**（最多 30 条）。规则一多就会稀释、互相矛盾：
+ * 用户在管理后台写 20 条，其中 2 条跟当前请求相关，
+ * 但模型要为另外 18 条分心，还可能被矛盾的规则带偏。
+ *
+ * 现在按用户这句话的意图检索：
+ *  · **常驻规则**（scope==='rule'，或文本里带「不许/永远/不能」这类硬话）
+ *    —— 跟具体意图无关，任何操作都要遵守，永远带上；
+ *  · **情境规则** —— 只在相关时带上。
+ *
+ * 规则总数不多时**全给**（检索有误伤风险，规则少时没必要冒险）。
+ * 详细口径见 shared/ruleRetrieval.mjs。
+ *
+ * @param {string} text 用户这一句话
+ * @returns {Array} 要注入提示词的规则
+ */
+function relevantProjectRules(text) {
+  return selectProjectRules(activeProjectRules(), text);
+}
+
+/**
+ * 这句话命中的动作族（给序列分组用）。
+ *
+ * detectActionFamilies 返回 null 表示「判断不出来」（可能涉及面很广）。
+ * 那种情况下**不参与序列复用** —— 分不清类型的请求不该拿别的类型的序列来重放。
+ *
+ * @param {string} text 用户原话
+ * @returns {string[]} 动作族；判断不出来时返回空数组
+ */
+function detectFamiliesFor(text) {
+  const f = detectActionFamilies(text);
+  // detectActionFamilies 返回的是 **Set**（不是数组）——
+  // 早先写成 Array.isArray(f) 恒为 false，于是所有请求的 families 都是空的，
+  // 序列分组等于没做（建柜和改尺寸会共用同一个 key）。
+  if (!f) return [];
+  return f instanceof Set ? [...f] : Array.isArray(f) ? [...f] : [];
 }
 
 // ── 导出链路的外部程序 ──
@@ -2313,6 +2366,27 @@ async function handleApi(req, res, pathname) {
         workspaceProject: agentProject,
         token: userToken,
         mcpBaseUrl,
+        /**
+         * ★ 纠正记忆接进 Agent 通道（2026-10-21 修的真缺陷）★
+         *
+         * 之前只有 /api/ai/plan 与 /api/ai/design 两条通道带了 projectRules，
+         * 而界面上**实际走的是本 Agent 通道** —— 也就是说：
+         * 用户在管理后台写的每一条纠正，Agent **从来都看不到**。
+         * 用户每次都得在对话里重说一遍。
+         * 这正是本项目最典型的失效模式：能力建了，但没接到真正在用的那条路上。
+         *
+         * 同样按意图检索（常驻规则必带 + 情境规则按需）。
+         */
+        projectRules: relevantProjectRules(body.intent.trim()),
+        /**
+         * ★ 操作序列复用（方案三）★★
+         *
+         * 查一条**完全一致**的历史成功序列 —— 命中就重放，0 次模型调用。
+         * 没命中就传 null，Agent 照常走模型（并可把本次成功记进库里）。
+         */
+        replaySeq: findReplayable(SEQ_PATH, sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim()))),
+        /** 相似序列：没有完全一致时，把上次的做法当范例给模型 */
+        similarSeq: findSimilar(SEQ_PATH, detectFamiliesFor(body.intent.trim()), sequenceKey(body.intent.trim(), detectFamiliesFor(body.intent.trim()))),
         aiConfig: {
           baseUrl,
           apiKey: key,
@@ -2333,6 +2407,26 @@ async function handleApi(req, res, pathname) {
           });
         },
       });
+      /**
+       * ★ 把这次的成功操作记进序列库（方案三）★★
+       *
+       * 记的是**可重放**的那部分（创建类，剔除删除类）。
+       * 下次同一句话进来时就能 0 次模型调用直接重放。
+       *
+       * 写盘失败不影响本次结果 —— 序列是优化，不是功能前提。
+       */
+      if (result.ok && !result.reused) {
+        try {
+          saveRunSequence(SEQ_PATH, {
+            intent: body.intent.trim(),
+            families: detectFamiliesFor(body.intent.trim()),
+            steps: result.steps,
+            summary: result.summary,
+          });
+        } catch {
+          /* 记不住不影响本次结果 */
+        }
+      }
       // 记账
       if (gate.account) auth.recordUsage(gate.account.id, { generation: false });
       /**
@@ -2701,7 +2795,7 @@ async function handleApi(req, res, pathname) {
          * 这是"说一次就够"的落点：用户在管理后台写一遍，
          * 之后每个请求都自动带上，不必在对话里反复强调。
          */
-        projectRules: activeProjectRules(),
+        projectRules: relevantProjectRules(text),
         temperature: Number(env.AI_TEMPERATURE ?? 0.1),
         // 关键点：规划请求必须尊重 .env 里的 AI_MAX_TOKENS。
         // 早先这里没传 maxTokens，buildChatRequest 永远落到 DEFAULT(4096)，
@@ -2964,7 +3058,7 @@ async function handleApi(req, res, pathname) {
         // P6：前端算好的知识摘要（Resolver 是纯前端确定性函数，服务端只透传文本）
         knowledgeDigest: typeof body.knowledgeDigest === 'string' ? body.knowledgeDigest.slice(0, 4000) : '',
         /** 管理后台确认过的纠正记忆（与 /api/ai/plan 同一份来源） */
-        projectRules: activeProjectRules(),
+        projectRules: relevantProjectRules(text),
         temperature: Number(env.AI_TEMPERATURE ?? 0.2),
         maxTokens: mt.value,
       });

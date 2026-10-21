@@ -1464,16 +1464,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
             }
 
             if (withFronts && isGlass) {
-              // 斜线只表示材质（灰玻），不表示开向 —— 开向仍由下方对角线表达。
-              // 45° 斜线在门洞矩形内截断，两道，避开与开向 X 的视觉混淆。
+              // 灰玻的低透明填充（斜纹在下方 drawSwing 之前画，避免重复）
               P.fillRect(left, right, zTop, zBot, L_FRONT, 0.12);
-              const hatch = (f: number): void => {
-                const hx = left + w * f;
-                const run = Math.min(right - hx, zBot - zTop);
-                if (run > 0) P.line(hx, hx + run, zBot, zBot - run, L_FRONT, 0.7);
-              };
-              hatch(0.33);
-              hatch(0.66);
             }
 
             if (withFronts) {

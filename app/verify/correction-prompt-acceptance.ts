@@ -95,14 +95,25 @@ section('4. 服务端真的在调 AI 时传了它（不是"函数支持了但没
   const mustHave: Array<[string, string]> = [
     ['activeProjectRules', '从 corrections.jsonl 读 active 条目的函数'],
     ["item.status !== 'active'", '只取 status=active（pending/rejected 不进提示词）'],
-    ['projectRules: activeProjectRules()', '调 AI 时真的把规则传下去'],
+    /**
+     * ★ 2026-10-21 改：不再断言 `projectRules: activeProjectRules()`。
+     *   纠正记忆已改成**按意图检索**（方案二），
+     *   调用点变成了 `projectRules: relevantProjectRules(text)`。
+     *   原来那条断言把"整包塞"当成了正确做法 ——
+     *   规则一多就会互相矛盾，正是它要修的问题。
+     */
+    ['relevantProjectRules', '按意图检索后把规则传下去'],
   ];
   for (const [needle, what] of mustHave) {
     ok(`★ server.mjs 源码含「${what}」`, serverSrc.includes(needle), `没找到：${needle}`);
   }
-  ok('★ 两条 AI 通道都传了 projectRules（至少两处调用）',
-    (serverSrc.match(/projectRules:\s*activeProjectRules\(\)/g) ?? []).length >= 2,
-    `实际 ${(serverSrc.match(/projectRules:\s*activeProjectRules\(\)/g) ?? []).length} 处`);
+  const prCalls = (serverSrc.match(/projectRules:\s*relevantProjectRules\(/g) ?? []).length;
+  ok('★ 三条 AI 通道都传了 projectRules（至少三处调用）',
+    prCalls >= 3,
+    `实际 ${prCalls} 处`);
+  ok('★ ★ Agent 通道也传了 projectRules（界面上真正在用的那条路）',
+    /runAgentLoop\(\{[\s\S]{0,3000}?projectRules: relevantProjectRules/.test(serverSrc),
+    'Agent 通道没接 projectRules —— 用户在管理后台写的规矩它就看不到');
 }
 
 // ═══════════════ 5. 读文件失败不让 AI 崩 ═══════════════

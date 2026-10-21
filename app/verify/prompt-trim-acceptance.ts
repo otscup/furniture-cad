@@ -77,7 +77,22 @@ section('3. 猜不出来时回退全量（不能为省 token 冒险）');
   ];
   for (const [label, text] of fallbacks) {
     const len = buildSystemPrompt({ focusText: text }).length;
-    ok(`${label}：回退全量（${len} = ${FULL}）`, len === FULL, `实际 ${len}`);
+    /**
+     * ★ 口径（2026-10-21 改）──
+     *   原来是断言 `len === FULL`（长度必须**精确等于**全量）。
+     *   加了标准做法（配方库）之后这个断言不成立了：
+     *   「把厨房地柜吊柜重新排一下…」会命中 kitchen-L 配方，
+     *   提示词因此比全量**更长**（10346 > 9731）——
+     *   而那正是**想要**的行为：命中配方就该加料。
+     *
+     *   真正要守的是「**没有因为裁剪而少给东西**」：
+     *   动作清单必须是**全量**（一条都不少），
+     *   而提示词总长 >= 全量（只多不少，绝不少）。
+     */
+    const prompt = buildSystemPrompt({ focusText: text });
+    const missing = ACTION_NAMES.filter((n) => !prompt.includes(`- ${n} ——`));
+    ok(`${label}：动作清单是全量（${ACTION_NAMES.length} 条一个不少）`, missing.length === 0, `少了：${missing.join(', ')}`);
+    ok(`${label}：提示词不比全量短（${len} >= ${FULL}）`, len >= FULL, `实际 ${len} < ${FULL}`);
   }
   ok('不传 focusText：全量', buildSystemPrompt().length === FULL);
 }

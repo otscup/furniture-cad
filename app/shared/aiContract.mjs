@@ -30,7 +30,12 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
+import { recipeBlockFor } from './recipes.mjs';
+import { renderProjectRules } from './ruleRetrieval.mjs';
+
+
 export const CONTRACT_VERSION = '1.0.0';
+
 
 /** 一次规划最多接受多少条动作 —— 防止模型"顺手把整套房子重排" */
 export const MAX_ACTIONS = 12;
@@ -901,14 +906,18 @@ export function validateAction(raw, ctx = {}) {
   const declared = spec.params ?? {};
   const extraP = Object.keys(paramsRaw).filter((k) => !(k in declared));
   if (extraP.length > 0) {
-    return { ok: false, code: 'EXTRA_PARAM', error: `参数 ${extraP.join('、')} 不在 "${name}" 的声明里` };
+    return { ok: false, code: 'EXTRA_PARAM', error: `参数 ${extraP.join('、')} 不在 "${name}" 的声明里。这个动作只接受：${Object.keys(declared).join('、') || '（无参数）'}。请删掉多余参数再调用。` };
   }
   const params = {};
   for (const [k, p] of Object.entries(declared)) {
     const v = paramsRaw[k];
     const optional = p.optional === true || !(spec.required ?? []).includes(k);
     if (v === undefined || v === null) {
-      if (!optional) return { ok: false, code: 'MISSING_PARAM', error: `"${name}" 缺少必填参数 ${k}` };
+      if (!optional) {
+        const missing = (spec.required ?? []).filter((rk) => paramsRaw[rk] === undefined || paramsRaw[rk] === null);
+        const shapes = missing.map((rk) => { const sp = declared[rk]; if (!sp) return rk; const dd = describeParam(rk, sp, spec); return rk + '(' + dd + ')'; });
+        return { ok: false, code: 'MISSING_PARAM', error: `"${name}" 缺少必填参数 ${k}。本次要补齐：${shapes.join('、')}。请把这些参数补上再调用一次（不要换动作）。` };
+      }
       continue;
     }
     const bad = checkParam(name, k, p, v, ctx);
@@ -916,7 +925,8 @@ export function validateAction(raw, ctx = {}) {
     params[k] = p.type === 'number' ? Math.round(v * 100) / 100 : v;
   }
   if (spec.atLeastOne && spec.atLeastOne.every((k) => params[k] === undefined)) {
-    return { ok: false, code: 'MISSING_PARAM', error: `"${name}" 至少要给出 ${spec.atLeastOne.join(' / ')} 中的一个` };
+    const shapes = spec.atLeastOne.map((rk) => { const sp = declared[rk]; if (!sp) return rk; return rk + '(' + describeParam(rk, sp, spec) + ')'; });
+    return { ok: false, code: 'MISSING_PARAM', error: `"${name}" 至少要给出 ${spec.atLeastOne.join(' / ')} 中的一个。这些参数的形状：${shapes.join('、')}。补一个再调用。` };
   }
   // 纯白名单动作（params 声明为空）如果带了参数，已被 EXTRA_PARAM 拦掉
 
@@ -936,13 +946,57 @@ export function validateAction(raw, ctx = {}) {
   return { ok: true, action: { action: name, target, params, reason } };
 }
 
+/**
+ * ── 常用取值提示（方案五）──
+ *
+ * ★ 为什么要加这个 ──
+ *   原来的报错只说"超出上限 6000"，模型看到之后常常**原样重试同一个数**，
+ *   连撞 3 次才放弃（agentLoop 的 MAX_CONSECUTIVE_FAILURES 就是这么被耗掉的）。
+ *   报错里直接给出**能用的值**，模型才有机会一次改对。
+ *
+ * ★ 提示从哪来 ──
+ *   ① 动作参数自己声明的 `hint`（人工写的，最准）；
+ *   ② 行业常用值（模块宽度 300/400/600/800/900 这类）。
+ *   只有在越界时**才**给提示 —— 正常值不该在报错里出现。
+ *
+ * @param {object} p 参数声明
+ * @param {number} v 收到的值
+ * @returns {string} 建议文本（可能为空串）
+ */
+function numberSuggestion(p, v) {
+  const parts = [];
+  if (typeof p.hint === 'string' && p.hint.trim()) {
+    parts.push(p.hint.trim());
+  } else if (Array.isArray(p.suggest) && p.suggest.length > 0) {
+    parts.push('常用值：' + p.suggest.join(' / '));
+  } else {
+    // 按量级给几个常见值 —— 家具模块宽度/高度/深度的常见档位
+    const common = COMMON_NUMBERS.filter((n) =>
+      (p.min === undefined || n >= p.min) && (p.max === undefined || n <= p.max)
+    );
+    if (common.length > 0) parts.push('常用值：' + common.join(' / '));
+  }
+  if (parts.length === 0) return '';
+  return '；' + parts.join('；') + '。请直接改成一个合法值再调用。';
+}
+
+/**
+ * 家具领域常见的尺寸档位（mm）。
+ * 越界报错时列出来，模型一眼能看出该往哪个方向改。
+ */
+const COMMON_NUMBERS = [100, 150, 200, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000, 1200, 1500, 1800, 2000, 2400, 3000];
+
 function checkParam(actionName, key, p, v, ctx) {
   const where = `${actionName}.${key}`;
   switch (p.type) {
     case 'number': {
-      if (!finite(v)) return `${where} 必须是数字（收到 ${JSON.stringify(v)}）`;
-      if (p.min !== undefined && v < p.min) return `${where} = ${v} 小于下限 ${p.min}${p.unit ?? ''}`;
-      if (p.max !== undefined && v > p.max) return `${where} = ${v} 超出上限 ${p.max}${p.unit ?? ''}`;
+      if (!finite(v)) return `${where} 必须是数字（收到 ${JSON.stringify(v)}）${numberSuggestion(p, v)}`;
+      if (p.min !== undefined && v < p.min) {
+        return `${where} = ${v} 小于下限 ${p.min}${p.unit ?? ''}${numberSuggestion(p, v)}`;
+      }
+      if (p.max !== undefined && v > p.max) {
+        return `${where} = ${v} 超出上限 ${p.max}${p.unit ?? ''}${numberSuggestion(p, v)}`;
+      }
       return null;
     }
     case 'string': {
@@ -955,7 +1009,7 @@ function checkParam(actionName, key, p, v, ctx) {
       const allowed = p.values ?? enumFromSource(p.from, ctx);
       if (!allowed || allowed.length === 0) return `${where} 的可选值在本次上下文中为空（检查规则集/项目数据）`;
       if (!allowed.some((a) => same(a, v))) {
-        return `${where} = ${JSON.stringify(v)} 不在允许值内（${allowed.slice(0, 12).join(' / ')}${allowed.length > 12 ? ' …' : ''}）`;
+        return `${where} = ${JSON.stringify(v)} 不在允许值内（${allowed.slice(0, 12).join(' / ')}${allowed.length > 12 ? ' …' : ''}）。请从上面这些值里**原样挑一个**（不要自己造词），再调用一次。`;
       }
       return null;
     }
@@ -1292,8 +1346,19 @@ const ACTION_FAMILIES = {
   assembly: ['assembly.create', 'assembly.delete'],
 };
 
-/** 用户这句话命中哪些族。命中越少越保守（少于 1 族 ⇒ 返回 null 表示全量）。 */
-function detectActionFamilies(text) {
+/**
+ * 用户这句话命中哪些族。命中越少越保守（少于 1 族 ⇒ 返回 null 表示全量）。
+ *
+ * ★ 导出原因 ──
+ *   操作序列复用（方案三）要用「动作族」给序列分组：
+ *   「建柜」和「改尺寸」是两类请求，序列不能互相重放。
+ *   之前这个函数是私有的，服务端拿不到 ——
+ *   于是要么复制一份（会漂移），要么不用分组（会把建柜的重放拿去改尺寸）。
+ *
+ * @param {string} text 用户原话
+ * @returns {string[]|null} 命中的族；null 表示无法判断（等价于全量）
+ */
+export function detectActionFamilies(text) {
   const hay = String(text ?? '');
   if (!hay.trim()) return null;
   const hit = new Set();
@@ -1324,24 +1389,43 @@ export function buildSystemPrompt(options = {}) {
   /**
    * 本项目的既定约定（来自管理后台的纠正记忆）。
    *
-   * ★ 必须先**过滤出真有内容的条目**，再用"过滤后是否为空"决定要不要输出标题。
-   *   原来写的是 `if (projectRules.length > 0)` —— 数组非空但条目全是空白时，
-   *   会留下一段只有标题、没有任何条目的空壳。那比"没这段"更糟：
-   *   模型会读到"本项目的既定约定："然后发现下面什么都没有，
-   *   容易理解成"这个项目没有约定"（而事实是"有约定但没写清"）。
-   *   验收 correction-prompt-acceptance 的第 2 节就是钉这个。
+   * ★ 渲染逻辑已抽到 shared/ruleRetrieval.mjs 的 renderProjectRules ──
+   *   plan / design / agent 三条通道都要渲染这段，
+   *   三处各写一遍 = 三处措辞会慢慢漂移，模型在不同通道里受到不同的对待。
+   *
+   * ★ 该函数内部**先过滤空条目再决定要不要输出标题** ──
+   *   数组非空但条目全是空白时，如果只看 length 就输出标题，
+   *   模型会读到「本项目的既定约定：」然后发现下面什么都没有，
+   *   容易理解成「这个项目没有约定」（而事实是「有约定但没写清」）。
+   *   那比没这段更糟。验收 correction-prompt-acceptance 第 2 节钉的就是这个。
    */
-  const ruleLines = [];
-  for (const rule of Array.isArray(projectRules) ? projectRules.slice(0, 30) : []) {
-    const text = String(rule?.nl ?? '').trim();
-    if (!text) continue;
-    const tags = Array.isArray(rule?.tags) && rule.tags.length > 0 ? `（${rule.tags.join('/')}）` : '';
-    ruleLines.push(`- ${text}${tags}`);
+  const rulesBlock = renderProjectRules(projectRules);
+  if (rulesBlock) {
+    lines.push(rulesBlock);
+    lines.push('');
   }
-  if (ruleLines.length > 0) {
-    lines.push('【本项目的既定约定】');
-    lines.push('下面这些是这个项目**已经确认过**的做法（来自管理后台的纠正记录）。它们优先于你的通用常识：');
-    lines.push(...ruleLines);
+  /**
+   * ── 标准做法（配方库）注入 ──
+   *
+   * ★ 为什么在这里注入，而不是让模型自己想 ──
+   *   实测：裁剪提示词让建柜从 6 步降到 2 步、33.9s 降到 13.6s。
+   *   提示词裁剪省的是**字数**；配方省的是**步数**——
+   *   步数 = 模型往返次数 = 耗时的主要来源。
+   *   同一个「L 型厨房」，不告诉它的话每次都要重新摸索：
+   *   建几个地柜？吊柜 mountHeight 给多少？地柜吊柜要不要分别成组？
+   *
+   * ★ 注入位置在「既定约定」之后、「绝对规则」之前 ──
+   *   既定约定是**这个项目**的规矩，配方是**这类需求**的通用做法，
+   *   绝对规则是**硬约束**。三者的优先级是：硬约束 > 项目约定 > 配方。
+   *   所以配方放在中间，且明说「与做法冲突时以用户为准」，
+   *   避免配方压过用户和项目约定。
+   *
+   * ★ 只在命中时注入 ──
+   *   没命中就是空串，一行都不加 —— 保持提示词短是既定方针。
+   */
+  const recipeBlock = recipeBlockFor(options.focusText);
+  if (recipeBlock) {
+    lines.push(recipeBlock);
     lines.push('');
   }
   lines.push('绝对规则（违反任何一条，你的输出会被程序直接丢弃）：');

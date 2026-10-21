@@ -19,6 +19,12 @@
  * ══════════════════════════════════════════════════════════════════════
  */
 
+import { recipeBlockFor } from '../shared/recipes.mjs';
+import { renderProjectRules } from '../shared/ruleRetrieval.mjs';
+import { renderSequenceHint } from '../shared/sequenceStore.mjs';
+
+
+
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_TOTAL_STEPS = 15;
 
@@ -125,7 +131,44 @@ async function callAiWithTools(aiConfig, messages, tools) {
  * @param opts.aiConfig { baseUrl, apiKey, model, timeoutMs }
  * @param opts.onStep 步骤回调（流式推送给前端，可选）
  */
-function summarizeProjectContext(project, activeRoomId) {
+/**
+ * 把一个分区的 kind 翻成人话（模型看得懂的说法）。
+ * @param {string} kind
+ * @returns {string}
+ */
+function describeUnitKind(kind) {
+  switch (kind) {
+    case 'hanging': return '挂衣区';
+    case 'drawers': return '抽屉区';
+    case 'appliance': return '电器位';
+    case 'open': return '开放格';
+    case 'shelves': return '层板格';
+    default: return String(kind ?? '分区');
+  }
+}
+
+/**
+ * ── 当前方案摘要（方案四）──
+ *
+ * ★ 修的是「Agent 多轮对话会失忆」──
+ *   上一版只给「有哪些柜、多大、什么类型」，模型于是：
+ *     · 不知道某个柜子**里面分了几个格**，要再调一次 get_state 去看；
+ *     · 不知道**上一轮自己刚改了什么**，于是把用户已经说过的事又做一遍
+ *       （典型表现：改完宽度后用户说「再宽点」，它却又按第一次的尺寸重算）。
+ *
+ * ★ 补了两样东西 ──
+ *   ① 每个柜的**分区结构**（几格、什么类型、有几门、有几抽屉）——
+ *      免掉 get_state 的一次往返，而且 get_state 读的是 live 不是 draft，
+ *      改了之后其实读不到最新状态。
+ *   ② **上一轮改了什么**（从 history 里取）——
+ *      让「再宽点」「刚才那个」这类指代有落点。
+ *
+ * @param {object} project 工作区项目
+ * @param {string} activeRoomId 当前房间
+ * @param {Array} history 对话历史（可选）
+ * @returns {string}
+ */
+export function summarizeProjectContext(project, activeRoomId, history = []) {
   if (!project || typeof project !== 'object') return '';
   const rooms = Array.isArray(project.rooms) ? project.rooms : [];
   const cabinets = Array.isArray(project.cabinets) ? project.cabinets : [];
@@ -144,15 +187,196 @@ function summarizeProjectContext(project, activeRoomId) {
     if (r.id === activeRoomId && rCabs.length > 0) {
       for (const c of rCabs) {
         const p = c.params || {};
-        lines.push(`  · 柜体「${c.name}」(cabinetId=${c.id})：${p.cabinetType || 'base'}，${p.width}×${p.height}×${p.depth}mm，离地=${p.mountHeight ?? 0}mm，位置=(${c.placement?.x ?? 0},${c.placement?.y ?? 0})`);
+        const units = Array.isArray(c.units) ? c.units : [];
+        let unitStr = '';
+        if (units.length > 0) {
+          const parts = units.map((u) => {
+            let s = describeUnitKind(u.kind);
+            if (u.doors && u.doors.count) s += `/${u.doors.count}门`;
+            if (u.drawers && u.drawers.count) s += `/${u.drawers.count}抽`;
+            if (u.shelves && u.shelves.count) s += `/${u.shelves.count}层板`;
+            if (u.rod && u.rod.count) s += '/挂衣杆';
+            if (u.appliance) s += '/' + (u.appliance.kind === 'fridge' ? '冰箱' : u.appliance.kind === 'washer' ? '洗衣机' : '电器');
+            return s;
+          });
+          unitStr = `，${units.length} 个分区（${parts.join('、')}）`;
+        }
+        lines.push(`  · 柜体「${c.name}」(cabinetId=${c.id})：${p.cabinetType || 'base'}，${p.width}×${p.height}×${p.depth}mm，离地=${p.mountHeight ?? 0}mm，位置=(${c.placement?.x ?? 0},${c.placement?.y ?? 0})${unitStr}`);
       }
     }
+  }
+  /**
+   * 上一轮改了什么 —— 让「再宽点」「刚才那个」有落点。
+   *
+   * 只取最近一轮带 agentSummary 的记录（更早的已经沉淀进上面的柜体列表了）。
+   */
+  const lastSummary = Array.isArray(history)
+    ? [...history].reverse().find((h) => h && h.agentSummary && String(h.agentSummary).trim())
+    : null;
+  if (lastSummary) {
+    lines.push(`上一轮你做的事：${String(lastSummary.agentSummary).trim()}`);
+    lines.push('（用户这次的话可能是在那个基础上继续改，例如「再宽点」「刚才那个」。）');
   }
   return lines.join('\n');
 }
 
+/**
+ * ── 重放一套操作序列 ──
+ *
+ * 全程在**新 draft** 里跑：
+ *  · 不传 draftId，让 MCP 自动建一个新草稿；
+ *  · 每一步都串上 draftId，后续步骤都落在同一个草稿里；
+ *  · 任何一步失败就停，并且**丢弃这个草稿**（半截改动绝不能留）。
+ *
+ * @param {object} seq 序列记录 {steps:[{tool,args}]}
+ * @param {object} ctx {mcpBaseUrl, token, roomId, roomName, onStep}
+ * @returns {Promise<{ok:boolean, steps:Array, summary:string, draftId:string|null, discardError:string}>}
+ */
+export async function replaySequence(seq, ctx) {
+  const { mcpBaseUrl, token, roomId, roomName, onStep } = ctx;
+  const steps = [];
+  let draftId = null;
+  let lastError = '';
+
+  for (const s of Array.isArray(seq?.steps) ? seq.steps : []) {
+    if (!s || !s.tool) continue;
+    const args = { ...(s.args ?? {}) };
+    // 不带 draftId 起步 ⇒ MCP 自动建新草稿
+    delete args.draftId;
+    if (draftId) args.draftId = draftId;
+    if (s.tool === 'cad.create_cabinet' && roomId && !args.roomId && !args.roomName) {
+      args.roomId = roomId;
+      if (roomName) args.roomName = roomName;
+    }
+
+    const result = await callMcpTool(mcpBaseUrl, token, s.tool, args);
+    const step = { round: 0, tool: s.tool, args, ok: false, replayed: true };
+    if (result.ok) {
+      step.ok = true;
+      step.result = result.data;
+      if (result.data?.draftId) draftId = result.data.draftId;
+      step.draftId = draftId;
+    } else {
+      step.ok = false;
+      step.error = result.error;
+      step.code = result.code;
+      lastError = result.error;
+      steps.push(step);
+      if (onStep) {
+        try { await onStep(step, draftId); } catch { /* 回调失败不影响主流程 */ }
+      }
+      /**
+       * 失败：丢弃半截草稿。
+       *
+       * ★ 为什么不能只看 draftId ──
+       *   第一步就失败时，MCP 那边已经建了草稿但**没回传 draftId**
+       *   （失败响应里只有 error）。此时若只判 `if (draftId)`，
+       *   草稿就漏在服务器上了 —— 用户界面上看不到，
+       *   却又实实在在存在（会出现在草稿列表里）。
+       *
+       *   所以：拿不到 draftId 时，先 cad.list_drafts 找出最新的那个草稿，
+       *   再丢它。拿不到列表就放弃（不猜 id，避免丢错别人的草稿）。
+       */
+      let discardError = '';
+      let discardTarget = draftId;
+      if (!discardTarget) {
+        try {
+          const listed = await callMcpTool(mcpBaseUrl, token, 'cad.list_drafts', {});
+          const list = Array.isArray(listed?.data?.drafts) ? listed.data.drafts
+            : Array.isArray(listed?.data) ? listed.data : [];
+          if (list.length > 0) {
+            const newest = [...list].sort((a, b) => (b.createdAt ?? b.at ?? 0) - (a.createdAt ?? a.at ?? 0))[0];
+            const id = newest?.draftId ?? newest?.id;
+            if (id) discardTarget = id;
+          }
+        } catch {
+          /* 拿不到列表就不猜 id，避免丢错草稿 */
+        }
+      }
+      if (discardTarget) {
+        try {
+          await callMcpTool(mcpBaseUrl, token, 'cad.discard_draft', { draftId: discardTarget });
+        } catch (e) {
+          discardError = String(e?.message ?? e);
+        }
+      }
+      return {
+        ok: false,
+        steps,
+        summary: '复用历史操作失败：' + lastError,
+        draftId: null,
+        discardError,
+      };
+    }
+    steps.push(step);
+    if (onStep) {
+      try { await onStep(step, draftId); } catch { /* 回调失败不影响主流程 */ }
+    }
+  }
+
+  return {
+    ok: steps.length > 0,
+    steps,
+    summary: steps.length > 0
+      ? '已按本项目上次的成功做法直接完成（' + steps.length + ' 步，未再调用模型）。'
+      : '复用没有可重放的步骤。',
+    draftId,
+    discardError: '',
+  };
+}
+/**
+ * ── 工具失败时给模型的下一步建议（方案五）──
+ *
+ * ★ 修的是「原地重试」──
+ *   之前失败时只把 error 原文回给模型。模型看到
+ *   「width 超出上限 6000」，最常见的反应是**再发一次一模一样的调用**——
+ *   因为报错里没有任何信息能告诉它该改成多少。
+ *   连撞 3 次就耗尽 MAX_CONSECUTIVE_FAILURES，整轮作废。
+ *
+ * ★ 这里补的是「怎么改」──
+ *   按错误码给出可执行的补救方向，模型才有机会一次改对。
+ *   注意：这里**不重写** error 原文（原文里已经有合法值了），
+ *   只补一个 hint 字段，两边信息都在。
+ *
+ * @param {string} error 错误原文
+ * @param {string} code 错误码
+ * @returns {string} 建议文本；无法判断时返回空串
+ */
+export function failureHint(error, code) {
+  const e = String(error ?? '');
+  switch (code) {
+    case 'NO_CABINET':
+      return '把 target.cabinetName 换成**实际存在的柜体名字**（可先调 cad.get_state 看有哪些柜子）；如果用户指的是刚建的那只，用它返回的名字。';
+    case 'NO_UNIT':
+      return '把 target.unit 补上：1 起的序号或分区昵称。';
+    case 'NO_ROOM':
+      return '项目里还没有房间。先调 cad.create_room 建一个，或在调用里带上 roomId / roomName。';
+    case 'COMMAND_REJECTED':
+      if (/重叠|碰撞|干涉|撞/.test(e)) {
+        return '这个位置放不下。改用语义落位（cad.place_cabinet 交给 placement 引擎算位置），或先挪开冲突的柜子，不要硬给 x/y。';
+      }
+      if (/板材|幅面|放不下|超长/.test(e)) {
+        return '这个尺寸超出板材幅面或工艺上限。把它改小一点（常见做法是拆成两个柜体，或减小 width/height），再调用。';
+      }
+      return '按错误信息里的提示改参数后重试一次；改不动就换一个做法。';
+    case 'BAD_PARAM':
+    case 'MISSING_PARAM':
+    case 'EXTRA_PARAM':
+      return '按错误信息里列出的合法值/参数形状改，**不要换动作**；同一动作最多改两次。';
+    case 'DRAFT_STALE':
+      return '这个 draft 已经不是最新的了。调 cad.list_drafts 看看有哪些可用的 draft，或者不要传 draftId 让它新建一个。';
+    case 'UNKNOWN_TOOL':
+      return '这个工具名不存在。只能用 cad.create_cabinet / cad.place_cabinet / cad.update_object / cad.delete_object / cad.create_room / cad.draw_wall / cad.create_assembly / cad.duplicate_object / cad.validate / cad.get_state / cad.list_drafts。';
+    case 'INVALID_PARAMS':
+      return '参数形状不对。按工具声明的 schema 重新组织参数（只放声明里有的键）。';
+    default:
+      if (/unknown|未知工具/i.test(e)) return '这个工具名不存在。只能用 cad.create_cabinet / cad.place_cabinet / cad.update_object / cad.delete_object / cad.create_room / cad.draw_wall / cad.create_assembly / cad.duplicate_object / cad.validate / cad.get_state / cad.list_drafts。';
+      if (/重叠|碰撞|干涉/.test(e)) return '这个位置放不下。改用 cad.place_cabinet 的语义落位，或先挪开冲突的柜子。';
+      return '';
+  }
+}
 export async function runAgentLoop(opts) {
-  const { intent, images, visionResult, draftId, roomId, roomName, workspaceProject, token, mcpBaseUrl, aiConfig, onStep, history } = opts;
+  const { intent, images, visionResult, draftId, roomId, roomName, workspaceProject, token, mcpBaseUrl, aiConfig, onStep, history, projectRules } = opts;
   const steps = [];
   let currentDraftId = draftId || null;
   let round = 0;
@@ -219,10 +443,49 @@ export async function runAgentLoop(opts) {
   }));
 
   // 2. 构建系统提示
-  const projectContextText = summarizeProjectContext(workspaceProject, roomId);
+  const projectContextText = summarizeProjectContext(workspaceProject, roomId, history);
+  /**
+   * ── 标准做法（配方库）注入（方案一）──
+   *
+   * ★ 为什么 Agent 通道尤其需要 ──
+   *   提示词裁剪把建柜从 6 步降到 2 步、33.9s 降到 13.6s，证明
+   *   「告诉它怎么走」比「让它自己摸索」有效得多。
+   *   而 Agent 通道每一步都要跟模型往返一次，步数就是钱。
+   *
+   * ★ 注入位置 ──
+   *   放在「规则」段之前：配方是**做法**，规则是**约束**，
+   *   做法先讲清楚，规则再兜底。配方末尾明说与用户冲突时以用户为准。
+   */
+  const recipeBlock = recipeBlockFor(intent);
+  /**
+   * ── 纠正记忆注入（2026-10-21）──
+   *
+   * ★ 这条通道之前**完全没有**纠正记忆 ──
+   *   /api/ai/plan 与 /api/ai/design 两条通道都带了 projectRules，
+   *   而界面上真正在用的是本 Agent 通道 —— 于是用户在管理后台写的规矩，
+   *   Agent 一条都看不到，每次都得在对话里重说。
+   *   能力建了但没接到在用的那条路上（本项目的典型失效模式）。
+   *
+   * 注入位置：配方之后、规则之前。
+   *   优先级是「硬约束（规则）> 项目约定（纠正记忆）> 通用做法（配方）」，
+   *   但措辞上要让模型知道：这些约定是**这个项目已确认过的**，优先于通用常识。
+   */
+  const rulesBlock = renderProjectRules(projectRules);
+  /**
+   * ── 相似序列当范例（方案三的第二档）──
+   *
+   * 没有完全一致的历史序列时，把**上次做过的类似操作**给模型当范例。
+   * 模型会照着抄，步数更少、参数更稳。
+   *
+   * ★ 与「完全重放」的区别 ──
+   *   完全重放 = 0 次模型调用，直接执行；
+   *   相似范例 = 模型仍然跑，但手里有一份本项目已验证过的做法。
+   *   后者是前者的降级方案，命中不了完全重放时兜底。
+   */
+  const seqHint = renderSequenceHint(opts.similarSeq);
   const systemPrompt = `你是家具 CAD 的 AI 装配 Agent。用户说出意图后，你调用 MCP 工具在 draft 草稿里搭建柜体。
 
-规则：
+${rulesBlock ? rulesBlock + '\n' : ''}${recipeBlock ? recipeBlock + '\n' : ''}${seqHint ? seqHint + '\n' : ''}规则：
 - 所有写操作只进 draft，不碰 live。${currentDraftId ? `继续使用 draft ${currentDraftId}。` : '没有 draft 时工具会自动创建。'}
 - 先理解意图，拆成工具调用。支持按顺序创建柜体、调整参数、建立组合。
 - 新建房间（cad.create_room）只需传 name 与 w、h（x、y 可省略或传 0，系统会自动将新房间排布在已有房间右侧，绝不重叠）。
@@ -273,6 +536,44 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
     messages.push({ role: 'user', content });
   } else {
     messages.push({ role: 'user', content: intent });
+  }
+
+  /**
+   * ── 操作序列复用（方案三）──
+   *
+   * ★ 命中时**一次模型调用都不用** ──
+   *   同一句话问两遍（或换个说法问同一件事），第二次直接重放上次的成功序列。
+   *   实测「建柜」一次 13.6s，其中模型思考占大头 —— 重放能把这部分全省掉。
+   *
+   * ★ 安全底线 ──
+   *   ① 只重放白名单里的工具（**删除类一律不重放**：重放删除的语义依赖
+   *      当时的项目状态，现在重放很可能删错东西，而且不可逆）；
+   *   ② 重放在**新的 draft** 里跑，失败就丢弃重来，**绝不碰 live**；
+   *   ③ 命中判定用**完全一致**的指纹（意图文本规范化后相同 + 动作族相同），
+   *      保证重放出来的参数真的适用于这次需求。
+   *
+   * ★ 失败就退回去让模型做 ──
+   *   重放失败不是错误，是"这条路走不通"。此时把重放过程记成步骤，
+   *   丢弃 draft，照常走模型 —— 用户拿到的仍是正确结果，只是慢一点。
+   */
+  if (opts.replaySeq) {
+    const replay = await replaySequence(opts.replaySeq, {
+      mcpBaseUrl, token, roomId, roomName, onStep,
+    });
+    if (replay.ok) {
+      return {
+        ok: true,
+        steps: replay.steps,
+        summary: replay.summary,
+        draftId: replay.draftId,
+        rounds: 1,
+        reused: true,
+      };
+    }
+    // 重放失败 → 丢弃半截 draft，照常走模型
+    if (replay.discardError) {
+      steps.push({ round: 0, tool: 'cad.discard_draft', args: { draftId: replay.draftId }, ok: false, error: replay.discardError });
+    }
   }
 
   // 3. 主循环
@@ -377,7 +678,11 @@ ${visionResult ? `Vision 识别结果（用户发的图里看到的）：\n${JSO
       messages.push({
         role: 'tool',
         tool_call_id: tc.id,
-        content: JSON.stringify(result.ok ? result.data : { error: result.error, code: result.code }),
+        content: JSON.stringify(
+          result.ok
+            ? result.data
+            : { error: result.error, code: result.code, hint: failureHint(result.error, result.code) },
+        ),
       });
 
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {

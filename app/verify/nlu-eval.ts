@@ -29,7 +29,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildSystemPrompt } from '../shared/aiContract.mjs';
+import { buildSystemPrompt, extractJson } from '../shared/aiContract.mjs';
 import { summarizeProjectContext } from '../server/agentLoop.mjs';
 import { emptyProject, rectRoom, createCabinet } from '../src/core/docFactory.ts';
 import type { RuleSet } from '../src/core/types.ts';
@@ -101,6 +101,15 @@ function buildProject(cabCount: number) {
  *   「刚才那个柜子太宽了」而不是「resize width=800」
  *   —— 前者才是用户真会说的话。
  */
+interface NluTurn {
+  /** 这一轮用户说的话 */
+  q: string;
+  /** 期望动作（空数组 = 期望追问） */
+  wantActions: string[];
+  /** 期望追问 */
+  wantClarify?: boolean;
+}
+
 interface NluCase {
   q: string;
   wantActions: string[];
@@ -108,11 +117,17 @@ interface NluCase {
   note?: string;
   /**
    * 场景：决定用几个柜的项目。
-   *   'single' = 一台柜（指代清楚）；'multi' = 三台柜（指代有歧义）。
+   *   'single' = 一台柜（指代清楚）；'multi' = 三台柜（指代有歧义）；
+   *   'turns'   = 多轮（跨轮指代）。
    */
-  scenario: 'single' | 'multi';
+  scenario: 'single' | 'multi' | 'turns';
   /** 两种回答都算对（追问也行、给对动作也行）—— 用于「本身就有歧义」的请求 */
   allowClarify?: boolean;
+  /**
+   * 多轮场景的完整对话（按顺序）。
+   *   判定只看**最后一轮**；前面的轮次用来建立指代对象。
+   */
+  turns?: NluTurn[];
 }
 /**
  * ★ 重复次数 k（2026-10-21）——
@@ -179,6 +194,56 @@ const CASES: NluCase[] = [
   { q: '建个柜子', wantActions: [], wantClarify: true, note: '柜型/宽高/位置都不明', scenario: 'multi' },
   { q: '再宽点', wantActions: [], wantClarify: true, note: '相对量但没基准', scenario: 'multi' },
   { q: '加个抽屉', wantActions: [], wantClarify: true, note: '哪个柜？多宽？', scenario: 'multi' },
+  /**
+   * ★ 场景 D：多轮（跨轮指代）——
+   *   「再宽点」「第一格」这类词**单独看没有意义**，意思全在上一轮里。
+   *   模型丢了上下文就只能瞎猜。
+   *
+   *   测法：多轮按顺序喂进去，**只看最后一轮**的判定。
+   *   前面几轮的作用是**建立指代对象**。
+   */
+  {
+    q: '再加 200 宽',
+    wantActions: ['cabinet.resize'],
+    scenario: 'turns',
+    note: '第 2 轮：第 1 轮建了 1800 宽的衣柜，第 2 轮说「再加 200」—— 相对量但有基准，模型该算出 2000',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '再加 200 宽', wantActions: ['cabinet.resize'] },
+    ],
+  },
+  {
+    q: '再宽点',
+    wantActions: [],
+    wantClarify: true,
+    scenario: 'turns',
+    note: '第 2 轮：「再宽点」是相对量但**没给加多少** —— 该问「加多少毫米」',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '再宽点', wantActions: [], wantClarify: true },
+    ],
+  },
+  {
+    q: '第一格换成玻璃门',
+    wantActions: ['cabinet.setUnitDoorMaterial', 'cabinet.setUnitParam'],
+    scenario: 'turns',
+    note: '第 2 轮：第 1 轮建了双分区衣柜，第 2 轮指「第一格」',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '第一格换成玻璃门', wantActions: ['cabinet.setUnitDoorMaterial', 'cabinet.setUnitParam'] },
+    ],
+  },
+  {
+    q: '那个抽屉也加个格子',
+    wantActions: [],
+    wantClarify: true,
+    scenario: 'turns',
+    note: '第 2 轮：「那个」指上一轮建的抽屉，但「加个格子」在抽屉区里说不清，该问',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '那个抽屉也加个格子', wantActions: [], wantClarify: true },
+    ],
+  },
 ];
 
 async function chat(model: string, messages: unknown[], maxTokens = 8192) {
@@ -205,7 +270,7 @@ async function chat(model: string, messages: unknown[], maxTokens = 8192) {
 }
 
 /** 场景 → 柜数 */
-const CAB_COUNT = { single: 1, multi: 3 } as const;
+const CAB_COUNT = { single: 1, multi: 3, turns: 1 } as const;
 
 const sys = buildSystemPrompt({});
 
@@ -228,28 +293,47 @@ interface RunResult {
   /** 网关调用是否成功（失败 = 超时/非 JSON 响应） */
   ok: boolean;
   status?: number;
+  /** 上游的结束原因（length = 撞到输出预算被截断） */
+  finish?: string;
+  /** 网关返回的原始错误（502 等） */
+  raw?: string;
+  /** 本次输出用了多少 completion token */
+  cc?: number;
+  /** 其中多少是推理 token */
+  rt?: number;
 }
 
 /**
  * 跑一条用例一次，返回判定结果。
  */
-async function runOnce(model: string, c: NluCase, ctx: string): Promise<RunResult> {
-  const r = await chat(model, [
-    { role: 'system', content: sys },
-    { role: 'user', content: ctx + '\n\n用户说：' + c.q },
-  ]);
+async function runOnce(
+  model: string,
+  c: NluCase,
+  ctx: string,
+  history: Array<{ role: string; text: string }> = [],
+): Promise<RunResult> {
+  const messages: unknown[] = [{ role: 'system', content: sys }];
+  // ★ 多轮：先喂历史，再喂本轮 ——
+  //   「再宽点」的意思全在历史里，丢了就只剩一个没有主语的词。
+  for (const h of history) messages.push({ role: h.role, content: h.text });
+  messages.push({ role: 'user', content: ctx + '\n\n用户说：' + c.q });
+  const r = await chat(model, messages);
   let actions: string[] = [];
   let reply = '';
   let parseFail = false;
   if (r.ok) {
-    const t = r.content.trim();
-    const js = t.replace(/^[\s\S]*?```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
-    try {
-      const j = JSON.parse(js || t) as { actions?: Array<{ action?: string }>; reply?: string };
+    // ★ 用**生产**的 extractJson ——
+    //   它有 firstBalancedObject 兜底，能从「先说一句人话再给 JSON」的输出里
+    //   提取出配平的 {...}。评测用简陋的正则会误判成「JSON 截断」，
+    //   而生产其实解析得好好的 ⇒ 评测反映的就不是真实行为。
+    const parsed = extractJson(r.content);
+    if (parsed.ok) {
+      const j = parsed.value as { actions?: Array<{ action?: string }>; reply?: string };
       actions = (j.actions ?? []).map((a) => String(a.action ?? ''));
       reply = String(j.reply ?? '');
-    } catch {
+    } else {
       parseFail = true;
+      if (process.env.NLU_DEBUG_RAW) console.log('[RAW-BAD] ' + r.content.slice(0, 400));
     }
   }
   // 判定：期望动作命中 = 通过；期望追问 = 没给动作 = 通过；allowClarify = 两者都行
@@ -261,7 +345,7 @@ async function runOnce(model: string, c: NluCase, ctx: string): Promise<RunResul
   } else {
     pass = c.wantActions.some((w) => actions.includes(w));
   }
-  return { pass, actions, reply, ms: r.ms, parseFail, ok: r.ok, status: r.status };
+  return { pass, actions, reply, ms: r.ms, parseFail, ok: r.ok, status: r.status, raw: r.raw, finish: r.finish, cc: r.usage?.completion_tokens, rt: r.usage?.completion_tokens_details?.reasoning_tokens };
 }
 
 /** 统计口径 */
@@ -290,7 +374,7 @@ async function evaluateModel(model: string): Promise<void> {
   console.log('模型：' + MODEL + '   每条跑 ' + K + ' 次');
   console.log('━'.repeat(64));
   const stats = new Map<string, Stat>();
-  for (const sc of ['single', 'multi']) {
+  for (const sc of ['single', 'multi', 'turns']) {
     stats.set(sc, { n: 0, passAt1: 0, passAtK: 0, passPowK: 0, stable: 0, unstable: 0 });
   }
   const details: string[] = [];
@@ -300,7 +384,23 @@ async function evaluateModel(model: string): Promise<void> {
     const { project, bedroom } = buildProject(CAB_COUNT[c.scenario]);
     const ctx = summarizeProjectContext(project, bedroom.id, []);
     const runs: RunResult[] = [];
-    for (let i = 0; i < K; i++) runs.push(await runOnce(model, c, ctx));
+    for (let i = 0; i < K; i++) {
+      // ★ 多轮：先把前几轮跑一遍（建立指代对象），把对话存进 history，
+      //   再跑**最后一轮**并判定它。
+      //   判定只看最后一轮 —— 前几轮是铺垫。
+      const history: Array<{ role: string; text: string }> = [];
+      const turns = c.turns ?? [{ q: c.q, wantActions: c.wantActions, wantClarify: c.wantClarify }];
+      const last = turns[turns.length - 1]!;
+      for (let ti = 0; ti < turns.length - 1; ti++) {
+        const t = turns[ti]!;
+        const pre = await runOnce(model, { ...c, q: t.q, wantActions: t.wantActions, wantClarify: t.wantClarify }, ctx, history);
+        //   ctx 已经出现在 system 之后的第一条 user 消息与本轮 user 消息里，
+        //   再放一遍会让上下文重复 3 次（36k+ 字符）⇒ 模型困惑 / 上游超长报错。
+        history.push({ role: 'user', text: t.q });
+        history.push({ role: 'assistant', text: pre.reply || (pre.actions.length ? pre.actions.join('、') : '（追问）') });
+      }
+      runs.push(await runOnce(model, { ...c, q: last.q, wantActions: last.wantActions, wantClarify: last.wantClarify }, ctx, history));
+    }
     const hits = runs.filter((x) => x.pass).length;
     const st = stats.get(c.scenario)!;
     st.n++;
@@ -313,8 +413,8 @@ async function evaluateModel(model: string): Promise<void> {
         // ★ 带上每次失败的原因 —— 「不稳定」可能是模型犹豫，也可能是超时/截断，
         //   这两者的修法完全不同（前者改提示词，后者改超时/输出预算）。
         const why = runs.filter((x) => !x.pass).map((x) =>
-          !x.ok ? ('网关失败:' + (x.status ?? '?'))
-            : x.parseFail ? 'JSON截断'
+          !x.ok ? ('网关失败:' + (x.status ?? '?') + (x.raw ? ' ' + String(x.raw).slice(0, 60) : ''))
+          : x.parseFail ? ((x.finish === 'length' ? '输出预算耗尽' : 'JSON格式坏') + ' finish=' + (x.finish ?? '?') + ' cc=' + (x.cc ?? '?') + ' 推理=' + (x.rt ?? '?'))
             : (x.actions.length ? '给了别的动作:' + x.actions.join('/') : '纯追问'));
         unstableCases.push('[' + c.scenario + '] ' + c.q + ' —— ' + hits + '/' + K + ' 次对（不稳定）；失败原因：' + why.join(' / '));
       }
@@ -331,7 +431,7 @@ async function evaluateModel(model: string): Promise<void> {
   console.log('='.repeat(64));
   console.log('★ 分场景（每条跑 ' + K + ' 次）—— 混在一起看不出「该问时问没问」：');
   for (const [sc, st] of stats) {
-    const label = sc === 'single' ? '单柜（该做就做）' : '多柜（该问就问）';
+    const label = sc === 'single' ? '单柜（该做就做）' : sc === 'multi' ? '多柜（该问就问）' : '多轮（跨轮指代）';
     const n = Math.max(1, st.n);
     console.log('  ' + label + '：pass@1 ' + (st.passAt1 / n * 100).toFixed(0) + '%   '
       + 'pass@' + K + ' ' + (st.passAtK / n * 100).toFixed(0) + '%   '

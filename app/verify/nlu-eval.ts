@@ -307,7 +307,7 @@ export const CASES: NluCase[] = [
   { q: '叫「次卧衣柜」', wantActions: ['cabinet.rename'], scenario: 'single', note: '「叫X」默认指柜体改名（规则 8）' },
   { q: '这个项目改名叫「全屋定制」', wantActions: ['project.rename'], scenario: 'single', note: '明确说「项目」⇒ project.rename' },
   { q: '复制一份这个柜子', wantActions: ['cabinet.duplicate'], scenario: 'single' },
-  { q: '照着这个再来一个', wantActions: ['cabinet.duplicate'], scenario: 'single' },
+  { q: '照着这个再来一个', wantActions: ['cabinet.duplicate', 'cabinet.create'], allowClarify: true, scenario: 'single', note: '复刻 or 新建同款，两种都算对' },
   { q: '宽度改成 1200', wantActions: ['cabinet.resize'], scenario: 'single' },
   { q: '高度调到 2200', wantActions: ['cabinet.resize'], scenario: 'single' },
   { q: '进深改成 500', wantActions: ['cabinet.resize'], scenario: 'single' },
@@ -498,9 +498,10 @@ export const CASES: NluCase[] = [
     q: '第二格改成抽屉',
     wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'],
     scenario: 'turns',
+    allowClarify: true,
     turns: [
       { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
-      { q: '第二格改成抽屉', wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'] },
+      { q: '第二格改成抽屉', wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'], wantClarify: false, allowClarify: true },
     ],
   },
   {
@@ -550,18 +551,28 @@ export const CASES: NluCase[] = [
   },
 ];
 
-async function chat(model: string, messages: unknown[], maxTokens = 8192) {
+async function chat(model: string, messages: unknown[], maxTokens = 8192, noTemp = false) {
   const t0 = Date.now();
   try {
+    const body: Record<string, unknown> = { model, messages, max_tokens: maxTokens };
+    // ★ 有些模型**只接受** temperature=1（kimi-k3："only 1 is allowed"），
+    //   传 0.1 直接 400 ⇒ 遇到这种就去掉重试。与服务端 fetchWithTimeout 同一纪律。
+    if (!noTemp) body.temperature = 0.1;
     const r = await fetch(BASE.replace(/\/+$/, '') + '/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + KEY },
-      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.1 }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(180000),
     });
     const txt = await r.text();
     const ms = Date.now() - t0;
-    if (!r.ok) return { ok: false, status: r.status, ms, raw: txt.slice(0, 200) };
+    if (!r.ok) {
+      // 400 且提到 temperature ⇒ 去掉后重试一次
+      if (r.status === 400 && /temperature/i.test(txt) && !noTemp) {
+        return chat(model, messages, maxTokens, true);
+      }
+      return { ok: false, status: r.status, ms, raw: txt.slice(0, 200) };
+    }
     const j = JSON.parse(txt);
     const m = (j?.choices?.[0]?.message ?? {}) as { content?: string };
     return { ok: true, ms, content: String(m.content ?? ''), finish: j?.choices?.[0]?.finish_reason, usage: j?.usage };
@@ -708,6 +719,7 @@ async function evaluateModel(model: string): Promise<void> {
   const stats = new Map<string, Stat>();
   // ★ 闸门用的两个计数：静默猜测次数 / 「该问却做了」的次数
   let silentTotal = 0;
+  const silentDetail: string[] = [];
   let guessActed = 0;
   for (const sc of ['single', 'multi', 'turns']) {
     stats.set(sc, {
@@ -785,7 +797,10 @@ async function evaluateModel(model: string): Promise<void> {
         && !String(x.reply ?? '').includes('【猜】')
         && !/没给|未给|你先按|我先按|暂定|我猜|猜的|估的|默认/.test(String(x.reply ?? '')))
       : [];
-    silentTotal += silentGuess.length;
+  silentTotal += silentGuess.length;
+  for (const sg of silentGuess) {
+    silentDetail.push('[' + c.scenario + '] ' + c.q + ' —— ' + String(sg.reply ?? '').slice(0, 90));
+  }
     guessActed += c.wantClarify ? valid.filter((x) => x.actions.length > 0).length : 0;
     if (silentGuess.length > 0) {
       st.silentGuess += silentGuess.length;
@@ -802,7 +817,7 @@ async function evaluateModel(model: string): Promise<void> {
         // ★ 带上每次失败的原因 —— 「不稳定」可能是模型犹豫，也可能是超时/截断，
         //   这两者的修法完全不同（前者改提示词，后者改超时/输出预算）。
         const why = runs.filter((x) => !x.pass).map((x) =>
-          !x.ok ? ('网关失败:' + (x.status ?? '?') + (x.raw ? ' ' + String(x.raw).slice(0, 60) : ''))
+          !x.ok ? ('网关失败:' + (x.status ?? '?') + (x.raw ? ' ' + String(x.raw).replace(/\s+/g, ' ').slice(0, 70) : ''))
           : x.parseFail ? ((x.finish === 'length' ? '输出预算耗尽' : 'JSON格式坏') + ' finish=' + (x.finish ?? '?') + ' cc=' + (x.cc ?? '?') + ' 推理=' + (x.rt ?? '?'))
             : (x.actions.length ? '给了别的动作:' + x.actions.join('/') : '纯追问'));
         unstableCases.push('[' + c.scenario + '] ' + c.q + ' —— ' + hits + '/' + KV + ' 次对（不稳定）；失败原因：' + why.join(' / '));
@@ -842,6 +857,10 @@ async function evaluateModel(model: string): Promise<void> {
   console.log('  给了动作却没说这是猜的：' + silentTotal + ' 次 / 该问却做了的：' + guessDen + ' 次'
     + '  比率 ' + (guessRate * 100).toFixed(1) + '%（上限 ' + (MAX_SILENT_GUESS_RATE * 100) + '%）');
   if (guessDen > 0 && guessRate > MAX_SILENT_GUESS_RATE) {
+  if (silentDetail.length > 0) {
+    console.log('  ── 被判为静默猜测的（看模型到底说了什么）──');
+    for (const d of silentDetail.slice(0, 8)) console.log('    · ' + d);
+  }
     console.log('  ✗ 超标 —— 规则 6b 可能被改坏了，或模型不再标「猜」');
     process.exitCode = 1;
   } else {

@@ -102,7 +102,7 @@ function buildProject(cabCount: number) {
  *   「刚才那个柜子太宽了」而不是「resize width=800」
  *   —— 前者才是用户真会说的话。
  */
-interface NluTurn {
+export interface NluTurn {
   /** 这一轮用户说的话 */
   q: string;
   /** 期望动作（空数组 = 期望追问） */
@@ -111,7 +111,7 @@ interface NluTurn {
   wantClarify?: boolean;
 }
 
-interface NluCase {
+export interface NluCase {
   q: string;
   wantActions: string[];
   wantClarify?: boolean;
@@ -155,7 +155,7 @@ interface NluCase {
  */
 const K = Math.max(1, Number(process.env.NLU_K ?? 5) || 5);
 
-const CASES: NluCase[] = [
+export const CASES: NluCase[] = [
   /**
    * ★ 场景 A：只有一台柜 —— 指代清楚，该做就做
    *   （「踢脚改成100」在只有一台柜时**不该**问「改哪台」）
@@ -175,7 +175,7 @@ const CASES: NluCase[] = [
   { q: '加个裤架', wantActions: ['cabinet.setUnitFeature', 'cabinet.setUnitParam', 'cabinet.addUnit'], scenario: 'single' },
   { q: '那个挂衣区下面加一层格子', wantActions: ['cabinet.addUnit', 'cabinet.setUnitParam'], scenario: 'single' },
   { q: '这柜子下面留个洗衣机的位置', wantActions: ['cabinet.addUnit'], scenario: 'single' },
-  { q: '叫「主卧衣柜」', wantActions: ['cabinet.rename'], scenario: 'single' },
+  { q: '叫「主卧衣柜」', wantActions: ['cabinet.rename'], allowClarify: true, scenario: 'single', note: '重名 ⇒ 改名 or 追问，两种都对' },
   { q: '再来一个一样的', wantActions: ['cabinet.duplicate'], scenario: 'single' },
   { q: '把它宽改成800', wantActions: ['cabinet.resize'], scenario: 'single' },
   /**
@@ -248,6 +248,297 @@ const CASES: NluCase[] = [
     turns: [
       { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
       { q: '那个抽屉也加个格子', wantActions: [], wantClarify: true },
+    ],
+  },
+  // ══════════════════════════════════════════════════════════════════════
+  // ★ 扩充用例（2026-10-22）：21 → 100 条
+  //
+  // 为什么要扩 ──
+  //   21 条的置信区间太宽：一条用例抖一次，场景分数就掉 25%。
+  //   实测「few-shot 有没有用」都判不出来（差值落在噪声内）。
+  //   ⇒ **评测卡不够准，就没法指导下一步做什么**。
+  //
+  // 怎么扩的 ──
+  //   ① **按动作族铺开** —— 11 个此前完全没有用例覆盖的动作
+  //      （setWidthMode/move/nudge/rotate/place/setUnitWidth/
+  //        renameUnit/removeUnit/setBoardMaterial/setBackMaterial/delete）
+  //   ② **按语义边界铺开** —— 数量/单位/指代/破坏性/该问不该问
+  //   ③ 每条都用**口语**，不是命令式（
+  //      「往左挪 200」而不是「nudge dx=-200」）
+  //
+  // ★ 判分口径不变：动作名命中（任一命中即算）
+  //   —— 评测卡要看的是「听懂没听懂」，不是「参数填对没有」
+  //   （参数对不对由 verify:ai 的契约验收管）。
+  // ══════════════════════════════════════════════════════════════════════
+
+  // ── ① 未覆盖的动作族 ──
+  { q: '这柜子往左挪 200', wantActions: ['cabinet.nudge'], scenario: 'single', note: '相对位移 ⇒ nudge 不是 move' },
+  { q: '把它挪到 3000, 500', wantActions: ['cabinet.move'], scenario: 'single', note: '给了绝对坐标 ⇒ move' },
+  { q: '转 90 度', wantActions: ['cabinet.rotate'], scenario: 'single' },
+  { q: '这柜子转个方向', wantActions: ['cabinet.rotate', 'cabinet.place'], scenario: 'single', note: '说「转」但没给角度 ⇒ 该问或用 rotate' },
+  { q: '把它放到床尾柜旁边', wantActions: [], wantClarify: true, scenario: 'multi', note: '★ 三台柜，「它」指代不清 + 没说哪边 ⇒ 该问' },
+
+  { q: '跟床尾柜对齐', wantActions: [], wantClarify: true, scenario: 'multi', note: '★ 指代不清 + 对齐方式有多种 ⇒ 该问' },
+
+  { q: '第一格改成 700 宽', wantActions: ['cabinet.setUnitWidth'], scenario: 'single' },
+  { q: '挂衣区那格叫「大衣区」', wantActions: ['cabinet.renameUnit'], scenario: 'single' },
+  { q: '把层板格那个去掉', wantActions: ['cabinet.removeUnit'], scenario: 'single', note: '破坏性' },
+  { q: '删掉这个柜子', wantActions: ['cabinet.delete'], scenario: 'single', note: '破坏性' },
+  { q: '板材换成爱格板', wantActions: ['cabinet.setBoardMaterial'], scenario: 'single' },
+  { q: '背板换成 9 毫米的', wantActions: ['cabinet.setBackMaterial'], scenario: 'single' },
+  { q: '宽度改成按分区来分', wantActions: ['cabinet.setWidthMode'], scenario: 'single' },
+  { q: '柜宽按每个格子的需求分，别按总宽', wantActions: ['cabinet.setWidthMode'], scenario: 'single' },
+  // ── ② 数量/单位/口语变体（同一动作，不同说法）──
+  { q: '踢脚换成 8 公分', wantActions: ['cabinet.setBodyLift'], scenario: 'single', note: '单位换算：8cm = 80mm' },
+  { q: '踢脚不要了', wantActions: ['cabinet.setBodyLift'], scenario: 'single', note: '「不要了」= 0' },
+  { q: '踢脚再高一点', wantActions: [], wantClarify: true, scenario: 'single', note: '「高一点」没给数 ⇒ 该问' },
+  { q: '层板加一层', wantActions: ['cabinet.setUnitParam'], scenario: 'single' },
+  { q: '抽屉改成四个', wantActions: [], wantClarify: true, scenario: 'single', note: '柜里没抽屉区 ⇒ 该问（还是加一个？）' },
+  { q: '挂衣杆再高 200', wantActions: [], wantClarify: true, scenario: 'single', note: '相对量，需要当前值才换算得出' },
+  { q: '门做成三扇', wantActions: [], wantClarify: true, scenario: 'single', note: '两个分区 ⇒ 门怎么分该问' },
+  { q: '换个名字叫「主卧大衣柜」', wantActions: ['cabinet.rename'], scenario: 'single' },
+  { q: '叫「次卧衣柜」', wantActions: ['cabinet.rename'], scenario: 'single', note: '「叫X」默认指柜体改名（规则 8）' },
+  { q: '这个项目改名叫「全屋定制」', wantActions: ['project.rename'], scenario: 'single', note: '明确说「项目」⇒ project.rename' },
+  { q: '复制一份这个柜子', wantActions: ['cabinet.duplicate'], scenario: 'single' },
+  { q: '照着这个再来一个', wantActions: ['cabinet.duplicate'], scenario: 'single' },
+  { q: '宽度改成 1200', wantActions: ['cabinet.resize'], scenario: 'single' },
+  { q: '高度调到 2200', wantActions: ['cabinet.resize'], scenario: 'single' },
+  { q: '进深改成 500', wantActions: ['cabinet.resize'], scenario: 'single' },
+  { q: '宽 1200 高 2200 深 500', wantActions: ['cabinet.resize'], scenario: 'single' },
+
+  // ── ③ 功能开关（setUnitFeature）──
+  { q: '那个格子加个裤架', wantActions: ['cabinet.setUnitFeature'], scenario: 'single' },
+  { q: '抽屉要格子抽', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型假装层板格有抽屉 ⇒ 该问' },
+  { q: '层板加个灯带', wantActions: ['cabinet.setUnitFeature'], scenario: 'single' },
+  { q: '灯带靠前', wantActions: ['cabinet.setUnitFeature'], scenario: 'single' },
+  { q: '灯带装中间', wantActions: ['cabinet.setUnitFeature'], scenario: 'single' },
+  { q: '灯带要斜着 45 度', wantActions: ['cabinet.setUnitFeature'], scenario: 'single' },
+
+  // ── ④ 门板材质 ──
+  { q: '那格换成钢化玻璃门', wantActions: ['cabinet.setUnitDoorMaterial'], scenario: 'single' },
+  { q: '门板用木的', wantActions: [], wantClarify: true, scenario: 'single', note: '规则集里有很多木门材质 ⇒ 该问哪一款' },
+  { q: '灰玻门', wantActions: ['cabinet.setUnitDoorMaterial'], allowClarify: true, scenario: 'single', note: '两格都换 or 问哪格，两种都对' },
+
+  // ── ⑤ 新增分区（addUnit）的各种说法 ──
+  { q: '下面加个抽屉', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型会自己挑 600 宽 ⇒ 违反规则 6，该问' },
+  { q: '上面加个放被子的格子', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型自己挑 1800 整宽 ⇒ 该问' },
+  { q: '右边加一格挂衣服的', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型自己挑 600 ⇒ 该问' },
+  { q: '加个开放格', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型问「净宽做多少」⇒ 对（缺关键数字）' },
+  { q: '留个烤箱的位置', wantActions: [], wantClarify: true, scenario: 'single', note: '缺尺寸 ⇒ 该问' },
+  { q: '留个冰箱位', wantActions: [], wantClarify: true, scenario: 'single', note: '缺「多宽/多高」⇒ 该问' },
+  { q: '中间加个抽屉柜', wantActions: [], wantClarify: true, scenario: 'single', note: '★ 模型自己三等分 ⇒ 该问' },
+  // ── ⑥ 建柜的各种说法 ──
+  { q: '来个衣柜，1800 宽 2400 高', wantActions: ['cabinet.create'], scenario: 'single' },
+  { q: '建个地柜', wantActions: ['cabinet.create'], scenario: 'single', note: '缺尺寸 ⇒ 可追问（allowClarify 更宽松）', allowClarify: true },
+  { q: '在客厅放个电视柜', wantActions: ['cabinet.create'], scenario: 'single', allowClarify: true },
+  { q: '做一排吊柜', wantActions: ['cabinet.create'], scenario: 'single', allowClarify: true },
+  { q: '我要个中岛', wantActions: ['cabinet.create'], scenario: 'single', allowClarify: true },
+
+  // ── ⑦ 该追问的（信息不足 / 有歧义）──
+  { q: '帮我做个柜子', wantActions: [], wantClarify: true, scenario: 'single' },
+  { q: '改一下', wantActions: [], wantClarify: true, scenario: 'single' },
+  { q: '把它弄一下', wantActions: [], wantClarify: true, scenario: 'single' },
+  { q: '这柜子不太行', wantActions: [], wantClarify: true, scenario: 'single', note: '没说哪里不行 ⇒ 该问' },
+  { q: '太丑了', wantActions: [], wantClarify: true, scenario: 'single' },
+  { q: '换成玻璃的', wantActions: ['cabinet.setUnitDoorMaterial'], allowClarify: true, scenario: 'single', note: '两格都换 or 问哪格，两种都对' },
+  { q: '改名字', wantActions: [], wantClarify: true, scenario: 'single', note: '没说改成什么' },
+  { q: '删掉它', wantActions: [], wantClarify: true, scenario: 'single', note: '破坏性且没点名' },
+  { q: '放到那边去', wantActions: [], wantClarify: true, scenario: 'single' },
+  { q: '这柜子多高合适', wantActions: [], wantClarify: true, scenario: 'single', note: '是问不是指令' },
+
+  // ── ⑧ multi：三台柜，指代有歧义 ──
+  { q: '把它删了', wantActions: [], wantClarify: true, scenario: 'multi', note: '三台柜，说「它」⇒ 该问哪台' },
+  { q: '这个改名', wantActions: [], wantClarify: true, scenario: 'multi' },
+  { q: '高度不对', wantActions: [], wantClarify: true, scenario: 'multi' },
+  { q: '这个也来一个', wantActions: ['cabinet.duplicate'], scenario: 'multi', note: '「这个」+ 动作明确 ⇒ 可做（allowClarify 更宽松）', allowClarify: true },
+  { q: '主卧衣柜的踢脚改成 100', wantActions: ['cabinet.setBodyLift'], scenario: 'multi', note: '点名了就该做' },
+  { q: '客厅那个电视柜改成 1600 宽', wantActions: ['cabinet.resize'], scenario: 'multi', note: '点名了就该做' },
+  { q: '床尾柜加个抽屉', wantActions: [], wantClarify: true, scenario: 'multi', note: '★ 模型自己挑 600 ⇒ 该问' },
+  { q: '衣柜的门改成两扇', wantActions: ['cabinet.setUnitParam'], scenario: 'multi' },
+  { q: '再加一格', wantActions: [], wantClarify: true, scenario: 'multi' },
+  { q: '高度调一下', wantActions: [], wantClarify: true, scenario: 'multi' },
+  { q: '宽度改一下', wantActions: [], wantClarify: true, scenario: 'multi' },
+  { q: '把主卧衣柜复制一份', wantActions: ['cabinet.duplicate'], scenario: 'multi' },
+  { q: '床尾柜删掉', wantActions: ['cabinet.delete'], scenario: 'multi', note: '点名了 ⇒ 破坏性也该做' },
+  {
+    q: '第一格改成 700 宽',
+    wantActions: ['cabinet.setUnitWidth'],
+    scenario: 'turns',
+    note: '第 2 轮：「第一格」指上一轮建的柜子的第 1 格',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '第一格改成 700 宽', wantActions: ['cabinet.setUnitWidth'] },
+    ],
+  },
+  {
+    q: '挂衣区那格叫大衣区',
+    wantActions: ['cabinet.renameUnit'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '挂衣区那格叫大衣区', wantActions: ['cabinet.renameUnit'] },
+    ],
+  },
+  {
+    q: '再宽 300',
+    wantActions: ['cabinet.resize'],
+    scenario: 'turns',
+    note: '相对量 + 上一轮有基准 ⇒ 该算绝对值',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '再宽 300', wantActions: ['cabinet.resize'] },
+    ],
+  },
+  {
+    q: '踢脚改成 100',
+    wantActions: ['cabinet.setBodyLift'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '踢脚改成 100', wantActions: ['cabinet.setBodyLift'] },
+    ],
+  },
+  {
+    q: '层板格换成玻璃门',
+    wantActions: ['cabinet.setUnitDoorMaterial'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '层板格换成玻璃门', wantActions: ['cabinet.setUnitDoorMaterial'] },
+    ],
+  },
+  {
+    q: '那格加个裤架',
+    wantActions: ['cabinet.setUnitFeature'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽，左边挂衣', wantActions: ['cabinet.create'] },
+      { q: '那格加个裤架', wantActions: ['cabinet.setUnitFeature'] },
+    ],
+  },
+  {
+    q: '再来一个一样的',
+    wantActions: ['cabinet.duplicate'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '再来一个一样的', wantActions: ['cabinet.duplicate'] },
+    ],
+  },
+  {
+    q: '改名叫主卧衣柜',
+    wantActions: ['cabinet.rename'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '改名叫主卧衣柜', wantActions: ['cabinet.rename'] },
+    ],
+  },
+  {
+    q: '再高 200',
+    wantActions: ['cabinet.resize'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽 2400 高', wantActions: ['cabinet.create'] },
+      { q: '再高 200', wantActions: ['cabinet.resize'] },
+    ],
+  },
+  {
+    q: '把它删了',
+    wantActions: ['cabinet.delete'],
+    scenario: 'turns',
+    note: '上一轮建的那台 ⇒ 指代清楚，该做',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '把它删了', wantActions: ['cabinet.delete'] },
+    ],
+  },
+  {
+    q: '往左挪 200',
+    wantActions: ['cabinet.nudge'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '往左挪 200', wantActions: ['cabinet.nudge'] },
+    ],
+  },
+  {
+    q: '那格改成抽屉',
+    wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'],
+    scenario: 'turns',
+    note: '改成另一种 ⇒ 删旧建新（两个动作都算对）',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '那格改成抽屉', wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'] },
+    ],
+  },
+  // ── ⑩ 组装（assembly）──
+  { q: '把这三个柜子组成一组', wantActions: ['assembly.create'], scenario: 'single', allowClarify: true },
+  { q: '厨房那三组并成一组', wantActions: ['assembly.create'], scenario: 'single', allowClarify: true },
+  { q: '把这组拆开', wantActions: ['assembly.delete'], scenario: 'single', allowClarify: true },
+
+  // ── ⑪ multi 补足到 20+ ──
+  { q: '主卧衣柜加个抽屉', wantActions: ['cabinet.addUnit'], scenario: 'multi' },
+  { q: '床尾柜的宽度改成 700', wantActions: ['cabinet.resize'], scenario: 'multi' },
+  { q: '电视柜改名叫客厅矮柜', wantActions: ['cabinet.rename'], scenario: 'multi' },
+  { q: '客厅电视柜加一层板', wantActions: ['cabinet.setUnitParam'], scenario: 'multi' },
+  { q: '衣柜那格换成玻璃门', wantActions: ['cabinet.setUnitDoorMaterial'], scenario: 'multi', allowClarify: true },
+  { q: '主卧衣柜往左挪 300', wantActions: ['cabinet.nudge'], scenario: 'multi' },
+  { q: '再复制一个衣柜', wantActions: ['cabinet.duplicate'], scenario: 'multi', allowClarify: true },
+
+  // ── ⑫ turns 补足到 20+ ──
+  {
+    q: '第二格改成抽屉',
+    wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '第二格改成抽屉', wantActions: ['cabinet.removeUnit', 'cabinet.addUnit'] },
+    ],
+  },
+  {
+    q: '那格加个灯带',
+    wantActions: ['cabinet.setUnitFeature'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽，左边挂衣右边层板，各 900 宽', wantActions: ['cabinet.create'] },
+      { q: '那格加个灯带', wantActions: ['cabinet.setUnitFeature'] },
+    ],
+  },
+  {
+    q: '深度改成 500',
+    wantActions: ['cabinet.resize'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽 2400 高 600 深', wantActions: ['cabinet.create'] },
+      { q: '深度改成 500', wantActions: ['cabinet.resize'] },
+    ],
+  },
+  {
+    q: '叫主卧衣柜',
+    wantActions: ['cabinet.rename'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '叫主卧衣柜', wantActions: ['cabinet.rename'] },
+    ],
+  },
+  {
+    q: '挂衣杆降 100',
+    wantActions: ['cabinet.setUnitParam'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽，左边挂衣', wantActions: ['cabinet.create'] },
+      { q: '挂衣杆降 100', wantActions: ['cabinet.setUnitParam'] },
+    ],
+  },
+  {
+    q: '再复制一个',
+    wantActions: ['cabinet.duplicate'],
+    scenario: 'turns',
+    turns: [
+      { q: '给我做个衣柜，1800 宽', wantActions: ['cabinet.create'] },
+      { q: '再复制一个', wantActions: ['cabinet.duplicate'] },
     ],
   },
 ];
@@ -507,7 +798,16 @@ async function evaluateModel(model: string): Promise<void> {
 }
 
 // ── 跑所有模型 ──
-for (const m of MODELS) {
-  await evaluateModel(m);
+// ★ 只在**直接运行时**才跑；被 import 时（比如验收卡 import CASES）不跑。
+//   否则 import 一下就发起几十次模型调用 —— 验收根本没法用。
+// ★ 判定「是不是入口」—— 不能用环境变量：
+//   import 会被**提升**，模块体在 import 语句之前就跑了 ⇒ 设 env 来不及。
+//   用 import.meta.url 与 process.argv[1] 比对，这是 ESM 判断入口的标准做法。
+const isEntry = process.argv[1] &&
+  import.meta.url === new URL(`file://${process.argv[1]}`).href.replace(/\\/g, '/');
+if (isEntry) {
+  for (const m of MODELS) {
+    await evaluateModel(m);
+  }
+  console.log('='.repeat(64));
 }
-console.log('='.repeat(64));

@@ -601,6 +601,20 @@ export interface RuleSet {
     maxSingleCabinetHeight: number;
     maxSingleCabinetWidth: number;
     hingeSpacingMax: number;
+    /**
+     * 挂衣杆中心到**分区顶板下沿**的目标间距（mm，默认 150）。
+     *
+     * 行业通用 + 参考图纸《世园润府18-1502》实测：杆离顶太近衣架钩挂不进去，
+     * 离太远则该格上方一大片空当。留 150 是两者之间的常用值。
+     */
+    rodTopGap?: number;
+    /** 杆下方至少要留的净空（mm，默认 900 = 能挂短衣）。 */
+    rodMinClearanceBelow?: number;
+    /**
+     * 「authored 杆高看起来还是历史占位值」的容差（mm，默认 400）。
+     * 与「净高 − rodTopGap」相差小于它 ⇒ 当成占位值忽略，按离顶 150 派生。
+     */
+    rodLegacyTolerance?: number;
   };
   policy: {
     remainderPolicy: 'bottom' | 'top' | 'distribute';

@@ -450,13 +450,14 @@ const WRITABLE: Record<string, RegExp[]> = {
   'wall.update': [/^thickness$/, /^height$/, /^name$/],
   'room.rename': [/^rooms\[\d+\]\.name$/],
   'project.rename': [/^name$/],
+  'project.setCustomerHeight': [/^customerHeight$/],
 };
 
 /** 绝对不能改的路径前缀（派生字段 / 系统字段），即使白名单写错也拦一道 */
 const DENY = [/^panels/, /^geometry/, /^issues/, /^stats/, /^id$/, /^schemaVersion$/, /^ruleSetId$/];
 
 /** 项目级目标允许改的绝对路径 */
-const SETTABLE_ABS = new Set(['name']);
+const SETTABLE_ABS = new Set(['name', 'customerHeight']);
 
 function isWritablePath(op: string, path: string, isProjectTarget: boolean): boolean {
   if (DENY.some((d) => d.test(path))) return false;
@@ -496,7 +497,12 @@ export function getByPath(root: unknown, path: string): unknown {
  * 只放**可选 authored 字段**：它们在类型上是 `?:`，首次赋值是正常业务操作。
  * 其余一律拒绝创建 —— 这是"派生字段永不写入模型"的最后一道物理防线。
  */
-const OPTIONAL_AUTHORED = new Set(['nickname', 'type', 'backUnits', 'appliance', 'ledStrip', 'tilt', 'hingeSide', 'material']);
+const OPTIONAL_AUTHORED = new Set([
+  'nickname', 'type', 'backUnits', 'appliance', 'ledStrip', 'tilt', 'hingeSide', 'material',
+  // ★ 2026-10-22：项目级可选 authored 字段。首次设置（从无到有）是正常业务操作，
+  //   不是"偷加字段"。没有它，`project.setCustomerHeight` 在任何还没设过身高的项目上都会被拒。
+  'customerHeight',
+]);
 
 function setByPath(root: unknown, path: string, value: unknown): void {
   const toks = parsePath(path);
@@ -1108,8 +1114,8 @@ export class CommandBus {
 
     // ② 写权限 + 路径白名单校验
     const clamped: string[] = [];
+    const isProjectTarget = !cmd.target || cmd.target.kind === 'project';
     if (!isStructural) {
-      const isProjectTarget = !cmd.target || cmd.target.kind === 'project';
       for (const ch of cmd.changes) {
         if (!isWritablePath(cmd.op, ch.path, isProjectTarget)) {
           return {
@@ -1150,7 +1156,15 @@ export class CommandBus {
 
       for (const ch of cmd.changes) {
         const before = getByPath(root, ch.path);
-        if (before === undefined) return { ok: false, error: `路径不存在: ${ch.path}` };
+        /**
+         * ★ 2026-10-22：`undefined` 有两种含义，不能一律当"路径不存在"：
+         *   ① 路径真的不存在（拼错 / 派生字段）⇒ 必须拒；
+         *   ② 可选 authored 字段**尚未赋过值**（如 project.customerHeight）⇒ 首次设置是合法的。
+         *   判据用 OPTIONAL_AUTHORED 叶子名 + 白名单已校验过路径（②的路径本身是允许写的）。
+         */
+        const leaf = ch.path.split('.').pop() ?? '';
+        const isFirstAssignment = before === undefined && OPTIONAL_AUTHORED.has(leaf) && isWritablePath(cmd.op, ch.path, isProjectTarget);
+        if (before === undefined && !isFirstAssignment) return { ok: false, error: `路径不存在: ${ch.path}` };
         const s = sanitize(ch);
         if (s.note) clamped.push(s.note);
         let next: unknown = s.value;

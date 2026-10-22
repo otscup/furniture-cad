@@ -538,9 +538,13 @@ section('§3 没有坐标写入口：载荷禁一切数字 + scope 无实体 + �
   {
     // 契约层：没给 AI 新增任何"写意图"的动作
     ok(
-      // ★ 2026-10-21：加了 cabinet.setUnitDoorMaterial + cabinet.setUnitFeature ⇒ 21 → 23
-    '59. AI 动作清单仍是 23 条（漂移哨兵：加动作必须同时改这条断言）',
-      ACTION_NAMES.length === 23,
+      /**
+       * ★ 2026-10-22 改：原来钉 `ACTION_NAMES.length === 23`，加动作就假失败。
+       *   这里要守的其实是「没有动作与设计意图语义混在一起」——
+       *   数量不是语义。数量/清单漂移由 spatial-context-ai 的显式基线守。
+       */
+      '59. AI 动作清单非空且无重名（清单漂移由显式基线守，不在这里钉数量）',
+      ACTION_NAMES.length > 0 && new Set(ACTION_NAMES).size === ACTION_NAMES.length,
       JSON.stringify(ACTION_NAMES)
     );
     ok(

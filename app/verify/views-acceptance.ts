@@ -6,6 +6,7 @@ import type { BBox, Cabinet, Prim, RuleSet, Vec2 } from '../src/core/types.ts';
 import { computeCabinetLayout, doorWidths } from '../src/core/geometry/layout.ts';
 import { buildCabinetViews, buildProjectViews, estimateTextWidth, type ViewSet } from '../src/core/geometry/views.ts';
 import { bboxOf } from '../src/core/geometry/transform.ts';
+import { effectiveRodZ } from '../src/core/geometry/generate.ts';
 import { equalSpacing } from '../src/core/allocate.ts';
 import { createCabinet, sampleProject } from '../src/core/docFactory.ts';
 
@@ -529,7 +530,13 @@ const rodUnit = cab.layout.units.find((u) => u.rod);
 if (rodUnit) {
   const idx = cab.layout.units.indexOf(rodUnit);
   const x0 = L.unitX0[idx];
-  const z = innerBottomZ + rodUnit.rod!.heightFromBottom;
+  /**
+   * ★ 2026-10-22：期望值必须用**派生后的有效杆高**，不能用 authored 原值。
+   *   杆高现在是「净高 − rodTopGap」派生的（authored 1800 只是历史占位值），
+   *   拿 authored 算期望就会与图面差 300+ mm（这条断言正是这样抓住我的改动的）。
+   */
+  const rowNetH = L.netH ?? innerH;
+  const z = innerBottomZ + effectiveRodZ(rodUnit, rowNetH, rules);
   const rodLines = vs.prims.front.filter(
     (p) => p.k === 'poly' && p.layer === 'F-CAB-HW' && !!p.dash && Math.abs(inv.front(p.pts[0]).y - z) < TOL
   );

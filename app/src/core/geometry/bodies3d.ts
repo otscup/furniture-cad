@@ -23,6 +23,7 @@ import type { Cabinet, RuleSet, UnitSpec } from '../types.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights } from './layout.ts';
 import { equalSpacing } from '../allocate.ts';
 import { localToWorld } from './transform.ts';
+import { effectiveRodZ } from './generate.ts';
 
 export interface Box3D {
   id: string;
@@ -206,7 +207,9 @@ export function buildCabinetBodies(cab: Cabinet, rules: RuleSet): Box3D[] {
       if (u.rod && u.rod.count > 0) {
         // 挂衣杆用细长盒表达（圆柱渲染留给后续，视觉可辨即可）：
         // 沿柜宽横向、进深居中、离该排内空底 rodHeight
-        const rz = rowZ0 + u.rod.heightFromBottom;
+        // ★ 2026-10-22：改用派生后的有效杆高，与 2D 三视图同一口径
+        //   （否则 2D 的杆离顶 150、3D 的还在 1800，两张图对不上）。
+        const rz = rowZ0 + effectiveRodZ(u, rowNetH, rules);
         const yMid = (shelfY0 + shelfY1) / 2;
         push('rod', `${cab.id}_${u.id}_ROD`, '挂衣杆',
           x0 + 30, x0 + netW - 30, yMid - 15, yMid + 15,

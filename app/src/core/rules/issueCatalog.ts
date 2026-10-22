@@ -1195,6 +1195,13 @@ const RULE_CARDS: Record<string, RuleCard> = {
     hint: () => '把挂衣杆下移或把上方层板上移，留出至少 100mm。',
     manual: '怎么调属于设计决定。',
   },
+  'ERGO-ROD-BELOW': {
+    title: '挂衣杆下方净空不够',
+    severity: 'WARNING',
+    message: (c) => `「${str(c, 'cabName')}」的挂衣杆下方只有 ${num(c, 'below')}mm 净空，小于${str(c, 'zoneType')}需要的 ${num(c, 'need')}mm —— 衣服会拖地或堆在底板上。`,
+    hint: (c) => `把杆提高到至少 ${num(c, 'need')}mm（离分区内底），或把这格做成顶部叠放/短衣区。`,
+    manual: '分区用途属于设计决定。',
+  },
   'ERGO-HANG-ZONE': {
     title: '挂衣区净高不够',
     severity: 'WARNING',

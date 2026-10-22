@@ -63,9 +63,16 @@ section('2. 图纸计划：横向单柜单页，三视图同柜同源');
   const book = buildRoomBook(project, rules, 'rb-v1');
   const html = roomBookHtml(book);
   const pages = html.match(/data-page-kind="cabinet"/g) ?? [];
-  ok(`HTML 备用版保留每房间历史布局页（${book.sections.length}）与单柜页（${project.cabinets.length}）`, (html.match(/data-page-kind="layout"/g) ?? []).length === book.sections.length && pages.length === project.cabinets.length, `layouts=${(html.match(/data-page-kind="layout"/g) ?? []).length}; cabinets=${pages.length}`);
-  const noLayouts = roomBookHtml(book, { layoutRoomIds: [] });
-  ok('显式空 layoutRoomIds 时 HTML 不输出任何布局页', !(noLayouts.match(/data-page-kind="layout"/g) ?? []).length && (noLayouts.match(/data-page-kind="cabinet"/g) ?? []).length === project.cabinets.length);
+  /**
+   * ★ 2026-10-22 语义变更：**默认不再输出房间平面布局页**（用户要求「平面图可以不要」）。
+   *   要复现旧行为必须显式传 `layoutRoomIds`。
+   */
+  ok(`默认不输出房间平面布局页，只出单柜页（${project.cabinets.length} 张）`,
+    (html.match(/data-page-kind="layout"/g) ?? []).length === 0 && pages.length === project.cabinets.length,
+    `layouts=${(html.match(/data-page-kind="layout"/g) ?? []).length}; cabinets=${pages.length}`);
+  const allLayouts = roomBookHtml(book, { layoutRoomIds: book.sections.map((s) => s.roomId) });
+  ok('显式点名全部房间时仍可复现旧的每房间布局页', (allLayouts.match(/data-page-kind="layout"/g) ?? []).length === book.sections.length && (allLayouts.match(/data-page-kind="cabinet"/g) ?? []).length === project.cabinets.length,
+    `layouts=${(allLayouts.match(/data-page-kind="layout"/g) ?? []).length}`);
   const onlyA = roomBookHtml(book, { layoutRoomIds: ['room_a'] });
   const aLayoutIndex = onlyA.indexOf('data-page-kind="layout" data-room-id="room_a"');
   const aCabinetIndex = onlyA.indexOf('data-page-kind="cabinet" data-room-id="room_a"');

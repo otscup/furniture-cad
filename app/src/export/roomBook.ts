@@ -718,8 +718,11 @@ const CSS = `
 
 /**
  * 按需为选中的房间先出一页平面布局，再为房间内每个柜体单独出图（横向 A3）。
- * HTML 打印版未指定时保留历史全房间布局；正式 PDF 调用方显式传空数组，默认只出逐柜页。
- * 页面身份同时写入 data 属性和图框文字，便于自动化检查与后续追溯。
+ *
+ * ★ 2026-10-22：**默认不再插入房间平面布局页**（用户要求「平面图可以不要，只保留俯视图」）。
+ *   平面页是独立渲染分支，去掉它不影响订单页/柜体页/清单的结构。
+ *   仍可用 `layoutRoomIds` 显式点名要哪些房间的平面页（旧行为可复现）。
+ *   页面身份同时写入 data 属性和图框文字，便于自动化检查与后续追溯。
  */
 export function roomBookHtml(
   book: RoomBook,
@@ -727,7 +730,8 @@ export function roomBookHtml(
 ): string {
   const pages: string[] = [];
   const sheetMode = options.sheetMode ?? 'cabinet';
-  const layoutRoomIds = new Set(options.layoutRoomIds ?? book.sections.map((section) => section.roomId));
+  // 缺省 = 不输出任何平面布局页（逐柜页里已有俯视图）。
+  const layoutRoomIds = new Set(options.layoutRoomIds ?? []);
   for (const section of book.sections) {
     const scheduleItems = (cabinets: RoomBookCabinet[]) => cabinets.map((cabinet) =>
       `<span class="layout-schedule-tag">${esc(cabinet.mapTag)}</span>${esc(cabinet.name)} ${cabinet.width}×${cabinet.height}×${cabinet.depth}mm${
@@ -777,6 +781,13 @@ export function roomBookHtml(
       );
     }
     if (sheetMode === 'cabinet' || sheetMode === 'both') {
+      /**
+       * ★ 2026-10-22：柜体编号清单（schedule）原来是挂在**房间平面页**上的。
+       *   平面页默认不再输出后，这份清单会一起消失 —— 而它是拆单必需信息
+       *   （编号 B1/W1 → 柜名 → 完整尺寸 → 参考预留净空）。
+       *   所以改挂到**本房间第一张柜体页**上：信息不丢，也不再多出一页。
+       */
+      const scheduleHomeId = !layoutRoomIds.has(section.roomId) ? section.cabinets[0]?.id : undefined;
       for (const cabinet of section.cabinets) {
         const noteBlocks = [
           ...(cabinet.safetyNote ? [`<div class="cabinet-safety-note">${esc(cabinet.safetyNote)}</div>`] : []),
@@ -785,8 +796,10 @@ export function roomBookHtml(
         const noteStack = noteBlocks
           ? `<aside class="cabinet-note-stack" aria-label="${esc(cabinet.name)}生产警告与加工说明">${noteBlocks}</aside>`
           : '';
+        // 没有平面页时，编号清单跟着本房间第一张柜体页走（见 scheduleHomeId 的说明）
+        const scheduleHere = cabinet.id === scheduleHomeId ? schedule : '';
         pages.push(
-          `<section class="page cabinet-page" data-page-kind="cabinet" data-room-id="${esc(section.roomId)}" data-cabinet-id="${esc(cabinet.id)}" aria-label="${esc(section.roomName)} / ${esc(cabinet.name)}"><div class="sheet-wrap">${cabinet.sheetSvg}</div>${noteStack}</section>`,
+          `<section class="page cabinet-page" data-page-kind="cabinet" data-room-id="${esc(section.roomId)}" data-cabinet-id="${esc(cabinet.id)}" aria-label="${esc(section.roomName)} / ${esc(cabinet.name)}"><div class="sheet-wrap">${cabinet.sheetSvg}</div>${noteStack}${scheduleHere}</section>`,
         );
       }
     }

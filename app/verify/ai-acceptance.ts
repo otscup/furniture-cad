@@ -122,6 +122,8 @@ const MINIMAL: Record<string, unknown> = {
   'cabinet.duplicate': { action: 'cabinet.duplicate', target: { cabinetName: cab0.name }, params: { offset: 800 } },
   'cabinet.delete': { action: 'cabinet.delete', target: { cabinetName: cab0.name }, params: {} },
   'project.rename': { action: 'project.rename', target: {}, params: { name: '验收项目' } },
+  // ★ 2026-10-22：客户身高（人体工学校验的输入口）
+  'project.setCustomerHeight': { action: 'project.setCustomerHeight', target: {}, params: { height: 1700 } },
   // v0.3 P2：组合。成员用现有柜体 id，不给任何坐标（AI 不许写坐标是硬边界）
   'assembly.create': {
     action: 'assembly.create',

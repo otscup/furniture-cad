@@ -1227,6 +1227,22 @@ function compileResolved(action: AiAction, project: Project, rules: RuleSet): Co
       if (to === project.name) return { ok: false, error: `项目本来就叫「${project.name}」` };
       return { ok: true, command: CMD.renameProject(project.name, to, src), summary: `重命名项目 →「${to}」` };
     }
+    case 'project.setCustomerHeight': {
+      /**
+       * 客户身高（mm）。接受 1700 / 1.7 / "170cm" 这几种模型常见写法：
+       * 模型经常把米当毫米给（"身高 1.7"），这里统一归一，不靠提示词约束死。
+       */
+      const raw = Number(p.height);
+      if (!Number.isFinite(raw) || raw < 0) return { ok: false, error: `客户身高需要一个数字（mm），收到的是「${String(p.height)}」` };
+      // 小于 3 的当作"米"换算（1.7 → 1700）
+      const mm = raw > 0 && raw < 3 ? Math.round(raw * 1000) : Math.round(raw);
+      if (mm > 2500) return { ok: false, error: `客户身高 ${mm}mm 不像人体身高（上限 2500mm）。请确认单位是毫米` };
+      return {
+        ok: true,
+        command: CMD.setCustomerHeight(project.customerHeight, mm === 0 ? null : mm, src),
+        summary: mm === 0 ? '清除客户身高' : `客户身高 → ${mm}mm`,
+      };
+    }
 
     default:
       /**
@@ -1322,4 +1338,5 @@ export const COMPILED_ACTIONS = [
   'assembly.create',
   'assembly.delete',
   'project.rename',
+  'project.setCustomerHeight',
 ] as const;

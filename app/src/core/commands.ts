@@ -624,3 +624,25 @@ export function updateOpening(
 export function renameProject(from: string, to: string, source: CommandSource = 'ui'): Command {
   return cmd('project.rename', source, { kind: 'project', id: 'project' }, [{ path: 'name', op: 'set', value: to }], `重命名项目「${from}」→「${to}」`);
 }
+
+/**
+ * 设置客户身高（mm）—— 人体工学校验的输入。
+ *
+ * ★ 为什么必须是个正式 Command（2026-10-22）：
+ *   `project.customerHeight` 的校验逻辑（抽屉够不够得着、挂衣杆会不会太高）
+ *   早就写好了，但**没有任何入口能填这个值**：
+ *   UI 没有输入框、AI 契约里没有这个字段 ⇒ 规则永远跑不到。
+ *   "能力建了但没接到在用的那条路上" —— 这是本项目反复出现的失效模式。
+ *
+ * 传 null / 0 = 清除（回到"不做人体工学校验"）。
+ */
+export function setCustomerHeight(from: number | undefined, heightMm: number | null, source: CommandSource = 'ui'): Command {
+  const value = heightMm === null || heightMm === 0 ? null : Math.round(Math.max(0, Math.min(2500, heightMm)));
+  return cmd(
+    'project.setCustomerHeight',
+    source,
+    { kind: 'project', id: 'project' },
+    [{ path: 'customerHeight', op: 'set', value, unit: 'mm' }],
+    value === null ? `清除客户身高（原 ${from ?? '未设置'}mm）` : `客户身高 ${from ?? '未设置'} → ${value}mm`,
+  );
+}

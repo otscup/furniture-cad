@@ -477,10 +477,20 @@ const BASELINE_ACTIONS = [
   // ★ 2026-10-21：新增两个（补能力缺口，见 AGENT-CAPABILITY-2026-10-21.md）
   'cabinet.setUnitDoorMaterial',
   'cabinet.setUnitFeature',
+  // ★ 2026-10-22：客户身高（人体工学校验的输入口，之前 UI/AI 都填不了）
+  'project.setCustomerHeight',
 ];
 ok(
-  '42. 动作清单与 P9.1 之前**逐字一致**（23 个；加动作必须同时改这条断言，漂移哨兵）',
-  JSON.stringify([...ACTION_NAMES].sort()) === JSON.stringify([...BASELINE_ACTIONS].sort()) && ACTION_NAMES.length === 23,
+  /**
+   * ★ 断言语义，不断言计数（交接文档附录 C 的教训）。
+   *
+   *   原来这条还钉了 `ACTION_NAMES.length === 23` —— 加一个动作就假失败，
+   *   而假失败会被当成"基线本来就红"而被忽略，最后让人误判项目坏了。
+   *   真正要守的是「清单没有漂移出这份显式基线」，
+   *   所以只要 `ACTION_NAMES` 与 `BASELINE_ACTIONS` 逐项相同即可。
+   */
+  '42. 动作清单与显式基线逐项一致（加动作要同步改这份基线，漂移哨兵）',
+  JSON.stringify([...ACTION_NAMES].sort()) === JSON.stringify([...BASELINE_ACTIONS].sort()),
   JSON.stringify(ACTION_NAMES)
 );
 ok(

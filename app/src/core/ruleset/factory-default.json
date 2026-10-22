@@ -123,7 +123,9 @@
     "maxShelfSpan": 900,
     "maxSingleCabinetHeight": 2400,
     "maxSingleCabinetWidth": 2400,
-    "hingeSpacingMax": 500
+    "hingeSpacingMax": 500,
+    "rodTopGap": 150,
+    "rodMinClearanceBelow": 900
   },
   "policy": {
     "remainderPolicy": "bottom",

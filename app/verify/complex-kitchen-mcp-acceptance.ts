@@ -525,7 +525,11 @@ async function main(): Promise<void> {
   // ★ 断言语义，不断言计数：图纸页 = 上下叠放组的数量（地柜+吊柜同组一页），
   //   不是柜体数。钉死 7 会在「一页一组」之后假失败（这正是交接文档警告的模式）。
   const expectedCabinetPages = groupCabinetsForSheets(project.cabinets).length;
-  assert('图纸册 HTML 结构含 1 个布局页 + 每组柜体一页', layoutPages === 1 && cabinetPages === expectedCabinetPages, `layout=${layoutPages} cabinet=${cabinetPages} expected=${expectedCabinetPages}; ${htmlBytes.length} bytes`);
+  /**
+   * ★ 2026-10-22：默认不再输出房间平面布局页（用户要求「平面图可以不要」）。
+   *   这里断言"默认 0 个布局页 + 每组柜体一页"；布局页能否复现由 verify:roombook 守。
+   */
+  assert('图纸册 HTML 默认无平面布局页，且每组柜体一页', layoutPages === 0 && cabinetPages === expectedCabinetPages, `layout=${layoutPages} cabinet=${cabinetPages} expected=${expectedCabinetPages}; ${htmlBytes.length} bytes`);
   assert('正式 HTTP 图册有标签编号清单、房间免责声明与三页柜体免责声明', ['B1', 'W1', '01 三抽地柜', safetyPhrase, '水槽预留 650×450mm', '灶具预留 640×520mm', '烤箱预留安装净空 568×600×560mm'].every((text) => html.includes(text)), 'source RoomBook 注记已回读');
   assert('正式 HTTP 图册保留唯一真实非零地柜 KICK RULE-MIN-PANEL 完整警告', warningRows.length === 1 && warningRows.every((row) => html.includes(row.text)), warningRows.map((row) => row.cabinet.name).join(', '));
   const finalLiveSnapshot = await readLiveExportSnapshot();

@@ -208,6 +208,16 @@ function ProjectProps(props: { project: Project; rules: RuleSet; geom: ProjectGe
         <Row label="名称">
           <TextField value={project.name} onCommit={(v) => props.onRun(CMD.renameProject(project.name, v))} />
         </Row>
+        {/* 客户身高：人体工学校验的输入。规则早就写好，缺的是这个入口（见 setCustomerHeight）。 */}
+        <Row label="客户身高">
+          <TextField
+            value={project.customerHeight ? String(project.customerHeight) : ''}
+            onCommit={(v) => {
+              const n = Number(v.trim());
+              props.onRun(CMD.setCustomerHeight(project.customerHeight, Number.isFinite(n) && n > 0 ? n : null));
+            }}
+          />
+        </Row>
         <Row label="项目 ID" derived>
           <Text mono>{project.id}</Text>
         </Row>

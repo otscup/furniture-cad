@@ -1,6 +1,7 @@
 import type { BBox, Cabinet, Prim, Project, RuleSet, Vec2 } from '../types.ts';
 import { equalSpacing } from '../allocate.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights } from './layout.ts';
+import { effectiveRodZ } from './generate.ts';
 import { buildFrontPickLines, buildSideTopPickLines } from './pickLines.ts';
 import type { PickLine } from './pickLines.ts';
 import { bboxOf } from './transform.ts';
@@ -947,7 +948,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       }
       if (u.rod && u.rod.count > 0) {
         // 垂直于视图方向的一根杆 → 画成小十字
-        const rz = z0 + u.rod.heightFromBottom;
+        const rz = z0 + effectiveRodZ(u, netHRow, rules);
         S.line(rodCenterY - 70, rodCenterY + 70, rz, rz, L_HW, 1.8);
         S.line(rodCenterY, rodCenterY, rz - 70, rz + 70, L_HW, 1.8);
       }
@@ -1278,7 +1279,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
         // ── 1. 挂衣区：衣服挂在杆上（衣架 + 衣服轮廓，与参考图同款）──
         if (u.rod && u.rod.count > 0) {
-          const rodZ = rowZ0 + u.rod.heightFromBottom;
+          // ★ 用派生后的有效杆高（离顶板 rodTopGap），不是 authored 原值。
+          const rodZ = rowZ0 + effectiveRodZ(u, rowNH, rules);
           const isLong = rowNH >= 1200; // 长衣/短衣按净高区分
           /**
            * ── 为什么改成"按可用宽度铺满" ──
@@ -1305,8 +1307,25 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const slotW = Math.min(260, netW / 4);
           const n = Math.max(2, Math.min(6, Math.floor(netW / slotW)));
           const garmentHalfW = Math.min(110, slotW * 0.42);
-          const maxGarmentH = rowNH - u.rod.heightFromBottom - 70 - 50;
-          const garmentH = isLong ? Math.min(900, maxGarmentH) : Math.min(600, maxGarmentH);
+          /**
+           * ★★ 衣服**向下**挂（2026-10-22 按参考图纸《世园润府18-1502》实测修正）。
+           *
+           *   历史缺陷：这一块把衣服画在杆的**上方**（rodZ+80 起、再 +garmentH 往上长），
+           *   于是图上衣服"立在挂衣杆上" —— 用户一眼看出不对。
+           *   CAD 坐标系 +Y 向上（见 VariantPanel.tsx 的 scale(1,-1) 说明），
+           *   所以"从杆往上"就是"衣服浮在杆之上"，与真实挂法相反。
+           *
+           *   参考图 p5 实测画法（自杆向下量）：
+           *     杆下 0→衣架钩竖杆       约 60mm
+           *     衣架肩线（V 形）        再向下约 90mm
+           *     衣服本体                从肩线垂下，长衣 ~900 / 短衣 ~600
+           *   全部向下展开，杆以上只剩被褥格。
+           */
+          const hookLen = Math.min(60, rowNH * 0.03);
+          const shoulderDrop = Math.min(90, rowNH * 0.045);
+          // 杆下方可用高度：留出杆下的钩 + 肩线，再给下沿 50mm 不碰底
+          const availBelow = (rodZ - rowZ0) - hookLen - shoulderDrop - 50;
+          const garmentH = Math.max(0, isLong ? Math.min(900, availBelow) : Math.min(600, availBelow));
           if (garmentH > 200) {
             const actualSlot = netW / n;
             for (let k = 0; k < n; k++) {
@@ -1314,22 +1333,36 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
               const hx = x0 + actualSlot * (k + 0.5);
               // 肩半宽占槽位的 40%（参考图比例），但不超 garmentHalfW
               const hw = Math.min(garmentHalfW, actualSlot * 0.4);
+              // ① 衣架钩：杆上一个小圆弧（参考图里钩子是半圆扣在杆上）
+              P.arc(hx, rodZ + 4, Math.min(22, hw * 0.35), 0, Math.PI, L_HW, LW);
+              // ② 钩向下接竖杆
+              P.line(hx, hx, rodZ, rodZ - hookLen, L_HW, 1.0);
+              // ③ 衣架肩线：从竖杆底部分别向左下、右下张开（V 形）
+              const shoulderZ = rodZ - hookLen - shoulderDrop;
+              P.line(hx, hx - hw, rodZ - hookLen, shoulderZ, L_HW, LW);
+              P.line(hx, hx + hw, rodZ - hookLen, shoulderZ, L_HW, LW);
               /**
-               * 衣架钩要**真的钩在杆上**：从杆往下 0 → 25 的短竖线，
-               * 然后两条肩线从钩底张到肩宽。原来的钩只有 25mm 长，
-               * 在 2400mm 高的柜里几乎看不见，观感上衣服就是"飘着"。
+               * ④ 衣服本体（西装外套轮廓）—— 按参考图纸《世园润府18-1502》p5 实测。
+               *
+               *   参考图不是简单梯形，而是一件**西装上衣**，特征自上而下：
+               *     · 斜肩：肩线从领口向外下方倾斜
+               *     · 翻领：领口左右两片斜线交成 V（图中清晰可见）
+               *     · 袖子：两侧有竖向内轮廓线，把袖子和衣身分开
+               *     · 口袋：右下侧一个小方巾形 + 5 个小圆点（纽扣）
+               *   下摆略收窄，长度按长衣/短衣。
                */
-              P.line(hx, hx, rodZ, rodZ + 30, L_HW, 1.0);
-              P.line(hx, hx - hw, rodZ + 30, rodZ + 80, L_HW, LW);
-              P.line(hx, hx + hw, rodZ + 30, rodZ + 80, L_HW, LW);
-              // 衣服轮廓（梯形：肩宽 → 下摆稍宽），参考图同款
-              const shoulderZ = rodZ + 80;
-              const hemZ = shoulderZ + garmentH;
-              const hemHW = hw * 1.15;
+              const hemZ = shoulderZ - garmentH;
+              const hemHW = hw * 0.92;
+              // 斜肩：肩点比领口低一点，形成西装肩线
+              const shoulderDropPx = Math.min(garmentH * 0.06, 40);
+              const collarW = hw * 0.22;
+              // 主体外形（肩 → 袖 → 下摆）
               P.poly(
                 [
-                  { x: hx - hw, y: shoulderZ },
-                  { x: hx + hw, y: shoulderZ },
+                  { x: hx - hw, y: shoulderZ - shoulderDropPx },
+                  { x: hx - collarW, y: shoulderZ },
+                  { x: hx + collarW, y: shoulderZ },
+                  { x: hx + hw, y: shoulderZ - shoulderDropPx },
                   { x: hx + hemHW, y: hemZ },
                   { x: hx - hemHW, y: hemZ },
                 ],
@@ -1337,6 +1370,23 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
                 LW,
                 true
               );
+              // 翻领 V（领口两片）
+              const lapelBottom = shoulderZ - garmentH * 0.22;
+              P.line(hx - collarW, hx, shoulderZ, lapelBottom, L_HW, LW * 0.9);
+              P.line(hx + collarW, hx, shoulderZ, lapelBottom, L_HW, LW * 0.9);
+              // 袖子内轮廓（左右各一道竖线，略内收）
+              const sleeveInset = hw * 0.34;
+              P.line(hx - sleeveInset, hx - sleeveInset, shoulderZ - shoulderDropPx * 1.6, hemZ + garmentH * 0.12, L_HW, LW * 0.8);
+              P.line(hx + sleeveInset, hx + sleeveInset, shoulderZ - shoulderDropPx * 1.6, hemZ + garmentH * 0.12, L_HW, LW * 0.8);
+              // 口袋方巾 + 纽扣（只在够高的衣服上画，避免糊成一团）
+              if (garmentH > 420) {
+                const pkZ = hemZ + garmentH * 0.22;
+                P.line(hx + hw * 0.18, hx + hw * 0.62, pkZ, pkZ + garmentH * 0.05, L_HW, LW * 0.8);
+                for (let bi = 0; bi < 5; bi++) {
+                  const bz = pkZ - garmentH * 0.04 - bi * garmentH * 0.035;
+                  P.arc(hx + hw * 0.42, bz, Math.max(2.5, hw * 0.035), 0, Math.PI * 2, L_HW, LW * 0.7);
+                }
+              }
             }
           }
         }
@@ -1888,7 +1938,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
         // 挂衣杆：只在开放格可见（门后的杆在外观图上不画，内部图照画）。高度按本行内空底起算。
         if (u.rod && u.rod.count > 0 && (!withFronts || openUnit)) {
-          const rz = rowZ0 + u.rod.heightFromBottom;
+          const rz = rowZ0 + effectiveRodZ(u, rowNH, rules);
           P.line(x0 + 2, x0 + netW - 2, rz, rz, L_HW, 1.6, ROD_DASH);
         }
 
@@ -2024,7 +2074,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           put(cx, ctx.z0 + ctx.netH * 0.55, `${rowTag}抽屉面板 ×${u.drawers.count}`, 112, L_TEXT, 'c');
         }
         if (u.rod && u.rod.count > 0) {
-          put(cx, ctx.z0 + u.rod.heightFromBottom + 190, `挂衣杆 · 距内底 ${u.rod.heightFromBottom}`, 108, L_HW, 'c');
+          const rodLabelZ = ctx.z0 + effectiveRodZ(u, ctx.netH, rules);
+    put(cx, rodLabelZ + 190, `挂衣杆 · 距内底 ${effectiveRodZ(u, ctx.netH, rules)}`, 108, L_HW, 'c');
         }
         if (u.doors) {
           put(cx, ctx.z0 + ctx.netH - 620, `${rowTag}门板 ×${u.doors.count}（已移开）`, 108, L_TEXT, 'c');

@@ -1,5 +1,6 @@
 import type { Cabinet, CabinetGeometry, Issue, RuleSet, UnitSpec } from '../types.ts';
 import { computeCabinetLayout, doorWidths, drawerCellHeights, backPanelSize } from '../geometry/layout.ts';
+import { effectiveRodZ } from '../geometry/generate.ts';
 import { BACK_UNITS_PATH, isMultiRow, layoutRows, unitPathPrefix } from '../layoutModel.ts';
 import { buildIssue, type IssueCtx } from './issueCatalog.ts';
 
@@ -317,7 +318,13 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
 
         // 挂衣杆：高度 + 与上方层板间隙 + 挂衣区净高
         if (u.rod && u.rod.count > 0) {
-          const rodH = Math.round(z0Row + u.rod.heightFromBottom);
+          /**
+           * ★★ 2026-10-22：校验必须用**派生后的有效杆高**，不能用 authored 原值。
+           *   否则「离顶板 150」的规则永远校验不到真实图面上的那根杆
+           *   （authored 默认 0 = 由派生层推算，原值本身没有物理意义）。
+           */
+          const rodZ = effectiveRodZ(u, netH, rules);
+          const rodH = Math.round(z0Row + rodZ);
           const rodLimit = height + 200;
           if (rodH > rodLimit) {
             emit('ERGO-ROD-HEIGHT', `${cab.id}.${u.id}`, 'unit', {
@@ -328,14 +335,27 @@ export function validateCabinet(cab: Cabinet, geom: CabinetGeometry, rules: Rule
               limit: rodLimit,
             });
           }
-          // 杆到分区顶的间隙（衣服挂不进去的硬限制）
-          const gap = Math.round(netH - u.rod.heightFromBottom);
+          // 杆到分区顶的间隙（衣服挂不进去的硬限制）。目标值 rodTopGap，下限 100。
+          const gap = Math.round(netH - rodZ);
           if (gap < 100) {
             emit('ERGO-ROD-CLEARANCE', `${cab.id}.${u.id}`, 'unit', {
               ...ctxBase,
               cabName,
               gap,
               min: 100,
+            });
+          }
+          // 杆下方净空：挂衣服要够长。短衣 900 / 长衣 1400，按本格净高判长/短。
+          const below = Math.round(rodZ);
+          const zoneIsLong = netH >= 1200;
+          const needBelow = zoneIsLong ? rules.limits?.rodMinClearanceBelow ?? 900 : 600;
+          if (below < needBelow) {
+            emit('ERGO-ROD-BELOW', `${cab.id}.${u.id}`, 'unit', {
+              ...ctxBase,
+              cabName,
+              below,
+              need: needBelow,
+              zoneType: zoneIsLong ? '长衣' : '短衣',
             });
           }
           // 挂衣区净高：≥1200 算长衣区，<1200 算短衣区

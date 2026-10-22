@@ -572,6 +572,27 @@ export const ACTIONS = {
     params: { name: { type: 'string', max: MAX_STRING } },
     required: ['name'],
   },
+  /**
+   * ★ 客户身高（2026-10-22）—— 人体工学校验的唯一输入口。
+   *
+   *   校验规则（抽屉够不着 / 挂衣杆太高）在 validate.ts 里早就有，
+   *   但因为没有这个动作、UI 也没有输入框，`project.customerHeight` 永远是空的
+   *   ⇒ 规则从未触发过。用户实测反馈：「170 的业主还给弄个 1800 高的抽屉」。
+   *
+   *   典型触发语：「业主身高 170」「身高 1 米 65」「客户比较矮」。
+   */
+  'project.setCustomerHeight': {
+    label: '记录客户身高（人体工学）',
+    target: 'project',
+    params: {
+      height: {
+        type: 'number', min: 0, max: 2500, integer: true,
+        desc: '客户身高（mm）。1700 = 1.7 米。传 0 表示清除',
+      },
+    },
+    required: ['height'],
+    detail: '用户说起身高/个子/够不够得着时才用。传 1700（mm），不是 1.7。设了之后抽屉净高、挂衣杆高度会按人体工学校验。',
+  },
 };
 
 export const ACTION_NAMES = Object.keys(ACTIONS);
@@ -1455,6 +1476,7 @@ const ACTION_FAMILIES = {
   geometry: ['cabinet.resize', 'cabinet.setWidthMode', 'cabinet.setBodyLift', 'cabinet.move', 'cabinet.nudge', 'cabinet.rotate', 'cabinet.place'],
   units: ['cabinet.addUnit', 'cabinet.removeUnit', 'cabinet.setUnitWidth', 'cabinet.setUnitParam', 'cabinet.renameUnit', 'cabinet.setUnitDoorMaterial', 'cabinet.setUnitFeature'],
   naming: ['cabinet.rename', 'project.rename'],
+  ergonomics: ['project.setCustomerHeight'],
   material: ['cabinet.setBoardMaterial', 'cabinet.setBackMaterial'],
   assembly: ['assembly.create', 'assembly.delete'],
 };

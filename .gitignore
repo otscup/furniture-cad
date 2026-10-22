@@ -52,3 +52,6 @@ app/verify-output/
 
 # 验收临时目录（TMPDIR 指到项目内时产生）
 app/verify/out/tmp/
+
+# 参考图纸的页渲染件：由 PDF 渲染而来，可再生（见 REFERENCE-DRAWING-2026-10-22.md 的复现步骤）
+app/verify/out/ref/

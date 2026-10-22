@@ -397,6 +397,15 @@ export function makeUnit(opts: {
         ...base,
         nickname,
         // 挂衣区自带一块顶层层板 —— 与 defaultUnits 的挂衣区结构一致
+        // ★ 未显式给 rodHeight 时按**分区净高**推导（见 rodHeightForNet），不再写死 1800：
+        //   写死会让 1200 高的分区把杆算到顶板以上，2400 高的分区又让杆离顶板留 600 空当。
+        /**
+         * ★ authored 默认仍是 1800 —— **不能改成 0**（2026-10-22 实测）：
+         *   `heightFromBottom` 是 authored 字段，会写进项目文件；
+         *   改默认值会破坏 v0.2 文件逐字节兼容（verify:migration A8 立刻变红）。
+         *   "离顶板 150" 的修正放在**派生层**（见 generate.ts 的 effectiveRodZ），
+         *   那里不改 semantic model —— derived 不落盘是架构铁律。
+         */
         rod: { count: 1, heightFromBottom: Math.round(opts.rodHeight ?? 1800), hardware: pickRod(opts.rules) },
         shelves: { count: 1, mode: 'equal', gapPerSide: 0.5, ledStrip: 'none' },
       };

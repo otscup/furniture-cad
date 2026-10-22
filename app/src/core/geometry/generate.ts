@@ -46,6 +46,56 @@ export function getCabinetFootprint(cab: Cabinet): Vec2[] {
  * ★ 核心：Semantic Model → Panel Model + 2D 图元
  * 纯函数，无副作用，可被穷举单测（恒等式断言见 rules/validate.ts）
  */
+/**
+ * ★★ 挂衣杆的**有效高度**（离本分区内底，mm）—— 全项目唯一口径（2026-10-22）。
+ *
+ * ── 修的是什么 ──
+ *   历史行为：一律用 authored 的 `rod.heightFromBottom`（默认 1800）当绝对高度，
+ *   完全不看这一格的净高。后果经用户实测确认：
+ *     · 2400 高的分区 → 杆离顶板 600，衣服挂进去上面一大片空当；
+ *     · 1200 高的分区 → 杆算到顶板**以上**，图上是一根穿出去的线；
+ *     · 用户原话：「挂衣杆不该在柜子中间，应该离放衣服那格的顶板隔 150 左右」。
+ *
+ * ── 现在的口径（行业通用 + 参考图纸《世园润府18-1502》实测）──
+ *   杆中心到分区顶板下沿 = `rules.cabinet.rodTopGap`（默认 150mm）
+ *   ⇒ 有效杆高 = 净高 − 150。
+ *
+ *   authored 值仍然被**尊重为上限**（AI/用户可以主动调低杆高，语义仍是"离内底"），
+ *   但不会被用到"离顶板不足 150"的地方 —— 那正是"衣服塞不进去"的物理原因。
+ *
+ * ★ 只在派生里算，绝不写回 semantic model：derived 不落盘是架构铁律。
+ */
+export function effectiveRodZ(
+  unit: { rod?: { heightFromBottom?: number } },
+  netH: number,
+  rules: RuleSet,
+): number {
+  const rodTopGap = rules.limits?.rodTopGap ?? 150;
+  const authored = unit.rod?.heightFromBottom ?? 0;
+  const byTopGap = Math.max(0, netH - rodTopGap);
+  /**
+   * ★ 口径：**以「离顶板 150」为准**。
+   *
+   * ── 为什么不直接信 authored ──
+   *   `heightFromBottom` 的默认值 1800 是 **P0 阶段的历史占位值**，
+   *   不是任何人做的设计决定。存量项目里几乎每一格都写着 1800。
+   *   如果"authored 一律优先"，等于永远用 1800 —— 杆还是留在半空
+   *   （实测 2284 净高：杆离顶 502mm，正是用户抱怨"不该在柜子中间"的样子）。
+   *
+   * ── 怎么区分「历史占位」与「真的想低挂」 ──
+   *   按两者差距分段：
+   *     · 与 byTopGap 相差 < `legacyTolerance`（默认 400）⇒ 视为历史占位，用 byTopGap
+   *     · 明显更低（如儿童衣柜短衣区想挂到 1000）⇒ 那是真意图，尊重 authored
+   *
+   *   shortcut: 400mm 的判据是经验阈值，换工厂若确有"故意低挂 300~400"的做法，
+   *   应改成显式的 `rodMount: 'top-150' | 'from-bottom'` 字段而不是调这个数。
+   */
+  const legacyTolerance = rules.limits?.rodLegacyTolerance ?? 400;
+  const looksLikeLegacyDefault = authored > 0 && Math.abs(byTopGap - authored) < legacyTolerance;
+  const picked = authored > 0 && !looksLikeLegacyDefault && authored < byTopGap ? authored : byTopGap;
+  return Math.round(Math.max(0, picked));
+}
+
 export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
   const issues: Issue[] = [];
   const panels: Panel[] = [];
@@ -265,6 +315,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
     units.forEach((u, i) => {
       const netW = netsRow[i]!;
       const netH = unitNetH(u, rowNetH);
+      const rodZWithinRow = effectiveRodZ(u, netH, rules);
       if (u.kind === 'appliance' && u.appliance) {
         buildAppliance(u.id, u, netW, rowShelfDepth, zOffset);
         // 电器格带门 = 洞口与门板打架 —— 如实报 ERROR 并不产出矛盾板件，不静默画一个怪门
@@ -275,7 +326,7 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
       if (u.drawers) buildDrawerBank(u.id, u, netW, netH);
       if (u.shelves && u.shelves.count > 0) buildShelves(u.id, u.shelves, netW, netH, rowShelfDepth, zOffset);
       if (u.rod && u.rod.count > 0) {
-        hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${zOffset + u.rod.heightFromBottom}mm`, belongsTo: `${cabId}.${u.id}` });
+        hardware.push({ id: `HW_${cabId}_${u.id}_ROD`, nameZh: '挂衣杆', kind: 'rod', qty: u.rod.count, spec: `${rules.hardware[u.rod.hardware]?.name ?? u.rod.hardware} L=${netW - 2}mm，距柜内底 ${zOffset + rodZWithinRow}mm`, belongsTo: `${cabId}.${u.id}` });
       }
       if (u.doors && u.kind !== 'appliance') buildDoors(u.id, u, netW, netH);
     });
@@ -570,7 +621,8 @@ export function generateCabinet(cab: Cabinet, rules: RuleSet): CabinetGeometry {
         }
       }
       if (u.rod) {
-        elevation.push({ k: 'poly', pts: [{ x: x0 + 2, y: rowZ0 + u.rod.heightFromBottom }, { x: x0 + netW - 2, y: rowZ0 + u.rod.heightFromBottom }], closed: false, layer: L_HW, lw: 1.4, dash: [40, 20, 6, 20] });
+        const rz = rowZ0 + effectiveRodZ(u, rowNetH, rules);
+        elevation.push({ k: 'poly', pts: [{ x: x0 + 2, y: rz }, { x: x0 + netW - 2, y: rz }], closed: false, layer: L_HW, lw: 1.4, dash: [40, 20, 6, 20] });
       }
     });
   });

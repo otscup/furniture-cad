@@ -1,0 +1,79 @@
+[
+  {
+    "id": "single-hanging",
+    "name": "单格挂衣柜",
+    "truth": {
+      "cabinets": 1,
+      "width": 900,
+      "height": 2400,
+      "depth": 600,
+      "units": 1,
+      "unitKinds": [
+        "hanging"
+      ],
+      "doors": 0
+    }
+  },
+  {
+    "id": "two-shelves",
+    "name": "两格层板柜",
+    "truth": {
+      "cabinets": 1,
+      "width": 1200,
+      "height": 2000,
+      "depth": 600,
+      "units": 2,
+      "unitKinds": [
+        "shelves",
+        "shelves"
+      ],
+      "doors": 0
+    }
+  },
+  {
+    "id": "hanging-plus-shelves",
+    "name": "挂衣+层板两格",
+    "truth": {
+      "cabinets": 1,
+      "width": 1800,
+      "height": 2400,
+      "depth": 600,
+      "units": 2,
+      "unitKinds": [
+        "hanging",
+        "shelves"
+      ],
+      "doors": 0
+    }
+  },
+  {
+    "id": "drawer-bank",
+    "name": "三抽柜",
+    "truth": {
+      "cabinets": 1,
+      "width": 800,
+      "height": 800,
+      "depth": 600,
+      "units": 1,
+      "unitKinds": [
+        "drawerBank"
+      ],
+      "doors": 0
+    }
+  },
+  {
+    "id": "two-doors",
+    "name": "两门柜",
+    "truth": {
+      "cabinets": 1,
+      "width": 1000,
+      "height": 2200,
+      "depth": 600,
+      "units": 1,
+      "unitKinds": [
+        "hanging"
+      ],
+      "doors": 2
+    }
+  }
+]

@@ -21,6 +21,12 @@ memory/*.bak
 # Chrome 临时 profile（验收时建在系统临时目录，偶尔因删除保护残留在这里）
 app/verify/out/chrome-profile-*/
 
+# 视觉 ground truth 图集：图是**可再生**的（node verify/vision-fixtures.mjs），
+# 不入库；只留 truth.json（ground truth 本身要进版本库，评测卡读它）。
+app/verify/fixtures/*.png
+app/verify/fixtures/*.svg
+app/verify/fixtures/*.html
+
 # 验收运行日志：每次跑都变，且体积不小，不进版本控制
 app/verify/out/*.log
 

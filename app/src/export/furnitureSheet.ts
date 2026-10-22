@@ -347,6 +347,12 @@ export interface FurnitureSheetResult {
   bbox: { min: Vec2; max: Vec2 };
   furnitureName: string;
   roomName: string;
+  /** 各视图在图纸上的位置（世界坐标 bbox）—— 用于把单个视图裁出来给视觉模型 */
+  views: {
+    plan: { x: number; y: number; w: number; h: number } | null;
+    front: { x: number; y: number; w: number; h: number };
+    internal: { x: number; y: number; w: number; h: number };
+  };
 }
 
 export interface RoomGroup {
@@ -856,6 +862,25 @@ export function buildFurnitureSheet(
     bbox: { min: { x: 0, y: 0 }, max: { x: SHEET_W, y: SHEET_H } },
     furnitureName,
     roomName: room.name,
+    /**
+     * ★ 各视图在图纸上的位置（世界坐标 bbox）。
+     *
+     *   用途：把「外观正面图」那一块**单独裁出来**给视觉模型看
+     *   （三段式识别的第一步）。
+     *
+     *   ★ 为什么要有这个 ──
+     *   整图是「俯视+正视+内部」拼版，模型容易把**同一只柜的多个视图**
+     *   当成多个柜体（实测 kimi-k3 就把一只衣柜认成 C1+C2）。
+     *   而单视图没有这个歧义。
+     *
+     *   坐标来自 placeScaled 的返回值 —— 与实际画出来的位置**同一份计算**，
+     *   不会和图纸对不上。
+     */
+    views: {
+      plan: pbBox.w > 0 ? { x: pbBox.x, y: pbBox.y, w: pbBox.w, h: pbBox.h } : null,
+      front: { x: efBox.x, y: efBox.y, w: efBox.w, h: efBox.h },
+      internal: { x: eiBox.x, y: eiBox.y, w: eiBox.w, h: eiBox.h },
+    },
   };
 }
 

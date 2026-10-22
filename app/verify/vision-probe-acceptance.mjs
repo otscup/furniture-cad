@@ -52,7 +52,7 @@ if (!BASE || !KEY) { console.log('.env 里没有 AI_BASE_URL / AI_API_KEY ——
 const RED_PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC';
 
-async function ask(model, withImage) {
+async function ask(model, withImage, attempt = 0) {
   const content = withImage
     ? [{ type: 'text', text: '这张图是什么颜色？' }, { type: 'image_url', image_url: { url: RED_PNG } }]
     : [{ type: 'text', text: '这张图是什么颜色？' }];
@@ -62,8 +62,17 @@ async function ask(model, withImage) {
     body: JSON.stringify({ model, messages: [{ role: 'user', content }], max_tokens: 512 }),
     signal: AbortSignal.timeout(180000),
   });
-  if (!r.ok) return { ok: false, error: 'HTTP ' + r.status };
-  const j = await JSON.parse(await r.text());
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    // ★ 上游会**临时不可用**（engine is not available / 429 / 504），
+    //   退避后重试 —— 否则一次抖动就报「验收失败」，那是噪音不是问题。
+    if (attempt < 4 && (r.status === 429 || r.status === 500 || r.status === 502 || r.status === 504)) {
+      await new Promise((x) => setTimeout(x, 4000 * (attempt + 1)));
+      return ask(model, withImage, attempt + 1);
+    }
+    return { ok: false, error: 'HTTP ' + r.status + ' ' + text.slice(0, 120) };
+  }
+  const j = JSON.parse(await r.text());
   return {
     ok: true,
     pt: Number(j?.usage?.prompt_tokens ?? 0),

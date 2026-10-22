@@ -129,7 +129,11 @@
     "verify:server-integrity": "node verify/server-integrity.mjs",
     "eval:vision": "node verify/vision-eval.mjs",
     "verify:vision-probe": "node verify/vision-probe-acceptance.mjs",
-    "check:vision": "node verify/vision-check.mjs"
+    "check:vision": "node verify/vision-check.mjs",
+    "fixtures:vision": "node --experimental-strip-types verify/vision-fixtures.mjs",
+    "eval:vision-ab": "node --experimental-strip-types verify/vision-eval2.mjs",
+    "eval:vision-cost": "node verify/vision-token-cost.mjs",
+    "verify:views-bbox": "node --experimental-strip-types verify/views-bbox-acceptance.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

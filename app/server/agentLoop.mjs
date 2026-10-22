@@ -149,6 +149,56 @@ function describeUnitKind(kind) {
 }
 
 /**
+ * 把一个分区说全 —— **AI 要改的每个数值都在这儿**。
+ *
+ * ★ 为什么要补全 ──
+ *   原来只说「挂衣区/挂衣杆」「层板格/3层板」——
+ *   **杆高、分区净宽、门数、电器洞口尺寸都没进去**。
+ *   ⇒ 模型遇到「挂衣杆再高 200」时会说
+ *     「系统里没有记录这个分区的杆高基准值」——
+ *   ★ **它说的是事实**：那个数真的不在提示词里。
+ *   模型不是笨，是**信息没给全**。
+ *
+ * ★ 补全后能直接换算相对量：
+ *   「挂衣杆再高 200」⇒ 1800 + 200 = 2000（不用问用户）。
+ *
+ * @param {object} u 分区（layout.units / rows[j].units 里的一项）
+ * @returns {string}
+ */
+function describeUnitFull(u) {
+  let s = describeUnitKind(u.kind);
+  // 分区净宽：相对量（「这格再宽 100」）要靠它换算
+  if (typeof u.requestedWidth === 'number') s += `/${u.requestedWidth}宽`;
+  if (u.shelves && u.shelves.count) s += `/${u.shelves.count}层板`;
+  if (u.drawers && u.drawers.count) s += `/${u.drawers.count}抽`;
+  if (u.doors && u.doors.count) {
+    s += `/${u.doors.count}门`;
+    // ★ 门板**材质**也要在 —— 「换成玻璃门」得知道现在是什么，
+    //   「改成木的」也一样。只给门数不给材质，模型只能问。
+    if (u.doors.material) s += `(材质${u.doors.material})`;
+  }
+  // 挂衣杆：只要杆高，没有杆高就没法算「再高 200」
+  if (u.rod && u.rod.count) {
+    s += '/挂衣杆';
+    if (typeof u.rod.heightFromBottom === 'number') s += `(离底${u.rod.heightFromBottom})`;
+  }
+  // 电器洞口：留了位但不知道多大，模型只能问
+  if (u.appliance) {
+    const kindZh = u.appliance.kind === 'fridge' ? '冰箱' : u.appliance.kind === 'washer' ? '洗衣机' : '电器';
+    s += '/' + kindZh;
+    const ap = u.appliance.opening ?? u.appliance;
+    const ow = ap.openingWidth ?? u.openingWidth;
+    const oh = ap.openingHeight ?? u.openingHeight;
+    const od = ap.openingDepth ?? u.openingDepth;
+    if (typeof ow === 'number' || typeof oh === 'number') {
+      s += `(洞口${ow ?? '?'}×${oh ?? '?'}${typeof od === 'number' ? '×' + od : ''})`;
+    }
+  }
+  if (typeof u.topDrawers === 'number' && u.topDrawers > 0) s += `/${u.topDrawers}顶抽`;
+  return s;
+}
+
+/**
  * ── 当前方案摘要（方案四）──
  *
  * ★ 修的是「Agent 多轮对话会失忆」──
@@ -214,30 +264,21 @@ export function summarizeProjectContext(project, activeRoomId, history = []) {
           // 多行柜：分区在 rows[j].units 里
           const rowDesc = rows.map((row, ri) => {
             const us = Array.isArray(row.units) ? row.units : [];
-            const ps = us.map((u) => {
-              let s = describeUnitKind(u.kind);
-              if (u.shelves && u.shelves.count) s += `/${u.shelves.count}层板`;
-              if (u.drawers && u.drawers.count) s += `/${u.drawers.count}抽`;
-              if (u.doors && u.doors.count) s += `/${u.doors.count}门`;
-              if (u.rod && u.rod.count) s += '/挂衣杆';
-              return s;
-            });
+            const ps = us.map((u) => describeUnitFull(u));
             return `第${ri + 1}行(${ps.join('、') || '空'})`;
           });
           unitStr = `，上下 ${rows.length} 行（${rowDesc.join('，')}）`;
         } else if (units.length > 0) {
-          const parts = units.map((u) => {
-            let s = describeUnitKind(u.kind);
-            if (u.doors && u.doors.count) s += `/${u.doors.count}门`;
-            if (u.drawers && u.drawers.count) s += `/${u.drawers.count}抽`;
-            if (u.shelves && u.shelves.count) s += `/${u.shelves.count}层板`;
-            if (u.rod && u.rod.count) s += '/挂衣杆';
-            if (u.appliance) s += '/' + (u.appliance.kind === 'fridge' ? '冰箱' : u.appliance.kind === 'washer' ? '洗衣机' : '电器');
-            return s;
-          });
+          const parts = units.map((u) => describeUnitFull(u));
           unitStr = `，${units.length} 个分区（${parts.join('、')}）`;
         }
-        lines.push(`  · 柜体「${c.name}」(cabinetId=${c.id})：${p.cabinetType || 'base'}，${p.width}×${p.height}×${p.depth}mm，离地=${p.mountHeight ?? 0}mm，位置=(${c.placement?.x ?? 0},${c.placement?.y ?? 0})${unitStr}`);
+        // ★ 「离地」= **踢脚高**（bodyLift），不是挂高（mountHeight）。
+        //   原来这里写的是 mountHeight —— 两个完全不同的字段，
+        //   结果地柜（bodyLift=80）被显示成「离地=0mm」，
+        //   模型据此以为踢脚是 0（「踢脚改成100」就换算错了）。
+        const lift = p.bodyLift ?? 0;
+        const mount = p.mountHeight ?? 0;
+        lines.push(`  · 柜体「${c.name}」(cabinetId=${c.id})：${p.cabinetType || 'base'}，${p.width}×${p.height}×${p.depth}mm，踢脚=${lift}mm${mount ? `，挂高=${mount}mm` : ''}，位置=(${c.placement?.x ?? 0},${c.placement?.y ?? 0})${unitStr}`);
       }
     }
   }

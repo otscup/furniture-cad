@@ -46,7 +46,7 @@ section('1. 分区结构（★ 2026-10-21 修的真 bug）');
     id: 'c1', name: '主卧衣柜', roomId: room.id, x: 100, y: 60, rotation: 0, rules,
     params: { width: 1800, height: 2400, depth: 600, bodyLift: 80, cabinetType: 'tall', mountHeight: 0 },
     units: [
-      { id: 'u1', kind: 'hanging', requestedWidth: 900, nickname: '挂衣区', rod: { count: 1, heightFromBottom: 1800 } },
+      { id: 'u1', kind: 'hanging', requestedWidth: 900, nickname: '挂衣区', rod: { count: 1, heightFromBottom: 1800 }, doors: { count: 1, gapOuter: 0, gapMid: 0, material: 'M_GLASS_8_GREY' } },
       { id: 'u2', kind: 'shelves', requestedWidth: 900, nickname: '层板格', shelves: { count: 3, mode: 'equal', gapPerSide: 0.5, ledStrip: 'front', tilt: 0 } },
     ],
   }));
@@ -59,6 +59,16 @@ section('1. 分区结构（★ 2026-10-21 修的真 bug）');
   ok('★ ★ 摘要里有分区类型（挂衣区/层板格）', ctx.includes('挂衣区') && ctx.includes('层板格'));
   ok('★ ★ 摘要里有层板数（3）—— 模型要靠它算「再加两层」', /3层板/.test(ctx), ctx.slice(0, 200));
   ok('★ 摘要里有挂衣杆', ctx.includes('挂衣杆'));
+  // ★ 2026-10-22 补：**AI 要改的每个数值都得在摘要里**。
+  //   原来只有「挂衣区/挂衣杆」，**杆高、分区净宽、门数、电器洞口尺寸都没进去**。
+  //   ⇒ 模型遇到「挂衣杆再高 200」会说「系统里没有记录杆高基准值」——
+  //   ★ **它说的是事实**。模型不笨，是信息没给全。
+  ok('★★ 摘要里有挂衣杆高度（模型要靠它算「再高 200」）', /离底\s*1800/.test(ctx), ctx.slice(0, 260));
+  ok('★★ 摘要里有分区净宽（模型要靠它算「再宽 100」）', /900宽/.test(ctx), ctx.slice(0, 260));
+  ok('★★ 摘要里有门板材质（「换成玻璃门」得知道现在是什么）', /材质M_GLASS_8_GREY/.test(ctx), ctx.slice(0, 300));
+  // ★ 「离地」曾经错写成 mountHeight（挂高）—— 地柜 bodyLift=80 却被显示成「离地=0mm」，
+  //   模型据此以为踢脚是 0（「踢脚改成100」就换算错了）。
+  ok('★★ 摘要里的踢脚高是 bodyLift（不是 mountHeight）', /踢脚=80mm/.test(ctx), ctx.slice(0, 300));
   ok('★ 摘要里有柜体名与 id', ctx.includes('主卧衣柜') && ctx.includes('cabinetId=c1'));
   ok('★ 摘要里有柜体尺寸', /1800×2400×600/.test(ctx));
 }

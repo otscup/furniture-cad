@@ -296,6 +296,8 @@ interface RunResult {
   reply: string;
   ms: number;
   parseFail: boolean;
+  /** 基础设施故障（网关抖了/空内容/JSON 坏）—— 不是模型判断错，不计入准确率 */
+  infraFail?: boolean;
   /** 网关调用是否成功（失败 = 超时/非 JSON 响应） */
   ok: boolean;
   status?: number;
@@ -350,6 +352,11 @@ async function runOnce(
       if (process.env.NLU_DEBUG_RAW) console.log('[RAW-BAD] ' + r.content.slice(0, 400));
     }
   }
+  // ★★ 区分「模型答错」与「**根本没答**」——
+  //   网关 502/504、模型返回空内容、JSON 解析失败 ⇒ 这些**不是模型判断错**，
+  //   是基础设施抖了。算进准确率会把「网关故障」误报成「模型变笨了」，
+  //   也会让 A/B 对照的结论失真（实测有一轮「多轮 50%」其实是 6 次空答案）。
+  const infraFail = !r.ok || (r.ok && r.content.trim() === '') || parseFail;
   // 判定：期望动作命中 = 通过；期望追问 = 没给动作 = 通过；allowClarify = 两者都行
   let pass: boolean;
   if (c.allowClarify) {
@@ -359,7 +366,7 @@ async function runOnce(
   } else {
     pass = c.wantActions.some((w) => actions.includes(w));
   }
-  return { pass, actions, reply, ms: r.ms, parseFail, ok: r.ok, status: r.status, raw: r.raw, finish: r.finish, cc: r.usage?.completion_tokens, rt: r.usage?.completion_tokens_details?.reasoning_tokens };
+  return { pass, actions, reply, ms: r.ms, parseFail, infraFail, ok: r.ok, status: r.status, raw: r.raw, finish: r.finish, cc: r.usage?.completion_tokens, rt: r.usage?.completion_tokens_details?.reasoning_tokens };
 }
 
 /** 统计口径 */
@@ -376,6 +383,10 @@ interface Stat {
   stable: number;
   /** k 次里有时对有时不对的用例数 */
   unstable: number;
+  /** 基础设施故障次数（网关抖了/空内容）—— 不计入准确率 */
+  infra: number;
+  /** 完全没拿到有效回答的用例数 */
+  noAnswer: number;
 }
 
 /**
@@ -389,7 +400,10 @@ async function evaluateModel(model: string): Promise<void> {
   console.log('━'.repeat(64));
   const stats = new Map<string, Stat>();
   for (const sc of ['single', 'multi', 'turns']) {
-    stats.set(sc, { n: 0, passAt1: 0, passAtK: 0, passPowK: 0, stable: 0, unstable: 0 });
+    stats.set(sc, {
+      n: 0, infra: 0, noAnswer: 0,
+      passAt1: 0, passAtK: 0, passPowK: 0, stable: 0, unstable: 0,
+    });
   }
   const details: string[] = [];
   const unstableCases: string[] = [];
@@ -429,12 +443,20 @@ async function evaluateModel(model: string): Promise<void> {
       }
       runs.push(await runOnce(model, { ...c, q: last.q, wantActions: last.wantActions, wantClarify: last.wantClarify }, ctx, history, project));
     }
-    const hits = runs.filter((x) => x.pass).length;
+    // ★ 基础设施故障（网关抖了/空内容/JSON 坏）**不计入准确率** ——
+    //   它测的是网关，不是模型。算进去会让「网关故障」伪装成「模型变笨」，
+    //   也会让 A/B 结论失真（实测有一轮「多轮 50%」其实是 6 次空答案）。
+    const valid = runs.filter((x) => !x.infraFail);
+    const infra = runs.length - valid.length;
     const st = stats.get(c.scenario)!;
     st.n++;
-    st.passAt1 += hits / K;
+    st.infra += infra;
+    if (valid.length === 0) { st.noAnswer++; continue; }
+    const hits = valid.filter((x) => x.pass).length;
+    const KV = valid.length;
+    st.passAt1 += hits / KV;
     if (hits >= 1) st.passAtK++;
-    if (hits === K) { st.passPowK++; st.stable++; }
+    if (hits === KV) { st.passPowK++; st.stable++; }
     else {
       st.unstable++;
       if (hits > 0) {
@@ -444,12 +466,12 @@ async function evaluateModel(model: string): Promise<void> {
           !x.ok ? ('网关失败:' + (x.status ?? '?') + (x.raw ? ' ' + String(x.raw).slice(0, 60) : ''))
           : x.parseFail ? ((x.finish === 'length' ? '输出预算耗尽' : 'JSON格式坏') + ' finish=' + (x.finish ?? '?') + ' cc=' + (x.cc ?? '?') + ' 推理=' + (x.rt ?? '?'))
             : (x.actions.length ? '给了别的动作:' + x.actions.join('/') : '纯追问'));
-        unstableCases.push('[' + c.scenario + '] ' + c.q + ' —— ' + hits + '/' + K + ' 次对（不稳定）；失败原因：' + why.join(' / '));
+        unstableCases.push('[' + c.scenario + '] ' + c.q + ' —— ' + hits + '/' + KV + ' 次对（不稳定）；失败原因：' + why.join(' / '));
       }
     }
-    const mark = hits === K ? 'v' : hits === 0 ? 'x' : '~';
+    const mark = hits === KV ? 'v' : hits === 0 ? 'x' : '~';
     const acts = [...new Set(runs.flatMap((x) => x.actions))].join('/') || '(追问)';
-    console.log('  ' + mark + ' [' + c.scenario + '] ' + c.q.padEnd(22) + ' ' + hits + '/' + K + '  ' + acts.slice(0, 52));
+    console.log('  ' + mark + ' [' + c.scenario + '] ' + c.q.padEnd(22) + ' ' + hits + '/' + KV + '  ' + acts.slice(0, 52));
     if (hits === 0) {
       const r0 = runs[0];
       details.push('[' + c.scenario + '] ' + c.q + ' —— 0/' + K + ' 次对。模型答：' + (r0.reply || (r0.parseFail ? '(JSON 截断)' : '')).slice(0, 100));
@@ -465,6 +487,7 @@ async function evaluateModel(model: string): Promise<void> {
       + 'pass@' + K + ' ' + (st.passAtK / n * 100).toFixed(0) + '%   '
       + 'pass^' + K + ' ' + (st.passPowK / n * 100).toFixed(0) + '%   '
       + '（全对 ' + st.stable + ' / 不稳定 ' + st.unstable + ' / 共 ' + st.n + '）');
+      + (st.infra ? '   ⚠ 基础设施故障 ' + st.infra + ' 次（已剔除）' : '');
   }
   console.log('');
   console.log('★ 两个口径的区别 —— 家具出错图不可逆，**pass^k 才是该盯的那个**：');

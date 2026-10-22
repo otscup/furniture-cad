@@ -1,3 +1,5 @@
+import { renderExamples } from './recipeExamples.mjs';
+
 /**
  * ══════════════════════════════════════════════════════════════════════
  *  标准配方库（Recipes）
@@ -75,8 +77,8 @@ export const RECIPES = [
     steps: [
       '1. 建柜体：width 按用户给的净宽，height 通常 2400，depth 600。',
       '2. 用 cabinet.addUnit 分区：上格（放被子）+ 挂衣区（rod）+ 底部叠放区。',
-      '3. 挂衣区用 kind=hanging，rod.heightFromBottom 约 1500。',
-      '4. 门用 cabinet.update_object 设 doors.count。',
+      '3. 挂衣区用 kind=hanging，杆高在 addUnit 时用 rodHeight 给（约 1500-1800）。',
+      '4. 门数用 cabinet.setUnitParam 设 doors.count（不是 update_object —— 那是 MCP 工具名，AI 动作里没有）。',
       '5. 门板开向由用户说向左/向右开决定；没提就按右开。',
     ],
     traps: [
@@ -265,18 +267,35 @@ export function matchRecipes(text, options = {}) {
  * @param {Array} matched matchRecipes 的结果
  * @returns {string} 没有配方时返回空串
  */
-export function renderRecipes(matched) {
+export function renderRecipes(matched, options = {}) {
   if (!Array.isArray(matched) || matched.length === 0) return '';
+  // ★ 通道 ──
+  //   'agent'  ：Agent 通道，调 **MCP 工具**（cad.create_room / cad.validate …）
+  //   'action' ：规划/设计通道，只能出 **AI 动作**（cabinet.create / assembly.create …）
+  //
+  //   同一份 steps 原本两边共用 ⇒ 一半是错的：
+  //   规划通道看到「先 cad.create_room」会照抄一个不存在的动作。
+  //   ⇒ 按通道**过滤**，不写两份（两份一定漂移）。
+  const channel = options.channel === 'agent' ? 'agent' : 'action';
+  const keep = (text) => {
+    const mentionsMcp = /\bcad\.[a-zA-Z_]+/.test(text);
+    // Agent 通道：MCP 步骤保留；规划通道：含 MCP 工具名的步骤剔除。
+    if (channel === 'agent') return true;
+    return !mentionsMcp;
+  };
   const lines = [];
   lines.push('【标准做法】');
   lines.push('这类需求的成熟做法如下，照着走可以少走弯路、少调几次工具：');
   for (const m of matched) {
+    const steps = (m.steps ?? []).filter(keep);
+    const traps = (m.traps ?? []).filter(keep);
+    if (steps.length === 0 && traps.length === 0) continue;
     lines.push('');
     lines.push('■ ' + m.title + '：');
-    for (const s of m.steps) lines.push('  ' + s);
-    if (m.traps && m.traps.length > 0) {
+    for (const s of steps) lines.push('  ' + s);
+    if (traps.length > 0) {
       lines.push('  常见坑：');
-      for (const t of m.traps) lines.push('  ✗ ' + t);
+      for (const t of traps) lines.push('  ✗ ' + t);
     }
   }
   lines.push('');
@@ -292,5 +311,16 @@ export function renderRecipes(matched) {
  * @returns {string} 提示词文本（无命中则空串）
  */
 export function recipeBlockFor(text, options = {}) {
-  return renderRecipes(matchRecipes(text, options));
+  const matched = matchRecipes(text, options);
+  // ★ 做法（steps/traps）+ **范例（用户这么说 → 动作长这样）**
+  //   调研：「模型是抄示例不是读规则」—— 只给描述，模型仍要自己翻译。
+  //   范例给的是**可直接照抄的形状**。
+  //
+  //   ★ 范例只给**规划通道**（AI 动作）——
+  //   Agent 通道调的是 MCP 工具，格式完全不同，给错范例比不给更糟。
+  const channel = options.channel === 'agent' ? 'agent' : 'action';
+  const steps = renderRecipes(matched, { channel });
+  // ★ NLU_NO_EXAMPLES=1 可关掉范例 —— 用来做「有/无 few-shot」的 A/B 对照。
+  const examples = (channel === 'agent' || process.env.NLU_NO_EXAMPLES) ? '' : renderExamples(text);
+  return [steps, examples].filter(Boolean).join('\n\n');
 }

@@ -573,7 +573,8 @@ export async function runAgentLoop(opts) {
    *   放在「规则」段之前：配方是**做法**，规则是**约束**，
    *   做法先讲清楚，规则再兜底。配方末尾明说与用户冲突时以用户为准。
    */
-  const recipeBlock = recipeBlockFor(intent);
+  // ★ Agent 通道调的是 **MCP 工具**（cad.*），配方要按 agent 口径渲染
+  const recipeBlock = recipeBlockFor(intent, { channel: 'agent' });
   /**
    * ── 纠正记忆注入（2026-10-21）──
    *

@@ -125,7 +125,15 @@ section('1. 标准配方库：命中即注入，不命中不加料');
    */
   const { systemPrompt: promptWithRecipe } = buildAgentSystemPrompt({ recipeBlock: '【配方】衣柜：先建柜再分区' });
   ok('★ ★ Agent 通道把配方块插进了系统提示词（行为断言）', promptWithRecipe.includes('【配方】衣柜'));
-  ok('★ 服务端把配方模块传给了 Agent（server 引用 recipeBlockFor 或 agentLoop 内部取）', agentSrc.includes('recipeBlockFor(intent)') || serverSrc.includes('recipeBlockFor'));
+  // ★ 行为断言：真的渲染一次，看 Agent 通道拿到的是不是 **agent 口径**的配方
+  //   （含 cad.* 的 MCP 步骤保留）。
+  //   原来扫源码找 'recipeBlockFor(intent)'，我加了第二个参数就误报 ——
+  //   ★ 源码扫描守不住重构，这个坑今天已经踩过两次。
+  const agentRecipeBlock = recipeBlockFor('厨房做一排地柜', { channel: 'agent' });
+  const actionRecipeBlock = recipeBlockFor('厨房做一排地柜', { channel: 'action' });
+  ok('★ 服务端把配方模块传给了 Agent（行为断言：agent 口径含 MCP 步骤）',
+    agentRecipeBlock.includes('cad.create_assembly') && !actionRecipeBlock.includes('cad.create_assembly'),
+    'agent: ' + agentRecipeBlock.slice(0, 120) + ' / action: ' + actionRecipeBlock.slice(0, 120));
 
   /**
    * ── 1.5 配方内容本身的要求 ──

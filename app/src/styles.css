@@ -819,6 +819,14 @@ a.tb-btn { text-decoration: none; }
 .plan-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .plan-label { font-size: 11.5px; font-weight: 600; color: var(--text); margin: 3px 0; }
 .plan-reason { font-size: 10.5px; color: var(--text-2); font-style: italic; line-height: 1.5; margin-top: 2px; }
+
+/* ★ 「这是 AI 猜的」—— 必须一眼看到，不能混在灰色斜体小字里。 */
+.plan-guess { margin-top: 4px; padding: 5px 8px; border-radius: 4px;
+  background: rgba(214, 138, 0, 0.10); border-left: 3px solid var(--warn, #d68a00); }
+.plan-guess-tag { display: inline-block; font-size: 10.5px; font-weight: 700;
+  color: var(--warn, #d68a00); margin-right: 6px; letter-spacing: .3px; }
+.plan-guess-text { font-size: 11.5px; color: var(--text); line-height: 1.55; }
+.plan-guess .plan-reason { margin-top: 3px; }
 .plan-issues { margin-top: 4px; font-size: 10.5px; line-height: 1.6; display: flex; flex-direction: column; gap: 3px; }
 
 .diff-list { margin: 3px 0 3px; padding-left: 16px; }

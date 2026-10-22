@@ -584,6 +584,8 @@ if (!BASE || !KEY || MODELS.length === 0) {
 interface RunResult {
   pass: boolean;
   actions: string[];
+  /** 每条动作的 reason（用来判「模型有没有标出这是它猜的」） */
+  reasons?: string[];
   reply: string;
   ms: number;
   parseFail: boolean;
@@ -627,6 +629,7 @@ async function runOnce(
   const r = await chat(model, messages);
   let actions: string[] = [];
   let reply = '';
+  let reasons: string[] = [];
   let parseFail = false;
   if (r.ok) {
     // ★ 用**生产**的 extractJson ——
@@ -635,9 +638,11 @@ async function runOnce(
     //   而生产其实解析得好好的 ⇒ 评测反映的就不是真实行为。
     const parsed = extractJson(r.content);
     if (parsed.ok) {
-      const j = parsed.value as { actions?: Array<{ action?: string }>; reply?: string };
+      const j = parsed.value as { actions?: Array<{ action?: string; reason?: string }>; reply?: string };
       actions = (j.actions ?? []).map((a) => String(a.action ?? ''));
       reply = String(j.reply ?? '');
+      // ★ 也取 reason —— 用来判「模型有没有标出这是它猜的」
+      reasons = (j.actions ?? []).map((a) => String(a.reason ?? ''));
     } else {
       parseFail = true;
       if (process.env.NLU_DEBUG_RAW) console.log('[RAW-BAD] ' + r.content.slice(0, 400));
@@ -657,7 +662,7 @@ async function runOnce(
   } else {
     pass = c.wantActions.some((w) => actions.includes(w));
   }
-  return { pass, actions, reply, ms: r.ms, parseFail, infraFail, ok: r.ok, status: r.status, raw: r.raw, finish: r.finish, cc: r.usage?.completion_tokens, rt: r.usage?.completion_tokens_details?.reasoning_tokens };
+  return { pass, actions, reply, reasons, ms: r.ms, parseFail, infraFail, ok: r.ok, status: r.status, raw: r.raw, finish: r.finish, cc: r.usage?.completion_tokens, rt: r.usage?.completion_tokens_details?.reasoning_tokens };
 }
 
 /** 统计口径 */
@@ -678,6 +683,10 @@ interface Stat {
   infra: number;
   /** 完全没拿到有效回答的用例数 */
   noAnswer: number;
+  /** 给了动作但 reason 里没标【猜】的次数（静默地自己挑数字） */
+  silentGuess: number;
+  /** 全部次数都静默猜的用例数 */
+  allSilentGuess: number;
 }
 
 /**
@@ -692,7 +701,7 @@ async function evaluateModel(model: string): Promise<void> {
   const stats = new Map<string, Stat>();
   for (const sc of ['single', 'multi', 'turns']) {
     stats.set(sc, {
-      n: 0, infra: 0, noAnswer: 0,
+      n: 0, infra: 0, noAnswer: 0, silentGuess: 0, allSilentGuess: 0,
       passAt1: 0, passAtK: 0, passPowK: 0, stable: 0, unstable: 0,
     });
   }
@@ -743,6 +752,33 @@ async function evaluateModel(model: string): Promise<void> {
     st.n++;
     st.infra += infra;
     if (valid.length === 0) { st.noAnswer++; continue; }
+    // ★★ 「模型给了动作但没标出这是它猜的」——
+    //   规则 6b 允许它先按默认值做，但**必须**在 reason 里用 【猜】 标出。
+    //   静默地按自己挑的数字做 ⇒ 用户点确认前根本不知道 ⇒ 最危险。
+    // ★★ 「模型给了动作但没标出这是它猜的」——
+    //
+    //   规则 6b 允许它先按默认值做，但**必须**在 reason 里用 【猜】 标出。
+    //   静默地按自己挑的数字做 ⇒ 用户点确认前根本不知道 ⇒ 最危险。
+    //
+    //   ★ 判据只在**「该问而没问」的用例**上做 ——
+    //   那些用例正是「缺关键数字」的典型（「下面加个抽屉」）。
+    //   其他用例（「踢脚改成 100」）用户**给了**数字，
+    //   模型不标猜是**对的**，不该算成静默猜测。
+    const silentGuess = c.wantClarify
+    //   ★ 判定「有没有说」时，**reason 和 reply 都算** ——
+    //     模型实测两种都用了：
+    //       reason: 「【猜】用户没给净宽，按常见模块净宽 600」
+    //       reply : 「宽度你没给——我先按常见模块净宽 600 建了出来」
+    //     两者都是**让用户知道**了，目的达到。
+    ? valid.filter((x) => x.actions.length > 0
+        && !(x.reasons ?? []).some((r) => r && r.includes('【猜】'))
+        && !String(x.reply ?? '').includes('【猜】')
+        && !/没给|未给|你先按|我先按|暂定|我猜|猜的|估的|默认/.test(String(x.reply ?? '')))
+      : [];
+    if (silentGuess.length > 0) {
+      st.silentGuess += silentGuess.length;
+      if (silentGuess.length === valid.length) st.allSilentGuess++;
+    }
     const hits = valid.filter((x) => x.pass).length;
     const KV = valid.length;
     st.passAt1 += hits / KV;
@@ -777,8 +813,9 @@ async function evaluateModel(model: string): Promise<void> {
     console.log('  ' + label + '：pass@1 ' + (st.passAt1 / n * 100).toFixed(0) + '%   '
       + 'pass@' + K + ' ' + (st.passAtK / n * 100).toFixed(0) + '%   '
       + 'pass^' + K + ' ' + (st.passPowK / n * 100).toFixed(0) + '%   '
-      + '（全对 ' + st.stable + ' / 不稳定 ' + st.unstable + ' / 共 ' + st.n + '）');
-      + (st.infra ? '   ⚠ 基础设施故障 ' + st.infra + ' 次（已剔除）' : '');
+      + '（全对 ' + st.stable + ' / 不稳定 ' + st.unstable
+      + (st.infra ? '   ⚠ 基础设施故障 ' + st.infra + ' 次（已剔除）' : '')
+      + (st.silentGuess ? '   ⚠ 静默猜测 ' + st.silentGuess + ' 次' : ''));
   }
   console.log('');
   console.log('★ 两个口径的区别 —— 家具出错图不可逆，**pass^k 才是该盯的那个**：');

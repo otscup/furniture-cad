@@ -10,6 +10,7 @@ import { buildSnapshot, snapshotBytes, type AiSnapshot } from '../../ai/snapshot
 import { commitPlan, dryRunPlan, type PlanRun } from '../../ai/planRunner.ts';
 import { parseImageVisionImport } from '../../ai/import/imageVisionAdapter.ts';
 import { mergeVisionResults } from '../../ai/vision/visionResultToNormalized.ts';
+import { hasGuess, splitGuess } from '../../ai/guessMarker.ts';
 import { compileImport } from '../../ai/import/compileImport.ts';
 import {
   finalizeDraft,
@@ -1505,10 +1506,16 @@ export function AIPanel(props: { bus: CommandBus; version: number; token: string
                                     <code>{s.tool}</code>
                                     <span className={s.ok ? 'ok-tag' : 'fail-tag'}>{s.ok ? '成功' : '失败'}</span>
                                   </div>
-                                  <details>
-                                    <summary>参数</summary>
+                                   <details>
+                                     <summary>参数</summary>
                                     <pre className="code">{JSON.stringify(s.args, null, 2)}</pre>
                                   </details>
+                                  {hasGuess(s.args?.reason) ? (
+                                    <div className="plan-guess">
+                                      <span className="plan-guess-tag">这是 AI 猜的</span>
+                                      <span className="plan-guess-text">{splitGuess(s.args?.reason).guess}</span>
+                                    </div>
+                                  ) : null}
                                   {s.ok ? (
                                     <details>
                                       <summary>结果</summary>

@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import type { PlanRun } from '../../ai/planRunner.ts';
 import type { Issue } from '../../core/types.ts';
 import { Pill, Row, Text } from './common.tsx';
+import { splitGuess } from '../../ai/guessMarker.ts';
 
 /**
  * 干跑预览的通用渲染块 —— plan 模式与 P3 的 design 模式**共用同一套**。
@@ -51,7 +52,21 @@ export function PlanRunView(props: {
             </span>
           </div>
           {s.error ? <div className="alert alert-error">{s.error}</div> : null}
-          {s.action.reason ? <div className="plan-reason">AI 理由：{s.action.reason}</div> : null}
+          {s.action.reason ? (() => {
+            // ★ 「猜」的部分**单独高亮** ——
+            //   规则 6b：模型可以先按默认值做，但必须标出来。
+            //   混在一行 10.5px 斜体灰字里 = 用户看不见 = 白标。
+            const { guess, rest } = splitGuess(s.action.reason);
+            return guess ? (
+              <div className="plan-guess">
+                <span className="plan-guess-tag">这是 AI 猜的</span>
+                <span className="plan-guess-text">{guess}</span>
+                {rest ? <div className="plan-reason">{rest}</div> : null}
+              </div>
+            ) : (
+              <div className="plan-reason">AI 理由：{rest}</div>
+            );
+          })() : null}
           {s.ok ? (
             <>
               <div className="plan-label">{s.label}</div>

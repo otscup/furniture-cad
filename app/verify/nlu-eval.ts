@@ -153,6 +153,13 @@ export interface NluCase {
  *   用 NLU_K 环境变量可调；判断改动前后的差异时**必须 k>=5 且做 A/B 对照**
  *   （NLU_NO_FOCUS=1 可关掉焦点栈做对照）。
  */
+/**
+ * 静默猜测比率的上限（10%）。
+ *
+ * 依据：规则 6b 之前 ≈ 100%（每条都猜、每条都不说），
+ * 之后实测约 2%。门槛留 3 倍余量 —— 抓量级劣化，不抓 1~2 次抖动。
+ */
+const MAX_SILENT_GUESS_RATE = 0.1;
 const K = Math.max(1, Number(process.env.NLU_K ?? 5) || 5);
 
 export const CASES: NluCase[] = [
@@ -699,6 +706,9 @@ async function evaluateModel(model: string): Promise<void> {
   console.log('模型：' + MODEL + '   每条跑 ' + K + ' 次');
   console.log('━'.repeat(64));
   const stats = new Map<string, Stat>();
+  // ★ 闸门用的两个计数：静默猜测次数 / 「该问却做了」的次数
+  let silentTotal = 0;
+  let guessActed = 0;
   for (const sc of ['single', 'multi', 'turns']) {
     stats.set(sc, {
       n: 0, infra: 0, noAnswer: 0, silentGuess: 0, allSilentGuess: 0,
@@ -775,6 +785,8 @@ async function evaluateModel(model: string): Promise<void> {
         && !String(x.reply ?? '').includes('【猜】')
         && !/没给|未给|你先按|我先按|暂定|我猜|猜的|估的|默认/.test(String(x.reply ?? '')))
       : [];
+    silentTotal += silentGuess.length;
+    guessActed += c.wantClarify ? valid.filter((x) => x.actions.length > 0).length : 0;
     if (silentGuess.length > 0) {
       st.silentGuess += silentGuess.length;
       if (silentGuess.length === valid.length) st.allSilentGuess++;
@@ -816,6 +828,24 @@ async function evaluateModel(model: string): Promise<void> {
       + '（全对 ' + st.stable + ' / 不稳定 ' + st.unstable
       + (st.infra ? '   ⚠ 基础设施故障 ' + st.infra + ' 次（已剔除）' : '')
       + (st.silentGuess ? '   ⚠ 静默猜测 ' + st.silentGuess + ' 次' : ''));
+  }
+  // ★★★ 发布闸门：静默猜测比率 ───
+  //
+  //   「模型给了动作却没说这是它猜的」—— 违反规则 6b。
+  //   阈值 10%：抓量级劣化（规则被删了 / 模型不标了），不抓 1~2 次抖动。
+  //   ★ 口径：分母 = 「该问而没问」的用例里模型**给了动作**的次数
+  //     （不是全部用例数 —— 用户给了数字的用例本来就不该标）。
+  const guessDen = guessActed;
+  const guessRate = guessDen > 0 ? silentTotal / guessDen : 0;
+  console.log('');
+  console.log('★ 发布闸门：静默猜测');
+  console.log('  给了动作却没说这是猜的：' + silentTotal + ' 次 / 该问却做了的：' + guessDen + ' 次'
+    + '  比率 ' + (guessRate * 100).toFixed(1) + '%（上限 ' + (MAX_SILENT_GUESS_RATE * 100) + '%）');
+  if (guessDen > 0 && guessRate > MAX_SILENT_GUESS_RATE) {
+    console.log('  ✗ 超标 —— 规则 6b 可能被改坏了，或模型不再标「猜」');
+    process.exitCode = 1;
+  } else {
+    console.log('  ✓ 在阈值内');
   }
   console.log('');
   console.log('★ 两个口径的区别 —— 家具出错图不可逆，**pass^k 才是该盯的那个**：');

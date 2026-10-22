@@ -350,7 +350,12 @@ section('§6 导出面：没有 winner / best / recommended / adopt');
 // ═══════════════════ §7 AI 契约：无 geometry、动作清单不增 ═══════════════════
 section('§7 AI 契约：动作仍 21 条，评分不进契约');
 {
-  ok('36. ACTION_NAMES 仍是 21 条', ACTION_NAMES.length === 21, ACTION_NAMES.length);
+  // ★ 本意是「AI 不许获得选方案/落地类动作」，不是「数必须是 21」。
+  //   2026-10-22 动作从 21 扩到 23（补了 setWidthMode / setUnitWidth 等），
+  //   钉死数字会让这条**假失败**，而本意那条 354 行才是真正在守的。
+  ok('36. 动作清单里没有「选方案/落地」类动作（不是钉死条数）',
+    !ACTION_NAMES.some((a) => /score|rank|winner|best|apply|commit|accept/i.test(a)),
+    ACTION_NAMES.filter((a) => /score|rank|winner|best|apply|commit|accept/i.test(a)).join(','));
   ok('37. 动作清单里没有任何 score 相关动作', !ACTION_NAMES.some((a) => /score|rank|winner|best/i.test(a)), ACTION_NAMES.filter((a) => /score|rank/i.test(a)));
   const contract = readFileSync(join(APP, 'shared/aiContract.mjs'), 'utf8');
   ok('38. AI 契约里没有评分**入口**（模型不能调用评分、更不能据评分决策）', !/scoreCandidateLayout|DesignScore|compareDesignScores/.test(contract));
@@ -688,7 +693,9 @@ section('§20 候选生命周期（draft → evaluated）与 AI 只读候选评�
   const contract = readFileSync(join(APP, 'shared/aiContract.mjs'), 'utf8');
   ok('120. ★ AI 契约里写清了 candidateScore 的只读读法（看到评分 ≠ 可以据此决策）',
     contract.includes('candidateScore') && /只读/.test(contract) && /不能.{0,6}据此选择/.test(contract));
-  ok('121. 动作清单仍 21 条（AI 没有获得任何"选方案 / 落地"的动作）', ACTION_NAMES.length === 21, ACTION_NAMES.length);
+  ok('121. 动作清单仍无「选方案/落地」类动作（AI 只出编辑动作）',
+    !ACTION_NAMES.some((a) => /score|rank|winner|best|apply|commit|accept/i.test(a)),
+    ACTION_NAMES.filter((a) => /score|rank|winner|best|apply|commit|accept/i.test(a)).join(','));
 
   // 哨兵自检（"断言不可信比失败更危险"）：用故意写坏的样本确认它们真能判红
   ok('122. 哨兵自检：ADOPT_LIKE 认得出 adoptScore', ADOPT_LIKE.test('adoptScore') === true);

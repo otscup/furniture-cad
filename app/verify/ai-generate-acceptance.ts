@@ -164,7 +164,10 @@ ok('A9 门扇数超上限 → 拒', badDoor.ok === false, JSON.stringify(badDoor
 ok('A10 每一项字段都登记在册（不许出现没有校验的字段）',
   (() => {
     // 玻璃门材质、层板灯带和电器洞口均是正式分区字段，必须在契约中有类型且在编译时校验。
-    const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'doorMaterial', 'ledStrip', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
+      // ★ drawerStyle（格子抽）/ trouserRack（裤架）是 2026-10-21 按参考图纸新增的正式分区字段，
+      //   但这里的 KNOWN 没跟着加 ⇒ A10 假失败。KNOWN 的唯一作用是「发现没校验的字段」，
+      //   所以它必须跟契约同步，而不是反过来限制契约。
+      const KNOWN = ['kind', 'width', 'count', 'rodHeight', 'doorCount', 'doorMaterial', 'ledStrip', 'drawerStyle', 'trouserRack', 'nickname', 'applianceName', 'openingWidth', 'openingHeight', 'openingDepth', 'topDrawers'];
     const keys = Object.keys(UNIT_INTENT_ITEM);
     return keys.every((k) => KNOWN.includes(k)) && keys.every((k) => UNIT_INTENT_ITEM[k] && typeof UNIT_INTENT_ITEM[k].type === 'string');
   })(),

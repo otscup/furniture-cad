@@ -21,6 +21,13 @@ import ezdxf
 from ezdxf import bbox
 from ezdxf.audit import Auditor
 
+# Windows 控制台默认 GBK：stdout 写 UTF-8 JSON（含 Ø 等非 GBK 记号）会 UnicodeEncodeError。
+# Node 侧按 UTF-8 读，所以必须显式改掉 stdio 编码。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def layout_bounds(layout) -> dict[str, float] | None:
     entities = list(layout)

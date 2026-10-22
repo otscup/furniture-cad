@@ -172,6 +172,10 @@ async function main(): Promise<void> {
       AI_BASE_URL: `http://127.0.0.1:${aiPort}/v1`,
       AI_API_KEY: 'agent-room-context-test-key',
       AI_MODEL: 'mock-agent-model',
+      // ★ 序列复用缓存必须隔离到临时目录：默认落在 app/memory/sequences.jsonl，
+      //   上一轮跑过的同一句意图会被**直接重放**（0 次模型调用）⇒
+      //   本套件断言「发出去的 system 提示」就恒为空（假失败）。
+      APP_SEQ_PATH: join(temp, 'sequences.jsonl'),
     },
     stdio: 'ignore',
   });
@@ -193,7 +197,8 @@ async function main(): Promise<void> {
     steps?: Array<{ tool: string; args?: Record<string, unknown>; result?: { draftId?: string } }>;
   };
   ok('Agent API 请求成功', response.status === 200 && result.ok === true, `${response.status} ${result.error ?? ''}`);
-  ok('Agent 系统提示包含当前房间身份', firstSystemPrompt.includes('roomId=room_second') && firstSystemPrompt.includes('书房'));
+  ok('Agent 系统提示包含当前房间身份', firstSystemPrompt.includes('roomId=room_second') && firstSystemPrompt.includes('书房'),
+    firstSystemPrompt.split('\n').filter((line) => /房间|roomId/.test(line)).join(' | ').slice(0, 400) || `(system 提示为空，长度 ${firstSystemPrompt.length})`);
 
   const createStep = result.steps?.find((step) => step.tool === 'cad.create_cabinet');
   const assemblyStep = result.steps?.find((step) => step.tool === 'cad.create_assembly');
@@ -298,6 +303,10 @@ async function main(): Promise<void> {
       AI_BASE_URL: `http://127.0.0.1:${aiPort}/v1`,
       AI_API_KEY: 'agent-room-context-test-key',
       AI_MODEL: 'mock-agent-model',
+      // ★ 序列复用缓存必须隔离到临时目录：默认落在 app/memory/sequences.jsonl，
+      //   上一轮跑过的同一句意图会被**直接重放**（0 次模型调用）⇒
+      //   本套件断言「发出去的 system 提示」就恒为空（假失败）。
+      APP_SEQ_PATH: join(temp, 'sequences.jsonl'),
     },
     stdio: 'ignore',
   });

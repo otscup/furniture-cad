@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCabinet, emptyProject, rectRoom } from '../src/core/docFactory.ts';
 import { serializeProjectFile } from '../src/core/projectFile.ts';
 
@@ -83,7 +83,8 @@ async function startServer() {
   const originalNodeOptions = process.env.NODE_OPTIONS ?? '';
   writeFileSync(preloadPath, [
     "const fs = require('node:fs');",
-    "if (process.argv.some((arg) => arg.endsWith('/emit-roombook.ts'))) {",
+    // Windows 的 argv 是反斜杠路径，先归一化再比对（否则标记永不触发）。
+    "if (process.argv.some((arg) => arg.replace(/\\\\/g, '/').endsWith('/emit-roombook.ts'))) {",
     "  const marker = process.env.FURNICAD_ROOMBOOK_STARTED_FILE;",
     "  if (marker) fs.writeFileSync(marker, 'started');",
     "  const delay = Number(process.env.FURNICAD_ROOMBOOK_DELAY_MS || 0);",
@@ -106,7 +107,9 @@ async function startServer() {
       APP_WORKSPACE_PATH: workspacePath,
       FURNICAD_ROOMBOOK_STARTED_FILE: markerPath,
       FURNICAD_ROOMBOOK_DELAY_MS: '1600',
-      NODE_OPTIONS: `${originalNodeOptions}${originalNodeOptions ? ' ' : ''}--require=${preloadPath}`,
+      // ★ 必须用 --import + file:// URL：--require 在路径含空格时（"DeepSeek workers"）
+      //   会被 node 拆成多个参数 ⇒ 预加载静默失效 ⇒ 本套件的并发窗口永远观测不到。
+      NODE_OPTIONS: `${originalNodeOptions}${originalNodeOptions ? ' ' : ''}--import=${pathToFileURL(preloadPath).href}`,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

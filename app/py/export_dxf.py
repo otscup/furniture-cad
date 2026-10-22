@@ -29,6 +29,13 @@ from pathlib import Path
 import ezdxf
 from ezdxf import bbox
 from ezdxf.enums import TextEntityAlignment
+
+# Windows 控制台默认 GBK：stdout/stderr 写 UTF-8（含 Ø 等非 GBK 记号、中文报错）会 UnicodeEncodeError。
+# Node 侧按 UTF-8 读，所以必须显式改掉，否则导出报错只剩乱码。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 from ezdxf.math import Matrix44
 
 TXT_STYLE = "HZ"

@@ -9,8 +9,8 @@
  *   exportCutlist  : project → emit-neutral.ts → JS 组 CSV → CSV string
  *   exportRoombook : project → emit-roombook.ts → HTML string
  */
-import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -140,12 +140,44 @@ function pythonExe() {
 }
 
 /**
+ * 选一个**Python 子进程真的写得进去**的临时目录。
+ *
+ * ★ 为什么不能只用 os.tmpdir()：系统 TEMP 未必对子进程可写
+ *   （受限服务器 / 容器挂载 / 沙箱策略下实测 PermissionError）。
+ *   node 能写不代表 python 能写 —— 一旦写不进去，DXF 导出整条链就报
+ *   "python 退出码 1"，看起来像代码坏了。
+ *   探测一次并缓存：优先系统临时目录，不行就退回项目内 .tmp。
+ */
+let dxfTempBase;
+function dxfTempBaseDir() {
+  if (dxfTempBase !== undefined) return dxfTempBase;
+  const candidates = [process.env.FURNITURE_TMPDIR, tmpdir(), join(ROOT, '.tmp')].filter(Boolean);
+  for (const base of candidates) {
+    try {
+      mkdirSync(base, { recursive: true });
+      const probeDir = mkdtempSync(join(base, 'probe-'));
+      try {
+        // 用 python 本体探测：这才是真正要写文件的进程。
+        execFileSync(pythonExe(), ['-c', 'import sys,os; open(os.path.join(sys.argv[1],"w"),"w").write("x")', probeDir], { stdio: 'ignore' });
+        dxfTempBase = base;
+        return base;
+      } finally {
+        rmSync(probeDir, { recursive: true, force: true });
+      }
+    } catch {
+      // 换下一个候选
+    }
+  }
+  throw new Error('找不到 Python 可写的临时目录：DXF 导出需要能写临时文件的位置。可用 FURNITURE_TMPDIR 指定。');
+}
+
+/**
  * DXF 导出：返回 { buffer, filename, info }。
  * which: ['plan','sheet'] 子集；version: 'R2007' | 'R2000'
  */
 export async function exportDxf(project, { which = ['plan', 'sheet'], version = 'R2007', modelVersion = 'unknown', planRoomIds, sheetMode } = {}) {
   await assertExportable(project);
-  const dir = mkdtempSync(join(tmpdir(), 'furniture-dxf-'));
+  const dir = mkdtempSync(join(dxfTempBaseDir(), 'furniture-dxf-'));
   const neutralPath = join(dir, 'neutral.json');
   const dxfPath = join(dir, 'out.dxf');
   const cleanup = () => {

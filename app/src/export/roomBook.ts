@@ -485,8 +485,15 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     const layoutSafetyNote = group.cabinets.some((cabinet) =>
       (cabinet.params.counterCutouts?.length ?? 0) > 0 || allUnits(cabinet.layout).some((unit) => unit.kind === 'appliance' && unit.appliance)
     ) ? '参考预留｜非 CNC 开孔｜待拆单确认。柜体编号通过引线对应下方清单；图中虚线/洞口为设计参考，须按实机与拆单复核，不代表已完成加工。' : null;
-    /** 上下叠放分组结果（一页一组）。放在 return 之前只算一次。 */
-    const sheetGroups = groupCabinetsForSheets(group.cabinets);
+    /**
+     * 上下叠放分组结果（一页一组）。放在 return 之前只算一次。
+     * ★ 组内顺序由 groupCabinetsForSheets 决定（mountHeight → x），
+     *   但**页序**必须回到房间的规范顺序（y → x，见 roomIndex）——
+     *   否则同一房间的柜体页会按 x 排队，房间纵深方向（里/外）的阅读顺序就丢了。
+     */
+    const roomOrder = new Map(group.cabinets.map((cabinet, index) => [cabinet.id, index]));
+    const sheetGroups = groupCabinetsForSheets(group.cabinets)
+      .sort((a, b) => Math.min(...a.cabinets.map(c => roomOrder.get(c.id) ?? 0)) - Math.min(...b.cabinets.map(c => roomOrder.get(c.id) ?? 0)));
     // [fix] 预计算本房间所有柜子的 ViewSet，供立面图复用，避免重复调 buildCabinetViews
     // TODO: buildFurnitureSheet 内部也调 buildCabinetViews，理想情况应把这份缓存继续往下传，
     // 彻底消除 roomBook 构建时的双倍计算。目前先解决立面图内部的重复（缓存回填机制已就绪）。

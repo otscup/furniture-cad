@@ -12,14 +12,16 @@ import type { Cabinet, Project, RuleSet } from '../src/core/types.ts';
 import { detectCollisions, generateProject } from '../src/core/geometry/project.ts';
 import { buildProjectBodies } from '../src/core/geometry/bodies3d.ts';
 import { buildCabinetViews } from '../src/core/geometry/views.ts';
-import { buildRoomPlanCallouts } from '../src/export/roomBook.ts';
+import { buildRoomPlanCallouts, groupCabinetsForSheets } from '../src/export/roomBook.ts';
 import { buildFurnitureSheet } from '../src/export/furnitureSheet.ts';
 import { cabinetWarningIssues, formatCabinetWarning } from '../src/export/warningNotes.ts';
+import { resolvePythonExe } from '../server/pythonExe.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const rules = JSON.parse(readFileSync(join(root, 'src/core/ruleset/factory-default.json'), 'utf8')) as RuleSet;
 const tempDir = mkdtempSync(join(tmpdir(), 'furnicad-complex-mcp-'));
+const PY = resolvePythonExe(root) ?? 'python';
 const outDir = resolve(process.env.VERIFY_OUTPUT_DIR ?? join(root, 'verify-output/complex-kitchen'));
 mkdirSync(outDir, { recursive: true });
 const safetyPhrase = '参考预留｜非 CNC 开孔｜待拆单确认';
@@ -27,6 +29,20 @@ let child: ChildProcess | null = null;
 let port = 0;
 let nextId = 1;
 let checks = 0;
+
+/**
+ * ★ PDF 子系统在本机不可用时跳过 PDF 断言（与 verify:export 同一口径）。
+ *   WeasyPrint 需要 GTK（libgobject/Pango/Cairo），开发机通常没有；
+ *   照旧跑下去只会得到一串"导出失败"的假红，看起来像代码坏了。
+ */
+let pdfAvailable: boolean | undefined;
+function hasPdf(): boolean {
+  if (pdfAvailable === undefined) {
+    try { execFileSync(PY, ['-c', 'import weasyprint'], { stdio: 'ignore' }); pdfAvailable = true; } catch { pdfAvailable = false; }
+    if (!pdfAvailable) console.log('\n  ⚠ 本机缺 WeasyPrint/GTK ⇒ 跳过 PDF 断言（不是代码失败；生产镜像里有）。');
+  }
+  return pdfAvailable;
+}
 
 function assert(name: string, cond: boolean, detail = ''): void {
   checks++;
@@ -83,7 +99,7 @@ async function startServer(): Promise<void> {
     cwd: root,
     env: {
       ...process.env,
-      PORT: String(port), APP_HOST: '127.0.0.1', APP_PYTHON: process.env.APP_PYTHON ?? 'python3',
+      PORT: String(port), APP_HOST: '127.0.0.1', APP_PYTHON: PY,
       APP_ENV_PATH: join(tempDir, '.env'), APP_ACCOUNTS_PATH: join(tempDir, 'accounts.json'),
       APP_AUDIT_PATH: join(tempDir, 'audit.jsonl'), APP_MEM_PATH: join(tempDir, 'corrections.jsonl'),
       APP_REGISTRATIONS_PATH: join(tempDir, 'registrations.json'), APP_WORKSPACE_PATH: wsPath,
@@ -338,12 +354,12 @@ async function main(): Promise<void> {
     'base_kicks=[{"id":r.get("板件ID"),"owner":r.get("所属"),"dims":[r.get(k) for k in keys]} for r in kicks if r.get("所属")==sys.argv[2]]',
     'print(json.dumps({"rows":len(rows),"bad":bad,"wall_kicks":wall_kicks,"base_kicks":base_kicks},ensure_ascii=False))',
   ].join('\n');
-  const csvReadback = JSON.parse(execFileSync('python3', ['-c', csvReadbackScript, csvPath, base1, wall1, wall2, wall3], { encoding: 'utf8' })) as { rows: number; bad: Array<unknown>; wall_kicks: Array<unknown>; base_kicks: Array<{ id: string; owner: string; dims: string[] }> };
+  const csvReadback = JSON.parse(execFileSync(PY, ['-c', csvReadbackScript, csvPath, base1, wall1, wall2, wall3], { encoding: 'utf8' })) as { rows: number; bad: Array<unknown>; wall_kicks: Array<unknown>; base_kicks: Array<{ id: string; owner: string; dims: string[] }> };
   assert('实际 CSV 每块板件长/宽/厚均为正，且三只吊柜没有 KICK/KICKB 行', csvReadback.rows > 0 && csvReadback.bad.length === 0 && csvReadback.wall_kicks.length === 0, JSON.stringify({ rows: csvReadback.rows, bad: csvReadback.bad.slice(0, 2), wallKickRows: csvReadback.wall_kicks }));
   assert('实际 CSV 保留地柜有效 KICK，且唯一 warning target 指向同一板件 ID', csvReadback.base_kicks.length === 1 && csvReadback.base_kicks[0]?.id === `P_${base1}_KICK` && warningRows[0]?.issue.target === csvReadback.base_kicks[0]?.id, JSON.stringify(csvReadback.base_kicks));
   assert('正式 HTTP DXF 布局+逐柜名称和完整外尺寸', dxfBytes.length > 10000 && created.every((cab) => dxfText.includes(cab.name) && dxfText.includes(`${cab.width}×${cab.height}×${cab.depth}`)), `${dxfBytes.length} bytes; ${dxfResponse.headers.get('Content-Disposition') ?? ''}`);
   assert('DXF 包含台面预留标签/尺寸和烤箱洞口尺寸', dxfText.includes('水槽预留') && dxfText.includes('650×450') && dxfText.includes('灶具预留') && dxfText.includes('640×520') && dxfText.includes('568×600'), '正式端点回读的预留尺寸均保留');
-  const dxfReadback = JSON.parse(execFileSync('python3', [join(root, 'py/verify_dxf.py'), dxfPath], { encoding: 'utf8' })) as { paperLayouts?: Array<{ name: string; texts?: string[]; fitsPrintableArea?: boolean }> };
+  const dxfReadback = JSON.parse(execFileSync(PY, [join(root, 'py/verify_dxf.py'), dxfPath], { encoding: 'utf8' })) as { paperLayouts?: Array<{ name: string; texts?: string[]; fitsPrintableArea?: boolean }> };
   const paperLayouts = dxfReadback.paperLayouts ?? [];
   const layoutHasSafety = (namePart: string) => {
     const layout = paperLayouts.find((candidate) => candidate.name.includes(namePart));
@@ -372,6 +388,7 @@ async function main(): Promise<void> {
   const hobBandLabel = hobViews.prims.top.find((prim: any) => prim.k === 'text' && String(prim.text).startsWith('灶具预留')) as any;
   assert('水槽与灶具预留标签都在各自俯视框外，不穿过虚线框/中隔线', Boolean(sinkBandLabel && sinkBandLabel.p.y < sinkViews.meta.top.bbox.min.y && hobBandLabel && hobBandLabel.p.y < hobViews.meta.top.bbox.min.y), `sink=${sinkBandLabel?.p.y ?? 'missing'} frame=${sinkViews.meta.top.bbox.min.y}..${sinkViews.meta.top.bbox.max.y}; hob=${hobBandLabel?.p.y ?? 'missing'} frame=${hobViews.meta.top.bbox.min.y}..${hobViews.meta.top.bbox.max.y}`);
 
+  if (!hasPdf()) { console.log('  跳过本段 PDF 导出链路断言（环境缺 GTK —— 不是代码失败）'); } else {
   const pdfExportStartedAt = Date.now();
   const pdfResponse = await postOfficialExport('/api/export/pdf', { layoutRoomIds: [roomId] });
   const pdfBytes = Buffer.from(await pdfResponse.arrayBuffer());
@@ -473,7 +490,7 @@ async function main(): Promise<void> {
     '  out.append({"file":path,"width":w,"height":h,"leftmostInkPx":left,"fiveMmSafePixels":safe,"ok":w==1500 and left>=safe})',
     'print(json.dumps(out))',
   ].join('\n');
-  const rasterEdgeChecks = JSON.parse(execFileSync('python3', ['-c', rasterEdgeScript, ...rasterPages], { encoding: 'utf8' })) as Array<{ file: string; width: number; height: number; leftmostInkPx: number; fiveMmSafePixels: number; ok: boolean }>;
+  const rasterEdgeChecks = JSON.parse(execFileSync(PY, ['-c', rasterEdgeScript, ...rasterPages], { encoding: 'utf8' })) as Array<{ file: string; width: number; height: number; leftmostInkPx: number; fiveMmSafePixels: number; ok: boolean }>;
   assert('PDF 第4/6/8页实际 A3 栅格最左墨迹均位于5mm安全边距内（装订线无贴边裁字）', rasterEdgeChecks.length === 3 && rasterEdgeChecks.every((check) => check.ok), JSON.stringify(rasterEdgeChecks));
   const backPanelRasterRegions = backPanelSidebarChecks.map((check) => ({
     page: check.page,
@@ -494,15 +511,21 @@ async function main(): Promise<void> {
     '  out.append({"page":region["page"],"file":path,"labelPixels":red,"crop":[x0,y0,x1,y1],"ok":red>=30})',
     'print(json.dumps(out))',
   ].join('\n');
-  const backPanelRasterChecks = JSON.parse(execFileSync('python3', ['-c', backPanelRasterScript, JSON.stringify(backPanelRasterRegions), ...rasterPages], { encoding: 'utf8' })) as Array<{ page: number; file: string; labelPixels: number; crop: number[]; ok: boolean }>;
+  const backPanelRasterChecks = JSON.parse(execFileSync(PY, ['-c', backPanelRasterScript, JSON.stringify(backPanelRasterRegions), ...rasterPages], { encoding: 'utf8' })) as Array<{ page: number; file: string; labelPixels: number; crop: number[]; ok: boolean }>;
   assert('PDF 第4/6/8页实际栅格在右侧信息栏可见红色背板注记像素', backPanelRasterChecks.length === 3 && backPanelRasterChecks.every((check) => check.ok), JSON.stringify(backPanelRasterChecks));
+  }
   const roomBookResponse = await postOfficialExport('/api/export/roombook');
   const htmlBytes = Buffer.from(await roomBookResponse.arrayBuffer());
   assertSnapshotBoundResponse('正式 HTTP /api/export/roombook', roomBookResponse);
   const htmlPath = join(outDir, 'complex-kitchen-roombook.html');
   writeFileSync(htmlPath, htmlBytes);
   const html = htmlBytes.toString('utf8');
-  assert('图纸册 HTML 结构含 1 个布局页 + 7 张柜体页', (html.match(/data-page-kind="layout"/g) ?? []).length === 1 && (html.match(/data-page-kind="cabinet"/g) ?? []).length === 7, `${htmlBytes.length} bytes`);
+  const layoutPages = (html.match(/data-page-kind="layout"/g) ?? []).length;
+  const cabinetPages = (html.match(/data-page-kind="cabinet"/g) ?? []).length;
+  // ★ 断言语义，不断言计数：图纸页 = 上下叠放组的数量（地柜+吊柜同组一页），
+  //   不是柜体数。钉死 7 会在「一页一组」之后假失败（这正是交接文档警告的模式）。
+  const expectedCabinetPages = groupCabinetsForSheets(project.cabinets).length;
+  assert('图纸册 HTML 结构含 1 个布局页 + 每组柜体一页', layoutPages === 1 && cabinetPages === expectedCabinetPages, `layout=${layoutPages} cabinet=${cabinetPages} expected=${expectedCabinetPages}; ${htmlBytes.length} bytes`);
   assert('正式 HTTP 图册有标签编号清单、房间免责声明与三页柜体免责声明', ['B1', 'W1', '01 三抽地柜', safetyPhrase, '水槽预留 650×450mm', '灶具预留 640×520mm', '烤箱预留安装净空 568×600×560mm'].every((text) => html.includes(text)), 'source RoomBook 注记已回读');
   assert('正式 HTTP 图册保留唯一真实非零地柜 KICK RULE-MIN-PANEL 完整警告', warningRows.length === 1 && warningRows.every((row) => html.includes(row.text)), warningRows.map((row) => row.cabinet.name).join(', '));
   const finalLiveSnapshot = await readLiveExportSnapshot();
@@ -532,7 +555,7 @@ async function main(): Promise<void> {
     }) },
     collision: { verticalSeparationPass: true, sameElevationNegativePass: true },
     manufacturing: { panelCount: allManufacturingPanels.length, invalidDimensionPanels: invalidManufacturingPanels.length, wallKickPanels: wallKickPanels.length, baseKickPanelIds: baseKickPanels.map((panel) => panel.id), warningPanelIds: warningRows.map((row) => row.issue.target) },
-    exports: { csv: { path: csvPath, bytes: csvBytes.length, modifiedAt: new Date(csvMtimeMs).toISOString(), panelRows: csvReadback.rows, invalidRows: csvReadback.bad.length, wallKickRows: csvReadback.wall_kicks.length, baseKickRows: csvReadback.base_kicks }, pdf: { path: pdfPath, bytes: pdfBytes.length, pages: pdfPageCount, layoutRoomIds: [roomId], modifiedAt: new Date(pdfMtimeMs).toISOString(), generatedAfterRequest: pdfMtimeMs >= pdfExportStartedAt, warningReadBacks: pdfWarningChecks, backPanelSidebarChecks, backPanelRasterChecks, wallCabinetPages: wallPdfPages, bindingEdgeRasterChecks: rasterEdgeChecks }, dxf: { path: dxfPath, bytes: dxfBytes.length, safetyNotesReadBack: dxfSafetyChecks.every(Boolean), safetyNoteLayouts: safetyLayoutNames, warningReadBacks: dxfWarningChecks, wallCabinetPages: dxfWallPages }, html: { path: htmlPath, bytes: htmlBytes.length, warningNotesReadBack: warningRows.length } },
+    exports: { csv: { path: csvPath, bytes: csvBytes.length, modifiedAt: new Date(csvMtimeMs).toISOString(), panelRows: csvReadback.rows, invalidRows: csvReadback.bad.length, wallKickRows: csvReadback.wall_kicks.length, baseKickRows: csvReadback.base_kicks }, pdf: hasPdf() ? { path: pdfPath, bytes: pdfBytes.length, pages: pdfPageCount, layoutRoomIds: [roomId], modifiedAt: new Date(pdfMtimeMs).toISOString(), generatedAfterRequest: pdfMtimeMs >= pdfExportStartedAt, warningReadBacks: pdfWarningChecks, backPanelSidebarChecks, backPanelRasterChecks, wallCabinetPages: wallPdfPages, bindingEdgeRasterChecks: rasterEdgeChecks } : { skipped: '本机缺 WeasyPrint/GTK' }, dxf: { path: dxfPath, bytes: dxfBytes.length, safetyNotesReadBack: dxfSafetyChecks.every(Boolean), safetyNoteLayouts: safetyLayoutNames, warningReadBacks: dxfWarningChecks, wallCabinetPages: dxfWallPages }, html: { path: htmlPath, bytes: htmlBytes.length, warningNotesReadBack: warningRows.length } },
   };
   writeFileSync(join(outDir, 'acceptance.json'), JSON.stringify(report, null, 2), 'utf8');
   console.log(JSON.stringify(report, null, 2));

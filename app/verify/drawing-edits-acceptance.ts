@@ -13,6 +13,7 @@ import { serializeProjectFile, parseProjectFile } from '../src/core/projectFile.
 import { buildFurnitureSheet } from '../src/export/furnitureSheet.ts';
 import { toNeutralExport } from '../src/export/neutralSheet.ts';
 import { buildRoomBook } from '../src/export/roomBook.ts';
+import { resolvePythonExe } from '../server/pythonExe.mjs';
 
 const rules = JSON.parse(readFileSync('src/core/ruleset/factory-default.json', 'utf8')) as RuleSet;
 const original = sampleProject(rules);
@@ -235,9 +236,10 @@ try {
   const neutralPath = join(temp, 'neutral.json');
   const dxfPath = join(temp, 'drawing-edits.dxf');
   writeFileSync(neutralPath, JSON.stringify(neutral), 'utf8');
-  const exported = spawnSync('python3', ['py/export_dxf.py', neutralPath, dxfPath, 'R2007'], { encoding: 'utf8' });
+  const PY = resolvePythonExe(process.cwd()) ?? 'python';
+  const exported = spawnSync(PY, ['py/export_dxf.py', neutralPath, dxfPath, 'R2007'], { encoding: 'utf8' });
   ok(exported.status === 0, `DXF export succeeds: ${(exported.stderr || exported.stdout).slice(0, 400)}`);
-  const verified = spawnSync('python3', ['py/verify_dxf.py', dxfPath, neutralPath], { encoding: 'utf8' });
+  const verified = spawnSync(PY, ['py/verify_dxf.py', dxfPath, neutralPath], { encoding: 'utf8' });
   ok(verified.status === 0, `DXF read-back verifier runs: ${(verified.stderr || verified.stdout).slice(0, 400)}`);
   const report = JSON.parse(verified.stdout);
   ok(report.neutralSemantics?.ok === true, `DXF read-back preserves all page coordinates, closure and rotation: ${JSON.stringify(report.neutralSemantics?.errors ?? [])}`);

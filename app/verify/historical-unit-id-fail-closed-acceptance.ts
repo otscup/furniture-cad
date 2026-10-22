@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync as execFileSyncSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,7 @@ import { replaceDrawingEdits } from '../src/core/drawingEdits.ts';
 import { parseProjectFile, serializeProjectFile } from '../src/core/projectFile.ts';
 import { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT, WorkspaceStore, type DraftSyncReceipt } from '../src/workspace/workspace.ts';
 import { hashProjectSnapshot } from '../server/projectHash.mjs';
+import { resolvePythonExe } from '../server/pythonExe.mjs';
 
 const APP = join(import.meta.dirname, '..');
 const rules = JSON.parse(readFileSync(join(APP, 'src/core/ruleset/factory-default.json'), 'utf8')) as RuleSet;
@@ -17,6 +18,22 @@ const TMP = mkdtempSync(join(tmpdir(), 'historical-unit-id-guard-'));
 let pass = 0;
 let fail = 0;
 const failures: string[] = [];
+
+/**
+ * ★ PDF 出口需要 WeasyPrint + GTK（libgobject/Pango/Cairo），开发机通常没有。
+ *   没有时 PDF 必然 500 —— 那是环境，不是代码缺陷；断言要按能力跳过。
+ */
+let pdfCapable: boolean | undefined;
+function hasPdf(): boolean {
+  if (pdfCapable === undefined) {
+    try {
+      const py = resolvePythonExe(APP);
+      execFileSyncSync(py!, ['-c', 'import weasyprint'], { stdio: 'ignore' });
+      pdfCapable = true;
+    } catch { pdfCapable = false; }
+  }
+  return pdfCapable;
+}
 const children: ChildProcess[] = [];
 const serverLogs = new Map<ChildProcess, string>();
 
@@ -534,12 +551,19 @@ async function main(): Promise<void> {
     http(good, '/api/export/cutlist', 'POST', cleanExportBody),
     http(good, '/api/export/roombook', 'POST', cleanExportBody),
   ]);
-  check('唯一 ID HTTP PDF/DXF/CSV/roombook 四出口仍成功返回文件内容', goodHttpExports.every((response) => response.status === 200 && response.text.length > 0), stable(goodHttpExports.map((response) => ({ status: response.status, type: response.headers.get('content-type') }))));
+  // ★ PDF 需要 WeasyPrint+GTK；本机没有时 PDF 出口必然 500（环境，不是代码）。
+  //   其余三个出口无条件必须成功。
+  const pdfOk = goodHttpExports[0]!.status === 200;
+  const nonPdfOk = goodHttpExports.slice(1).every((response) => response.status === 200 && response.text.length > 0);
+  check('唯一 ID HTTP DXF/CSV/roombook 三出口仍成功返回文件内容', nonPdfOk, stable(goodHttpExports.map((response) => ({ status: response.status, type: response.headers.get('content-type') }))));
+  check('唯一 ID HTTP PDF 出口（需 WeasyPrint/GTK）', pdfOk || !hasPdf(), pdfOk ? 'ok' : 'skipped: 本机缺 WeasyPrint/GTK');
   const goodMcpExports = await Promise.all([
     mcp(good, 'cad.export_pdf', {}), mcp(good, 'cad.export_dxf', { which: ['sheet'] }),
     mcp(good, 'cad.export_bom_csv', {}), mcp(good, 'cad.export_roombook', {}),
   ]);
-  check('唯一 ID MCP PDF/DXF/CSV/roombook 四出口仍成功且返回 base64 文件', goodMcpExports.every((response) => !response.isError && response.payload?.ok === true && typeof response.payload?.base64 === 'string' && response.payload.base64.length > 0), stable(goodMcpExports.map((response) => response.payload?.code ?? response.payload?.filename)));
+  const mcpOk = (response: { isError?: boolean; payload?: any }) => !response.isError && response.payload?.ok === true && typeof response.payload?.base64 === 'string' && response.payload.base64.length > 0;
+  check('唯一 ID MCP DXF/CSV/roombook 三出口仍成功且返回 base64 文件', goodMcpExports.slice(1).every(mcpOk), stable(goodMcpExports.map((response) => response.payload?.code ?? response.payload?.filename)));
+  check('唯一 ID MCP PDF 出口（需 WeasyPrint/GTK）', mcpOk(goodMcpExports[0]!) || !hasPdf(), mcpOk(goodMcpExports[0]!) ? 'ok' : 'skipped: 本机缺 WeasyPrint/GTK');
   await stopServer(good);
 
   console.log(`\n历史重复 Unit ID fail-closed 独立验收：通过 ${pass} / 失败 ${fail}`);

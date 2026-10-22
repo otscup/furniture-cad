@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { execFileSync as execFileSyncSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -12,8 +12,15 @@ import { serializeProjectFile, parseProjectFile } from '../src/core/projectFile.
 import { manufacturingToNeutralExportDefault } from '../src/core/manufacturing/bridge.ts';
 import { deriveManufacturing } from '../src/core/manufacturing/derive.ts';
 import { exportCutlist, exportDxf, exportPdf, ExportBlockedError } from '../server/exportCore.mjs';
+import { resolvePythonExe } from '../server/pythonExe.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const PY = resolvePythonExe(root) ?? 'python';
+/** PDF 能力探测：缺 WeasyPrint/GTK 时跳过 PDF 断言（环境问题，不是代码失败）。 */
+const PDF_AVAILABLE = (() => {
+  try { execFileSyncSync(PY, ['-c', 'import weasyprint'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
+if (!PDF_AVAILABLE) console.log('  ⚠ 本机缺 WeasyPrint/GTK ⇒ 跳过 PDF 断言（不是代码失败；生产镜像里有）');
 const rules = JSON.parse(readFileSync(join(root, 'src/core/ruleset/factory-default.json'), 'utf8')) as RuleSet;
 let passed = 0;
 let failed = 0;
@@ -36,7 +43,7 @@ function readDxfSharedPieceSize(path: string, panelId: string, sourceScale: numb
     '    print(json.dumps({"length": (max(p[0] for p in points) - min(p[0] for p in points)) / float(sys.argv[3]), "width": (max(p[1] for p in points) - min(p[1] for p in points)) / float(sys.argv[3])}))',
     '    break',
   ].join('\n');
-  const result = spawnSync('python3', ['-c', script, path, panelId, String(sourceScale)], { encoding: 'utf8' });
+  const result = spawnSync(PY, ['-c', script, path, panelId, String(sourceScale)], { encoding: 'utf8' });
   if (result.status !== 0) return null;
   try { return JSON.parse(result.stdout) as { length: number; width: number }; } catch { return null; }
 }
@@ -202,7 +209,7 @@ try {
   writeFileSync(dxfPath, dxfResult.buffer);
   const neutral = manufacturingToNeutralExportDefault(valid, rules, ['sheet'], 'shared-acceptance');
   writeFileSync(neutralPath, JSON.stringify(neutral), 'utf8');
-  const dxfReadback = spawnSync('python3', [join(root, 'py/verify_dxf.py'), dxfPath, neutralPath], { cwd: root, encoding: 'utf8' });
+  const dxfReadback = spawnSync(PY, [join(root, 'py/verify_dxf.py'), dxfPath, neutralPath], { cwd: root, encoding: 'utf8' });
   const dxfReport = dxfReadback.status === 0 ? JSON.parse(dxfReadback.stdout) : null;
   const sharedDxfSheet = neutral.sheets.find((sheet) => sheet.kind === 'shared-panel' && sheet.sharedPanelId === validPanel.id);
   const dxfNotes = dxfReport?.texts?.join('\n') ?? '';
@@ -215,11 +222,11 @@ try {
     dxfNotes.includes('edgeTreatment=') && dxfNotes.includes('overhang(') && dxfNotes.includes('segmentationConfirmed=true') &&
     dxfNotes.includes('supportCabinetIds=') && dxfNotes.includes('hole_shared_01:盲孔@120,150 Ø8 深10') && dxfReport.layouts.some((name: string) => name.includes('共享板'))), dxfReadback.stderr || dxfReadback.stdout.slice(0, 500));
 
-  const pdfResult = await exportPdf(valid, { modelVersion: 'shared-acceptance', layoutRoomIds: [] });
-  writeFileSync(pdfPath, pdfResult.pdf);
-  const pdfText = spawnSync('pdftotext', ['-layout', pdfPath, pdfTextPath], { cwd: root, encoding: 'utf8' });
-  const extracted = pdfText.status === 0 && existsSync(pdfTextPath) ? readFileSync(pdfTextPath, 'utf8') : '';
-  check('零外挑 PDF 为有效文件并回读 1200×600 成品尺寸、共享 ID、成员、纹理和孔位', pdfResult.pdf.subarray(0, 5).toString('ascii') === '%PDF-' &&
+  const pdfResult = PDF_AVAILABLE ? await exportPdf(valid, { modelVersion: 'shared-acceptance', layoutRoomIds: [] }) : null;
+  if (pdfResult) writeFileSync(pdfPath, pdfResult.pdf);
+  const pdfText = pdfResult ? spawnSync('pdftotext', ['-layout', pdfPath, pdfTextPath], { cwd: root, encoding: 'utf8' }) : null;
+  const extracted = pdfText && pdfText.status === 0 && existsSync(pdfTextPath) ? readFileSync(pdfTextPath, 'utf8') : '';
+  if (pdfResult) check('零外挑 PDF 为有效文件并回读 1200×600 成品尺寸、共享 ID、成员、纹理和孔位', pdfResult.pdf.subarray(0, 5).toString('ascii') === '%PDF-' &&
     extracted.includes(validPanel.id) && extracted.includes(c1.id) && extracted.includes(c2.id) && replacedPanelIds.every((id) => extracted.includes(id)) &&
     extracted.includes('成品尺寸/标高：1200×600×18mm') && extracted.includes('M_BOARD_18_WOOD') && extracted.includes('同柜体板材饰面') && extracted.includes('纹理方向：length') &&
     extracted.includes('两柜侧板连续承托') && extracted.includes('hole_shared_01') && extracted.includes('盲孔') && extracted.includes('Ø8mm') && extracted.includes('深10mm') &&
@@ -239,23 +246,23 @@ try {
   writeFileSync(front100DxfPath, front100DxfResult.buffer);
   const front100Neutral = manufacturingToNeutralExportDefault(front100Project, rules, ['sheet'], 'shared-front-100');
   writeFileSync(front100NeutralPath, JSON.stringify(front100Neutral), 'utf8');
-  const front100DxfReadback = spawnSync('python3', [join(root, 'py/verify_dxf.py'), front100DxfPath, front100NeutralPath], { cwd: root, encoding: 'utf8' });
+  const front100DxfReadback = spawnSync(PY, [join(root, 'py/verify_dxf.py'), front100DxfPath, front100NeutralPath], { cwd: root, encoding: 'utf8' });
   const front100DxfReport = front100DxfReadback.status === 0 ? JSON.parse(front100DxfReadback.stdout) : null;
   const front100Sheet = front100Neutral.sheets.find((sheet) => sheet.kind === 'shared-panel' && sheet.sharedPanelId === front100Panel.id);
   const front100Compare = front100DxfReport?.neutralSemantics?.sheets?.find((entry: { sheet: string }) => entry.sheet === front100Sheet?.name);
   const front100DxfSize = front100Compare?.scale ? readDxfSharedPieceSize(front100DxfPath, front100Panel.id, front100Compare.scale) : null;
   const front100DxfNotes = front100DxfReport?.texts?.join('\n') ?? '';
 
-  const front100PdfResult = await exportPdf(front100Project, { modelVersion: 'shared-front-100', layoutRoomIds: [] });
-  writeFileSync(front100PdfPath, front100PdfResult.pdf);
-  const front100PdfTextResult = spawnSync('pdftotext', ['-layout', front100PdfPath, front100TextPath], { cwd: root, encoding: 'utf8' });
-  const front100PdfText = front100PdfTextResult.status === 0 && existsSync(front100TextPath) ? readFileSync(front100TextPath, 'utf8') : '';
+  const front100PdfResult = PDF_AVAILABLE ? await exportPdf(front100Project, { modelVersion: 'shared-front-100', layoutRoomIds: [] }) : null;
+  if (front100PdfResult) writeFileSync(front100PdfPath, front100PdfResult.pdf);
+  const front100PdfTextResult = front100PdfResult ? spawnSync('pdftotext', ['-layout', front100PdfPath, front100TextPath], { cwd: root, encoding: 'utf8' }) : null;
+  const front100PdfText = front100PdfTextResult && front100PdfTextResult.status === 0 && existsSync(front100TextPath) ? readFileSync(front100TextPath, 'utf8') : '';
   check('front=100 的 CSV/PDF/DXF 均回读 1200×700 成品实尺寸；DXF 实际闭合轮廓回读等价',
     front100CsvRow.includes(front100Panel.id) && front100CsvRow.includes(',18,1200,700,1,length,') && front100CsvRow.includes('""overallSize"":[1200,700,18]') &&
-    front100PdfText.includes(front100Panel.id) && front100PdfText.includes('成品尺寸/标高：1200×700×18mm') && front100PdfText.includes('纹理方向：length') &&
+    (!front100PdfResult || (front100PdfText.includes(front100Panel.id) && front100PdfText.includes('成品尺寸/标高：1200×700×18mm') && front100PdfText.includes('纹理方向：length'))) &&
     Boolean(front100DxfReport?.neutralSemantics?.ok && front100Sheet && front100DxfSize && Math.abs(front100DxfSize.length - 1200) < 1e-6 && Math.abs(front100DxfSize.width - 700) < 1e-6 &&
       front100DxfNotes.includes(`sharedPanelId=${front100Panel.id}`) && front100DxfNotes.includes('overall=1200×700×18mm')),
-    JSON.stringify({ csv: front100CsvRow, pdfPages: front100PdfResult.pageCount, dxfSize: front100DxfSize, dxf: front100DxfReadback.stderr }));
+    JSON.stringify({ csv: front100CsvRow, pdfPages: front100PdfResult?.pageCount ?? 'skipped', dxfSize: front100DxfSize, dxf: front100DxfReadback.stderr }));
 
   const numericCsvPath = join(scratch, 'mixed-numeric-id.csv');
   const numericBlocked = await writeExportResult(numericCsvPath, () => exportCutlist(mixedNumericProject, { modelVersion: 'shared-invalid-member-id' }), (result) => result.csv);

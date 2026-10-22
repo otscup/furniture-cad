@@ -124,17 +124,12 @@ const MUTANTS: Mutant[] = [
     id: 'M6',
     what: '未授权 viewer 访问管理能力：PAT 校验时把角色悄悄升成 owner',
     file: AUTH,
+    // ★ 锚点跟 auth.mjs 的 PAT 分支同步：PAT 已不再受 lockedUntil 影响
+    //   （口令爆破锁定不该让既有 PAT 失效），所以只用这条注释 + return a 定位。
     from:
-      '      const t = (a.tokens ?? []).find((x) => x.hash === h);\n' +
-      '      if (!t) continue;\n' +
-      "      if (a.status !== 'active') return null;\n" +
-      '      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;\n' +
+      '      // 同上：PAT 不因"某来源爆破口令"而失效（它本来就不是口令换来的）。\n' +
       '      return a;',
     to:
-      '      const t = (a.tokens ?? []).find((x) => x.hash === h);\n' +
-      '      if (!t) continue;\n' +
-      "      if (a.status !== 'active') return null;\n" +
-      '      if (a.lockedUntil && new Date(a.lockedUntil).getTime() > now) return null;\n' +
       '      // 变异：token 一验通过就把角色抬成 owner\n' +
       "      return { ...a, role: 'owner' };",
     expect: '④6（viewer 的 PAT 访问管理接口不再是 403）',

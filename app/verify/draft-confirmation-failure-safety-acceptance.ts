@@ -68,39 +68,45 @@ async function main(): Promise<void> {
   let draftTempWrites = 0;
   let draftUnlinkAttempts = 0;
   const ioFailure = (operation: string) => Object.assign(new Error(`injected filesystem ${operation} failure`), { code: 'EIO' });
+  // ★ Windows 路径是反斜杠：所有前缀/包含判定先归一化成 '/'。
+  //   否则 draft 临时写、quarantine rename、draft unlink 三个注入点永远不命中
+  //   （计数恒为 0，看起来像生产代码没走这些路径）。
+  const norm = (p: string) => String(p).replace(/\\/g, '/');
+  const draftsN = norm(draftsDir);
+  const workspaceN = norm(workspacePath);
   const fileSystemAdapter = {
     existsSync,
     readFileSync,
     readdirSync,
     mkdirSync,
     writeFileSync(path: string, data: string | Uint8Array, encoding?: any) {
-      if (path.startsWith(`${workspacePath}.`) && path.endsWith('.tmp')) workspaceTempWrites += 1;
-      if (path.startsWith(`${draftsDir}/`) && path.endsWith('.tmp')) draftTempWrites += 1;
-      if (failWriteTarget && path.startsWith(`${failWriteTarget}.`) && path.endsWith('.tmp')) {
+      if (norm(path).startsWith(`${workspaceN}.`) && path.endsWith('.tmp')) workspaceTempWrites += 1;
+      if (norm(path).startsWith(`${draftsN}/`) && path.endsWith('.tmp')) draftTempWrites += 1;
+      if (failWriteTarget && norm(path).startsWith(`${norm(failWriteTarget)}.`) && path.endsWith('.tmp')) {
         failWriteTarget = null;
         throw ioFailure('writeFileSync(temp)');
       }
-      if (failNextDraftTempWrite && path.startsWith(`${draftsDir}/`) && path.endsWith('.tmp')) {
+      if (failNextDraftTempWrite && norm(path).startsWith(`${draftsN}/`) && path.endsWith('.tmp')) {
         failNextDraftTempWrite = false;
         throw ioFailure('draft writeFileSync(temp)');
       }
       return writeFileSync(path, data as any, encoding);
     },
     renameSync(from: string, to: string) {
-      if (to === workspacePath) workspaceRenameAttempts += 1;
-      if (to.includes(`${draftsDir}/quarantine/`) && failNextQuarantineRename) {
+      if (norm(to) === workspaceN) workspaceRenameAttempts += 1;
+      if (norm(to).includes(`${draftsN}/quarantine/`) && failNextQuarantineRename) {
         failNextQuarantineRename = false;
         throw ioFailure('quarantine renameSync');
       }
-      if (failRenameTarget === to) {
+      if (failRenameTarget && norm(failRenameTarget) === norm(to)) {
         failRenameTarget = null;
         throw ioFailure('renameSync');
       }
       return renameSync(from, to);
     },
     unlinkSync(path: string) {
-      if (path.startsWith(`${draftsDir}/`) && !path.includes('/quarantine/')) draftUnlinkAttempts += 1;
-      if (failUnlinkTarget === path) {
+      if (norm(path).startsWith(`${draftsN}/`) && !norm(path).includes('/quarantine/')) draftUnlinkAttempts += 1;
+      if (failUnlinkTarget && norm(failUnlinkTarget) === norm(path)) {
         failUnlinkTarget = null;
         throw ioFailure('unlinkSync');
       }

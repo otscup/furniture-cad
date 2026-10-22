@@ -13,9 +13,15 @@ import { generateCabinet } from '../src/core/geometry/generate.ts';
 import { toNeutralExport } from '../src/export/neutralSheet.ts';
 import type { Project, RuleSet } from '../src/core/types.ts';
 import { exportDxf, exportPdf } from '../server/exportCore.mjs';
+import { resolvePythonExe } from '../server/pythonExe.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const app = join(here, '..');
+const PY = resolvePythonExe(app) ?? 'python';
+/** PDF 能力探测：缺 WeasyPrint/GTK 时跳过 PDF 断言（环境问题，不是代码失败）。 */
+const PDF_AVAILABLE = (() => {
+  try { execFileSync(PY, ['-c', 'import weasyprint'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
 const rules = JSON.parse(readFileSync(join(app, 'src/core/ruleset/factory-default.json'), 'utf8')) as RuleSet;
 const tmp = mkdtempSync(join(tmpdir(), 'furniture-door-dims-'));
 let passed = 0;
@@ -93,7 +99,7 @@ async function runExportCase(label: string, project: Project): Promise<void> {
   const dxf = await exportDxf(project, { which: ['sheet'], modelVersion });
   const dxfPath = join(tmp, `${label}.dxf`);
   writeFileSync(dxfPath, dxf.buffer);
-  const dxfReport = JSON.parse(execFileSync('python3', [join(app, 'py/verify_dxf.py'), dxfPath, neutralPath], { encoding: 'utf8' })) as any;
+  const dxfReport = JSON.parse(execFileSync(PY, [join(app, 'py/verify_dxf.py'), dxfPath, neutralPath], { encoding: 'utf8' })) as any;
   ok(`${label} 真正 DXF 回读的图元与中立数据逐项一致`, dxfReport.neutralSemantics?.ok === true, JSON.stringify(dxfReport.neutralSemantics));
   ok(`${label} 真正 DXF 只有一个可打印 A3 横向柜体图纸`, dxfReport.paperLayouts?.filter((layout: any) => layout.entityCount > 0).length === 1 && dxfReport.paperLayouts.filter((layout: any) => layout.entityCount > 0).every((layout: any) => layout.fitsPrintableArea), JSON.stringify(dxfReport.paperLayouts?.filter((layout: any) => layout.entityCount > 0)));
 
@@ -147,20 +153,29 @@ async function runExportCase(label: string, project: Project): Promise<void> {
   };
   ok(`${label} 整张中立图纸图元均在 A3 页面范围内`, pageBounds.minX >= 0 && pageBounds.minY >= 0 && pageBounds.maxX <= 14000 && pageBounds.maxY <= 10000, JSON.stringify(pageBounds));
 
-  const pdf = await exportPdf(project, { modelVersion });
-  const pdfPath = join(tmp, `${label}.pdf`);
-  writeFileSync(pdfPath, pdf.pdf);
-  const extracted = execFileSync('pdftotext', ['-layout', pdfPath, '-'], { encoding: 'utf8' });
-  const compactPdf = normalizeText(extracted);
-  const firstPageText = execFileSync('pdftotext', ['-f', '1', '-l', '1', '-layout', pdfPath, '-'], { encoding: 'utf8' });
-  const hasCabinetOnlyDefault = pdf.pageCount === 1 && normalizeText(firstPageText).includes('俯视图') && normalizeText(firstPageText).includes('外观正面图') && !normalizeText(firstPageText).includes('房间布局');
-  ok(`${label} 真正 PDF 默认只含 1 页单柜图，不插房间布局页`, pdf.pdf.subarray(0, 5).toString('ascii') === '%PDF-' && hasCabinetOnlyDefault, `${pdf.pageCount} 页 / ${pdf.pdf.length} bytes; cabinet=${normalizeText(firstPageText).includes('俯视图') && normalizeText(firstPageText).includes('外观正面图')}; layout=${normalizeText(firstPageText).includes('房间布局')}`);
+  /**
+   * ★ PDF 需要 WeasyPrint + GTK（libgobject/Pango/Cairo），开发机通常没有。
+   *   没有时只跳过 PDF 相关断言，DXF/规格表断言照常跑 —— 否则会得到一串假红。
+   */
+  const pdf = PDF_AVAILABLE ? await exportPdf(project, { modelVersion }) : null;
+  if (!pdf) console.log(`  ⚠ ${label}: 本机缺 WeasyPrint/GTK，跳过 PDF 断言（不是代码失败）`);
+  const compactPdf = pdf ? (() => {
+    const pdfPath = join(tmp, `${label}.pdf`);
+    writeFileSync(pdfPath, pdf.pdf);
+    const extractedText = execFileSync('pdftotext', ['-layout', pdfPath, '-'], { encoding: 'utf8' });
+    const firstPageText = execFileSync('pdftotext', ['-f', '1', '-l', '1', '-layout', pdfPath, '-'], { encoding: 'utf8' });
+    const hasCabinetOnlyDefault = pdf.pageCount === 1 && normalizeText(firstPageText).includes('俯视图') && normalizeText(firstPageText).includes('外观正面图') && !normalizeText(firstPageText).includes('房间布局');
+    ok(`${label} 真正 PDF 默认只含 1 页单柜图，不插房间布局页`, pdf.pdf.subarray(0, 5).toString('ascii') === '%PDF-' && hasCabinetOnlyDefault, `${pdf.pageCount} 页 / ${pdf.pdf.length} bytes; cabinet=${normalizeText(firstPageText).includes('俯视图') && normalizeText(firstPageText).includes('外观正面图')}; layout=${normalizeText(firstPageText).includes('房间布局')}`);
+    ok(`${label} PDF 门板表标出门扇数量`, /扇/.test(extractedText), extractedText.slice(-800));
+    return normalizeText(extractedText);
+  })() : '';
 
-  const missingSizes = manufacturedDoors
-    .map((panel) => `${Math.round(panel.width)}×${Math.round(panel.length)}mm`)
-    .filter((size) => !compactPdf.includes(normalizeText(size)));
-  ok(`${label} PDF 门板表逐扇包含制造清单的净宽×净高`, missingSizes.length === 0, `缺少规格: ${missingSizes.join(', ') || '无'}`);
-  ok(`${label} PDF 门板表标出门扇数量`, /扇/.test(extracted), extracted.slice(-800));
+  if (pdf) {
+    const missingSizes = manufacturedDoors
+      .map((panel) => `${Math.round(panel.width)}×${Math.round(panel.length)}mm`)
+      .filter((size) => !compactPdf.includes(normalizeText(size)));
+    ok(`${label} PDF 门板表逐扇包含制造清单的净宽×净高`, missingSizes.length === 0, `缺少规格: ${missingSizes.join(', ') || '无'}`);
+  }
 
   const scheduleTexts = sheetPrims
     .filter((prim: any) => prim.layer === 'F-TEXT' && prim.k === 'text')
@@ -179,10 +194,10 @@ async function runExportCase(label: string, project: Project): Promise<void> {
     manufacturedCounts.set(size, (manufacturedCounts.get(size) ?? 0) + 1);
   }
   const countMismatches = [...manufacturedCounts].filter(([size, count]) => scheduledCounts.get(size) !== count);
-  const pdfCountMismatches = [...manufacturedCounts].filter(([size, count]) => compactPdf.split(normalizeText(size)).length - 1 < count);
+  const pdfCountMismatches = pdf ? [...manufacturedCounts].filter(([size, count]) => compactPdf.split(normalizeText(size)).length - 1 < count) : [];
   const dxfCountMismatches = [...manufacturedCounts].filter(([size, count]) => dxfReport.texts.filter((text: string) => text.endsWith(size)).length < count);
   ok(`${label} 每扇尺寸表规格与制造板件逐项、逐数量一致`, countMismatches.length === 0, JSON.stringify({ expected: [...manufacturedCounts], scheduled: [...scheduledCounts] }));
-  ok(`${label} 真实 PDF 每个制造门规格均按扇数可查`, pdfCountMismatches.length === 0, JSON.stringify({ expected: [...manufacturedCounts], missing: pdfCountMismatches }));
+  if (pdf) ok(`${label} 真实 PDF 每个制造门规格均按扇数可查`, pdfCountMismatches.length === 0, JSON.stringify({ expected: [...manufacturedCounts], missing: pdfCountMismatches }));
   ok(`${label} 真实 DXF 每个制造门规格均按扇数可查`, dxfCountMismatches.length === 0, JSON.stringify({ expected: [...manufacturedCounts], missing: dxfCountMismatches }));
   ok(`${label} 门板尺寸文字落在 DXF 中并通过逐图元回归`, dxfReport.neutralSemantics?.ok === true && [...new Set(frontWidths)].every((width) => dxfReport.texts.includes(String(width))), JSON.stringify({ semanticSheets: dxfReport.neutralSemantics?.sheets?.length, widths: frontWidths }));
 }

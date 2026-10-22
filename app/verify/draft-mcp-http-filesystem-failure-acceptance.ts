@@ -3,7 +3,7 @@ import { createServer as createNetServer } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { emptyProject, rectRoom } from '../src/core/docFactory.ts';
 import { serializeProjectFile } from '../src/core/projectFile.ts';
 
@@ -54,6 +54,11 @@ import * as fs from 'node:fs';
 import { dirname, join } from 'node:path';
 const workspace = process.env.APP_WORKSPACE_PATH;
 const drafts = join(dirname(workspace), 'drafts');
+// ★ Windows 路径是反斜杠：统一换成 '/' 再比对前缀，否则 draft-write / draft-unlink
+//   这些注入点永远不命中（故障日志 draftSave=0、unlink=0，看起来像功能丢了）。
+const norm = (p) => String(p).replace(/\\\\/g, '/');
+const workspaceN = norm(workspace);
+const draftsN = norm(drafts);
 const control = process.env.APP_FS_FAULT_CONTROL;
 const log = process.env.APP_FS_FAULT_LOG;
 const failure = (op) => Object.assign(new Error('injected filesystem failure at ' + op), { code: 'EIO' });
@@ -81,11 +86,11 @@ const adapter = {
   mkdirSync: fs.mkdirSync,
   writeFileSync(path, data, encoding) {
     const target = String(path);
-    if (target.startsWith(workspace + '.') && target.endsWith('.tmp') && consume('live-write')) {
+    if (norm(target).startsWith(workspaceN + '.') && target.endsWith('.tmp') && consume('live-write')) {
       record('writeFileSync(temp)-EIO', target);
       throw failure('writeFileSync(temp)');
     }
-    if (target.startsWith(drafts + '/') && target.endsWith('.tmp') && consume('draft-write')) {
+    if (norm(target).startsWith(draftsN + '/') && target.endsWith('.tmp') && consume('draft-write')) {
       record('writeFileSync(draft-temp)-EIO', target);
       throw failure('writeFileSync(draft-temp)');
     }
@@ -93,11 +98,11 @@ const adapter = {
   },
   renameSync(from, to) {
     const target = String(to);
-    if (target === workspace && consume('live-rename')) {
+    if (norm(target) === workspaceN && consume('live-rename')) {
       record('renameSync(temp, workspace)-EIO', target);
       throw failure('renameSync(temp, workspace)');
     }
-    if (target.startsWith(drafts + '/quarantine/') && consume('draft-quarantine-rename')) {
+    if (norm(target).startsWith(draftsN + '/quarantine/') && consume('draft-quarantine-rename')) {
       record('renameSync(draft, quarantine)-EIO', target);
       throw failure('renameSync(draft, quarantine)');
     }
@@ -105,7 +110,7 @@ const adapter = {
   },
   unlinkSync(path) {
     const target = String(path);
-    if (target.startsWith(drafts + '/') && !target.includes('/quarantine/') && consume('draft-unlink')) {
+    if (norm(target).startsWith(draftsN + '/') && !norm(target).includes('/quarantine/') && consume('draft-unlink')) {
       record('unlinkSync(draft)-EIO', target);
       throw failure('unlinkSync(draft)');
     }
@@ -121,7 +126,8 @@ globalThis[Symbol.for('furniture-cad.workspaceFileSystemAdapter')] = adapter;
 async function startServer(): Promise<void> {
   port = await allocatePort();
   childOutput = '';
-  child = spawn(process.execPath, ['--import', preloadPath, join(root, 'server/server.mjs')], {
+  // --import 只接受 URL：Windows 绝对路径会被当成 scheme 'e:'（ERR_UNSUPPORTED_ESM_URL_SCHEME）。
+  child = spawn(process.execPath, ['--import', pathToFileURL(preloadPath).href, join(root, 'server/server.mjs')], {
     cwd: root,
     env: {
       ...process.env,
@@ -321,7 +327,9 @@ async function verifyPostCommitCleanupRecovery(transport: 'HTTP' | 'MCP', cabine
   const afterCommitFailure = await captureRecoveryState(draftId, syncId);
   const logEntries = readFileSync(faultLogPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const unlinkInjected = logEntries.some((entry) => entry.op === 'unlinkSync(draft)-EIO' && entry.path === draftFile);
-  const quarantineInjected = logEntries.some((entry) => entry.op === 'renameSync(draft, quarantine)-EIO' && entry.path.startsWith(`${quarantineDir}/`));
+  // Windows 路径是反斜杠：比较前统一成 '/'，否则这条断言永远为 false（假失败）。
+  const slash = (p: string) => String(p).replace(/\\/g, '/');
+  const quarantineInjected = logEntries.some((entry) => entry.op === 'renameSync(draft, quarantine)-EIO' && slash(entry.path).startsWith(`${slash(quarantineDir)}/`));
   const failureResponseIsExplicit = transport === 'HTTP'
     ? failedApply.status === 500 && failedApply.json?.code === 'APPLY_COMMITTED_CLEANUP_FAILED'
       && failedApply.json?.committed === true && failedApply.json?.retryable === true

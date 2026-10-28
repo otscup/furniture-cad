@@ -22,6 +22,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
 const VALIDATE_EXPORT_TS = join(ROOT, 'scripts', 'validate-export.ts');
+const LINT_DRAWING_TS = join(ROOT, 'scripts', 'lint-drawing.ts');
 const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
 const TS_NODE_ARGS = Number(process.versions.node.split(".")[0]) >= 22 ? ["--experimental-strip-types", "--no-warnings"] : ["--no-warnings"];
 
@@ -285,4 +286,17 @@ export async function exportPdf(project, { modelVersion = 'unknown', layoutRoomI
   const pageCount = Number(/__FC_PDF_PAGES__=(\d+)/.exec(rendered.stderr)?.[1] ?? 0);
   if (!Number.isInteger(pageCount) || pageCount < 1) throw new Error('PDF 渲染器未返回有效的页数元数据');
   return { pdf, pageCount, filename: htmlFilename.replace(/\.html$/i, '.pdf') };
+}
+
+/**
+ * 图纸可读性检查：返回 { ok, cabinets, primsChecked, summary, issues }。
+ *
+ * 与导出共用同一条纪律：几何只在 TS 子进程里从语义模型重算一遍 ——
+ * 不接受客户端上传的图元，否则检查的和看到的不是同一份图。
+ */
+export async function lintDrawing(project, { rulesPath } = {}) {
+  const { out } = await run(process.execPath, [...TS_NODE_ARGS, LINT_DRAWING_TS], {
+    input: JSON.stringify({ project, ...(rulesPath ? { rulesPath } : {}) }),
+  });
+  return JSON.parse(out);
 }

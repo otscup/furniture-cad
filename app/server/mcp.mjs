@@ -32,6 +32,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { registerWriteTools, WRITE_TOOLS } from './mcpWrite.mjs';
 import { registerExportTools, EXPORT_TOOLS } from './mcpExport.mjs';
+import { lintDrawing } from './exportCore.mjs';
 import { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT } from '../src/core/unitIdentity.mjs';
 
 /**
@@ -47,9 +48,10 @@ const NO_ARGS = z.object({}).default({});
 
 export const TOOL_GET_STATE = 'cad.get_state';
 export const TOOL_VALIDATE = 'cad.validate';
+export const TOOL_LINT_DRAWING = 'cad.lint_drawing';
 
 /** 允许暴露的 CAD 工具（只读 S2 + 写 S4/S5；新增必须走新一轮方案）。 */
-export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, ...WRITE_TOOLS, ...EXPORT_TOOLS];
+export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, TOOL_LINT_DRAWING, ...WRITE_TOOLS, ...EXPORT_TOOLS];
 
 const SERVER_INFO = { name: 'furniture-cad', version: '0.1.0' };
 
@@ -228,6 +230,43 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
         issues: v.issues.length,
       });
       return toolText(payload);
+    }
+  );
+
+  server.registerTool(
+    TOOL_LINT_DRAWING,
+    {
+      title: '检查图纸可读性',
+      description:
+        '只读：把当前工作区的柜体重新派生一遍 2D 图元，检查**图纸印出来能不能读**（文字压在衣物/五金示意线条上、文字互相压字）。' +
+        '与 cad.validate 分工不同：validate 回答"柜子做不做得出"，lint_drawing 回答"图纸清不清楚"。不修改任何数据。',
+      inputSchema: NO_ARGS,
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      if (r.error) {
+        auditToolCall(principal, TOOL_LINT_DRAWING, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
+        return r.error;
+      }
+      const ws = r.workspace;
+      try {
+        const result = await lintDrawing(ws.getProjectSnapshot());
+        auditToolCall(principal, TOOL_LINT_DRAWING, 'ok', {
+          workspaceId: ws.workspaceId,
+          liveModelVersion: ws.getLiveModelVersion(),
+          issues: result.issues.length,
+        });
+        return toolText({
+          ok: true,
+          workspaceId: ws.workspaceId,
+          liveModelVersion: ws.getLiveModelVersion(),
+          ...result,
+        });
+      } catch (error) {
+        auditToolCall(principal, TOOL_LINT_DRAWING, 'fail', { code: 'LINT_FAILED' });
+        return toolError('LINT_FAILED', `图纸检查失败：${error?.message ?? error}`);
+      }
     }
   );
 

@@ -71,6 +71,7 @@ async function allocatePort(): Promise<number> {
 const EXPECTED_TOOLS = [
   'cad.get_state',
   'cad.validate',
+  'cad.lint_drawing',
   'cad.create_cabinet',
   'cad.create_assembly',
   'cad.place_cabinet',
@@ -253,7 +254,7 @@ section('① 工具清单');
 {
   const r = await mcp(port, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, PAT_VIEWER);
   const names = (r.json?.result?.tools ?? []).map((t: any) => t.name);
-  ok('①1 tools/list 恰好 = 16 个工具（规格硬编码，顺序无关）',
+  ok('①1 tools/list 恰好 = 19 个工具（规格硬编码，顺序无关）',
     JSON.stringify([...names].sort()) === JSON.stringify([...EXPECTED_TOOLS].sort()), JSON.stringify(names));
   ok('①2 无 S6 词根（export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
 }

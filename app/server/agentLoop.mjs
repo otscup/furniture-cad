@@ -504,6 +504,8 @@ export function buildAgentSystemPrompt(opts = {}) {
 - 工具报错时读错误信息，调整参数重试。同一问题最多重试 3 轮，修不好就停下说明原因。
 - 完成后调用 cad.validate 确认 0 错误。
 - 再调用 cad.lint_drawing 检查图纸本身有没有压字（文字压在衣物/五金示意线条上）；有就调整标注位置再交付。
+- 拿不准几何时用 cad.get_views 把图元读回来自己核对，不要靠猜；要看效果好不好看用 cad.render 渲成 PNG（返回文件路径）。
+- 客户身高是人体工学规则的唯一输入（抽屉够不够得着、挂衣杆会不会太高）。用户提到身高、或要放抽屉/挂衣区时，调用 cad.set_project 传 customerHeight（mm）。
 - 【设计目标 intentRequest】当用户的诉求是**方向性的**（"柜子别跑到屋外去""别挡门窗""要贴墙"），而不是要你立刻改某只柜时，
   你可以在**最终回答**里附一个 JSON 代码块表达设计目标，系统会把它作为**待用户确认**的意图：
   \`\`\`json
@@ -548,7 +550,7 @@ export async function runAgentLoop(opts) {
      'cad.delete_object', 'cad.validate', 'cad.get_state',
      'cad.create_room', 'cad.draw_wall', 'cad.submit_proposal',
      'cad.duplicate_object', 'cad.create_assembly', 'cad.list_drafts',
-     'cad.lint_drawing'].includes(t.name)
+     'cad.lint_drawing', 'cad.get_views', 'cad.render', 'cad.set_project'].includes(t.name)
   );
 
   /**
@@ -583,7 +585,7 @@ export async function runAgentLoop(opts) {
      * 一旦撞名，第二个会覆盖第一个，表现为**模型调了 A、系统执行了 B** ——
      * 而且不报错、日志里看起来一切正常。这类失败模式比崩溃危险得多。
      *
-     * 当前 19 个工具（cad.get_state / cad.create_cabinet / …）不会撞，
+     * 当前 22 个工具（cad.get_state / cad.create_cabinet / …）不会撞，
      * 但这是将来加工具时最容易踩的一脚，所以在源头拦死：
      * 宁可启动时就炸，也不要悄悄调错工具。
      */

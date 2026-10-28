@@ -43,6 +43,7 @@ export const TOOL_CREATE_ROOM = 'cad.create_room';
 export const TOOL_DRAW_WALL = 'cad.draw_wall';
 export const TOOL_DUPLICATE_OBJECT = 'cad.duplicate_object';
 export const TOOL_CREATE_ASSEMBLY = 'cad.create_assembly';
+export const TOOL_SET_PROJECT = 'cad.set_project';
 
 const MCP_UNIT = z.object({
   kind: z.enum(['drawerBank', 'shelves', 'hanging', 'appliance', 'open']),
@@ -77,6 +78,7 @@ export const WRITE_TOOLS = [
   TOOL_DRAW_WALL,
   TOOL_DUPLICATE_OBJECT,
   TOOL_CREATE_ASSEMBLY,
+  TOOL_SET_PROJECT,
 ];
 
 // ── .ts 核心模块懒加载（--experimental-strip-types，与 workspaceHost 同一条路）──
@@ -963,6 +965,57 @@ export function registerWriteTools(server, { getWorkspaceState, principal, audit
       if (hit.length) newId = hit[hit.length - 1].id;
       auditToolCall(TOOL_DUPLICATE_OBJECT, 'ok', { draftId: d.draftId, sourceId: args.sourceId, newId });
       return toolText({ ok: true, draftId: d.draftId, newId, newName, label: cmd.label ?? '', ...staleHint(ws, d.handle) });
+    }
+  );
+
+  server.registerTool(
+    TOOL_SET_PROJECT,
+    {
+      title: '设置项目级参数（进 draft）',
+      description:
+        '在 draft 里设置项目级参数，不碰 live。目前是**客户身高**：这是人体工学规则的唯一输入 ——' +
+        '抽屉够不够得着（ERGO-DRAWER-HEIGHT）、挂衣杆会不会太高，全都靠它。' +
+        '不设这个值，那些规则永远不会跑（"能力建了却没接到在用的那条路上"）。传 0 或 null 表示清除。',
+      inputSchema: z.object({
+        customerHeight: z.number().int().min(0).max(2500).nullable().optional().describe('客户身高 mm；0/null=清除'),
+        draftId: z.string().optional().describe('追加到已有 draft；缺省新建'),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const deny = needDesign();
+      if (deny) return deny;
+      if (args.customerHeight === undefined) {
+        return toolError('INVALID_ARGUMENT', '至少给一个要设的字段（目前支持 customerHeight）。');
+      }
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      if (r.error) return r.error;
+      const ws = r.workspace;
+      const d = await withDraft(ws, args.draftId, principal.actor);
+      if (d.error) return d.error;
+      const fail = async (msg) => {
+        if (d.isNew) await cleanupNewDraft(ws, d.draftId);
+        auditToolCall(TOOL_SET_PROJECT, 'fail', { draftId: d.draftId, error: msg });
+        return toolError('COMMAND_REJECTED', msg);
+      };
+      const { commands } = await core();
+      const proj = ws.draftState(d.draftId);
+      if (!proj) return fail(`draft 不存在：${d.draftId}`);
+      const next = args.customerHeight === null || args.customerHeight === 0 ? null : args.customerHeight;
+      const cmd = commands.setCustomerHeight(proj.customerHeight, next, 'mcp');
+      const er = await executeDraftCommand(ws, d.draftId, cmd);
+      if (!er.ok) return fail(er.error ?? '命令被拒绝');
+      // 读回：身高一设，人体工学规则立刻可能翻出新的 ISSUE —— 当场告诉调用者，别等 validate 才发现。
+      const after = ws.draftState(d.draftId);
+      // 命令应用时 commandBus 已带着新身高重跑校验（commandBus.ts:2258）；
+      // 但 draftState 只回 Project，问题清单要从 validateDraft 取。
+      const fresh = (ws.validateDraft(d.draftId)?.issues ?? []).filter((i) => String(i.code ?? '').startsWith('ERGO-'));
+      auditToolCall(TOOL_SET_PROJECT, 'ok', { draftId: d.draftId, customerHeight: next, ergoIssues: fresh.length });
+      return toolText({
+        ok: true, draftId: d.draftId, customerHeight: next, label: cmd.label ?? '',
+        ergonomicIssues: fresh.map((i) => ({ severity: i.severity, code: i.code, target: i.target, message: i.message })),
+        ...staleHint(ws, d.handle),
+      });
     }
   );
 }

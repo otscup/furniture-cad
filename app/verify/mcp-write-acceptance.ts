@@ -72,6 +72,8 @@ const EXPECTED_TOOLS = [
   'cad.get_state',
   'cad.validate',
   'cad.lint_drawing',
+  'cad.get_views',
+  'cad.render',
   'cad.create_cabinet',
   'cad.create_assembly',
   'cad.place_cabinet',
@@ -84,6 +86,7 @@ const EXPECTED_TOOLS = [
   'cad.create_room',
   'cad.draw_wall',
   'cad.duplicate_object',
+  'cad.set_project',
   'cad.export_dxf',
   'cad.export_bom_csv',
   'cad.export_roombook',
@@ -254,7 +257,7 @@ section('① 工具清单');
 {
   const r = await mcp(port, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, PAT_VIEWER);
   const names = (r.json?.result?.tools ?? []).map((t: any) => t.name);
-  ok('①1 tools/list 恰好 = 19 个工具（规格硬编码，顺序无关）',
+  ok('①1 tools/list 恰好 = 22 个工具（规格硬编码，顺序无关）',
     JSON.stringify([...names].sort()) === JSON.stringify([...EXPECTED_TOOLS].sort()), JSON.stringify(names));
   ok('①2 无 S6 词根（export_*）', names.every((n: string) => !FORBIDDEN_ROOTS.some((x) => n.includes(x))), JSON.stringify(names));
 }
@@ -287,6 +290,12 @@ let CAB = '';
   const u = await callTool(port, PAT_DESIGNER, 'cad.update_object', { targetId: CAB, targetType: 'cabinet', field: 'width', value: 1600, draftId: DRAFT });
   ok('③3 draft 内改宽成功', !u.err, JSON.stringify(u.payload)?.slice(0, 160));
   ok('③4 改宽后 live 仍未变', (await snapOf(PAT_DESIGNER)) === before);
+  // set_project：项目级参数（客户身高）也是 draft 内写；身高是人体工学规则的唯一输入
+  const sp = await callTool(port, PAT_DESIGNER, 'cad.set_project', { customerHeight: 600, draftId: DRAFT });
+  ok('③4b set_project 写入客户身高', !sp.err && sp.payload?.customerHeight === 600, JSON.stringify(sp.payload)?.slice(0, 160));
+  ok('③4c set_project 回带人体工学问题清单（空也必须是数组）', Array.isArray(sp.payload?.ergonomicIssues), JSON.stringify(sp.payload?.ergonomicIssues)?.slice(0, 160));
+  const spBad = await callTool(port, PAT_DESIGNER, 'cad.set_project', { draftId: DRAFT });
+  ok('③4d set_project 没给字段 → 结构化 INVALID_ARGUMENT', spBad.err === true);
   const draftFiles = draftFilesFor('designer');
   ok('③5 draft 文件已落盘', draftFiles.some((f) => f.startsWith(DRAFT)), draftFiles.join(','));
 }

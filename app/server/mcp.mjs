@@ -32,7 +32,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { registerWriteTools, WRITE_TOOLS } from './mcpWrite.mjs';
 import { registerExportTools, EXPORT_TOOLS } from './mcpExport.mjs';
-import { lintDrawing } from './exportCore.mjs';
+import { lintDrawing, drawingViews, renderView } from './exportCore.mjs';
 import { findDuplicateUnitIds, WORKSPACE_UNIT_ID_CONFLICT } from '../src/core/unitIdentity.mjs';
 
 /**
@@ -49,9 +49,11 @@ const NO_ARGS = z.object({}).default({});
 export const TOOL_GET_STATE = 'cad.get_state';
 export const TOOL_VALIDATE = 'cad.validate';
 export const TOOL_LINT_DRAWING = 'cad.lint_drawing';
+export const TOOL_GET_VIEWS = 'cad.get_views';
+export const TOOL_RENDER = 'cad.render';
 
 /** 允许暴露的 CAD 工具（只读 S2 + 写 S4/S5；新增必须走新一轮方案）。 */
-export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, TOOL_LINT_DRAWING, ...WRITE_TOOLS, ...EXPORT_TOOLS];
+export const ALLOWED_TOOLS = [TOOL_GET_STATE, TOOL_VALIDATE, TOOL_LINT_DRAWING, TOOL_GET_VIEWS, TOOL_RENDER, ...WRITE_TOOLS, ...EXPORT_TOOLS];
 
 const SERVER_INFO = { name: 'furniture-cad', version: '0.1.0' };
 
@@ -266,6 +268,81 @@ function buildServer({ getWorkspaceState, principal, auditToolCall }) {
       } catch (error) {
         auditToolCall(principal, TOOL_LINT_DRAWING, 'fail', { code: 'LINT_FAILED' });
         return toolError('LINT_FAILED', `图纸检查失败：${error?.message ?? error}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    TOOL_GET_VIEWS,
+    {
+      title: '读回图纸图元',
+      description:
+        '只读：把柜体的 2D 视图图元读回来。不带参数 → 列出每只柜有哪些视图、各多少图元；' +
+        '带 view（front/top/side/internal）→ 返回该视图全部图元（折线/填充/文字，模型毫米坐标）。' +
+        '这是 cad.create_cabinet 等写工具的**回读口**：画完先读一遍，别靠猜。不修改任何数据。',
+      inputSchema: z.object({
+        cabinetId: z.string().optional().describe('柜体 id；缺省取第一只'),
+        view: z.enum(['front', 'top', 'side', 'internal']).optional().describe('视图；缺省列清单'),
+        prims: z.boolean().optional().describe('true=返回图元（等价于给了 view）'),
+      }).default({}),
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (args) => {
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      if (r.error) {
+        auditToolCall(principal, TOOL_GET_VIEWS, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
+        return r.error;
+      }
+      const ws = r.workspace;
+      const wantPrims = Boolean(args.view || args.prims);
+      try {
+        const result = await drawingViews(ws.getProjectSnapshot(), {
+          op: wantPrims ? 'prims' : 'list',
+          ...(args.cabinetId ? { cabinetId: args.cabinetId } : {}),
+          ...(args.view ? { view: args.view } : {}),
+        });
+        auditToolCall(principal, TOOL_GET_VIEWS, 'ok', { workspaceId: ws.workspaceId, prims: result.primCount ?? 0 });
+        return toolText({ ok: true, workspaceId: ws.workspaceId, liveModelVersion: ws.getLiveModelVersion(), ...result });
+      } catch (error) {
+        auditToolCall(principal, TOOL_GET_VIEWS, 'fail', { code: 'VIEWS_FAILED' });
+        return toolError('VIEWS_FAILED', `读回图元失败：${error?.message ?? error}`);
+      }
+    }
+  );
+
+  server.registerTool(
+    TOOL_RENDER,
+    {
+      title: '把图纸渲成 PNG',
+      description:
+        '只读：把某个柜的某个 2D 视图渲染成 PNG 并**落盘**，返回文件路径（不返回 base64，避免把上下文吃干）。' +
+        '这是唯一能"看见"效果图的通道 —— 几何对不对用 cad.lint_drawing / cad.validate 判断，好不好看只能用这个看。' +
+        '需要服务端机器上有 Chrome/Edge（可用 FURNICAD_CHROME 指定路径）。不修改工作区数据，只在磁盘上写图。',
+      inputSchema: z.object({
+        cabinetId: z.string().optional().describe('柜体 id；缺省取第一只'),
+        view: z.enum(['front', 'top', 'side', 'internal']).optional().describe('视图；缺省 front（立面外观图）'),
+        widthPx: z.number().int().min(400).max(4000).optional().describe('图片像素宽；缺省 1600'),
+      }).default({}),
+      annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async (args) => {
+      const r = workspaceOrError(await getWorkspaceState(principal.actor));
+      if (r.error) {
+        auditToolCall(principal, TOOL_RENDER, 'fail', { code: 'WORKSPACE_UNAVAILABLE' });
+        return r.error;
+      }
+      const ws = r.workspace;
+      try {
+        const result = await renderView(ws.getProjectSnapshot(), {
+          ...(args.cabinetId ? { cabinetId: args.cabinetId } : {}),
+          ...(args.view ? { view: args.view } : {}),
+          ...(args.widthPx ? { widthPx: args.widthPx } : {}),
+        });
+        auditToolCall(principal, TOOL_RENDER, 'ok', { workspaceId: ws.workspaceId, view: result.view, bytes: result.bytes });
+        return toolText({ ok: true, workspaceId: ws.workspaceId, liveModelVersion: ws.getLiveModelVersion(), ...result });
+      } catch (error) {
+        auditToolCall(principal, TOOL_RENDER, 'fail', { code: 'RENDER_FAILED' });
+        return toolError('RENDER_FAILED', `渲染失败：${error?.message ?? error}`);
       }
     }
   );

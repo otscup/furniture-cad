@@ -1,5 +1,7 @@
-import type { Cabinet, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
+import type { Cabinet, Issue, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { boxOverlap, primVisualExtent } from '../core/geometry/labels.ts';
+import { lintPrims } from '../core/geometry/drawingLint.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
 import { buildFurnitureSheet, computeUnfoldedWallX, groupByRoom } from './furnitureSheet.ts';
 import { buildCabinetViews, buildProjectViews, type ViewSet } from '../core/geometry/views.ts';
@@ -223,32 +225,130 @@ export function buildRoomElevation(
 
 const PAD = 120;
 
+/** 纸面尺寸（mm）。primsToSvg 靠它把模型毫米换算成落到纸上的毫米。 */
+export interface PaperSize { w: number; h: number }
+
+/** A3 横向整页。 */
+const PAGE_MM: PaperSize = { w: 420, h: 297 };
+/** 平面页 .sheet-wrap：inset 16mm 8mm 55mm（见 CSS .layout-page .sheet-wrap）。 */
+export const LAYOUT_SLOT_MM: PaperSize = { w: PAGE_MM.w - 8 * 2, h: PAGE_MM.h - 16 - 55 };
+/** 柜体页 / 整房页：.sheet-wrap 铺满整页。 */
+export const SHEET_SLOT_MM: PaperSize = PAGE_MM;
+/** 共享板页：page padding 12mm + .shared-panel-drawing height 185mm（见 CSS）。 */
+export const SHARED_SLOT_MM: PaperSize = { w: PAGE_MM.w - 12 * 2, h: 185 };
+
+/**
+ * 打印下限（纸面 mm）。图元线宽/字号都在模型毫米空间，缩到 A3 后一起缩小：
+ * 14000mm 图幅缩到 420mm 时 scale≈0.03，0.5 线宽落到纸上只有 0.015mm，打印机直接丢掉。
+ */
+export const PAPER_MIN_MM = { main: 0.25, aux: 0.13, text: 2.2 };
+/** 线宽 ≥1.5 的算主线（板件轮廓、图框），其余（五金、隐藏线、示意）按辅助线。 */
+const MAIN_LW = 1.5;
+const round3 = (value: number): number => Math.round(value * 1000) / 1000;
+
 /** Y-up CAD primitives to a self-contained SVG with readable, unmirrored text. */
-export function primsToSvg(prims: Prim[], cls: string): string {
+export function primsToSvg(prims: Prim[], cls: string, paper?: PaperSize): string {
   if (prims.length === 0) return `<svg class="${esc(cls)}" role="img" aria-label="空视图"></svg>`;
   const box = primPoints(prims);
   const minX = box.minX - PAD;
   const minY = box.minY - PAD;
   const width = Math.max(1, box.maxX - box.minX + PAD * 2);
   const height = Math.max(1, box.maxY - box.minY + PAD * 2);
+  // viewBox 按 preserveAspectRatio=xMidYMid meet 缩放：两轴取小值，另一轴留白。
+  const scale = paper ? Math.min(paper.w / width, paper.h / height) : 0;
+  // 线宽/字号先保模型语义，再抬到打印下限；不传 paper 时保持老行为（界面预览、脚本）。
+  const strokeWidth = (lw: number): number => {
+    const model = Math.max(1, lw * 1.6);
+    return scale > 0 ? round3(Math.max(model, (lw >= MAIN_LW ? PAPER_MIN_MM.main : PAPER_MIN_MM.aux) / scale)) : model;
+  };
+  const fontSize = (size: number): number => (scale > 0 ? round3(Math.max(size, PAPER_MIN_MM.text / scale)) : size);
   const body: string[] = [];
   for (const prim of prims) {
     if (prim.k === 'poly') {
       const points = prim.pts.map((point) => `${point.x},${point.y}`).join(' ');
       const dash = prim.dash ? ` stroke-dasharray="${prim.dash.join(' ')}"` : '';
       const tag = prim.closed ? 'polygon' : 'polyline';
-      body.push(`<${tag} points="${points}" fill="none" stroke="${strokeOf(prim.layer)}" stroke-width="${Math.max(1, prim.lw * 1.6)}"${dash}/>`);
+      body.push(`<${tag} points="${points}" fill="none" stroke="${strokeOf(prim.layer)}" stroke-width="${strokeWidth(prim.lw)}"${dash}/>`);
     } else if (prim.k === 'fill') {
       const points = prim.pts.map((point) => `${point.x},${point.y}`).join(' ');
       body.push(`<polygon points="${points}" fill="${fillOf(prim.layer)}" fill-opacity="${prim.alpha}" stroke="none"/>`);
     } else {
       const anchor = prim.align === 'c' ? 'middle' : prim.align === 'r' ? 'end' : 'start';
       const rotation = prim.rot ? ` rotate(${-prim.rot})` : '';
-      body.push(`<text transform="translate(${prim.p.x},${prim.p.y}) scale(1,-1)${rotation}" font-size="${prim.size}" fill="${strokeOf(prim.layer)}" text-anchor="${anchor}" font-family="Noto Sans CJK SC, Microsoft YaHei, sans-serif">${esc(prim.text)}</text>`);
+      body.push(`<text transform="translate(${prim.p.x},${prim.p.y}) scale(1,-1)${rotation}" font-size="${fontSize(prim.size)}" fill="${strokeOf(prim.layer)}" text-anchor="${anchor}" font-family="Noto Sans CJK SC, Microsoft YaHei, sans-serif">${esc(prim.text)}</text>`);
     }
   }
   return `<svg class="${esc(cls)}" viewBox="${minX} ${-(minY + height)} ${width} ${height}" preserveAspectRatio="xMidYMid meet" role="img"><g transform="scale(1,-1)">${body.join('')}</g></svg>`;
 }
+
+/**
+ * 导出前把压在衣物/五金示意线上的文字挪到空位。
+ *
+ * 判据不解析 lintPrims 的 message：只把这一条文字和内容层一起喂回去，
+ * 仍然报 DRAW_TEXT_OVER_CONTENT 就说明它压线（一个文字框只可能自己命中）。
+ * 候选取 8 方向 × 1..8 倍步长，步长与 labels.ts 的 LabelPlacer.fit 一致；
+ * 四周都挪不动就留在原位并记下 —— 不许为了看着干净把标注丢掉。
+ */
+export function avoidTextOverContent(
+  prims: Prim[],
+  scope: { view: string; target: string },
+): { prims: Prim[]; moved: string[]; kept: string[] } {
+  // 只取**线条**：F-CAB-HW 层里也有文字（挂衣杆/层板说明），把它算进来会让每个候选都"命中原位那条"。
+  const content = prims.filter((prim) => (prim.k === 'poly' || prim.k === 'fill') && prim.layer === 'F-CAB-HW');
+  if (content.length === 0 || !prims.some((prim) => prim.k === 'text')) return { prims, moved: [], kept: [] };
+  const hits = (prim: Prim): boolean =>
+    lintPrims([...content, prim], scope).some((issue) => issue.code === 'DRAW_TEXT_OVER_CONTENT');
+  const out = prims.slice();
+  const boxes = prims.map(extentBox);
+  const bounds = boxes.reduce((a, b) => ({
+    x0: Math.min(a.x0, b.x0), x1: Math.max(a.x1, b.x1), y0: Math.min(a.y0, b.y0), y1: Math.max(a.y1, b.y1), text: '',
+  }));
+  const moved: string[] = [];
+  const kept: string[] = [];
+  for (let index = 0; index < out.length; index += 1) {
+    const prim = out[index]!;
+    if (prim.k !== 'text' || !hits(prim)) continue;
+    const step = Math.max(40, prim.size * 0.95);
+    let placed: Prim | null = null;
+    for (let ring = 1; ring <= 8 && !placed; ring += 1) {
+      for (const [dx, dy] of AVOID_DIRS) {
+        const candidate: Prim = { ...prim, p: { x: prim.p.x + dx * step * ring, y: prim.p.y + dy * step * ring } };
+        const box = extentBox(candidate);
+        if (box.x0 < bounds.x0 || box.x1 > bounds.x1 || box.y0 < bounds.y0 || box.y1 > bounds.y1) continue;
+        if (hits(candidate)) continue;
+        const clash = out.some((other, otherIndex) => otherIndex !== index && other.k === 'text' && boxOverlap(box, boxes[otherIndex]!, 18));
+        if (clash) continue;
+        placed = candidate;
+        break;
+      }
+    }
+    if (placed) {
+      out[index] = placed;
+      boxes[index] = extentBox(placed);
+      moved.push(prim.text);
+    } else {
+      kept.push(prim.text);
+    }
+  }
+  return { prims: out, moved, kept };
+}
+
+interface ExtentBox { x0: number; x1: number; y0: number; y1: number; text: string }
+
+/** 与 lintPrims 同源的占位范围（字按字宽、图形按顶点）。 */
+function extentBox(prim: Prim): ExtentBox {
+  const points = primVisualExtent(prim);
+  return {
+    x0: Math.min(...points.map((point) => point.x)),
+    x1: Math.max(...points.map((point) => point.x)),
+    y0: Math.min(...points.map((point) => point.y)),
+    y1: Math.max(...points.map((point) => point.y)),
+    text: prim.k === 'text' ? prim.text : '',
+  };
+}
+
+/** 8 方向；先上、左、右、下，再四角（标注往上让最不挡图）。 */
+const AVOID_DIRS: Array<[number, number]> = [[0, 1], [-1, 0], [1, 0], [0, -1], [-1, 1], [1, 1], [-1, -1], [1, -1]];
 
 export interface RoomBookCabinet {
   id: string;
@@ -322,6 +422,8 @@ export interface RoomBook {
     hardwarePieces: number;
     purchased: number;
   }>;
+  /** 导出自动避让记录：INFO=挪开的压字，WARNING=四周无空位、只能保留原位的压字。 */
+  notices: Issue[];
   totals: { cabinets: number; panelKinds: number; panelPieces: number; purchased: number };
 }
 
@@ -471,6 +573,33 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
    */
   const projectViews = buildProjectViews(project, rules);
 
+  /**
+   * 导出前先避让压字：挪开的记 INFO（挪了几条要能追溯），挪不动的留原位记 WARNING。
+   * 只作用于印刷面（平面页 / 整房页 / 柜体页 / 共享板页）。
+   */
+  const notices: Issue[] = [];
+  const avoid = (prims: Prim[], view: string, target: string, targetKind: Issue['targetKind'] = 'cabinet'): Prim[] => {
+    const result = avoidTextOverContent(prims, { view, target });
+    if (result.moved.length > 0) {
+      notices.push({
+        severity: 'INFO',
+        code: 'DRAW_TEXT_AUTO_MOVED',
+        target,
+        targetKind,
+        message: view + '：自动挪开 ' + result.moved.length + ' 条压在线条上的文字（' + result.moved.join('、') + '）',
+      });
+    }
+    if (result.kept.length > 0) {
+      notices.push({
+        severity: 'WARNING',
+        code: 'DRAW_TEXT_MOVE_BLOCKED',
+        target,
+        targetKind,
+        message: view + '：' + result.kept.length + ' 条文字压在示意线上且四周无空位，已保留原位（' + result.kept.join('、') + '）',
+      });
+    }
+    return result.prims;
+  };
   const sections: RoomBookSection[] = groupByRoom(project).map((group) => {
     const callouts = buildRoomPlanCallouts(group.cabinets);
     const mapTags = new Map(callouts.labels.map((label) => [label.cabinetId, label.tag]));
@@ -512,11 +641,11 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     return {
     roomId: group.room.id,
     roomName: group.room.name,
-    layoutSvg: primsToSvg([...cleanLayoutPrims, ...callouts.prims], 'room-layout'),
+    layoutSvg: primsToSvg(avoid([...cleanLayoutPrims, ...callouts.prims], group.room.name + '·平面布局', group.room.id), 'room-layout', LAYOUT_SLOT_MM),
     layoutSafetyNote,
     elevationSvg: elevation.rendered > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
     elevationSkipped: elevation.skipped,
-    roomSheetSvg: roomWholeSheet ? primsToSvg(roomWholeSheet.prims, 'dwg-sheet room-whole-sheet') : null,
+    roomSheetSvg: roomWholeSheet ? primsToSvg(avoid(roomWholeSheet.prims, group.room.name + '·整体柜', group.room.id), 'dwg-sheet room-whole-sheet', SHEET_SLOT_MM) : null,
     /**
      * ★ 遍历粒度从"柜体"改为"上下叠放组"。
      *   同一个组只出一页（sheetGroup.cabinets 可能含 2 个以上柜体）。
@@ -632,7 +761,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
         panelPieces: generated?.stats.totalPieces ?? 0,
         hardware: (generated?.hardware ?? []).map((item) => ({ nameZh: item.nameZh, qty: item.qty, spec: item.spec })),
         purchased: generated?.purchased ?? [],
-        sheetSvg: primsToSvg(sheet.prims, 'dwg-sheet'),
+        sheetSvg: primsToSvg(avoid(sheet.prims, group.room.name + '·' + cabinet.name, cabinet.id), 'dwg-sheet', SHEET_SLOT_MM),
       };
     }),
   };
@@ -674,9 +803,10 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
         });
         prims.push({ k: 'poly', pts: points, closed: true, layer: 'PANEL_SHARED_HOLE', lw: 1.5 });
       }
-      return { ...panel, sheetSvg: primsToSvg(prims, 'shared-panel-sheet') };
+      return { ...panel, sheetSvg: primsToSvg(avoid(prims, panel.name + '·共享板', panel.id, 'panel'), 'shared-panel-sheet', SHARED_SLOT_MM) };
     }),
     summary,
+    notices,
     totals: {
       cabinets: summary.length,
       panelKinds: summary.reduce((sum, item) => sum + item.panelKinds, 0),

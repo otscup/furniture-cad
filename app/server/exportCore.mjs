@@ -23,6 +23,7 @@ const EMIT_NEUTRAL_TS = join(ROOT, 'scripts', 'emit-neutral.ts');
 const EMIT_ROOMBOOK_TS = join(ROOT, 'scripts', 'emit-roombook.ts');
 const VALIDATE_EXPORT_TS = join(ROOT, 'scripts', 'validate-export.ts');
 const LINT_DRAWING_TS = join(ROOT, 'scripts', 'lint-drawing.ts');
+const VIEWS_CLI_TS = join(ROOT, 'scripts', 'views-cli.ts');
 const EXPORT_DXF_PY = join(ROOT, 'py', 'export_dxf.py');
 const TS_NODE_ARGS = Number(process.versions.node.split(".")[0]) >= 22 ? ["--experimental-strip-types", "--no-warnings"] : ["--no-warnings"];
 
@@ -297,6 +298,35 @@ export async function exportPdf(project, { modelVersion = 'unknown', layoutRoomI
 export async function lintDrawing(project, { rulesPath } = {}) {
   const { out } = await run(process.execPath, [...TS_NODE_ARGS, LINT_DRAWING_TS], {
     input: JSON.stringify({ project, ...(rulesPath ? { rulesPath } : {}) }),
+  });
+  return JSON.parse(out);
+}
+
+/**
+ * 读回图纸：list = 有哪些柜/视图，prims = 某个视图的全部图元。
+ *
+ * 这是 19 个只写工具缺的那一半 —— 没有它，任何模型画完都只能靠猜。
+ * 同样在 TS 子进程里从语义模型重算，不接受客户端图元。
+ */
+export async function drawingViews(project, { cabinetId, view, op = 'list', rulesPath } = {}) {
+  const { out } = await run(process.execPath, [...TS_NODE_ARGS, VIEWS_CLI_TS], {
+    input: JSON.stringify({ op, project, ...(cabinetId ? { cabinetId } : {}), ...(view ? { view } : {}), ...(rulesPath ? { rulesPath } : {}) }),
+  });
+  return JSON.parse(out);
+}
+
+/**
+ * 把某个视图渲成 PNG（无头 Chrome 截图），返回落盘路径。
+ *
+ * 只做"看得见"，不做导出校验：图有错也要能看见错在哪，这和`assertExportable`是两件事。
+ */
+export async function renderView(project, { cabinetId, view, widthPx, outDir, rulesPath } = {}) {
+  const { out } = await run(process.execPath, [...TS_NODE_ARGS, VIEWS_CLI_TS], {
+    input: JSON.stringify({
+      op: 'png', project,
+      ...(cabinetId ? { cabinetId } : {}), ...(view ? { view } : {}),
+      ...(widthPx ? { widthPx } : {}), ...(outDir ? { outDir } : {}), ...(rulesPath ? { rulesPath } : {}),
+    }),
   });
   return JSON.parse(out);
 }

@@ -53,6 +53,22 @@
 `verify:print-space` 之前**没有 npm 入口**，只有文件没人跑；这次加进 `package.json`
 和 `verify:all`，它才算真的门。
 
+## 全量基线（121 套，逐套跑，2026-10-29 12:35）
+
+113 通过 / 8 失败，全部与本改动无关：
+
+- 7 套浏览器 UI 套件（`verify:ui`、`agent-room-sync-ui`、`historical-unit-id-readonly-ui`、
+  `shared-panel-browser-acceptance`、`room-workspace-cabinet-groups-ui`、
+  `room-workspace-roombook-identity`、`export-snapshot-ui`）：本机没有 `app/data/` 工作区文件，
+  匿名运行 `/api/workspace` 走 `allowCreate=false` 分支返回 500 `WORKSPACE_UNAVAILABLE`
+  （`server/server.mjs` → `workspaceHost.mjs`）。此前已用 stash 在 HEAD 上复现过，非本次引入。
+- `verify:vision-probe` 的"带图请求成功"：网关侧图片通道，与图纸无关。
+- 曾判为"网关抖动"的 `verify:agent-cache` / `agent-cache-mutations` 这一轮**全绿**。
+
+**坑（记下来别再踩）**：残留的 `node serve.mjs` 会占住 8791，后续 UI 套件变成
+`EADDRINUSE / listenInCluster` 而不是真实断言的失败 —— 看到这种尾巴先
+`Get-NetTCPConnection -State Listen`，别急着改代码。
+
 ## 明确没做
 
 - 板件名（左/右侧板、顶板、踢脚板）仍然横跨自己那块 18mm 板的两条边线 —— 这是制图惯例

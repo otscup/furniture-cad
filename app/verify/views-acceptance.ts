@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import type { BBox, Cabinet, Prim, RuleSet, Vec2 } from '../src/core/types.ts';
+import type { BBox, Cabinet, CabinetParams, Prim, RuleSet, UnitSpec, Vec2 } from '../src/core/types.ts';
 import { computeCabinetLayout, doorWidths } from '../src/core/geometry/layout.ts';
 import { buildCabinetViews, buildProjectViews, estimateTextWidth, type ViewSet } from '../src/core/geometry/views.ts';
 import { lintPrims } from '../src/core/geometry/drawingLint.ts';
@@ -766,6 +766,59 @@ ok(
   'I7 内部图的文字没有被衣物/五金示意线条穿过（避让器知道内容在哪）',
   inkHits.length === 0,
   inkHits.map((i) => i.message).join('；')
+);
+
+// ─────────────────── K. 包柱 / 柜底灯带 / 窄柜 / 电器柜 ───────────────────
+
+section('K. 包柱高柜、柜底灯带、窄柜与电器柜的特殊画法');
+
+/**
+ * 这四类都是用户看图提的：柱子包进柜子里要看得出来、吊柜底下有灯带、
+ * 300 宽小柜内部图挤成一团、冰箱柜不该标"左侧板"。
+ * 它们的共同点是"该画的画、不该画的不画"，正好是负样本最好写的一类。
+ */
+const mk = (params: Partial<CabinetParams>, units?: UnitSpec[]): Cabinet =>
+  createCabinet({ name: '试件', roomId: project.rooms[0].id, x: 0, y: 0, rules, params, units });
+const internalOf = (c: Cabinet): Prim[] => buildCabinetViews(c, rules).prims.internal;
+const countLayer = (list: Prim[], layer: string): number => list.filter((p) => p.k !== 'text' && p.layer === layer).length;
+
+const colParams: Partial<CabinetParams> = { width: 600, height: 2400, columnWrap: { width: 600, depth: 500, height: 2400 } };
+const colIv = internalOf(mk(colParams));
+const plainIv = internalOf(mk({ width: 600, height: 2400 }));
+ok(
+  'K1 包柱柜的内部图用剖面线把柱体画成实心块，无包柱的同尺寸柜没有这批线',
+  countLayer(colIv, 'F-CAB-HIDDEN') >= 8 && countLayer(plainIv, 'F-CAB-HIDDEN') <= 2,
+  `包柱 ${countLayer(colIv, 'F-CAB-HIDDEN')} 条 / 对照 ${countLayer(plainIv, 'F-CAB-HIDDEN')} 条`
+);
+ok(
+  'K2 包柱柜不排层板、不画衣物（柱子里没有空间）',
+  countLayer(colIv, 'F-CAB-HW') === 0 && !colIv.some((p) => p.k === 'text' && p.text.startsWith('层板')),
+  `五金线 ${countLayer(colIv, 'F-CAB-HW')} 条`
+);
+const ledOn = buildCabinetViews(mk({ width: 1200, height: 900, underLight: true }), rules).prims.front;
+const ledOff = buildCabinetViews(mk({ width: 1200, height: 900 }), rules).prims.front;
+ok(
+  'K3 柜底灯带 = 前视图底部多出 2 条横线（underLight 有/无之差恰好 2）',
+  countLayer(ledOn, 'F-CAB-HW') - countLayer(ledOff, 'F-CAB-HW') === 2,
+  `${countLayer(ledOn, 'F-CAB-HW')} - ${countLayer(ledOff, 'F-CAB-HW')}`
+);
+const narrowIv = internalOf(mk({ width: 320, height: 1400 }, [{ id: 'u1', kind: 'open', requestedWidth: 320 }]));
+const wideIv = internalOf(mk({ width: 1200, height: 1400 }, [{ id: 'u1', kind: 'open', requestedWidth: 1200 }]));
+ok(
+  'K4 窄柜（320 宽）内部图不硬塞标注，同结构宽柜照常标注（宁可不标也不压字）',
+  narrowIv.filter((p) => p.k === 'text').length === 0 && wideIv.filter((p) => p.k === 'text').length > 0,
+  `窄 ${narrowIv.filter((p) => p.k === 'text').length} 字 / 宽 ${wideIv.filter((p) => p.k === 'text').length} 字`
+);
+const appIv = internalOf(
+  mk({ width: 800, height: 2000 }, [
+    { id: 'u1', kind: 'appliance', requestedWidth: 800, appliance: { name: '冰箱', openingWidth: 760, openingHeight: 1800, openingDepth: 600, topDrawers: 0 } },
+  ])
+);
+const appNames = appIv.filter((p) => p.k === 'text').map((p) => (p.k === 'text' ? p.text : ''));
+ok(
+  'K5 电器柜内部图不标板件名（没有左侧板/底板/踢脚板可标，标了就是假图）',
+  !appNames.some((t) => t.includes('左侧板') || t.includes('底板') || t.includes('踢脚板')),
+  appNames.join(' | ')
 );
 
 // ─────────────────────── J. 图幅包围盒必须覆盖"看得见的东西" ───────────────────────

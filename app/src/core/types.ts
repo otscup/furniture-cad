@@ -317,6 +317,23 @@ export interface CabinetParams {
    * 与"结构异形走图元扩展"严格分流（见方案文档 §2.3 / §7）。
    */
   finishedEnds?: 'none' | 'left' | 'right' | 'both';
+  /**
+   * 柜内包柱（现场结构柱落在柜体范围内）。
+   *
+   * 餐边柜/衣柜做在客厅承重柱前面时，柜体把柱子整个包起来 —— 柱体占住内空，
+   * 那个位置**放不了层板**。此前模型没有这个语义，包柱柜只能画成一个空腔，
+   * 客户看图会以为里面还有储物空间。
+   * 尺寸以柜体背左角为原点、单位 mm；给了这个字段，内部图按剖切画成实心块并标注，
+   * 且该柜不排层板（见 views.ts 的层板守卫）。
+   */
+  columnWrap?: { width: number; depth: number; height: number };
+  /**
+   * 柜底灯带（吊柜底面朝下的外挂灯条）。
+   *
+   * 与 `shelves.ledStrip` 不是一回事：那个是**层板**上的灯槽、只在开放格可见；
+   * 这个是柜体**底沿下方**一条灯带，照下面的台面/壁龛，外观图与内部图都画。
+   */
+  underLight?: boolean;
 }
 
 export interface DrawerSpec {

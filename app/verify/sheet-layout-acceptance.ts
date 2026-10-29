@@ -163,6 +163,21 @@ section('3. 立面外观图：地柜与吊柜在同一张图、按真实标高�
     `lower.maxY=${Math.round(lowerOfFirst.maxY)} upper.minY=${Math.round(upperOfFirst.minY)}`);
   ok('地柜顶(800+100)与吊柜底(1500)之间的真实间隙被保留', upperOfFirst.minY - lowerOfFirst.maxY > 100,
     `gap=${Math.round(upperOfFirst.minY - lowerOfFirst.maxY)}`);
+
+  /**
+   * 用户要求「图纸只要 3 视图」。地柜 + 吊柜同页曾经被拆成
+   * 「地柜平面俯视图」+「吊柜平面俯视图」左右两张，共 4 个视图；
+   * 现在一律只出单个「俯视图」（内容 = 全部柜体的 top 视图）。
+   */
+  const allTitles = (sheet.prims.filter((p) => p.k === 'text') as Array<{ text: string }>).map((p) => p.text);
+  const viewTitles = allTitles.filter((t) => t === '俯视图' || t === '外观正面图' || t === '内部结构图');
+  ok('★ 地柜+吊柜同页仍是 3 视图：唯一「俯视图」+「外观正面图」+「内部结构图」，没有地柜/吊柜平面俯视图',
+    viewTitles.length === 3 && allTitles.filter((t) => t === '俯视图').length === 1
+      && !allTitles.some((t) => t.includes('地柜平面俯视图') || t.includes('吊柜平面俯视图')),
+    `视图标题：${viewTitles.join(' | ')}`);
+  ok('★ 单个俯视图仍然落在图幅上（有 bbox，不是被裁掉）',
+    sheet.views.plan !== null && sheet.views.plan.w > 0 && sheet.views.plan.h > 0,
+    JSON.stringify(sheet.views.plan));
 }
 
 // ═══════════════ 4. 文字不重叠（侧栏重叠事故回归）═══════════════

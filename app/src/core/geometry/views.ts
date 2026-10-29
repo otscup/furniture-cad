@@ -632,6 +632,12 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   const rowCtxs: RowCtx[] = L.rows.map((r) => ({ units: r.units, nets: r.nets, unitX0: r.unitX0, z0: r.z0, netH: r.netH }));
   /** 是否多行柜 —— 只用来决定**文案**（行标签前缀、逐行净宽清单），不参与任何几何计算 */
   const multiRow = L.rows.length > 1;
+  /**
+   * 整柜都是嵌入式电器格（冰箱柜）—— 只画外框与电器洞口净空，
+   * 不画板件骨架，也不标板件名：那种柜子内部没有侧板/层板可标，
+   * 标上去是假的（第一版图纸里冰箱柜内部图就标了"左侧板/底板/踢脚板"）。
+   */
+  const applianceOnly = L.rows.every((r) => r.units.length > 0 && r.units.every((u) => u.kind === 'appliance'));
 
   /**
    * 层板在 X 方向的真实跨度 —— 与板件清单严格同源。
@@ -983,6 +989,31 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   }
   I.rect(0, W, 0, H, L_FRAME, 1.8);
   drawFrontLike(I, false);
+  /**
+   * 柜内包柱：柱体按剖切画成实心块（浅填充 + 外框 + 一条对角虚线）。
+   * 贴在柜体背左角、按真实尺寸落位 —— 这是现场尺寸，不是设计尺寸，
+   * 所以既不写进板件清单，也不参与层板排布（见 drawFrontLike 的层板守卫）。
+   */
+  if (p.columnWrap) {
+    const cwCol = Math.min(p.columnWrap.width, W - 2 * t);
+    const chCol = Math.min(p.columnWrap.height, innerTopZ - innerBottomZ);
+    // 用"隐藏线"图层：柱体在柜内、被门板遮住，制图上也归隐藏线；
+    // 同时它不参与文字避让器的"内容线"登记（那是衣物的口径），标注可以压在柱体中间。
+    I.fillRect(t, t + cwCol, innerBottomZ, innerBottomZ + chCol, L_HIDDEN, 0.14);
+    I.rect(t, t + cwCol, innerBottomZ, innerBottomZ + chCol, L_HIDDEN, 1.3);
+    // 单柜视图有「结构柱」文字，但**图册视图会把内部图的文字整批去掉**
+    // （furnitureSheet.buildRawView 里 viewKind==='internal' 过滤 p.k==='text'），
+    // 柱体必须靠自己说明白：铺 45° 剖面线（制图里实心构件就是这么画的）。
+    const hz0 = innerBottomZ;
+    const hz1 = innerBottomZ + chCol;
+    const hx0 = t;
+    const hx1 = t + cwCol;
+    for (let c = hz0 - hx1; c < hz1 - hx0; c += 160) {
+      const xa = Math.max(hx0, hz0 - c);
+      const xb = Math.min(hx1, hz1 - c);
+      if (xb - xa > 20) I.line(xa, xb, xa + c, xb + c, L_HIDDEN, 0.6);
+    }
+  }
   drawLifestyleItems(I);
   const labelUnfitted = drawInternalLabels(I, prims.internal);
 
@@ -1262,6 +1293,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
 
   function drawLifestyleItems(P: ViewPainter): void {
+    // 包柱柜：内空整块被柱子占了，没有地方放被子/折衣/挂衣 —— 画上去等于告诉客户"里面能储物"
+    if (p.columnWrap) return;
     const LW = 0.7;
     // 柜体是否算"高柜"（衣柜/顶柜语境）：总高 ≥ 1800
     const isTallCab = H >= 1800;
@@ -1572,7 +1605,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
 
     // 电器柜（冰箱等嵌入式电器）：只画最外框线表示嵌入位置，不画任何板件线，前面完全敞开
     // 用户反馈：冰箱外面不应有柜子包住
-    const isApplianceCab = L.rows.every((r) => r.units.length > 0 && r.units.every((u) => u.kind === 'appliance'));
+    const isApplianceCab = applianceOnly;
     if (isApplianceCab) {
       P.rect(0, W, 0, H, L_VIEW, 1);
     } else {
@@ -1627,7 +1660,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         const openUnit = !u.doors && !u.drawers; // 开放格：外观图上能看见内部
 
         // 层板：只在内部图，或门板图的开放格里画。行内层板按**本行净高**均分。
-        if (u.shelves && u.shelves.count > 0 && (!withFronts || openUnit)) {
+        // 包柱柜内空被柱子占住 → 一块层板都排不了（否则层板线穿过柱体，图上是错的）
+        if (u.shelves && u.shelves.count > 0 && !p.columnWrap && (!withFronts || openUnit)) {
           const s = shelfSpanXIn(ctx, i);
           const tilt = u.shelves.tilt ?? 0;
           const span = s.b - s.a;
@@ -2008,6 +2042,19 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       }
     }
 
+    /**
+     * 柜底灯带（外挂灯条）：在柜体底沿**下方**画两条很近的横线。
+     *
+     * 与层板灯带（shelves.ledStrip）分开：那个是层板上的槽、只在开放格可见；
+     * 这个装在柜底朝下，外观图和内部图都看得见，所以不加 openUnit 守卫。
+     */
+    if (p.underLight) {
+      const y1 = bodyLift - 14;
+      const y2 = bodyLift - 26;
+      P.line(t, W - t, y1, y1, L_HW, 1.1);
+      P.line(t, W - t, y2, y2, L_HW, 1.1);
+    }
+
     if (!withFronts) {
       // 背板在正视图方向被完全遮挡 → 只画内空轮廓，提示"这里还有一层板"
       P.rect(t, W - t, innerBottomZ, innerTopZ, L_HIDDEN, 0.9, HIDDEN_DASH);
@@ -2032,6 +2079,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
    * 结果由 verify/views-acceptance.ts 与浏览器探针各自用**真实的文字宽度**断言。
    */
   function drawInternalLabels(P: ViewPainter, content: Prim[]): string[] {
+    // 整柜电器格：内部就是一个洞口，没有板件可标（标了就是假的）
+    if (applianceOnly) return [];
     const midZ = (bodyLift + H) / 2;
     const placer = new LabelPlacer();
     // 衣物/五金示意是"内容线"，不是标签：先把它们的包围盒登记进来，
@@ -2042,6 +2091,13 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
       const ys = q.pts.map((pt) => pt.y - fy);
       placer.reserveBox(Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys), 'content');
     }
+    /**
+     * 很窄的柜（<480，如 300 宽的吊柜）：内部图只有 300mm 宽，
+     * 竖排「左侧板」占掉 140mm、横排「层板 ×2」再占 260mm，怎么让都会压在一起。
+     * 这种柜子宁可不标板件名 —— 板件清单和柜体信息表里都写着，图纸要能读得清。
+     */
+    const narrow = W < 480;
+    if (narrow) return [];
     const put = (x: number, y: number, s: string, size: number, layer: string, align: Align, rot = 0): void => {
       const ny = placer.fit(x, y, s, size, align, rot, 0, H);
       P.text(x, ny, s, size, layer, align, rot);
@@ -2055,6 +2111,13 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     put(t / 2, midZ, '左侧板', 118, L_TEXT, 'c', 90);
     put(W - t / 2, midZ, '右侧板', 118, L_TEXT, 'c', 90);
 
+    // ②a 包柱：柱体在内部图里是剖切实心块，名字写在块中央（尺寸见柜体信息表）
+    if (p.columnWrap) {
+      const cwCol = Math.min(p.columnWrap.width, W - 2 * t);
+      const chCol = Math.min(p.columnWrap.height, innerTopZ - innerBottomZ);
+      put(t + cwCol / 2, innerBottomZ + chCol / 2, '结构柱', 100, L_TEXT, 'c');
+    }
+
     // ②b 见光板（Phase E 表达异形）：外露端板做 R36 圆弧，标签贴在该端板顶部
     const feLbl = p.finishedEnds ?? 'none';
     if (feLbl === 'left' || feLbl === 'both') put(t / 2, H - 220, '见光板 R36', 95, L_TEXT, 'c');
@@ -2064,7 +2127,8 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
     // 避让器优先向上让，如果先放底板，踢脚板的标签会被顶到 245 那条线以上，
     // 于是图上出现"踢脚板在底板上面"的倒序 —— 那是会误导人的。先放踢脚板，
     // 被顶上去的就变成底板，读数顺序与实物上下一致。
-    put(W / 2, bodyLift / 2, `踢脚板 H=${bodyLift}`, 108, L_TEXT, 'c');
+    // 落地柜才有踢脚板；吊柜 bodyLift=0，标一句"踢脚板 H=0"是假的，而且会跟底板压字
+    if (bodyLift > 0) put(W / 2, bodyLift / 2, `踢脚板 H=${bodyLift}`, 108, L_TEXT, 'c');
     put(W / 2, bodyLift + t / 2, '底板', 118, L_TEXT, 'c');
     put(W / 2, H - t / 2, '顶板', 118, L_TEXT, 'c');
 
@@ -2088,7 +2152,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
         const rowTag = multiRow ? `R${ri + 1} ` : '';
 
-        if (u.shelves && u.shelves.count > 0) {
+        if (u.shelves && u.shelves.count > 0 && !p.columnWrap) {
           const positions = equalSpacing(ctx.netH, u.shelves.count);
           const zLow = ctx.z0 + positions[0]!;
           const tilt = u.shelves.tilt ?? 0;
@@ -2105,9 +2169,9 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
           const rodNoteZ = H >= 1800 ? ctx.z0 + 160 : rodLabelZ + 190;
           put(cx, rodNoteZ, `挂衣杆 · 距内底 ${effectiveRodZ(u, ctx.netH, rules)}`, 108, L_HW, 'c');
         }
-        if (u.doors) {
-          // 不带「（已移开）」：那句话让标签 1014mm 宽、跨出分区并压住挂衣区，
-          // 而「移去门 / 抽面」视图注已经写明。
+        // 门板数量只在**高柜**里标：矮柜（餐边柜/吊柜 H<1200）内部图本来就窄，
+        // 这行字一定和底板/中立板/抽屉面板抢同一块地方，而外观图上几扇门一眼就数得清。
+        if (u.doors && H >= 1600) {
           put(cx, ctx.z0 + ctx.netH - 620, `${rowTag}门板 ×${u.doors.count}`, 108, L_TEXT, 'c');
         }
       });

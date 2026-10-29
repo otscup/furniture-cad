@@ -27,6 +27,7 @@ import type { Cabinet, DrawingEntity, Prim, Project, Room, RuleSet, Vec2 } from 
 import { buildCabinetViews, buildProjectViews, DimLayout, type ProjectViewSet } from '../core/geometry/views.ts';
 import { drawingEntityPrims } from '../core/drawingEdits.ts';
 import { computeCabinetLayout, doorWidths } from '../core/geometry/layout.ts';
+import { estimateTextWidth } from '../core/geometry/labels.ts';
 import { allUnits } from '../core/layoutModel.ts';
 import { indexProjectRooms } from '../core/roomIndex.ts';
 
@@ -563,12 +564,8 @@ export function buildFurnitureSheet(
 
   const unfoldedX = computeUnfoldedWallX(cabinets);
   const xOf = (c: Cabinet): number => unfoldedX.get(c.id) ?? c.placement.x;
-  const baseCabs = cabinets.filter((c) => classifyCabinet(c) === 'base');
-  const wallCabs = cabinets.filter((c) => classifyCabinet(c) === 'wall');
-  const tallCabs = cabinets.filter((c) => classifyCabinet(c) === 'tall');
-  const planCabs = [...baseCabs, ...tallCabs];
   /**
-   * ★ 整份项目的四视图（供 drawingEdits 坐标换算用）──
+   * ★ 整份项目的全部视图（供 drawingEdits 坐标换算用）──
    *
    * ★ 性能：这里曾经是 O(R×N²) 爆炸的根源 ──
    *   buildProjectViews 会给**项目里每只柜**各跑一次 buildCabinetViews，
@@ -586,19 +583,16 @@ export function buildFurnitureSheet(
   const projectViews = opts.projectViews ?? buildProjectViews(project, rules);
   const drawings = project.drawingEdits ?? [];
 
-  const planBase = buildRawView(planCabs, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);
-  const planWall = buildRawView(wallCabs, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);
-  // 只有同时存在地柜/高柜与吊柜时才分左右双俯视图（地柜平面结构图 + 吊柜平面结构图）；否则将整体俯视图居中置于上排
-  const hasDualPlan = planCabs.length > 0 && wallCabs.length > 0;
-  const planSingle = !hasDualPlan ? buildRawView(cabinets, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX) : null;
+  // 只出单个俯视图：内容 = 全部柜体的 top 视图，居中置于上排
+  const planSingle = buildRawView(cabinets, 'top', rules, () => 0, drawings, projectViews.placements, unfoldedX);
   const mountY = (cab: Cabinet) => cab.params.mountHeight ?? 0;
   const elevFront = buildRawView(cabinets, 'front', rules, mountY, drawings, projectViews.placements, unfoldedX);
   const elevInternal = buildRawView(cabinets, 'internal', rules, mountY, drawings, projectViews.placements, unfoldedX);
 
-  // ── 缩放：四视图统一缩放，确保占满 70%+ 页面 ──
+  // ── 缩放：三视图统一缩放，确保占满 70%+ 页面 ──
   const availViewW = (DRAW_W - VIEW_GAP_X) / 2;
-  const contentMaxW = Math.max(planSingle?.w ?? 0, planBase.w, planWall.w, elevFront.w, elevInternal.w, 1);
-  const contentPlanH = Math.max(planSingle?.h ?? 0, planBase.h, planWall.h, 1);
+  const contentMaxW = Math.max(planSingle.w, elevFront.w, elevInternal.w, 1);
+  const contentPlanH = Math.max(planSingle.h, 1);
   const contentElevH = Math.max(elevFront.h, elevInternal.h, 1);
 
   const sW = availViewW / contentMaxW;
@@ -640,8 +634,8 @@ export function buildFurnitureSheet(
     frontDimBand = Math.max(BASE_FRONT_DIM_BAND, frontDimensionProbe.outermostOffset('top') + PLAN_BOTTOM_RESERVE);
   }
 
-  // 2x2 布局：
-  //   上排：planBase (左) | planWall (右)
+  // 三视图布局：
+  //   上排：plan（单个俯视图，整幅居中）
   //   下排：elevFront (左) | elevInternal (右)
   //
   // 垂直排布（Y 轴向上，从下往上）：
@@ -671,12 +665,7 @@ export function buildFurnitureSheet(
     return { x: tx, y: ty, w: (bb.maxX - bb.minX) * s, h: (bb.maxY - bb.minY) * s };
   };
 
-  const pbBox = planSingle
-    ? placeScaled(planSingle, DRAW_X + (DRAW_W - planSingle.w * s) / 2, planY)
-    : placeScaled(planBase, DRAW_X, planY);
-  const pwBox = planSingle
-    ? { x: DRAW_X + DRAW_W / 2, y: planY, w: 0, h: 0 }
-    : placeScaled(planWall, DRAW_X + availViewW + VIEW_GAP_X, planY);
+  const pbBox = placeScaled(planSingle, DRAW_X + (DRAW_W - planSingle.w * s) / 2, planY);
   const efBox = placeScaled(elevFront, DRAW_X, elevY);
   const eiBox = placeScaled(elevInternal, DRAW_X + availViewW + VIEW_GAP_X, elevY);
 
@@ -730,15 +719,9 @@ export function buildFurnitureSheet(
   };
 
   if (pbBox.w > 0) {
-    const pbCabs = planSingle ? cabinets : planCabs;
-    addHDims(pbCabs, pbBox, 'pb');
-    const maxD = Math.max(...pbCabs.map((c) => c.params.depth));
+    addHDims(cabinets, pbBox, 'pb');
+    const maxD = Math.max(...cabinets.map((c) => c.params.depth));
     addVDims(pbBox, `${maxD}`, 'pb');
-  }
-  if (pwBox.w > 0) {
-    addHDims(wallCabs, pwBox, 'pw');
-    const maxD = Math.max(...wallCabs.map((c) => c.params.depth));
-    addVDims(pwBox, `${maxD}`, 'pw');
   }
   addHDims(cabinets, efBox, 'ef');
   addFrontPartitionAndDoorDims(dims, efBox, elevFrontRawBounds, cabinets, doorDimensions, s, frontCabinetX0, unfoldedX);
@@ -779,10 +762,7 @@ export function buildFurnitureSheet(
   // 俯视图标题固定在该视图自身尺寸链下方；不能把较低的立面底部尺寸算进来。
   const planTitleY = planY - 820;
   if (pbBox.w > 0) {
-    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, planSingle ? '俯视图' : '地柜平面俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
-  }
-  if (pwBox.w > 0) {
-    prims.push(textPrim(pwBox.x + pwBox.w / 2, planTitleY, '吊柜平面俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
+    prims.push(textPrim(pbBox.x + pbBox.w / 2, planTitleY, '俯视图', SZ_VIEW_TITLE, L_TEXT, 'c'));
   }
   const elevTitleY = Math.max(BOT_H + 180, minDimYBelow(elevY) - 400);
   prims.push(textPrim(efBox.x + efBox.w / 2, elevTitleY, '外观正面图', SZ_VIEW_TITLE, L_TEXT, 'c'));
@@ -798,8 +778,12 @@ export function buildFurnitureSheet(
       const m = (u.doors as any)?.material as string ?? '';
       return m.toLowerCase().includes('glass');
     }));
-  const hasLed = cabinets.some((cab) =>
-    allUnits(cab.layout).some((u: any) => (u as any).ledStrip && (u as any).ledStrip !== 'none'));
+  // 灯带两个来源：层板上的灯槽（shelves.ledStrip）与柜底外挂灯条（params.underLight）。
+  // 这里原来读的是 unit.ledStrip —— 字段其实在 u.shelves.ledStrip 上，走查了两年没红过，
+  // 因为"灯带居中"这条标注从来没有被画出来过。
+  const hasUnderLight = cabinets.some((cab) => cab.params.underLight === true);
+  const hasLed = hasUnderLight || cabinets.some((cab) =>
+    allUnits(cab.layout).some((u: any) => (u.shelves?.ledStrip ?? 'none') !== 'none'));
   const hasDrawer = cabinets.some((cab) =>
     allUnits(cab.layout).some((u: any) => (u as any).drawers));
   const hasShelf = cabinets.some((cab) =>
@@ -816,8 +800,22 @@ export function buildFurnitureSheet(
   const efTopInY = efBox.y + efBox.h * 0.85;
 
   // 短引线标注：文字在目标正上方 350 处，引线垂直，长度 350
+  //
+  // 红字之间也会互相压字：字高 17mm，正视图上沿那条带只放得下两三行，
+  // 两条标注的目标点挨得近就叠在一起（实测「黑框灰玻」压在「灯带居中」上）。
+  // 所以文字位置要占位：撞了就往上挪一行，引线跟着变长 —— 引线本身就是这么用的。
+  const annotBoxes: Array<{ x0: number; x1: number; y0: number; y1: number }> = [];
+  const annotFree = (b: { x0: number; x1: number; y0: number; y1: number }): boolean =>
+    !annotBoxes.some((o) => !(b.x1 < o.x0 || b.x0 > o.x1 || b.y1 < o.y0 || b.y0 > o.y1));
   const shortAnnot = (px: number, py: number, text: string): void => {
-    const tx = px, ty = py + 350;
+    const tx = px;
+    const halfW = estimateTextWidth(text, SZ_ANNOT) / 2 + 30;
+    let ty = py + 350;
+    for (let k = 0; k < 6; k++) {
+      const box = { x0: tx - halfW, x1: tx + halfW, y0: ty - SZ_ANNOT * 0.8, y1: ty + SZ_ANNOT * 0.8 };
+      if (annotFree(box)) { annotBoxes.push(box); break; }
+      ty += SZ_ANNOT * 1.4;
+    }
     // 短垂直引线
     prims.push(linePrim(tx, ty - 40, px, py, L_ANNOT_RED, 0.8));
     // 目标点小圆点
@@ -837,7 +835,8 @@ export function buildFurnitureSheet(
     shortAnnot(efCX - efBox.w * 0.25, efTopInY, '黑框灰玻');
   }
   if (hasLed) {
-    shortAnnot(efCX, efTopInY - efBox.h * 0.1, '灯带居中');
+    // 0.1 倍高度不够：实测与「黑框灰玻」只差 22mm，两条红字挤成一行读不清
+    shortAnnot(efCX, efTopInY - efBox.h * 0.22, hasUnderLight ? '柜底灯带' : '灯带居中');
   }
   if (hasDrawer) {
     shortAnnot(efCX + efBox.w * 0.2, efBotY, '托底抽');

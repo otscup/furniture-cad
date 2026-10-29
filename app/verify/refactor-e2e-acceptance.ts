@@ -2,7 +2,7 @@
  * 重构全链路端到端验收（P10.3 Refactor E2E Acceptance）：
  *  1. MCP / Agent 绘画过程 SSE 实时推送（GET /api/workspace/stream：init / draft.updated / agent.step / workspace.updated）
  *  2. 云端防空覆盖水位线保护（空本地浏览器打开绝不覆盖云端已画好的模型；手动改图 PUT /api/workspace 同步后直接解锁 PDF/DXF 导出）
- *  3. 吊柜自动排布对齐（X=0 正对地柜上方）+ 整房/整墙一体化 2×2 四视图（地柜平面俯视图 + 吊柜平面俯视图 + 外观正面图 + 内部结构图）+ L 型转角/同高防遮挡展开
+ *  3. 吊柜自动排布对齐（X=0 正对地柜上方）+ 整房/整墙一体化三视图（俯视图 + 外观正面图 + 内部结构图）+ L 型转角/同高防遮挡展开
  *  4. 双图（效果图 + 尺寸图）融合识图 + 存疑项非阻塞导入（先出图后页面微调）+ Shift 拖基准边 + 失效二维覆盖一键清理
  *  5. 聊天框防遮挡三栏全高布局校验
  */
@@ -208,9 +208,11 @@ async function main(): Promise<void> {
 
       const wholeSheet = buildFurnitureSheet(bus.getState().rooms[0]!, cabs, bus.getState(), rules, { furnitureName: '厨房整体柜' });
       const texts = wholeSheet.prims.filter((p) => p.k === 'text').map((p: any) => p.text);
-      ok('整墙 2×2 图纸同时包含「地柜平面俯视图」「吊柜平面俯视图」「外观正面图」「内部结构图」',
-        texts.includes('地柜平面俯视图') && texts.includes('吊柜平面俯视图') && texts.includes('外观正面图') && texts.includes('内部结构图'),
-        texts.filter((t: string) => t.includes('视图') || t.includes('图')).join(' | '));
+      const viewTitles = texts.filter((t: string) => t === '俯视图' || t === '外观正面图' || t === '内部结构图');
+      ok('整墙图纸只要 3 视图：唯一一个「俯视图」+「外观正面图」+「内部结构图」，不再拆地柜/吊柜双俯视',
+        viewTitles.length === 3 && texts.filter((t: string) => t === '俯视图').length === 1
+          && !texts.some((t: string) => t.includes('地柜平面俯视图') || t.includes('吊柜平面俯视图')),
+        texts.filter((t: string) => t.includes('视图')).join(' | '));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -387,12 +389,13 @@ async function main(): Promise<void> {
     ok('人工改图同步后导出整房一体化 PDF 成功（HTTP 200）', pdfRes.status === 200);
     const pdfBytes = Buffer.from(await pdfRes.arrayBuffer());
     mkdirSync(outputDir, { recursive: true });
-    const outPdfPath = join(outputDir, '整房一体化四视图图纸_世园润府对标样例.pdf');
+    const outPdfPath = join(outputDir, '整房一体化三视图图纸_世园润府对标样例.pdf');
     writeFileSync(outPdfPath, pdfBytes);
     const pdfPages = Number(pdfRes.headers.get('X-PDF-Page-Count') ?? 0);
     const pdfText = execFileSync('pdftotext', [outPdfPath, '-'], { encoding: 'utf8' });
-    ok('整房一体化 PDF 仅 1 页（5 台柜体合在一张 A3 图幅，不再拆成 5 页）且包含地柜/吊柜平面俯视图与正面/内部结构图',
-      pdfPages === 1 && pdfText.includes('地柜平面俯视图') && pdfText.includes('吊柜平面俯视图') && pdfText.includes('外观正面图') && pdfText.includes('内部结构图'),
+    ok('整房一体化 PDF 仅 1 页（5 台柜体合在一张 A3 图幅，不再拆成 5 页）且包含俯视图与正面/内部结构图，没有双俯视',
+      pdfPages === 1 && pdfText.includes('俯视图') && pdfText.includes('外观正面图') && pdfText.includes('内部结构图')
+        && !pdfText.includes('地柜平面俯视图') && !pdfText.includes('吊柜平面俯视图'),
       `pages=${pdfPages}, bytes=${pdfBytes.length}`);
 
     // 导出整房一体化 DXF（sheetMode: 'room'）
@@ -410,7 +413,7 @@ async function main(): Promise<void> {
     });
     ok('人工改图同步后导出整房一体化 DXF 成功（HTTP 200）', dxfRes.status === 200);
     const dxfBytes = Buffer.from(await dxfRes.arrayBuffer());
-    const outDxfPath = join(outputDir, '整房一体化四视图图纸_世园润府对标样例.dxf');
+    const outDxfPath = join(outputDir, '整房一体化三视图图纸_世园润府对标样例.dxf');
     writeFileSync(outDxfPath, dxfBytes);
     ok('整房一体化 DXF 文件有效且落盘成功', dxfBytes.length > 5000, `bytes=${dxfBytes.length}`);
 

@@ -79,6 +79,11 @@ section('2. 图纸计划：横向单柜单页，三视图同柜同源');
   ok('仅选择 A 主卧时只输出 A 布局页，且紧邻本房间首张柜体页之前', (onlyA.match(/data-page-kind="layout"/g) ?? []).length === 1 && aLayoutIndex >= 0 && aCabinetIndex > aLayoutIndex && !onlyA.includes('data-page-kind="layout" data-room-id="room_b"'));
   ok('每页保留房间名和柜体名', html.includes('B 书房 / 甲柜') && html.includes('A 主卧 / 南柜') && html.includes('未分配房间 / 孤儿柜'));
   ok('图纸页包含外观正面、内部结构与俯视图标题', html.includes('外观正面图') && html.includes('内部结构图') && html.includes('俯视图'));
+  // 只要 3 视图：每页恰好 1 个「俯视图」，不再有地柜/吊柜两张平面俯视图
+  ok('★ 每页只有 1 个「俯视图」（不拆地柜/吊柜双俯视）',
+    (html.match(/俯视图/g) ?? []).length === pages.length
+      && !html.includes('地柜平面俯视图') && !html.includes('吊柜平面俯视图'),
+    `俯视图标题 ${(html.match(/俯视图/g) ?? []).length} 处 / ${pages.length} 页`);
   ok('默认没有封面、尾页汇总或分解图', !html.includes('版本三件套') && !html.includes('清单汇总') && !html.includes('分解图'));
   ok('打印 CSS 锁定 A3 横向且无页边距', html.includes('@page { size: A3 landscape; margin: 0; }'));
   ok(`版本三件套生成器版本可追溯（${GENERATOR_VERSION}）`, html.includes(GENERATOR_VERSION));

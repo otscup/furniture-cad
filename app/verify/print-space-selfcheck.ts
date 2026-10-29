@@ -94,19 +94,27 @@ if (layout) {
   console.log('   平面页缩放 ' + plan.scale.toFixed(5) + '；线宽 ' + plan.minLine.toFixed(3) + '~' + plan.maxLine.toFixed(3) + 'mm；最小字号 ' + plan.minText.toFixed(2) + 'mm');
 }
 
-// ③ 已知压字：样例柜内部视图有 5 条文字压在挂衣杆/五金示意线上，导出前必须被挪开
+// ③ 真实样例柜：内部视图的压字已在 views.ts 根治（避让器一开始就知道衣物在哪），导出侧不该再有活干
 const source = project.cabinets[0]!;
 const views = buildCabinetViews(source, rules, { x: 0, y: 0, gapTop: 0, gapSide: 0, gapInt: 0 });
 const internal = views.prims.internal!;
-const known = overContent(internal);
-ok('样例柜内部视图确实有压字（自检前提）', known.length > 0, known.length + ' 条：' + known.map((i) => i.message).join(' / '));
-const moved = avoidTextOverContent(internal, { view: source.name + '·internal', target: source.id });
-ok('已知压字被挪开', moved.moved.length > 0, moved.moved.join('、'));
-ok('挪完只剩挪不动的（数量与 kept 对得上，没漏没多）', overContent(moved.prims).length === moved.kept.length, overContent(moved.prims).length + ' 条残留 / kept ' + moved.kept.length);
-ok('挪不动的宽标注确实被记录', moved.kept.length > 0, moved.kept.join('、'));
+ok('样例柜内部视图没有压字（曾 5 处，根治在避让器里）', overContent(internal).length === 0, overContent(internal).map((i) => i.message).join(' / '));
+const idle = avoidTextOverContent(internal, { view: source.name + '·internal', target: source.id });
+ok('没有压字时导出侧一动不动', idle.moved.length === 0 && idle.kept.length === 0, JSON.stringify([idle.moved, idle.kept]));
+
+// ③b 导出侧仍必须真会挪：合成一张"线穿字"的图，挪开后必须干净
+const movable: Prim[] = [
+  { k: 'poly', pts: [{ x: 0, y: 0 }, { x: 1000, y: 0 }, { x: 1000, y: 1400 }, { x: 0, y: 1400 }], closed: true, layer: 'F-CAB', lw: 2.4 },
+  { k: 'poly', pts: [{ x: 0, y: 700 }, { x: 1000, y: 700 }], closed: false, layer: 'F-CAB-HW', lw: 1 },
+  { k: 'text', p: { x: 500, y: 700 }, text: '层板 ×1', size: 100, layer: 'F-TEXT', align: 'c' },
+];
+ok('合成图确实压线（挪字用例不是空转）', overContent(movable).length === 1, String(overContent(movable).length));
+const relocation = avoidTextOverContent(movable, { view: 'T', target: 'c1' });
+ok('压字被挪开且记进 moved', relocation.moved.length === 1 && relocation.kept.length === 0, JSON.stringify([relocation.moved, relocation.kept]));
+ok('挪完之后不压线', overContent(relocation.prims).length === 0, overContent(relocation.prims).map((i) => i.message).join(' / '));
 ok('挪字不是删字（文字条数不变）',
-  moved.prims.filter((p) => p.k === 'text').length === internal.filter((p) => p.k === 'text').length,
-  moved.prims.filter((p) => p.k === 'text').length + '/' + internal.filter((p) => p.k === 'text').length);
+  relocation.prims.filter((p) => p.k === 'text').length === 1,
+  String(relocation.prims.filter((p) => p.k === 'text').length));
 
 // ④ 挪不动：整幅铺满五金示意线时，文字必须留在原位并被记进 kept（不许静默删掉）
 const dense: Prim[] = [

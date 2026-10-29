@@ -57,10 +57,11 @@ for (const cab of project.cabinets ?? []) {
 }
 ok('样例柜真的产出了图元', primsChecked > 0, String(primsChecked));
 ok('样例柜没有派生失败', !real.includes('DRAW_VIEW_BUILD_FAILED'));
-// 已知真缺陷（2026-10-22 看图确认的三段文字压在衣物上）：改好画法后这里会变空，
-// 到那时把断言改成"必须为空"，在此之前它守的是"这三段确实被抓住了"。
-ok('抓到了已知的挂衣杆压字', messages.some((m) => m.includes('挂衣杆')));
-ok('警告数量收敛在个位数（不是一版 21 条的噪音规则）', real.length <= 9, real.length + ' 条：' + [...new Set(real)].join(' / '));
+// 2026-10-22 看图确认的 5 处压字（两块净宽数字、层板、挂衣杆、门板说明）已按根因改掉：
+// 重复的净宽数字删了、避让器开始把衣物当"内容"绕开、放不下的图例删了。
+// 规则本身是否还活着由上面 ①⑥ 两个合成用例守着，这里改成"必须干净"。
+ok('样例柜四个视图一条问题都没有（曾经 5 处压字）', real.length === 0, real.length + ' 条：' + [...new Set(messages)].join(' / '));
+ok('规则不是恒真：合成用例里该报的两条都报了', pass >= 6);
 
 console.log('\n样例柜检查结果：图元 ' + primsChecked + '，问题 ' + real.length + ' 条');
 for (const m of messages) console.log('  - ' + m);

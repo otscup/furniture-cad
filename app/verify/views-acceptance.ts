@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import type { BBox, Cabinet, Prim, RuleSet, Vec2 } from '../src/core/types.ts';
 import { computeCabinetLayout, doorWidths } from '../src/core/geometry/layout.ts';
 import { buildCabinetViews, buildProjectViews, estimateTextWidth, type ViewSet } from '../src/core/geometry/views.ts';
+import { lintPrims } from '../src/core/geometry/drawingLint.ts';
 import { bboxOf } from '../src/core/geometry/transform.ts';
 import { effectiveRodZ } from '../src/core/geometry/generate.ts';
 import { equalSpacing } from '../src/core/allocate.ts';
@@ -753,6 +754,18 @@ ok(
   'I6 避让器没有 "让不开" 的标签（若有，假设清单里必须出现对应警告）',
   !vs.assumptions.some((a) => a.includes('标签没能找到不重叠的位置')),
   vs.assumptions.find((a) => a.includes('标签没能找到不重叠的位置')) ?? ''
+);
+
+// I1/I2 只验"文字不压文字"。真正让用户看不下去的是文字压在**衣物线条**上：
+// 避让器原来只登记标签、不知道衣服在哪，于是把"挂衣杆"从杆上滑进衣服里。
+// 这条把那个根因钉住 —— 一旦有人把内容线从避让器的视野里拿掉，它立刻变红。
+const inkHits = lintPrims(vs.prims.internal, { view: 'internal', target: cab.name, targetKind: 'cabinet' }).filter(
+  (i) => i.code === 'DRAW_TEXT_OVER_CONTENT'
+);
+ok(
+  'I7 内部图的文字没有被衣物/五金示意线条穿过（避让器知道内容在哪）',
+  inkHits.length === 0,
+  inkHits.map((i) => i.message).join('；')
 );
 
 // ─────────────────────── J. 图幅包围盒必须覆盖"看得见的东西" ───────────────────────

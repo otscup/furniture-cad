@@ -984,7 +984,7 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
   I.rect(0, W, 0, H, L_FRAME, 1.8);
   drawFrontLike(I, false);
   drawLifestyleItems(I);
-  const labelUnfitted = drawInternalLabels(I);
+  const labelUnfitted = drawInternalLabels(I, prims.internal);
 
   // ═══════════════ 5. 投影衔接线 ═══════════════
   const hinge: Prim[] = [];
@@ -1394,20 +1394,43 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         // ── 2. 叠放区：层板上画 2-3 条横线表示叠放衣物（无杆的层板格）──
         if (u.shelves && u.shelves.count > 0 && !(u.rod && u.rod.count > 0)) {
           const positions = equalSpacing(rowNH, u.shelves.count);
-          // 在每块层板上方画一叠（取前 2 块板，避免画满）
-          const stackCount = Math.min(2, positions.length);
+          /**
+           * 叠放区画"折好的衣服"，不是三条横线。
+           *
+           * 参考图《世园润府》p5：每层板上并排 2~3 件折衣，每件是**上宽下窄的叶形**
+           * （折边在中间），内部两道斜纹表示厚度。三条裸横线看着像"层板画多了"。
+           *
+           * 尺寸跟层间净空走：净空小就不画（画进去反而糊成一团）。
+           */
+          const stackCount = Math.min(3, positions.length);
           for (let s = 0; s < stackCount; s++) {
             const shelfZ = rowZ0 + positions[s]! + t; // 层板顶面
-            const stackW = Math.min(220, netW * 0.5);
-            const sx = x0 + (netW - stackW) / 2;
-            // 3 条横线 = 一叠衣服
-            for (let l = 0; l < 3; l++) {
-              const lz = shelfZ + 15 + l * 28;
-              // 别顶到上一块板
-              const nextShelfZ = s + 1 < positions.length ? rowZ0 + positions[s + 1]! : rowZ0 + rowNH;
-              if (lz + 10 < nextShelfZ) {
-                P.line(sx, sx + stackW, lz, lz, L_HW, LW);
-              }
+            const nextShelfZ = s + 1 < positions.length ? rowZ0 + positions[s + 1]! : rowZ0 + rowNH;
+            const room = nextShelfZ - shelfZ - 20;
+            const foldH = Math.min(52, room * 0.35);
+            if (foldH < 24) continue;
+            const itemW = Math.min(120, netW / 3.2);
+            const gapW = itemW * 0.18;
+            const n = Math.max(2, Math.min(3, Math.floor(netW / (itemW + gapW))));
+            const rowW = n * itemW + (n - 1) * gapW;
+            const startX = x0 + (netW - rowW) / 2;
+            for (let k = 0; k < n; k++) {
+              const ix = startX + k * (itemW + gapW);
+              const iz = shelfZ + 6;
+              const ix1 = ix + itemW;
+              const iz1 = iz + foldH;
+              // 折衣叶形：上下边略收，左右在 55% 高处外凸（折边）
+              P.poly([
+                { x: ix + itemW * 0.12, y: iz },
+                { x: ix1 - itemW * 0.12, y: iz },
+                { x: ix1, y: iz + foldH * 0.55 },
+                { x: ix1 - itemW * 0.12, y: iz1 },
+                { x: ix + itemW * 0.12, y: iz1 },
+                { x: ix, y: iz + foldH * 0.55 },
+              ], L_HW, LW, true);
+              // 两道折纹 = 厚度
+              P.line(ix + itemW * 0.2, ix1 - itemW * 0.2, iz + foldH * 0.34, iz + foldH * 0.34, L_HW, LW * 0.7);
+              P.line(ix + itemW * 0.2, ix1 - itemW * 0.2, iz + foldH * 0.68, iz + foldH * 0.68, L_HW, LW * 0.7);
             }
           }
           /**
@@ -2008,24 +2031,25 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
    *
    * 结果由 verify/views-acceptance.ts 与浏览器探针各自用**真实的文字宽度**断言。
    */
-  function drawInternalLabels(P: ViewPainter): string[] {
+  function drawInternalLabels(P: ViewPainter, content: Prim[]): string[] {
     const midZ = (bodyLift + H) / 2;
     const placer = new LabelPlacer();
+    // 衣物/五金示意是"内容线"，不是标签：先把它们的包围盒登记进来，
+    // 标签才会绕开挂衣区 —— 否则避让器眼里只有文字，会把"挂衣杆"滑进衣服里。
+    for (const q of content) {
+      if (q.k === 'text' || q.layer !== L_HW) continue;
+      const xs = q.pts.map((pt) => pt.x - ix0);
+      const ys = q.pts.map((pt) => pt.y - fy);
+      placer.reserveBox(Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys), 'content');
+    }
     const put = (x: number, y: number, s: string, size: number, layer: string, align: Align, rot = 0): void => {
       const ny = placer.fit(x, y, s, size, align, rot, 0, H);
       P.text(x, ny, s, size, layer, align, rot);
     };
 
-    // ① 各分区净宽属于顶部那条尺寸链，位置由尺寸链定死：只登记占位，不参与让路。
-    //    **逐行**：尺寸链挂在该行顶面之下（单行柜 = 内空顶面之下，与 v0.2 同位置）。
-    rowCtxs.forEach((ctx) => {
-      const dimZ = ctx.z0 + ctx.netH - 250;
-      for (let i = 0; i < ctx.units.length; i++) {
-        const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
-        placer.reserve(cx, dimZ, `${ctx.nets[i]}`, 108, 'c');
-        P.text(cx, dimZ, `${ctx.nets[i]}`, 108, L_DIM, 'c');
-      }
-    });
+    // ① 各分区净宽不再在这里重复画一遍：图幅上方的那条尺寸链（dims.add 的 partition 链）
+    //    已经逐分区标了净宽。原来这里在 netH-250 又画一次，等于同一串数字出现两遍，
+    //    而且挂衣区的那个正好落在衣服肩膀线上（lint 报 DRAW_TEXT_OVER_CONTENT）。
 
     // ② 侧板：板件又高又窄，横排文字必然伸进分区里压住抽屉说明 —— 竖排贴在板上
     put(t / 2, midZ, '左侧板', 118, L_TEXT, 'c', 90);
@@ -2075,24 +2099,23 @@ export function buildCabinetViews(cab: Cabinet, rules: RuleSet, opts: ViewOpts =
         }
         if (u.rod && u.rod.count > 0) {
           const rodLabelZ = ctx.z0 + effectiveRodZ(u, ctx.netH, rules);
-    put(cx, rodLabelZ + 190, `挂衣杆 · 距内底 ${effectiveRodZ(u, ctx.netH, rules)}`, 108, L_HW, 'c');
+          // 高柜 = 挂衣区，杆上方那条缝只有 150mm 放不下这行字（避让器一档就是一倍字高），
+          // 所以这种格子直接落在杆下方那段空区里，让避让器在衣服之间挑一行 —— 不从杆上往下滑，
+          // 因为它离空区一千多毫米，贪心一次只让 8 档就到不了。
+          const rodNoteZ = H >= 1800 ? ctx.z0 + 160 : rodLabelZ + 190;
+          put(cx, rodNoteZ, `挂衣杆 · 距内底 ${effectiveRodZ(u, ctx.netH, rules)}`, 108, L_HW, 'c');
         }
         if (u.doors) {
-          put(cx, ctx.z0 + ctx.netH - 620, `${rowTag}门板 ×${u.doors.count}（已移开）`, 108, L_TEXT, 'c');
+          // 不带「（已移开）」：那句话让标签 1014mm 宽、跨出分区并压住挂衣区，
+          // 而「移去门 / 抽面」视图注已经写明。
+          put(cx, ctx.z0 + ctx.netH - 620, `${rowTag}门板 ×${u.doors.count}`, 108, L_TEXT, 'c');
         }
       });
     });
 
-    // ⑥ 最长的一句补充说明最后放：它是解释性的，最该给别人让路。
-    // 另外把字数压到 8 个字 —— 原来的"（虚线 = 移去抽屉面板后所见）"
-    // 算出来 1496mm 宽，而抽屉分区净宽只有 582mm，文字会溢出视图左边界 400 多毫米。
-    rowCtxs.forEach((ctx, ri) => {
-      ctx.units.forEach((u, i) => {
-        if (!u.drawers) return;
-        const cx = ctx.unitX0[i]! + ctx.nets[i]! / 2;
-        put(cx, ctx.z0 + ctx.netH * 0.55 - 200, multiRow ? `R${ri + 1} 虚线 = 移去后所见` : '虚线 = 移去后所见', 95, L_TEXT, 'c');
-      });
-    });
+    // ⑥ 原来这里还有一句"虚线 = 移去后所见"图例，串在抽屉分区里。
+    //    它 892mm 宽、抽屉分区只有 582mm，无论怎么让都会压到抽屉说明或左侧板，
+    //    而且这句的意思视图名下方那句注（VIEW_NOTE.internal「移去门 / 抽面」）已经说了 —— 删掉。
 
     // 让不开的标签如实上报（调用方会把它写进假设清单，而不是静默压字）
     return [...placer.unfitted];

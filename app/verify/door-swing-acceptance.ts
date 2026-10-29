@@ -28,6 +28,7 @@ import * as CMD from '../src/core/commands.ts';
 import { createCabinet, defaultCabinetParams, defaultUnits, rectRoom } from '../src/core/docFactory.ts';
 import type { Cabinet, DoorHinge, DoorSwingDirection, Project, Room, Vec2 } from '../src/core/types.ts';
 import { getCabinetFootprint } from '../src/core/geometry/generate.ts';
+import { wallPlanPrims } from '../src/core/geometry/project.ts';
 import { parseProjectFile, resolveSchemaVersion, serializeProjectFile } from '../src/core/projectFile.ts';
 import {
   DOOR_SWING,
@@ -991,6 +992,55 @@ section('§7 UI 与持久化：能设 / 能清 / 重开保留 / 旧项目能开 
     block.slice(0, 160)
   );
 }
+
+  // 51. 平面图必须在洞口处断开 —— 以前墙是一整条实墙，图上永远看不到门洞
+  {
+    const room = mkRoom('r1');
+    const p = withNorthDoor(room, []);
+    const wall = p.rooms[0]!.walls[2]!;
+    const op = wall.openings![0]!;
+    const len = Math.hypot(wall.end.x - wall.start.x, wall.end.y - wall.start.y);
+    const ux = (wall.end.x - wall.start.x) / len;
+    const uy = (wall.end.y - wall.start.y) / len;
+    const mid = op.offset + op.width / 2;
+    const center: Vec2 = { x: wall.start.x + ux * mid, y: wall.start.y + uy * mid };
+    const prims = wallPlanPrims(wall);
+    const solids = prims.filter((x) => x.k === 'fill');
+    const jambs = prims.filter((x) => x.k === 'poly' && !x.closed);
+    ok(
+      '51a. 有门洞的墙被切成两段，洞口中心点不在任何一段墙实体里（图上能看见洞）',
+      solids.length === 2 && !solids.some((x) => x.k === 'fill' && pointInPolySafe(center, x.pts)),
+      JSON.stringify({ fills: solids.length, insideSolid: solids.some((x) => x.k === 'fill' && pointInPolySafe(center, x.pts)) })
+    );
+    ok(
+      '51b. 洞口两端各有一条封口线（洞是切开的，不是墙没画完）',
+      jambs.length === 2 && jambs.every((x) => x.k === 'poly' && x.pts.length === 2 && x.layer === 'A-WALL'),
+      JSON.stringify(jambs.map((x) => (x.k === 'poly' ? x.pts : null)))
+    );
+
+    const plain = mkRoom('r2').walls[2]!;
+    const plainPrims = wallPlanPrims(plain);
+    ok(
+      '51c. 没有洞口的墙仍然是「一块填充 + 一条闭合轮廓」两个图元（不回归）',
+      plain.openings === undefined && plainPrims.length === 2 && plainPrims[0]!.k === 'fill' && plainPrims[1]!.k === 'poly',
+      JSON.stringify(plainPrims.map((x) => x.k))
+    );
+
+    const renderer = readFileSync(join(APP, 'src/viewport/renderer.ts'), 'utf8');
+    ok(
+      '51d. 实时画布与导出图共用 wallPlanPrims（画布不再自己画一条完整实墙）',
+      /wallPlanPrims/.test(renderer) && !/layer: 'A-WALL', alpha: 0\.22/.test(renderer),
+      renderer.split('\n').filter((l) => /wallPlanPrims|A-WALL/.test(l)).join(' | ').slice(0, 200)
+    );
+
+    const book = readFileSync(join(APP, 'src/export/roomBook.ts'), 'utf8');
+    const neutral = readFileSync(join(APP, 'src/export/neutralSheet.ts'), 'utf8');
+    ok(
+      '51e. 两个导出面都叠了同源的门扇扇形（图上的扇形就是校验用的那条包络）',
+      /doorSwingPrimsOf\(project, group\.room\.id\)/.test(book) && /doorSwingPrimsOf\(project, room\.id\)/.test(neutral),
+      JSON.stringify({ book: /doorSwingPrimsOf/.test(book), neutral: /doorSwingPrimsOf/.test(neutral) })
+    );
+  }
 
 // ═══════════════ 汇总 ═══════════════
 console.log(`\n═══ P8.9 门扇开启验收：${passed} 通过 / ${failed} 失败 ═══`);

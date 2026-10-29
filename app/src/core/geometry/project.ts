@@ -25,20 +25,69 @@ export function wallPolygon(w: Wall): Vec2[] {
   ];
 }
 
-function wallPrims(w: Wall): Prim[] {
-  const poly = wallPolygon(w);
-  if (poly.length === 0) return [];
-  const out: Prim[] = [
-    { k: 'fill', pts: poly, layer: L_WALL, alpha: 0.22 },
-    { k: 'poly', pts: poly, closed: true, layer: L_WALL, lw: 2 },
+/** 沿墙取点：t = 沿中心线距离，side = +1/-1 为墙的两侧表面 */
+function wallEdgePoint(w: Wall, len: number, t: number, side: 1 | -1): Vec2 {
+  const ux = (w.end.x - w.start.x) / len;
+  const uy = (w.end.y - w.start.y) / len;
+  const half = (w.thickness / 2) * side;
+  return { x: w.start.x + ux * t - uy * half, y: w.start.y + uy * t + ux * half };
+}
+
+function wallSolidPrims(w: Wall, len: number, a: number, b: number): Prim[] {
+  const quad = [wallEdgePoint(w, len, a, 1), wallEdgePoint(w, len, b, 1), wallEdgePoint(w, len, b, -1), wallEdgePoint(w, len, a, -1)];
+  return [
+    { k: 'fill', pts: quad, layer: L_WALL, alpha: 0.22 },
+    { k: 'poly', pts: quad, closed: true, layer: L_WALL, lw: 2 },
   ];
+}
+
+/**
+ * 平面上的墙：洞口处**断开**，洞两端封口；窗在洞口里画两条墙线。
+ *
+ * 实时画布与导出图共用这一份 —— 以前两边各画一条完整实墙，
+ * 于是"图上没有门洞"这件事永远修不掉（也永远对不上报告）。
+ * 门扇与开启弧不在这里：那是空间层判出来的（doorSwingPrimsOf），
+ * 图上的扇形与校验用的扇形必须同源。
+ */
+export function wallPlanPrims(w: Wall): Prim[] {
   const len = Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y);
+  if (len === 0) return [];
+  const cuts = (w.openings ?? [])
+    .map((o) => [Math.max(0, o.offset), Math.min(len, o.offset + o.width)] as [number, number])
+    .filter(([a, b]) => b - a > 1)
+    .sort((x, y) => x[0] - y[0]);
+  const out: Prim[] = [];
+  let cur = 0;
+  for (const [a, b] of cuts) {
+    if (a - cur > 1) out.push(...wallSolidPrims(w, len, cur, a));
+    cur = Math.max(cur, b);
+  }
+  if (len - cur > 1) out.push(...wallSolidPrims(w, len, cur, len));
+  for (const [a, b] of cuts) {
+    for (const t of [a, b]) {
+      out.push({ k: 'poly', pts: [wallEdgePoint(w, len, t, 1), wallEdgePoint(w, len, t, -1)], closed: false, layer: L_WALL, lw: 2 });
+    }
+  }
+  for (const o of w.openings ?? []) {
+    if (o.kind !== 'window') continue;
+    const a = Math.max(0, o.offset);
+    const b = Math.min(len, o.offset + o.width);
+    if (b - a <= 1) continue;
+    for (const side of [1, -1] as const) {
+      out.push({ k: 'poly', pts: [wallEdgePoint(w, len, a, side), wallEdgePoint(w, len, b, side)], closed: false, layer: L_WALL, lw: 1 });
+    }
+  }
+  return out;
+}
+
+function wallLengthPrim(w: Wall): Prim[] {
+  const len = Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y);
+  if (len === 0) return [];
   const mx = (w.start.x + w.end.x) / 2;
   const my = (w.start.y + w.end.y) / 2;
   let rot = (Math.atan2(w.end.y - w.start.y, w.end.x - w.start.x) * 180) / Math.PI;
   if (rot > 90 || rot < -90) rot += 180;
-  out.push({ k: 'text', p: { x: mx, y: my }, text: `${Math.round(len)}`, size: 95, layer: L_WALL_TEXT, align: 'c', rot });
-  return out;
+  return [{ k: 'text', p: { x: mx, y: my }, text: `${Math.round(len)}`, size: 95, layer: L_WALL_TEXT, align: 'c', rot }];
 }
 
 export function generateProject(project: Project, rules: RuleSet): ProjectGeometry {
@@ -51,7 +100,7 @@ export function generateProject(project: Project, rules: RuleSet): ProjectGeomet
 
   for (const room of project.rooms) {
     for (const w of room.walls) {
-      const prims = wallPrims(w);
+      const prims = [...wallPlanPrims(w), ...wallLengthPrim(w)];
       plan.push(...prims);
       roomPlans[room.id]?.push(...prims);
       const keys = makePlanSourceKeys(`wall:${w.id}`, prims);

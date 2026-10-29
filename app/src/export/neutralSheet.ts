@@ -1,5 +1,6 @@
 import type { BBox, Cabinet, CabinetGeometry, Issue, Panel, Prim, Project, PurchasedItem, RuleSet, Vec2 } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { doorSwingPrimsOf } from '../viewport/doorSwingPrims.ts';
 import { buildProjectViews } from '../core/geometry/views.ts';
 import { buildFurnitureSheet, groupByRoom } from './furnitureSheet.ts';
 import { drawingPrims, planSourceKeys as makePlanSourceKeys } from '../core/drawingEdits.ts';
@@ -218,7 +219,7 @@ export function toNeutralExport(
         ...project,
         drawingEdits: (project.drawingEdits ?? []).filter(e => e.space === 'plan' && e.roomId === room.id),
       };
-      const prims = drawingPrims(roomProject, 'plan', geom.roomPlans[room.id] ?? [], geom.roomPlanSourceKeys[room.id] ?? []);
+      const prims = drawingPrims(roomProject, 'plan', [...(geom.roomPlans[room.id] ?? []), ...doorSwingPrimsOf(project, room.id)], geom.roomPlanSourceKeys[room.id] ?? []);
       if (prims.length === 0) return;
       const planPrims = [...prims];
       const planBox = bboxOf(prims);

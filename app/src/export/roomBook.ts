@@ -1,5 +1,6 @@
 import type { Cabinet, Issue, Prim, Project, PurchasedItem, RuleSet } from '../core/types.ts';
 import { generateProject } from '../core/geometry/project.ts';
+import { doorSwingPrimsOf } from '../viewport/doorSwingPrims.ts';
 import { boxOverlap, primVisualExtent } from '../core/geometry/labels.ts';
 import { lintPrims } from '../core/geometry/drawingLint.ts';
 import { localToWorld, polyLocalToWorld } from '../core/geometry/transform.ts';
@@ -641,7 +642,7 @@ export function buildRoomBook(project: Project, rules: RuleSet, modelVersion: st
     return {
     roomId: group.room.id,
     roomName: group.room.name,
-    layoutSvg: primsToSvg(avoid([...cleanLayoutPrims, ...callouts.prims], group.room.name + '·平面布局', group.room.id), 'room-layout', LAYOUT_SLOT_MM),
+    layoutSvg: primsToSvg(avoid([...cleanLayoutPrims, ...doorSwingPrimsOf(project, group.room.id), ...callouts.prims], group.room.name + '·平面布局', group.room.id), 'room-layout', LAYOUT_SLOT_MM),
     layoutSafetyNote,
     elevationSvg: elevation.rendered > 0 ? primsToSvg(elevation.prims, 'room-elevation') : null,
     elevationSkipped: elevation.skipped,

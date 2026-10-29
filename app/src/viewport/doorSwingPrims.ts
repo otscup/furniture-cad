@@ -15,10 +15,11 @@ import { deriveDoorSwing } from '../core/spatial/index.ts';
  * unknown（没指定铰链/方向、房间不闭合、洞口非法…）**不画**：
  * 没判出来就不假装有范围，界面照实显示"未指定"。
  */
-export function doorSwingPrimsOf(project: Project): Prim[] {
+export function doorSwingPrimsOf(project: Project, roomId?: string): Prim[] {
   const { doors } = deriveDoorSwing(project);
   const out: Prim[] = [];
   for (const d of doors) {
+    if (roomId !== undefined && d.roomId !== roomId) continue;
     const env = d.envelope;
     if (d.status !== 'ok' || !env) continue;
     out.push({ k: 'fill', pts: env.poly, layer: 'A-DOOR-SWING', alpha: 0.1 });

@@ -1,6 +1,6 @@
 import type { DrawingEntity, Prim, Project, ProjectGeometry, Vec2 } from '../core/types.ts';
 import { getCabinetFootprint } from '../core/geometry/generate.ts';
-import { wallPolygon } from '../core/geometry/project.ts';
+import { wallPlanPrims } from '../core/geometry/project.ts';
 import type { Camera } from './camera.ts';
 import { niceGridStep, screenToWorld, worldToScreen } from './camera.ts';
 import { UI_COLORS, layerOf } from './layers.ts';
@@ -353,18 +353,9 @@ function drawWalls(inp: RenderInput, to: P2S): void {
 
   for (const room of project.rooms) {
     for (const w of room.walls) {
-      const poly = wallPolygon(w);
-      if (poly.length === 0) continue;
-      drawPrims(
-        ctx,
-        [
-          { k: 'fill', pts: poly, layer: 'A-WALL', alpha: 0.22 },
-          { k: 'poly', pts: poly, closed: true, layer: 'A-WALL', lw: 2 },
-        ],
-        to,
-        hiddenLayers,
-        cam.scale
-      );
+      const wallPrims = wallPlanPrims(w);
+      if (wallPrims.length === 0) continue;
+      drawPrims(ctx, wallPrims, to, hiddenLayers, cam.scale);
 
       const len = Math.hypot(w.end.x - w.start.x, w.end.y - w.start.y);
       if (len * cam.scale > 46) {
